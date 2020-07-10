@@ -26,7 +26,6 @@ import (
 	"github.com/cilium/cilium/pkg/logging/logfields"
 
 	"github.com/sirupsen/logrus"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 )
 
@@ -50,12 +49,12 @@ type PeerManager interface {
 // gRPC API endpoint.
 type Peer struct {
 	hubblePeer.Peer
-	Conn *grpc.ClientConn
+	Conn ClientConn
 }
 
 type peer struct {
 	hubblePeer.Peer
-	conn *grpc.ClientConn
+	conn ClientConn
 	err  error
 	mu   lock.Mutex
 }
@@ -300,8 +299,7 @@ func (m *Manager) connect(p *peer) {
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		m.log.WithFields(logrus.Fields{
-			"address":      p.Address,
-			"dial timeout": m.opts.DialTimeout,
+			"address": p.Address,
 		}).Debugf("Connecting peer %s...", p.Name)
 		if p.conn != nil {
 			switch p.conn.GetState() {
@@ -316,13 +314,11 @@ func (m *Manager) connect(p *peer) {
 				p.conn = nil
 			}
 		}
-		//FIXME: remove WithInsecure once mutual TLS is implemented
-		conn, err := newConn(p.Address.String(), m.opts.DialTimeout, grpc.WithInsecure(), grpc.WithBlock())
+		conn, err := m.opts.ClientConnBuilder.ClientConn(p.Address.String())
 		if err != nil {
 			m.log.WithFields(logrus.Fields{
-				"address":      p.Address,
-				"dial timeout": m.opts.DialTimeout,
-				"error":        err,
+				"address": p.Address,
+				"error":   err,
 			}).Warningf("Failed to create gRPC client connection to peer %s", p.Name)
 		} else {
 			p.conn = conn
@@ -345,10 +341,4 @@ func (m *Manager) disconnect(p *peer) {
 	}
 	p.conn = nil
 	m.log.Debugf("Peer %s disconnected", p.Name)
-}
-
-func newConn(target string, dialTimeout time.Duration, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
-	defer cancel()
-	return grpc.DialContext(ctx, target, opts...)
 }
