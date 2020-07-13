@@ -579,6 +579,8 @@ The following metrics have been added:
   in the system
 * ``bpf_progs_virtual_memory_max_bytes``: Max memory used by BPF programs
   installed in the system
+* ``cilium_kvstore_quorum_errors_total`` counts the number of kvstore quorum
+  loss errors. The label ``error`` indicates the type of error.
 
 Both ``bpf_maps_virtual_memory_max_bytes`` and ``bpf_progs_virtual_memory_max_bytes``
 are currently reporting the system-wide memory usage of BPF that is directly
@@ -598,6 +600,7 @@ The following metrics have been renamed:
 * ``cilium_operator_eni_resync_total`` to ``cilium_operator_ipam_resync_total``
 * ``cilium_operator_eni_aws_api_duration_seconds`` to ``cilium_operator_ipam_api_duration_seconds``
 * ``cilium_operator_eni_ec2_rate_limit_duration_seconds`` to ``cilium_operator_ipam_api_rate_limit_duration_seconds``
+* ``cilium_operator_ipam_ec2_resync`` to ``cilium_operator_ipam_resync``
 
 Deprecated cilium-operator options
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
