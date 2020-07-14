@@ -178,7 +178,8 @@ func (m *Manager) manageConnections() {
 			m.mu.Lock()
 			p := m.peers[name]
 			m.mu.Unlock()
-			m.connect(p)
+			// a connection request has been made, make sure to attempt a connection
+			m.connect(p, true)
 		case <-time.After(m.opts.ConnCheckInterval):
 			var retry []*peer
 			m.mu.Lock()
@@ -200,7 +201,7 @@ func (m *Manager) manageConnections() {
 			m.mu.Unlock()
 			for _, p := range retry {
 				m.disconnect(p)
-				m.connect(p)
+				m.connect(p, false)
 			}
 		}
 	}
@@ -298,12 +299,12 @@ func (m *Manager) update(hp *hubblePeer.Peer) {
 	}
 }
 
-func (m *Manager) connect(p *peer) {
+func (m *Manager) connect(p *peer, ignoreBackoff bool) {
 	go func() {
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		now := time.Now()
-		if p.nextConnAttempt.After(now) {
+		if p.nextConnAttempt.After(now) && !ignoreBackoff {
 			return
 		}
 		if p.conn != nil {
