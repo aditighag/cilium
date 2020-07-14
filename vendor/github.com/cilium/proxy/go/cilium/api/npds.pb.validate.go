@@ -310,6 +310,8 @@ func (m *PortNetworkPolicyRule) Validate() error {
 		return nil
 	}
 
+	// no validation rules for Name
+
 	_PortNetworkPolicyRule_RemotePolicies_Unique := make(map[uint64]struct{}, len(m.GetRemotePolicies()))
 
 	for idx, item := range m.GetRemotePolicies() {
@@ -905,20 +907,28 @@ func (m *L7NetworkPolicyRules) Validate() error {
 		return nil
 	}
 
-	if len(m.GetL7Rules()) < 1 {
-		return L7NetworkPolicyRulesValidationError{
-			field:  "L7Rules",
-			reason: "value must contain at least 1 item(s)",
-		}
-	}
-
-	for idx, item := range m.GetL7Rules() {
+	for idx, item := range m.GetL7AllowRules() {
 		_, _ = idx, item
 
 		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
 			if err := v.Validate(); err != nil {
 				return L7NetworkPolicyRulesValidationError{
-					field:  fmt.Sprintf("L7Rules[%v]", idx),
+					field:  fmt.Sprintf("L7AllowRules[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
+				}
+			}
+		}
+
+	}
+
+	for idx, item := range m.GetL7DenyRules() {
+		_, _ = idx, item
+
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return L7NetworkPolicyRulesValidationError{
+					field:  fmt.Sprintf("L7DenyRules[%v]", idx),
 					reason: "embedded message failed validation",
 					cause:  err,
 				}
@@ -994,7 +1004,24 @@ func (m *L7NetworkPolicyRule) Validate() error {
 		return nil
 	}
 
+	// no validation rules for Name
+
 	// no validation rules for Rule
+
+	for idx, item := range m.GetMetadataRule() {
+		_, _ = idx, item
+
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return L7NetworkPolicyRuleValidationError{
+					field:  fmt.Sprintf("MetadataRule[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
+				}
+			}
+		}
+
+	}
 
 	return nil
 }

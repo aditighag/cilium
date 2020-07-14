@@ -129,7 +129,7 @@ func (s *R2d2Suite) TestR2d2OnDataAllowDenyCmd(c *C) {
 		  rules: <
 		    l7_proto: "r2d2"
             l7_rules: <
-                l7_rules: <
+                l7_allow_rules: <
 			        rule: <
 			            key: "cmd"
 			            value: "READ"
@@ -159,7 +159,7 @@ func (s *R2d2Suite) TestR2d2OnDataAllowDenyRegex(c *C) {
 		  rules: <
 		    l7_proto: "r2d2"
             l7_rules: <
-                l7_rules: <
+                l7_allow_rules: <
 			        rule: <
 			            key: "file"
 			            value: "s.*"
