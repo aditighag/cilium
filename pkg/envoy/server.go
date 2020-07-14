@@ -44,6 +44,8 @@ import (
 	envoy_config_listener "github.com/cilium/proxy/go/envoy/config/listener/v3"
 	envoy_config_route "github.com/cilium/proxy/go/envoy/config/route/v3"
 	envoy_config_http "github.com/cilium/proxy/go/envoy/extensions/filters/network/http_connection_manager/v3"
+	envoy_mongo_proxy "github.com/cilium/proxy/go/envoy/extensions/filters/network/mongo_proxy/v3"
+	envoy_mysql_proxy "github.com/cilium/proxy/go/envoy/extensions/filters/network/mysql_proxy/v3"
 	envoy_config_tcp "github.com/cilium/proxy/go/envoy/extensions/filters/network/tcp_proxy/v3"
 	envoy_type_matcher "github.com/cilium/proxy/go/envoy/type/matcher/v3"
 
@@ -411,6 +413,37 @@ func (s *XDSServer) AddListener(name string, kind policy.L7ParserType, port uint
 		listenerConf.FilterChains = append(listenerConf.FilterChains, s.getHttpFilterChainProto(tlsClusterName, true))
 	} else {
 		listenerConf.FilterChains = append(listenerConf.FilterChains, s.getTcpFilterChainProto(clusterName, true))
+
+		mySqlChain := s.getTcpFilterChainProto(clusterName, false)
+		mySqlChain.Filters = append([]*envoy_config_listener.Filter{{
+			Name: "envoy.filters.network.mysql_proxy",
+			ConfigType: &envoy_config_listener.Filter_TypedConfig{
+				TypedConfig: toAny(&envoy_mysql_proxy.MySQLProxy{
+					StatPrefix: "mysql",
+				}),
+			}}}, mySqlChain.Filters...)
+		mySqlChain.FilterChainMatch = &envoy_config_listener.FilterChainMatch{
+			// must have transport match, otherwise TLS inspector will be automatically inserted
+			TransportProtocol:    "raw_buffer",
+			ApplicationProtocols: []string{"envoy.filters.network.mysql_proxy"},
+		}
+		listenerConf.FilterChains = append(listenerConf.FilterChains, mySqlChain)
+
+		mongoChain := s.getTcpFilterChainProto(clusterName, false)
+		mongoChain.Filters = append([]*envoy_config_listener.Filter{{
+			Name: "envoy.mongo_proxy",
+			ConfigType: &envoy_config_listener.Filter_TypedConfig{
+				TypedConfig: toAny(&envoy_mongo_proxy.MongoProxy{
+					StatPrefix:          "mongo",
+					EmitDynamicMetadata: true,
+				}),
+			}}}, mongoChain.Filters...)
+		mongoChain.FilterChainMatch = &envoy_config_listener.FilterChainMatch{
+			// must have transport match, otherwise TLS inspector will be automatically inserted
+			TransportProtocol:    "raw_buffer",
+			ApplicationProtocols: []string{"envoy.mongo_proxy"},
+		}
+		listenerConf.FilterChains = append(listenerConf.FilterChains, mongoChain)
 	}
 
 	s.listenerMutator.Upsert(ListenerTypeURL, name, listenerConf, []string{"127.0.0.1"}, wg,
