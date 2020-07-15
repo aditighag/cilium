@@ -561,6 +561,9 @@ const (
 	// EnableIPv6Name is the name of the option to enable IPv6 support
 	EnableIPv6Name = "enable-ipv6"
 
+	// EnableMonitorSocket is the name of the option to enable the monitor socket
+	EnableMonitorSocketName = "enable-monitor-socket"
+
 	// MonitorQueueSizeName is the name of the option MonitorQueueSize
 	MonitorQueueSizeName = "monitor-queue-size"
 
@@ -1360,6 +1363,9 @@ type DaemonConfig struct {
 	CTMapEntriesTimeoutSVCAny time.Duration
 	CTMapEntriesTimeoutSYN    time.Duration
 	CTMapEntriesTimeoutFIN    time.Duration
+
+	// EnableMonitorSocket enables the monitor unix domain socket server
+	EnableMonitorSocket bool
 
 	// MonitorAggregationInterval configures the interval between monitor
 	// messages when monitor aggregation is enabled.
@@ -2323,6 +2329,7 @@ func (c *DaemonConfig) Populate() {
 	c.IPTablesLockTimeout = viper.GetDuration(IPTablesLockTimeout)
 	c.IPSecKeyFile = viper.GetString(IPSecKeyFileName)
 	c.ModePreFilter = viper.GetString(PrefilterMode)
+	c.EnableMonitorSocket = viper.GetBool(EnableMonitorSocketName)
 	c.MonitorAggregation = viper.GetString(MonitorAggregationName)
 	c.MonitorAggregationInterval = viper.GetDuration(MonitorAggregationInterval)
 	c.MonitorQueueSize = viper.GetInt(MonitorQueueSizeName)

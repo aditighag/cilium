@@ -583,11 +583,14 @@ func NewDaemon(ctx context.Context, epMgr *endpointmanager.EndpointManager, dp d
 		if err != nil {
 			return nil, nil, err
 		}
-		err = monitoragent.ServeMonitorAPI(monitorAgent)
-		if err != nil {
-			return nil, nil, err
-		}
 		d.monitorAgent = monitorAgent
+
+		if option.Config.EnableMonitorSocket {
+			err = monitoragent.ServeMonitorAPI(monitorAgent)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
 	}
 
 	if err := d.syncEndpointsAndHostIPs(); err != nil {
