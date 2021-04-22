@@ -78,7 +78,7 @@ func (c *CNPStatusUpdateContext) updateStatus(ctx context.Context, cnp *types.Sl
 		if option.Config.K8sEventHandover {
 			err = c.updateViaKVStore(ctx, cnp, false, false, policyImportErr, rev, cnp.Annotations)
 		} else {
-			err = c.updateViaAPIServer(cnp, false, false, policyImportErr, rev, cnp.Annotations)
+			err = c.UpdateViaAPIServer(cnp, false, false, policyImportErr, rev, cnp.Annotations)
 		}
 	} else {
 		// If the deadline by the above context, then not all endpoints
@@ -87,7 +87,7 @@ func (c *CNPStatusUpdateContext) updateStatus(ctx context.Context, cnp *types.Sl
 		if option.Config.K8sEventHandover {
 			err = c.updateViaKVStore(ctx, cnp, waitForEPsErr == nil, true, waitForEPsErr, rev, cnp.Annotations)
 		} else {
-			err = c.updateViaAPIServer(cnp, waitForEPsErr == nil, true, waitForEPsErr, rev, cnp.Annotations)
+			err = c.UpdateViaAPIServer(cnp, waitForEPsErr == nil, true, waitForEPsErr, rev, cnp.Annotations)
 		}
 	}
 
@@ -211,7 +211,7 @@ func formatKeyForKvstore(o K8sMetaObject) string {
 	return path.Join(CCNPStatusesPath, getKeyFromObject(o))
 }
 
-func (c *CNPStatusUpdateContext) updateViaAPIServer(cnp *types.SlimCNP, enforcing, ok bool, cnpError error, rev uint64, cnpAnnotations map[string]string) error {
+func (c *CNPStatusUpdateContext) UpdateViaAPIServer(cnp *types.SlimCNP, enforcing, ok bool, cnpError error, rev uint64, cnpAnnotations map[string]string) error {
 	var (
 		annotations map[string]string
 	)
