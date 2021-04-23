@@ -211,7 +211,7 @@ func formatKeyForKvstore(o K8sMetaObject) string {
 	return path.Join(CCNPStatusesPath, getKeyFromObject(o))
 }
 
-func (c *CNPStatusUpdateContext) UpdateViaAPIServer(cnp *types.SlimCNP, enforcing, ok bool, cnpError error, rev uint64, cnpAnnotations map[string]string) error {
+func (c *CNPStatusUpdateContext) updateViaAPIServer(cnp *types.SlimCNP, enforcing, ok bool, cnpError error, rev uint64, cnpAnnotations map[string]string) error {
 	var (
 		annotations map[string]string
 	)
