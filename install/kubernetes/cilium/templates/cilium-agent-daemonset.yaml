@@ -371,6 +371,13 @@ spec:
       hostNetwork: true
       initContainers:
 {{- if and .Values.nodeinit.enabled (not (eq .Values.nodeinit.bootstrapFile "")) }}
+      - name: mount-cgroup
+        command: ['sh', '-c', 'mount | grep "/run/cilium/cgroupv2 type cgroup2" || { echo "Mounting cgroup filesystem..."; mount -t cgroup2 none /run/cilium/cgroupv2; }']
+        image: "quay.io/aditighag/cilium-dev:cgroup-fix"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        volumeMounts:
+          - mountPath: /run/cilium/cgroupv2
+            name: cilium-cgroup
       - name: wait-for-node-init
         command: ['sh', '-c', 'until stat {{ .Values.nodeinit.bootstrapFile }} > /dev/null 2>&1; do echo "Waiting on node-init to run..."; sleep 1; done']
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}{{ if .Values.image.useDigest }}@{{ .Values.image.digest }}{{ end }}"
@@ -427,6 +434,9 @@ spec:
 {{- /* Required for wait-bpf-mount to work */}}
           mountPropagation: HostToContainer
 {{- end }}
+        - mountPath: /run/cilium/cgroupv2
+          name: cilium-cgroup
+          mountPropagation: Bidirectional
         - mountPath: /var/run/cilium
           name: cilium-run
 {{- if .Values.nodeinit.resources }}
@@ -457,6 +467,10 @@ spec:
           path: /sys/fs/bpf
           type: DirectoryOrCreate
         name: bpf-maps
+      - hostPath:
+          path: /run/cilium/cgroupv2
+          type: DirectoryOrCreate
+        name: cilium-cgroup
 {{- end }}
       # To install cilium cni plugin in the host
       - hostPath:
