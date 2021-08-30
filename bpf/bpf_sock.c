@@ -344,6 +344,7 @@ static __always_inline int __sock4_xlate_fwd(struct bpf_sock_addr *ctx,
 	struct lb4_service *backend_slot;
 	bool backend_from_affinity = false;
 	__u32 backend_id = 0;
+	bool udp_sock_affinity = false;
 
 	if (!udp_only && !sock_proto_enabled(ctx->protocol))
 		return -ENOTSUP;
@@ -389,6 +390,17 @@ static __always_inline int __sock4_xlate_fwd(struct bpf_sock_addr *ctx,
 				 */
 				backend_id = 0;
 		}
+	} else if (udp_only) {
+		udp_sock_affinity = true;
+		id.sock_cookie = sock_local_cookie(ctx_full);
+		backend_id = lb4_affinity_backend_id_by_sock(svc, &id);
+		backend_from_affinity = true;
+
+		if (backend_id != 0) {
+			backend = __lb4_lookup_backend(backend_id);
+			if (!backend)
+				backend_id = 0;
+		}
 	}
 
 	if (backend_id == 0) {
@@ -414,8 +426,13 @@ static __always_inline int __sock4_xlate_fwd(struct bpf_sock_addr *ctx,
 	    sock4_skip_xlate_if_same_netns(ctx_full, backend))
 		return -ENXIO;
 
-	if (lb4_svc_is_affinity(svc) && !backend_from_affinity)
-		lb4_update_affinity_by_netns(svc, &id, backend_id);
+	if (!backend_from_affinity) {
+		if (lb4_svc_is_affinity(svc)) {
+			lb4_update_affinity_by_netns(svc, &id, backend_id);
+		} else if (udp_sock_affinity) {
+			lb4_update_affinity_by_sock(svc, &id, backend_id);
+		}
+	}
 
 	if (sock4_update_revnat(ctx_full, backend, &orig_key,
 				svc->rev_nat_index) < 0) {

@@ -1333,6 +1333,56 @@ lb4_update_affinity_by_netns(const struct lb4_service *svc __maybe_unused,
 #endif
 }
 
+static __always_inline __u32
+lb4_affinity_backend_id_by_sock(const struct lb4_service *svc __maybe_unused,
+		union lb4_affinity_client_id *id __maybe_unused)
+{
+#if defined(ENABLE_SESSION_AFFINITY)
+	struct lb4_affinity_key key = {
+			.rev_nat_id   = svc->rev_nat_index,
+			.sock_cookie  = true,
+			.client_id    = *id,
+	};
+	struct lb_affinity_val *val;
+
+	val = map_lookup_elem(&LB4_AFFINITY_MAP, &key);
+	if (val != NULL) {
+		struct lb_affinity_match match = {
+				.rev_nat_id	= svc->rev_nat_index,
+				.backend_id	= val->backend_id,
+		};
+
+		if (!map_lookup_elem(&LB_AFFINITY_MATCH_MAP, &match)) {
+			map_delete_elem(&LB4_AFFINITY_MAP, &key);
+			return 0;
+		}
+
+		return val->backend_id;
+	}
+
+#endif
+	return 0;
+}
+
+static __always_inline void
+lb4_update_affinity_by_sock(const struct lb4_service *svc __maybe_unused,
+				 union lb4_affinity_client_id *id __maybe_unused,
+			 	__u32 backend_id __maybe_unused)
+{
+#if defined(ENABLE_SESSION_AFFINITY)
+	struct lb4_affinity_key key = {
+			.rev_nat_id	= svc->rev_nat_index,
+			.sock_cookie = true,
+			.client_id	= *id,
+	};
+	struct lb_affinity_val val = {
+			.backend_id	= backend_id,
+	};
+
+	map_update_elem(&LB4_AFFINITY_MAP, &key, &val, 0);
+#endif
+}
+
 static __always_inline int lb4_local(const void *map, struct __ctx_buff *ctx,
 				     int l3_off, int l4_off,
 				     struct csum_offset *csum_off,
