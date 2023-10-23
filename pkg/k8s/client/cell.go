@@ -151,6 +151,12 @@ func newClientsetForUserAgent(lc cell.Lifecycle, log logrus.FieldLogger, cfg Con
 		return &compositeClientset{disabled: true}, nil
 	}
 
+
+	if cfg.K8sAPIServer != "" &&
+		!strings.HasPrefix(cfg.K8sAPIServer, "http") {
+		cfg.K8sAPIServer = "http://" + cfg.K8sAPIServer // default to HTTP
+	}
+
 	apiServerURLs := []string{}
 
 	for _, apiServerURL := range cfg.K8sAPIServerURLs {
