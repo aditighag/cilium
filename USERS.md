@@ -5,7 +5,7 @@ Sharing experiences and learning from other users is essential. We are
 frequently asked who is using a particular feature of Cilium so people can get in
 contact with other users to share experiences and best practices. People
 also often want to know if product/platform X has integrated Cilium.
-While the [Cilium Slack community](https://cilium.herokuapp.com/) allows
+While the [Cilium Slack community](https://slack.cilium.io) allows
 users to get in touch, it can be challenging to find this information quickly.
 
 The following is a directory of adopters to help identify users of individual
@@ -94,6 +94,12 @@ Users (Alphabetically)
       L: https://cloud.arangodb.com
       Q: @ewoutp @Robert-Stam
 
+    * N: Archer Aviation
+      D: Archer Aviation uses Cilium as part of the foundation of the Kubernetes cluster.
+      U: Networking, Observability, Security
+      L: https://www.archer.com
+      Q: @Hongbo Miao
+
     * N: Ascend.io
       D: Ascend.io is using Cilium as a consistent CNI for our Data Automation Platform on GKE, EKS, and AKS.
       U: Transparent Encryption, Overlay Networking, Cluster Mesh, Egress Gateway, Network Policy, Hubble
@@ -116,6 +122,12 @@ Users (Alphabetically)
       U: CNI, Network Policies, Hubble
       Q: @Bernard Halas
       L: https://github.com/berops/claudie
+
+    * N: Bitnami
+      D: Cilium is part of the largest open-source application catalog.
+      U: CNI, Hubble, BGP, eBPF, CiliumNetworkPolicy, CiliumClusterwideNetworkPolicy
+      L: https://bitnami.com/stack/cilium
+      Q: @carrodher
 
     * N: ByteDance
       D: ByteDance is using Cilium as CNI plug-in for self-hosted Kubernetes.
@@ -763,6 +775,12 @@ Users (Alphabetically)
       D: Veepee is using Cilium on their on-premise Kubernetes clusters, hosting majority of their applications.
       U. CNI, BGP, eBPF, Hubble, DirectRouting (via kube-router)
       Q: @nerzhul
+
+    * N: VMware by Broadcom
+      D: VMware offers multi-arch (ARM, AMD) and multi-distro (Ubuntu, RedHat UBI, Debian, PhotonOS) Cilium as part of the Tanzu Application Catalog, enabling customers to deploy it in their Kubernetes infrastructure.
+      U: CNI, Hubble, BGP, eBPF, CiliumNetworkPolicy, CiliumClusterwideNetworkPolicy
+      L: https://app-catalog.vmware.com/catalog?gfilter=cilium
+      Q: @carrodher
 
     * N: Wildlife Studios
       D: Wildlife Studios is using Cilium in AWS for all their game production clusters (self hosted k8s)

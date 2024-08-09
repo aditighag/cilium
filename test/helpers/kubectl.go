@@ -6,9 +6,11 @@ package helpers
 import (
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path"
@@ -78,6 +80,9 @@ const (
 )
 
 var (
+	// cliOverrideOptions are populated from -cilium.install-helm-overrides.
+	cliOverrideOptions = map[string]string{}
+
 	// defaultHelmOptions are passed to helm in ciliumInstallHelm, unless
 	// overridden by options passed in at invocation. In those cases, the test
 	// has a specific need to override the option.
@@ -280,6 +285,33 @@ func Init() {
 	// preflight must match the cilium agent image (that's the point)
 	defaultHelmOptions["preflight.image.repository"] = defaultHelmOptions["image.repository"]
 	defaultHelmOptions["preflight.image.tag"] = defaultHelmOptions["image.tag"]
+
+	if config.CiliumTestConfig.InstallHelmOverrides != "" {
+		parseHelmOverrides(config.CiliumTestConfig.InstallHelmOverrides, cliOverrideOptions)
+	}
+}
+
+func parseHelmOverrides(overridesStr string, overrides map[string]string) {
+	rdr := csv.NewReader(strings.NewReader(overridesStr))
+	rdr.LazyQuotes = true
+	for {
+		record, err := rdr.Read()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			fmt.Fprintf(os.Stderr, "failed to parse install-helm-overrides %q: %v\n", config.CiliumTestConfig.InstallHelmOverrides, err)
+			os.Exit(1)
+		}
+		for _, row := range record {
+			toks := strings.Split(row, "=")
+			if len(toks) != 2 {
+				fmt.Fprintf(os.Stderr, "failed to parse install-helm-overrides value %q, unexpected format (should be x.y.z=foo)\n", row)
+				os.Exit(1)
+			}
+			overrides[toks[0]] = toks[1]
+		}
+	}
 }
 
 // GetCurrentK8SEnv returns the value of K8S_VERSION from the OS environment.
@@ -2494,13 +2526,29 @@ func (kub *Kubectl) overwriteHelmOptions(options map[string]string) error {
 	// Do not schedule cilium-agent on the NO_CILIUM_ON_NODE nodes
 	noCiliumNodes := GetNodesWithoutCilium()
 	if len(noCiliumNodes) > 0 {
-		opts := map[string]string{
-			"affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key":      "cilium.io/ci-node",
-			"affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].operator": "NotIn",
-		}
-		for i, n := range noCiliumNodes {
-			key := fmt.Sprintf("affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values[%d]", i)
-			opts[key] = kub.GetNodeCILabel(n)
+		opts := make(map[string]string)
+		// Component represents the path within the top level of the
+		// Cilium values.yaml configuration for a specific resource.
+		for _, component := range []string{
+			"", // cilium-agent
+			"envoy",
+			"hubble.relay",
+			"operator",
+			"preflight",
+		} {
+			prefix := strings.TrimPrefix(
+				strings.Join(
+					append(
+						[]string{component},
+						"affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0]",
+					), ".",
+				), ".")
+			opts[prefix+".key"] = "cilium.io/ci-node"
+			opts[prefix+".operator"] = "NotIn"
+			for i, n := range noCiliumNodes {
+				key := prefix + fmt.Sprintf(".values[%d]", i)
+				opts[key] = kub.GetNodeCILabel(n)
+			}
 		}
 		for key, value := range opts {
 			options = addIfNotOverwritten(options, key, value)
@@ -2568,7 +2616,7 @@ func (kub *Kubectl) overwriteHelmOptions(options map[string]string) error {
 		if err != nil {
 			return err
 		}
-		devices := fmt.Sprintf(`'{%s,%s,%s}'`, privateIface, defaultIfaceIPv4, defaultIfaceIPv6)
+		devices := fmt.Sprintf(`{%s,%s,%s}`, privateIface, defaultIfaceIPv4, defaultIfaceIPv6)
 		addIfNotOverwritten(options, "devices", devices)
 	}
 
@@ -2584,6 +2632,10 @@ func (kub *Kubectl) overwriteHelmOptions(options map[string]string) error {
 
 	if !SupportIPv6Connectivity() {
 		options["ipv6.enabled"] = "false"
+	}
+
+	for k, v := range cliOverrideOptions {
+		options[k] = v
 	}
 
 	return nil
@@ -2735,7 +2787,11 @@ func (kub *Kubectl) RunHelm(action, repo, helmName, version, namespace string, o
 	optionsString := ""
 
 	for k, v := range options {
-		optionsString += fmt.Sprintf(" --set %s=%s ", k, v)
+		if v == "true" || v == "false" {
+			optionsString += fmt.Sprintf(" --set %s=%s ", k, v)
+		} else {
+			optionsString += fmt.Sprintf(" --set '%s=%s' ", k, v)
+		}
 	}
 
 	return kub.ExecMiddle(fmt.Sprintf("helm %s %s %s "+
@@ -4281,7 +4337,11 @@ func (kub *Kubectl) HelmTemplate(chartDir, namespace, filename string, options m
 	optionsString := ""
 
 	for k, v := range options {
-		optionsString += fmt.Sprintf(" --set %s=%s ", k, v)
+		if v == "true" || v == "false" {
+			optionsString += fmt.Sprintf(" --set %s=%s ", k, v)
+		} else {
+			optionsString += fmt.Sprintf(" --set '%s=%s' ", k, v)
+		}
 	}
 
 	return kub.ExecMiddle("helm template --validate " +

@@ -34,6 +34,7 @@ import (
 	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/envoy"
 	"github.com/cilium/cilium/pkg/gops"
+	"github.com/cilium/cilium/pkg/identity/identitymanager"
 	ipamcell "github.com/cilium/cilium/pkg/ipam/cell"
 	"github.com/cilium/cilium/pkg/k8s"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
@@ -161,6 +162,10 @@ var (
 		// be synced
 		k8sSynced.Cell,
 
+		// IdentityManager maintains the set of identities and a count of its
+		// users.
+		identitymanager.Cell,
+
 		// EndpointManager maintains a collection of the locally running endpoints.
 		endpointmanager.Cell,
 
@@ -250,9 +255,6 @@ var (
 
 		// Redirect policy manages the Local Redirect Policies.
 		redirectpolicy.Cell,
-
-		// The device reloader reloads the datapath when the devices change at runtime.
-		cell.Invoke(registerDeviceReloader),
 
 		// The node discovery cell provides the local node configuration and node discovery
 		// which communicate changes in local node information to the API server or KVStore.

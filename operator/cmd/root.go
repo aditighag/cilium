@@ -15,6 +15,9 @@ import (
 	"time"
 
 	"github.com/cilium/hive/cell"
+
+	"github.com/cilium/cilium/operator/doublewrite"
+
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -23,6 +26,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
+
+	"github.com/cilium/cilium/pkg/labelsfilter"
 
 	operatorApi "github.com/cilium/cilium/api/v1/operator/server"
 	ciliumdbg "github.com/cilium/cilium/cilium-dbg/cmd"
@@ -36,6 +41,7 @@ import (
 	"github.com/cilium/cilium/operator/pkg/bgpv2"
 	"github.com/cilium/cilium/operator/pkg/ciliumendpointslice"
 	"github.com/cilium/cilium/operator/pkg/ciliumenvoyconfig"
+	"github.com/cilium/cilium/operator/pkg/client"
 	controllerruntime "github.com/cilium/cilium/operator/pkg/controller-runtime"
 	gatewayapi "github.com/cilium/cilium/operator/pkg/gateway-api"
 	"github.com/cilium/cilium/operator/pkg/ingress"
@@ -46,7 +52,7 @@ import (
 	operatorWatchers "github.com/cilium/cilium/operator/watchers"
 	"github.com/cilium/cilium/pkg/clustermesh/endpointslicesync"
 	"github.com/cilium/cilium/pkg/clustermesh/mcsapi"
-	operatorClusterMesh "github.com/cilium/cilium/pkg/clustermesh/operator"
+	cmoperator "github.com/cilium/cilium/pkg/clustermesh/operator"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/controller"
 	"github.com/cilium/cilium/pkg/defaults"
@@ -98,11 +104,18 @@ var (
 		// Runs the gops agent, a tool to diagnose Go processes.
 		gops.Cell(defaults.GopsPortOperator),
 
-		// Provides Clientset, API for accessing Kubernetes objects.
-		k8sClient.Cell,
-
-		// Provides a ClientBuilderFunc that can be used by other cells to create a client.
-		k8sClient.ClientBuilderCell,
+		// Provides a Kubernetes client and ClientBuilderFunc that can be used by other cells to create a client.
+		client.Cell,
+		cell.ProvidePrivate(func(clientParams operatorClientParams) k8sClient.ClientParams {
+			return k8sClient.ClientParams{
+				K8sClientQPS:   clientParams.OperatorK8sClientQPS,
+				K8sClientBurst: clientParams.OperatorK8sClientBurst,
+			}
+		}),
+		cell.Config(operatorClientParams{
+			OperatorK8sClientQPS:   100.0,
+			OperatorK8sClientBurst: 200,
+		}),
 
 		// Provides the modular metrics registry, metric HTTP server and legacy metrics cell.
 		operatorMetrics.Cell,
@@ -188,7 +201,7 @@ var (
 			nodeipam.Cell,
 			auth.Cell,
 			store.Cell,
-			operatorClusterMesh.Cell,
+			cmoperator.Cell,
 			endpointslicesync.Cell,
 			mcsapi.Cell,
 			legacyCell,
@@ -200,6 +213,10 @@ var (
 			// setup operations. This is a hacky workaround until the kvstore is
 			// refactored into a proper cell.
 			identitygc.Cell,
+
+			// When the Double Write Identity Allocation mode is enabled, the Double Write
+			// Metric Reporter helps with monitoring the state of identities in KVStore and CRD
+			doublewrite.Cell,
 
 			// CiliumEndpointSlice controller depends on the CiliumEndpoint and
 			// CiliumEndpointSlice resources. It reconciles the state of CESs in the
@@ -459,13 +476,15 @@ func kvstoreEnabled() bool {
 	}
 
 	return option.Config.IdentityAllocationMode == option.IdentityAllocationModeKVstore ||
+		option.Config.IdentityAllocationMode == option.IdentityAllocationModeDoubleWriteReadCRD ||
+		option.Config.IdentityAllocationMode == option.IdentityAllocationModeDoubleWriteReadKVstore ||
 		operatorOption.Config.SyncK8sServices ||
 		operatorOption.Config.SyncK8sNodes
 }
 
 var legacyCell = cell.Invoke(registerLegacyOnLeader)
 
-func registerLegacyOnLeader(lc cell.Lifecycle, clientset k8sClient.Clientset, resources operatorK8s.Resources, factory store.Factory, svcResolver *dial.ServiceResolver) {
+func registerLegacyOnLeader(lc cell.Lifecycle, clientset k8sClient.Clientset, resources operatorK8s.Resources, factory store.Factory, svcResolver *dial.ServiceResolver, cfgMCSAPI cmoperator.MCSAPIConfig) {
 	ctx, cancel := context.WithCancel(context.Background())
 	legacy := &legacyOnLeader{
 		ctx:          ctx,
@@ -474,6 +493,7 @@ func registerLegacyOnLeader(lc cell.Lifecycle, clientset k8sClient.Clientset, re
 		resources:    resources,
 		storeFactory: factory,
 		svcResolver:  svcResolver,
+		cfgMCSAPI:    cfgMCSAPI,
 	}
 	lc.Append(cell.Hook{
 		OnStart: legacy.onStart,
@@ -489,6 +509,7 @@ type legacyOnLeader struct {
 	resources    operatorK8s.Resources
 	storeFactory store.Factory
 	svcResolver  *dial.ServiceResolver
+	cfgMCSAPI    cmoperator.MCSAPIConfig
 }
 
 func (legacy *legacyOnLeader) onStop(_ cell.HookContext) error {
@@ -585,6 +606,19 @@ func (legacy *legacyOnLeader) onStart(_ cell.HookContext) error {
 				StoreFactory: legacy.storeFactory,
 				SyncCallback: func(_ context.Context) {},
 			})
+			legacy.wg.Add(1)
+			go func() {
+				mcsapi.StartSynchronizingServiceExports(legacy.ctx, mcsapi.ServiceExportSyncParameters{
+					ClusterName:             clusterInfo.Name,
+					ClusterMeshEnableMCSAPI: legacy.cfgMCSAPI.ClusterMeshEnableMCSAPI,
+					Clientset:               legacy.clientset,
+					ServiceExports:          legacy.resources.ServiceExports,
+					Services:                legacy.resources.Services,
+					StoreFactory:            legacy.storeFactory,
+					SyncCallback:            func(context.Context) {},
+				})
+				legacy.wg.Done()
+			}()
 		}
 
 		if legacy.clientset.IsEnabled() {
@@ -608,7 +642,7 @@ func (legacy *legacyOnLeader) onStart(_ cell.HookContext) error {
 			withKVStore = true
 		}
 
-		startKvstoreWatchdog()
+		startKvstoreWatchdog(legacy.cfgMCSAPI)
 	}
 
 	if legacy.clientset.IsEnabled() &&
@@ -653,9 +687,11 @@ func (legacy *legacyOnLeader) onStart(_ cell.HookContext) error {
 		nodeManager.Resync(legacy.ctx, time.Time{})
 	}
 
-	if option.Config.IdentityAllocationMode == option.IdentityAllocationModeCRD {
+	if option.Config.IdentityAllocationMode == option.IdentityAllocationModeCRD ||
+		option.Config.IdentityAllocationMode == option.IdentityAllocationModeDoubleWriteReadKVstore ||
+		option.Config.IdentityAllocationMode == option.IdentityAllocationModeDoubleWriteReadCRD {
 		if !legacy.clientset.IsEnabled() {
-			log.Fatal("CRD Identity allocation mode requires k8s to be configured.")
+			log.Fatalf("%s Identity allocation mode requires k8s to be configured.", option.Config.IdentityAllocationMode)
 		}
 		if operatorOption.Config.EndpointGCInterval == 0 {
 			log.Fatal("Cilium Identity garbage collector requires the CiliumEndpoint garbage collector to be enabled")
@@ -673,6 +709,12 @@ func (legacy *legacyOnLeader) onStart(_ cell.HookContext) error {
 		if err != nil {
 			log.WithError(err).WithField(logfields.LogSubsys, "CCNPWatcher").Fatal(
 				"Cannot connect to Kubernetes apiserver ")
+		}
+	}
+
+	if legacy.clientset.IsEnabled() {
+		if err := labelsfilter.ParseLabelPrefixCfg(option.Config.Labels, option.Config.NodeLabels, option.Config.LabelPrefixFile); err != nil {
+			log.WithError(err).Fatal("Unable to parse Label prefix configuration")
 		}
 	}
 

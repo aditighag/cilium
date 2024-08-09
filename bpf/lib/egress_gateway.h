@@ -29,10 +29,11 @@ int egress_gw_fib_lookup_and_redirect(struct __ctx_buff *ctx, __be32 egress_ip, 
 {
 	struct bpf_fib_lookup_padded fib_params = {};
 	int oif = 0;
+	int ret;
 
-	*ext_err = (__s8)fib_lookup_v4(ctx, &fib_params, egress_ip, daddr, 0);
+	ret = (__s8)fib_lookup_v4(ctx, &fib_params, egress_ip, daddr, 0);
 
-	switch (*ext_err) {
+	switch (ret) {
 	case BPF_FIB_LKUP_RET_SUCCESS:
 		break;
 	case BPF_FIB_LKUP_RET_NO_NEIGH:
@@ -45,6 +46,7 @@ int egress_gw_fib_lookup_and_redirect(struct __ctx_buff *ctx, __be32 egress_ip, 
 			return CTX_ACT_OK;
 		break;
 	default:
+		*ext_err = (__s8)ret;
 		return DROP_NO_FIB;
 	}
 
@@ -52,7 +54,7 @@ int egress_gw_fib_lookup_and_redirect(struct __ctx_buff *ctx, __be32 egress_ip, 
 	if (is_defined(IS_BPF_HOST) && fib_params.l.ifindex == ctx_get_ifindex(ctx))
 		return CTX_ACT_OK;
 
-	return fib_do_redirect(ctx, true, &fib_params, false, ext_err, &oif);
+	return fib_do_redirect(ctx, true, &fib_params, false, ret, &oif, ext_err);
 }
 
 #ifdef ENABLE_EGRESS_GATEWAY
@@ -163,15 +165,6 @@ egress_gw_request_needs_redirect_hook(struct ipv4_ct_tuple *rtuple,
 				      enum ct_status ct_status,
 				      __be32 *gateway_ip)
 {
-#if defined(IS_BPF_LXC)
-	/* If the packet is a reply or is related, it means that outside
-	 * has initiated the connection, and so we should skip egress
-	 * gateway, since an egress policy is only matching connections
-	 * originating from a pod.
-	 */
-	if (ct_status == CT_REPLY || ct_status == CT_RELATED)
-		return CTX_ACT_OK;
-#else
 	/* We lookup CT in forward direction at to-netdev and expect to
 	 * get CT_ESTABLISHED for outbound connection as
 	 * from_container should have already created a CT entry.
@@ -181,7 +174,6 @@ egress_gw_request_needs_redirect_hook(struct ipv4_ct_tuple *rtuple,
 	 */
 	if (ct_status != CT_ESTABLISHED)
 		return CTX_ACT_OK;
-#endif
 
 	return egress_gw_request_needs_redirect(rtuple, gateway_ip);
 }

@@ -28,11 +28,7 @@ import (
 const preferPublicIP bool = true
 
 var (
-	// addrsMu protects addrs. Outside the addresses struct
-	// so that we can Uninitialize() without linter complaining
-	// about lock copying.
-	addrsMu lock.RWMutex
-	addrs   addresses
+	addrs addresses
 
 	// localNode holds the current state of the local "types.Node".
 	// This is defined here until all uses of the getters and
@@ -55,8 +51,8 @@ func getLocalNode() LocalNode {
 }
 
 type addresses struct {
-	ipv4Loopback net.IP
-	routerInfo   RouterInfo
+	mu         lock.RWMutex
+	routerInfo RouterInfo
 }
 
 type RouterInfo interface {
@@ -73,17 +69,17 @@ func makeIPv6HostIP() net.IP {
 	return ip
 }
 
-// InitDefaultPrefix initializes the node address and allocation prefixes with
+// initDefaultPrefix initializes the node address and allocation prefixes with
 // default values derived from the system. device can be set to the primary
 // network device of the system in which case the first address with global
 // scope will be regarded as the system's node address.
-func InitDefaultPrefix(device string) {
+func initDefaultPrefix(device string) {
 	localNode.Update(func(n *LocalNode) {
-		SetDefaultPrefix(option.Config, device, n)
+		setDefaultPrefix(option.Config, device, n)
 	})
 }
 
-func SetDefaultPrefix(cfg *option.DaemonConfig, device string, node *LocalNode) {
+func setDefaultPrefix(cfg *option.DaemonConfig, device string, node *LocalNode) {
 	if cfg.EnableIPv4 {
 		isIPv6 := false
 
@@ -165,16 +161,14 @@ func clone(ip net.IP) net.IP {
 
 // GetIPv4Loopback returns the loopback IPv4 address of this node.
 func GetIPv4Loopback() net.IP {
-	addrsMu.RLock()
-	defer addrsMu.RUnlock()
-	return clone(addrs.ipv4Loopback)
+	return getLocalNode().IPv4Loopback
 }
 
 // SetIPv4Loopback sets the loopback IPv4 address of this node.
 func SetIPv4Loopback(ip net.IP) {
-	addrsMu.Lock()
-	addrs.ipv4Loopback = clone(ip)
-	addrsMu.Unlock()
+	localNode.Update(func(n *LocalNode) {
+		n.IPv4Loopback = ip
+	})
 }
 
 // GetIPv4AllocRange returns the IPv4 allocation prefix of this node
@@ -246,16 +240,16 @@ func GetK8sExternalIPv4() net.IP {
 
 // GetRouterInfo returns additional information for the router, the cilium_host interface.
 func GetRouterInfo() RouterInfo {
-	addrsMu.RLock()
-	defer addrsMu.RUnlock()
+	addrs.mu.RLock()
+	defer addrs.mu.RUnlock()
 	return addrs.routerInfo
 }
 
 // SetRouterInfo sets additional information for the router, the cilium_host interface.
 func SetRouterInfo(info RouterInfo) {
-	addrsMu.Lock()
+	addrs.mu.Lock()
 	addrs.routerInfo = info
-	addrsMu.Unlock()
+	addrs.mu.Unlock()
 }
 
 // GetHostMasqueradeIPv4 returns the IPv4 address to be used for masquerading
@@ -280,8 +274,8 @@ func SetIPv6NodeRange(net *cidr.CIDR) {
 }
 
 // AutoComplete completes the parts of addressing that can be auto derived
-func AutoComplete() error {
-	InitDefaultPrefix(option.Config.DirectRoutingDevice)
+func AutoComplete(directRoutingDevice string) error {
+	initDefaultPrefix(directRoutingDevice)
 
 	if option.Config.EnableIPv6 && GetIPv6AllocRange() == nil {
 		return fmt.Errorf("IPv6 allocation CIDR is not configured. Please specify --%s", option.IPv6Range)

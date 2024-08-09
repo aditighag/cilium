@@ -360,6 +360,40 @@ depending on the external and internal traffic policies:
 | Local    | Local    | Node-local only         | Node-local only       |
 +----------+----------+-------------------------+-----------------------+
 
+Selective Service Exposure
+**************************
+
+By default, Cilium exposes Kubernetes services on all nodes in the cluster. To expose a
+service only on a subset of the nodes instead, use the ``service.cilium.io/node`` label for
+the relevant nodes. For example, label a node as follows:
+
+.. code-block:: shell-session
+
+  $ kubectl label node node_name service.cilium.io/node=beefy
+
+To add a new service that should only be exposed to nodes with label ``service.cilium.io/node=beefy``, install the service as follows:
+
+.. code-block:: yaml
+
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: example-service
+    labels:
+      service.cilium.io/node: beefy
+  spec:
+    selector:
+      app: example
+    ports:
+      - port: 8765
+        targetPort: 9376
+    type: LoadBalancer
+
+Note that changing a node label after a service has been exposed matching that label does not
+automatically update the list of nodes where the service is exposed. To update exposure of the
+service after changing node labels, restart the Cilium agent. Generally it is advised to fixate the
+node label upon joining the Kubernetes cluster and retain it throughout the node's lifetime.
+
 .. _maglev:
 
 Maglev Consistent Hashing
@@ -1637,14 +1671,10 @@ Limitations
       device changes.
     * When socket-LB feature is enabled, pods sending (connected) UDP traffic to services
       can continue to send traffic to a service backend even after it's deleted. Cilium agent
-      handles such scenarios by forcefully terminating pod sockets in the host network
-      namespace that are connected to deleted backends, so that the pods can be
-      load-balanced to active backends. This functionality requires these
-      kernel configs to be enabled: ``CONFIG_INET_DIAG``, ``CONFIG_INET_UDP_DIAG``
-      and ``CONFIG_INET_DIAG_DESTROY``. If you have application pods (not deployed in the
-      host network namespace) making long-lived connections using (connected) UDP,
-      you can enable ``bpf-lb-sock-hostns-only`` in order to enable the socket-LB
-      feature only in the host network namespace.
+      handles such scenarios by forcefully terminating application sockets that are connected
+      to deleted backends, so that the applications can be load-balanced to active backends.
+      This functionality requires these kernel configs to be enabled:
+      ``CONFIG_INET_DIAG``, ``CONFIG_INET_UDP_DIAG`` and ``CONFIG_INET_DIAG_DESTROY``.
     * Cilium's BPF-based masquerading is recommended over iptables when using the
       BPF-based NodePort. Otherwise, there is a risk for port collisions between
       BPF and iptables SNAT, which might result in dropped NodePort

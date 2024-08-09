@@ -13,17 +13,11 @@ type Datapath interface {
 	// Node must return the handler for node events
 	Node() NodeHandler
 
-	NodeIDs() NodeIDHandler
-
 	NodeNeighbors() NodeNeighbors
 
 	// LocalNodeAddressing must return the node addressing implementation
 	// of the local node
 	LocalNodeAddressing() NodeAddressing
-
-	// Loader must return the implementation of the loader, which is responsible
-	// for loading, reloading, and compiling datapath programs.
-	Loader() Loader
 
 	// WireguardAgent returns the WireGuard agent for the local node
 	WireguardAgent() WireguardAgent

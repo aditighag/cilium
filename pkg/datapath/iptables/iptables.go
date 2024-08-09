@@ -100,8 +100,8 @@ type ipt struct {
 	waitArgs []string
 }
 
-func (ipt *ipt) initArgs(waitSeconds int) {
-	v, err := ipt.getVersion()
+func (ipt *ipt) initArgs(ctx context.Context, waitSeconds int) {
+	v, err := ipt.getVersion(ctx)
 	if err == nil {
 		switch {
 		case isWaitSecondsMinVersion(v):
@@ -126,8 +126,8 @@ func (ipt *ipt) getIpset() string {
 	return ipt.ipset
 }
 
-func (ipt *ipt) getVersion() (semver.Version, error) {
-	b, err := exec.WithTimeout(defaults.ExecTimeout, ipt.prog, "--version").CombinedOutput(log, false)
+func (ipt *ipt) getVersion(ctx context.Context) (semver.Version, error) {
+	b, err := exec.CommandContext(ctx, ipt.prog, "--version").CombinedOutput(log, false)
 	if err != nil {
 		return semver.Version{}, err
 	}
@@ -212,17 +212,6 @@ func (m *Manager) removeCiliumRules(table string, prog runnable, match string) e
 		// -A CILIUM_FORWARD -o cilium_host -m comment --comment "cilium: any->cluster on cilium_host forward accept" -j ACCEPT
 		// -A POSTROUTING -m comment --comment "cilium-feeder: CILIUM_POST" -j CILIUM_POST
 		if !strings.Contains(rule, match) {
-			continue
-		}
-
-		// Temporary fix while Iptables is upgraded to >= 1.8.5
-		// (See GH-20884).
-		//
-		// The version currently shipped with Cilium (1.8.4) does not
-		// support the deletion of NOTRACK rules, so we will just ignore
-		// them here and let the agent remove them when it deletes the
-		// entire chain.
-		if strings.Contains(rule, "-j NOTRACK") {
 			continue
 		}
 
@@ -321,10 +310,27 @@ func newIptablesManager(p params) *Manager {
 		cniConfigManager: p.CNIConfigManager,
 	}
 
+	argsInit := make(chan struct{})
+
+	// init iptables/ip6tables wait arguments before using them in the reconciler or in the manager (e.g: GetProxyPorts)
+	p.Lifecycle.Append(cell.Hook{
+		OnStart: func(ctx cell.HookContext) error {
+			defer close(argsInit)
+			ip4tables.initArgs(ctx, int(p.Cfg.IPTablesLockTimeout/time.Second))
+			if p.SharedCfg.EnableIPv6 {
+				ip6tables.initArgs(ctx, int(p.Cfg.IPTablesLockTimeout/time.Second))
+			}
+			return nil
+		},
+	})
+
 	p.Lifecycle.Append(iptMgr)
 
 	p.JobGroup.Add(
 		job.OneShot("iptables-reconciliation-loop", func(ctx context.Context, health cell.Health) error {
+			// each job runs in an independent goroutine, so we need to explicitly wait for
+			// iptables arguments initialization before starting the reconciler.
+			<-argsInit
 			return reconciliationLoop(
 				ctx, p.Logger, health,
 				iptMgr.sharedCfg.InstallIptRules, &iptMgr.reconcilerParams,
@@ -417,9 +423,6 @@ func (m *Manager) Start(ctx cell.HookContext) error {
 	}
 	m.haveBPFSocketAssign = m.sharedCfg.EnableBPFTProxy
 
-	ip4tables.initArgs(int(m.cfg.IPTablesLockTimeout / time.Second))
-	ip6tables.initArgs(int(m.cfg.IPTablesLockTimeout / time.Second))
-
 	return nil
 }
 
@@ -500,6 +503,8 @@ func (m *Manager) inboundProxyRedirectRule(cmd string) []string {
 	// 1. route return traffic to the proxy
 	// 2. route original direction traffic that would otherwise be intercepted
 	//    by ip_early_demux
+	// Explicitly support chaining Envoy listeners via the loopback device by
+	// excluding traffic for the loopback device.
 	toProxyMark := fmt.Sprintf("%#08x", linux_defaults.MagicMarkIsToProxy)
 	matchFromIPSecEncrypt := fmt.Sprintf("%#08x/%#08x", linux_defaults.RouteMarkEncrypt, linux_defaults.RouteMarkMask)
 	matchProxyToWorld := fmt.Sprintf("%#08x/%#08x", linux_defaults.MarkProxyToWorld, linux_defaults.RouteMarkMask)
@@ -507,6 +512,7 @@ func (m *Manager) inboundProxyRedirectRule(cmd string) []string {
 		"-t", "mangle",
 		cmd, ciliumPreMangleChain,
 		"-m", "socket", "--transparent",
+		"!", "-o", "lo",
 		"-m", "mark", "!", "--mark", matchFromIPSecEncrypt,
 		"-m", "mark", "!", "--mark", matchProxyToWorld,
 		"-m", "comment", "--comment", "cilium: any->pod redirect proxied traffic to host proxy",

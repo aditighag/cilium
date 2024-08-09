@@ -11,6 +11,7 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -20,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 
 	"github.com/cilium/cilium/operator/pkg/gateway-api/helpers"
 	"github.com/cilium/cilium/operator/pkg/model/translation"
@@ -28,6 +30,7 @@ import (
 )
 
 const (
+	// Deprecated: owningGatewayLabel will be removed later in favour of gatewayNameLabel
 	owningGatewayLabel = "io.cilium.gateway/owning-gateway"
 
 	lastTransitionTime = "LastTransitionTime"
@@ -39,15 +42,17 @@ type gatewayReconciler struct {
 	Scheme     *runtime.Scheme
 	translator translation.Translator
 
-	logger *slog.Logger
+	logger        *slog.Logger
+	installedCRDs []schema.GroupVersionKind
 }
 
-func newGatewayReconciler(mgr ctrl.Manager, translator translation.Translator, logger *slog.Logger) *gatewayReconciler {
+func newGatewayReconciler(mgr ctrl.Manager, translator translation.Translator, logger *slog.Logger, installedCRDs []schema.GroupVersionKind) *gatewayReconciler {
 	return &gatewayReconciler{
-		Client:     mgr.GetClient(),
-		Scheme:     mgr.GetScheme(),
-		translator: translator,
-		logger:     logger,
+		Client:        mgr.GetClient(),
+		Scheme:        mgr.GetScheme(),
+		translator:    translator,
+		logger:        logger,
+		installedCRDs: installedCRDs,
 	}
 }
 
@@ -55,7 +60,7 @@ func newGatewayReconciler(mgr ctrl.Manager, translator translation.Translator, l
 // The reconciler will be triggered by Gateway, or any cilium-managed GatewayClass events
 func (r *gatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	hasMatchingControllerFn := hasMatchingController(context.Background(), r.Client, controllerName, r.logger)
-	return ctrl.NewControllerManagedBy(mgr).
+	gatewayBuilder := ctrl.NewControllerManagedBy(mgr).
 		// Watch its own resource
 		For(&gatewayv1.Gateway{},
 			builder.WithPredicates(predicate.NewPredicateFuncs(hasMatchingControllerFn))).
@@ -75,11 +80,6 @@ func (r *gatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&gatewayv1.HTTPRoute{},
 			r.enqueueRequestForOwningHTTPRoute(r.logger),
 			builder.WithPredicates(onlyStatusChanged())).
-		// Watch TLS Route status changes, there is one assumption that any change in spec will
-		// always update status always at least for observedGeneration value.
-		Watches(&gatewayv1alpha2.TLSRoute{},
-			r.enqueueRequestForOwningTLSRoute(r.logger),
-			builder.WithPredicates(onlyStatusChanged())).
 		// Watch GRPCRoute status changes, there is one assumption that any change in spec will
 		// always update status always at least for observedGeneration value.
 		Watches(&gatewayv1.GRPCRoute{},
@@ -92,11 +92,24 @@ func (r *gatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// Watch related namespace in allowed namespaces
 		Watches(&corev1.Namespace{},
 			r.enqueueRequestForAllowedNamespace()).
+		// Watch for changes to Reference Grants
+		Watches(&gatewayv1beta1.ReferenceGrant{}, r.enqueueRequestForReferenceGrant()).
 		// Watch created and owned resources
 		Owns(&ciliumv2.CiliumEnvoyConfig{}).
 		Owns(&corev1.Service{}).
-		Owns(&corev1.Endpoints{}).
-		Complete(r)
+		Owns(&corev1.Endpoints{})
+
+	for _, gvk := range r.installedCRDs {
+		switch gvk.Kind {
+		case helpers.TLSRouteKind:
+			// Watch TLS Route status changes, there is one assumption that any change in spec will
+			// always update status always at least for observedGeneration value.
+			gatewayBuilder = gatewayBuilder.Watches(&gatewayv1alpha2.TLSRoute{},
+				r.enqueueRequestForOwningTLSRoute(r.logger),
+				builder.WithPredicates(onlyStatusChanged()))
+		}
+	}
+	return gatewayBuilder.Complete(r)
 }
 
 // enqueueRequestForOwningGatewayClass returns an event handler for all Gateway objects
@@ -279,4 +292,33 @@ func (r *gatewayReconciler) enqueueRequestForAllowedNamespace() handler.EventHan
 
 func (r *gatewayReconciler) usedInGateway(obj client.Object) bool {
 	return len(getGatewaysForSecret(context.Background(), r.Client, obj, r.logger)) > 0
+}
+
+func (r *gatewayReconciler) enqueueRequestForReferenceGrant() handler.EventHandler {
+	return handler.EnqueueRequestsFromMapFunc(r.enqueueAll())
+}
+
+func (r *gatewayReconciler) enqueueAll() handler.MapFunc {
+	return func(ctx context.Context, o client.Object) []reconcile.Request {
+		scopedLog := r.logger.With(logfields.Controller, gateway, logfields.Resource, client.ObjectKeyFromObject(o))
+		list := &gatewayv1.GatewayList{}
+
+		if err := r.Client.List(ctx, list, &client.ListOptions{}); err != nil {
+			scopedLog.Error("Failed to list Gateway", logfields.Error, err)
+			return []reconcile.Request{}
+		}
+
+		requests := make([]reconcile.Request, 0, len(list.Items))
+		for _, item := range list.Items {
+			gw := client.ObjectKey{
+				Namespace: item.GetNamespace(),
+				Name:      item.GetName(),
+			}
+			requests = append(requests, reconcile.Request{
+				NamespacedName: gw,
+			})
+			scopedLog.Info("Enqueued Gateway for resource", gateway, gw)
+		}
+		return requests
+	}
 }

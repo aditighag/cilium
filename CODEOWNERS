@@ -290,7 +290,6 @@ Makefile* @cilium/build
 /daemon/cmd/hubble.go @cilium/sig-hubble
 /daemon/cmd/ipcache* @cilium/ipcache
 /daemon/cmd/kube_proxy* @cilium/sig-datapath
-/daemon/cmd/loadbalancer.go @cilium/sig-lb
 /daemon/cmd/metrics.go @cilium/metrics
 /daemon/cmd/policy* @cilium/sig-policy
 /daemon/cmd/state.go @cilium/endpoint
@@ -340,7 +339,8 @@ Makefile* @cilium/build
 /Documentation/network/concepts/ipam/azure* @cilium/sig-ipam @cilium/azure @cilium/docs-structure
 /Documentation/network/concepts/ipam/eni* @cilium/sig-ipam @cilium/aws @cilium/docs-structure
 /Documentation/network/ebpf/ @cilium/sig-datapath @cilium/docs-structure
-/Documentation/network/egress-gateway.rst @cilium/egress-gateway @cilium/docs-structure
+/Documentation/network/egress-gateway-toc.rst @cilium/egress-gateway @cilium/docs-structure
+/Documentation/network/egress-gateway/ @cilium/egress-gateway @cilium/docs-structure
 /Documentation/network/kubernetes/ @cilium/sig-k8s @cilium/docs-structure
 /Documentation/network/kubernetes/bandwidth-manager.rst @cilium/sig-datapath @cilium/docs-structure
 /Documentation/network/kubernetes/ipam* @cilium/sig-ipam @cilium/docs-structure
@@ -385,7 +385,7 @@ Makefile* @cilium/build
 /images/hubble-relay @cilium/sig-hubble
 /images/runtime/update-cilium-runtime-image.sh @cilium/github-sec
 /install/kubernetes/ @cilium/sig-k8s @cilium/helm
-/install/kubernetes/cilium/**/cilium-envoy @cilium/sig-k8s @cilium/helm @cilium/sig-servicemesh
+/install/kubernetes/cilium/**/cilium-envoy @cilium/sig-k8s @cilium/helm @cilium/envoy @cilium/sig-servicemesh
 /install/kubernetes/cilium/**/spire @cilium/sig-k8s @cilium/helm @cilium/sig-servicemesh
 /install/kubernetes/cilium/templates/clustermesh* @cilium/sig-k8s @cilium/helm @cilium/sig-clustermesh
 /install/kubernetes/cilium/templates/hubble* @cilium/sig-k8s @cilium/helm @cilium/sig-hubble
@@ -396,14 +396,15 @@ Makefile* @cilium/build
 /operator/pkg/bgpv2 @cilium/sig-bgp
 /operator/pkg/ciliumendpointslice @cilium/sig-scalability
 /operator/pkg/ciliumenvoyconfig @cilium/sig-servicemesh
-/operator/pkg/controller-runtime @cilium/sig-servicemesh
+/operator/pkg/controller-runtime @cilium/envoy @cilium/sig-servicemesh
 /operator/pkg/gateway-api @cilium/sig-servicemesh
 /operator/pkg/ingress @cilium/sig-servicemesh
 /operator/pkg/lbipam @cilium/sig-lb
 /operator/pkg/model @cilium/sig-servicemesh
 /operator/pkg/networkpolicy @cilium/sig-policy
-/operator/pkg/secretsync @cilium/sig-servicemesh
+/operator/pkg/secretsync @cilium/envoy @cilium/sig-servicemesh
 /operator/watchers/bgp.go @cilium/sig-bgp
+/pkg/act/ @cilium/sig-datapath @cilium/metrics
 /pkg/annotation @cilium/sig-k8s
 /pkg/alibabacloud/ @cilium/alibabacloud
 /pkg/alignchecker/ @cilium/sig-datapath @cilium/loader
@@ -487,6 +488,7 @@ Makefile* @cilium/build
 /pkg/k8s/apis/cilium.io/v2/cegp_types.go @cilium/egress-gateway
 /pkg/k8s/apis/cilium.io/v2/ @cilium/api @cilium/sig-k8s
 /pkg/kvstore/ @cilium/kvstore
+/pkg/kvstore/etcdinit @cilium/sig-clustermesh @cilium/kvstore
 /pkg/l2announcer/ @cilium/sig-agent
 /pkg/labels @cilium/sig-policy @cilium/api
 /pkg/labelsfilter @cilium/sig-policy

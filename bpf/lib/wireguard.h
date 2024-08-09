@@ -70,7 +70,7 @@ wg_maybe_redirect_to_encrypt(struct __ctx_buff *ctx, __be16 proto)
 		 * IPv4 tunneling.
 		 */
 		if (ctx_is_overlay(ctx))
-			goto encrypt;
+			goto overlay_encrypt;
 # endif /* HAVE_ENCAP */
 
 		dst = lookup_ip4_remote_endpoint(ip4->daddr, 0);
@@ -110,10 +110,7 @@ wg_maybe_redirect_to_encrypt(struct __ctx_buff *ctx, __be16 proto)
 #endif /* !ENABLE_NODE_ENCRYPTION */
 
 	/* We don't want to encrypt any traffic that originates from outside
-	 * the cluster.
-	 * Without this check, that may happen for the egress gateway, when
-	 * reply traffic arrives from the cluster-external server and goes to
-	 * the client pod.
+	 * the cluster. This check excludes DSR traffic from the LB node to a remote backend.
 	 */
 	if (!src || !identity_is_cluster(src->sec_identity))
 		goto out;
@@ -129,9 +126,9 @@ maybe_encrypt: __maybe_unused
 	 * required.
 	 */
 	if (dst && dst->key) {
-encrypt: __maybe_unused
 		if (src)
 			set_identity_mark(ctx, src->sec_identity, MARK_MAGIC_IDENTITY);
+overlay_encrypt: __maybe_unused
 		return ctx_redirect(ctx, WG_IFINDEX, 0);
 	}
 

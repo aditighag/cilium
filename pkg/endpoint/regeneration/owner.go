@@ -8,6 +8,7 @@ import (
 
 	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/fqdn/restore"
+	"github.com/cilium/cilium/pkg/identity"
 	monitorAPI "github.com/cilium/cilium/pkg/monitor/api"
 )
 
@@ -26,6 +27,9 @@ type Owner interface {
 	// Datapath returns a reference to the datapath implementation.
 	Datapath() datapath.Datapath
 
+	// Loader returns a reference to the loader implementation.
+	Loader() datapath.Loader
+
 	// GetDNSRules creates a fresh copy of DNS rules that can be used when
 	// endpoint is restored on a restart.
 	// The endpoint lock must not be held while calling this function.
@@ -34,4 +38,8 @@ type Owner interface {
 	// RemoveRestoredDNSRules removes any restored DNS rules for
 	// this endpoint from the DNS proxy.
 	RemoveRestoredDNSRules(epID uint16)
+
+	AddIdentity(*identity.Identity)
+	RemoveIdentity(*identity.Identity)
+	RemoveOldAddNewIdentity(*identity.Identity, *identity.Identity)
 }

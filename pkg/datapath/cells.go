@@ -12,6 +12,7 @@ import (
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/statedb"
 
+	"github.com/cilium/cilium/pkg/act"
 	"github.com/cilium/cilium/pkg/bpf"
 	"github.com/cilium/cilium/pkg/datapath/agentliveness"
 	"github.com/cilium/cilium/pkg/datapath/garp"
@@ -28,11 +29,13 @@ import (
 	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
 	"github.com/cilium/cilium/pkg/datapath/linux/utime"
 	"github.com/cilium/cilium/pkg/datapath/loader"
+	"github.com/cilium/cilium/pkg/datapath/node"
 	"github.com/cilium/cilium/pkg/datapath/orchestrator"
 	"github.com/cilium/cilium/pkg/datapath/prefilter"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
 	"github.com/cilium/cilium/pkg/datapath/types"
+	"github.com/cilium/cilium/pkg/loadbalancer/experimental"
 	"github.com/cilium/cilium/pkg/maps"
 	"github.com/cilium/cilium/pkg/maps/eventsmap"
 	"github.com/cilium/cilium/pkg/maps/nodemap"
@@ -85,6 +88,9 @@ var Cell = cell.Module(
 	// Provides the legacy accessor for the above, the NodeAddressing interface.
 	NodeAddressingCell,
 
+	// Provides the DirectRoutingDevice selection logic.
+	tables.DirectRoutingDeviceCell,
+
 	// This cell periodically updates the agent liveness value in configmap.Map to inform
 	// the datapath of the liveness of the agent.
 	agentliveness.Cell,
@@ -130,6 +136,12 @@ var Cell = cell.Module(
 
 	// Provides node handler, which handles node events.
 	cell.Provide(linuxdatapath.NewNodeHandler),
+	cell.Provide(node.NewNodeIDApiHandler),
+
+	// Provides Active Connection Tracking metrics based on counts of
+	// opened (from BPF ACT map), closed (from BPF ACT map), and failed
+	// connections (from ctmap's GC).
+	act.Cell,
 )
 
 func newWireguardAgent(lc cell.Lifecycle, sysctl sysctl.Sysctl) *wg.Agent {
@@ -168,14 +180,13 @@ func newDatapath(params datapathParams) types.Datapath {
 		NodeMap:        params.NodeMap,
 		NodeAddressing: params.NodeAddressing,
 		BWManager:      params.BandwidthManager,
-		Loader:         params.Loader,
 		NodeManager:    params.NodeManager,
 		DB:             params.DB,
 		Devices:        params.Devices,
 		Orchestrator:   params.Orchestrator,
 		NodeHandler:    params.NodeHandler,
-		NodeIDHandler:  params.NodeIDHandler,
 		NodeNeighbors:  params.NodeNeighbors,
+		ExpConfig:      params.ExpConfig,
 	})
 
 	params.LC.Append(cell.Hook{
@@ -184,7 +195,7 @@ func newDatapath(params datapathParams) types.Datapath {
 				return fmt.Errorf("requirements failed: %w", err)
 			}
 
-			datapath.NodeIDs().RestoreNodeIDs()
+			params.NodeIDHandler.RestoreNodeIDs()
 			return nil
 		},
 	})
@@ -208,12 +219,8 @@ type datapathParams struct {
 
 	NodeAddressing types.NodeAddressing
 
-	// Depend on DeviceManager to ensure devices have been resolved.
-	// This is required until option.Config.GetDevices() has been removed and
-	// uses of it converted to Table[Device].
-	DeviceManager *linuxdatapath.DeviceManager
-	DB            *statedb.DB
-	Devices       statedb.Table[*tables.Device]
+	DB      *statedb.DB
+	Devices statedb.Table[*tables.Device]
 
 	BandwidthManager types.BandwidthManager
 
@@ -236,4 +243,6 @@ type datapathParams struct {
 	NodeIDHandler types.NodeIDHandler
 
 	NodeNeighbors types.NodeNeighbors
+
+	ExpConfig experimental.Config
 }

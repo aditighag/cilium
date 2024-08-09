@@ -4701,9 +4701,38 @@ type FleetLaunchTemplateOverrides struct {
 	// The Availability Zone in which to launch the instances.
 	AvailabilityZone *string
 
-	// The ID of the AMI. An AMI is required to launch an instance. This parameter is
-	// only available for fleets of type instant . For fleets of type maintain and
-	// request , you must specify the AMI ID in the launch template.
+	// The ID of the AMI in the format ami-17characters00000 .
+	//
+	// Alternatively, you can specify a Systems Manager parameter, using one of the
+	// following formats. The Systems Manager parameter will resolve to an AMI ID on
+	// launch.
+	//
+	// To reference a public parameter:
+	//
+	//   - resolve:ssm:public-parameter
+	//
+	// To reference a parameter stored in the same account:
+	//
+	//   - resolve:ssm:parameter-name
+	//
+	//   - resolve:ssm:parameter-name:version-number
+	//
+	//   - resolve:ssm:parameter-name:label
+	//
+	// To reference a parameter shared from another Amazon Web Services account:
+	//
+	//   - resolve:ssm:parameter-ARN
+	//
+	//   - resolve:ssm:parameter-ARN:version-number
+	//
+	//   - resolve:ssm:parameter-ARN:label
+	//
+	// For more information, see [Use a Systems Manager parameter instead of an AMI ID] in the Amazon EC2 User Guide.
+	//
+	// This parameter is only available for fleets of type instant . For fleets of type
+	// maintain and request , you must specify the AMI ID in the launch template.
+	//
+	// [Use a Systems Manager parameter instead of an AMI ID]: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/create-launch-template.html#use-an-ssm-parameter-instead-of-an-ami-id
 	ImageId *string
 
 	// The attributes for the instance types. When you specify instance attributes,
@@ -4750,7 +4779,13 @@ type FleetLaunchTemplateOverrides struct {
 	// The ID of the subnet in which to launch the instances.
 	SubnetId *string
 
-	// The number of units provided by the specified instance type.
+	// The number of units provided by the specified instance type. These are the same
+	// units that you chose to set the target capacity in terms of instances, or a
+	// performance characteristic such as vCPUs, memory, or I/O.
+	//
+	// If the target capacity divided by this value is not a whole number, Amazon EC2
+	// rounds the number of instances to the next whole number. If this value is not
+	// specified, the default is 1.
 	//
 	// When specifying weights, the price used in the lowest-price and
 	// price-capacity-optimized allocation strategies is per unit hour (where the
@@ -4768,9 +4803,38 @@ type FleetLaunchTemplateOverridesRequest struct {
 	// The Availability Zone in which to launch the instances.
 	AvailabilityZone *string
 
-	// The ID of the AMI. An AMI is required to launch an instance. This parameter is
-	// only available for fleets of type instant . For fleets of type maintain and
-	// request , you must specify the AMI ID in the launch template.
+	// The ID of the AMI in the format ami-17characters00000 .
+	//
+	// Alternatively, you can specify a Systems Manager parameter, using one of the
+	// following formats. The Systems Manager parameter will resolve to an AMI ID on
+	// launch.
+	//
+	// To reference a public parameter:
+	//
+	//   - resolve:ssm:public-parameter
+	//
+	// To reference a parameter stored in the same account:
+	//
+	//   - resolve:ssm:parameter-name
+	//
+	//   - resolve:ssm:parameter-name:version-number
+	//
+	//   - resolve:ssm:parameter-name:label
+	//
+	// To reference a parameter shared from another Amazon Web Services account:
+	//
+	//   - resolve:ssm:parameter-ARN
+	//
+	//   - resolve:ssm:parameter-ARN:version-number
+	//
+	//   - resolve:ssm:parameter-ARN:label
+	//
+	// For more information, see [Use a Systems Manager parameter instead of an AMI ID] in the Amazon EC2 User Guide.
+	//
+	// This parameter is only available for fleets of type instant . For fleets of type
+	// maintain and request , you must specify the AMI ID in the launch template.
+	//
+	// [Use a Systems Manager parameter instead of an AMI ID]: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/create-launch-template.html#use-an-ssm-parameter-instead-of-an-ami-id
 	ImageId *string
 
 	// The attributes for the instance types. When you specify instance attributes,
@@ -4820,7 +4884,13 @@ type FleetLaunchTemplateOverridesRequest struct {
 	// ID.
 	SubnetId *string
 
-	// The number of units provided by the specified instance type.
+	// The number of units provided by the specified instance type. These are the same
+	// units that you chose to set the target capacity in terms of instances, or a
+	// performance characteristic such as vCPUs, memory, or I/O.
+	//
+	// If the target capacity divided by this value is not a whole number, Amazon EC2
+	// rounds the number of instances to the next whole number. If this value is not
+	// specified, the default is 1.
 	//
 	// When specifying weights, the price used in the lowest-price and
 	// price-capacity-optimized allocation strategies is per unit hour (where the
@@ -8399,8 +8469,12 @@ type IpamDiscoveredPublicAddress struct {
 	// The resource discovery ID.
 	IpamResourceDiscoveryId *string
 
-	// The network border group that the resource that the IP address is assigned to
-	// is in.
+	// The Availability Zone (AZ) or Local Zone (LZ) network border group that the
+	// resource that the IP address is assigned to is in. Defaults to an AZ network
+	// border group. For more information on available Local Zones, see [Local Zone availability]in the Amazon
+	// EC2 User Guide.
+	//
+	// [Local Zone availability]: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-byoip.html#byoip-zone-avail
 	NetworkBorderGroup *string
 
 	// The description of the network interface that IP address is assigned to.
@@ -8444,6 +8518,9 @@ type IpamDiscoveredPublicAddress struct {
 // the resource.
 type IpamDiscoveredResourceCidr struct {
 
+	// The Availability Zone ID.
+	AvailabilityZoneId *string
+
 	// The percentage of IP address space in use. To convert the decimal to a
 	// percentage, multiply the decimal by 100. Note the following:
 	//
@@ -8462,6 +8539,10 @@ type IpamDiscoveredResourceCidr struct {
 
 	// The resource discovery ID.
 	IpamResourceDiscoveryId *string
+
+	// For elastic network interfaces, this is the status of whether or not the
+	// elastic network interface is attached.
+	NetworkInterfaceAttachmentStatus IpamNetworkInterfaceAttachmentStatus
 
 	// The resource CIDR.
 	ResourceCidr *string
@@ -8517,6 +8598,48 @@ type IpamDiscoveryFailureReason struct {
 
 	// The discovery failure message.
 	Message *string
+
+	noSmithyDocumentSerde
+}
+
+// A verification token is an Amazon Web Services-generated random value that you
+// can use to prove ownership of an external resource. For example, you can use a
+// verification token to validate that you control a public IP address range when
+// you bring an IP address range to Amazon Web Services (BYOIP).
+type IpamExternalResourceVerificationToken struct {
+
+	// ARN of the IPAM that created the token.
+	IpamArn *string
+
+	// Token ARN.
+	IpamExternalResourceVerificationTokenArn *string
+
+	// The ID of the token.
+	IpamExternalResourceVerificationTokenId *string
+
+	// The ID of the IPAM that created the token.
+	IpamId *string
+
+	// Region of the IPAM that created the token.
+	IpamRegion *string
+
+	// Token expiration.
+	NotAfter *time.Time
+
+	// Token state.
+	State IpamExternalResourceVerificationTokenState
+
+	// Token status.
+	Status TokenState
+
+	// Token tags.
+	Tags []Tag
+
+	// Token name.
+	TokenName *string
+
+	// Token value.
+	TokenValue *string
 
 	noSmithyDocumentSerde
 }
@@ -8614,14 +8737,21 @@ type IpamPool struct {
 	// overlap or conflict.
 	IpamScopeType IpamScopeType
 
-	// The locale of the IPAM pool. In IPAM, the locale is the Amazon Web Services
-	// Region where you want to make an IPAM pool available for allocations. Only
-	// resources in the same Region as the locale of the pool can get IP address
-	// allocations from the pool. You can only allocate a CIDR for a VPC, for example,
-	// from an IPAM pool that shares a locale with the VPC’s Region. Note that once you
-	// choose a Locale for a pool, you cannot modify it. If you choose an Amazon Web
-	// Services Region for locale that has not been configured as an operating Region
-	// for the IPAM, you'll get an error.
+	// The locale of the IPAM pool.
+	//
+	// The locale for the pool should be one of the following:
+	//
+	//   - An Amazon Web Services Region where you want this IPAM pool to be available
+	//   for allocations.
+	//
+	//   - The network border group for an Amazon Web Services Local Zone where you
+	//   want this IPAM pool to be available for allocations ([supported Local Zones] ). This option is only
+	//   available for IPAM IPv4 pools in the public scope.
+	//
+	// If you choose an Amazon Web Services Region for locale that has not been
+	// configured as an operating Region for the IPAM, you'll get an error.
+	//
+	// [supported Local Zones]: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-byoip.html#byoip-zone-avail
 	Locale *string
 
 	// The Amazon Web Services account ID of the owner of the IPAM pool.
@@ -8810,6 +8940,9 @@ type IpamPublicAddressTags struct {
 
 // The CIDR for an IPAM resource.
 type IpamResourceCidr struct {
+
+	// The Availability Zone ID.
+	AvailabilityZoneId *string
 
 	// The compliance status of the IPAM resource. For more information on compliance
 	// statuses, see [Monitor CIDR usage by resource]in the Amazon VPC IPAM User Guide.
@@ -10272,10 +10405,16 @@ type LaunchTemplateOverrides struct {
 	// The ID of the subnet in which to launch the instances.
 	SubnetId *string
 
-	// The number of units provided by the specified instance type.
+	// The number of units provided by the specified instance type. These are the same
+	// units that you chose to set the target capacity in terms of instances, or a
+	// performance characteristic such as vCPUs, memory, or I/O.
 	//
-	// When specifying weights, the price used in the lowest-price and
-	// price-capacity-optimized allocation strategies is per unit hour (where the
+	// If the target capacity divided by this value is not a whole number, Amazon EC2
+	// rounds the number of instances to the next whole number. If this value is not
+	// specified, the default is 1.
+	//
+	// When specifying weights, the price used in the lowestPrice and
+	// priceCapacityOptimized allocation strategies is per unit hour (where the
 	// instance price is divided by the specified weight). However, if all the
 	// specified weights are above the requested TargetCapacity , resulting in only 1
 	// instance being launched, the price used is per instance hour.
@@ -13600,12 +13739,17 @@ type RequestLaunchTemplateData struct {
 	// The name or Amazon Resource Name (ARN) of an IAM instance profile.
 	IamInstanceProfile *LaunchTemplateIamInstanceProfileSpecificationRequest
 
-	// The ID of the AMI. Alternatively, you can specify a Systems Manager parameter,
-	// which will resolve to an AMI ID on launch.
+	// The ID of the AMI in the format ami-17characters00000 .
 	//
-	// Valid formats:
+	// Alternatively, you can specify a Systems Manager parameter, using one of the
+	// following formats. The Systems Manager parameter will resolve to an AMI ID on
+	// launch.
 	//
-	//   - ami-17characters00000
+	// To reference a public parameter:
+	//
+	//   - resolve:ssm:public-parameter
+	//
+	// To reference a parameter stored in the same account:
 	//
 	//   - resolve:ssm:parameter-name
 	//
@@ -13613,13 +13757,24 @@ type RequestLaunchTemplateData struct {
 	//
 	//   - resolve:ssm:parameter-name:label
 	//
-	//   - resolve:ssm:public-parameter
+	// To reference a parameter shared from another Amazon Web Services account:
 	//
-	// Currently, EC2 Fleet and Spot Fleet do not support specifying a Systems Manager
-	// parameter. If the launch template will be used by an EC2 Fleet or Spot Fleet,
-	// you must specify the AMI ID.
+	//   - resolve:ssm:parameter-ARN
+	//
+	//   - resolve:ssm:parameter-ARN:version-number
+	//
+	//   - resolve:ssm:parameter-ARN:label
 	//
 	// For more information, see [Use a Systems Manager parameter instead of an AMI ID] in the Amazon EC2 User Guide.
+	//
+	// If the launch template will be used for an EC2 Fleet or Spot Fleet, note the
+	// following:
+	//
+	//   - Only EC2 Fleets of type instant support specifying a Systems Manager
+	//   parameter.
+	//
+	//   - For EC2 Fleets of type maintain or request , or for Spot Fleets, you must
+	//   specify the AMI ID.
 	//
 	// [Use a Systems Manager parameter instead of an AMI ID]: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/create-launch-template.html#use-an-ssm-parameter-instead-of-an-ami-id
 	ImageId *string
@@ -15799,6 +15954,12 @@ type SpotFleetLaunchSpecification struct {
 	// If the target capacity divided by this value is not a whole number, Amazon EC2
 	// rounds the number of instances to the next whole number. If this value is not
 	// specified, the default is 1.
+	//
+	// When specifying weights, the price used in the lowestPrice and
+	// priceCapacityOptimized allocation strategies is per unit hour (where the
+	// instance price is divided by the specified weight). However, if all the
+	// specified weights are above the requested TargetCapacity , resulting in only 1
+	// instance being launched, the price used is per instance hour.
 	WeightedCapacity *float64
 
 	noSmithyDocumentSerde
@@ -19269,15 +19430,12 @@ type VolumeDetail struct {
 }
 
 // Describes the modification status of an EBS volume.
-//
-// If the volume has never been modified, some element values will be null.
 type VolumeModification struct {
 
 	// The modification completion or failure time.
 	EndTime *time.Time
 
-	// The current modification state. The modification state is null for unmodified
-	// volumes.
+	// The current modification state.
 	ModificationState VolumeModificationState
 
 	// The original IOPS rate of the volume.

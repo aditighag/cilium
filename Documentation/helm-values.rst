@@ -419,7 +419,7 @@
    * - :spelling:ignore:`certgen`
      - Configure certificate generation for Hubble integration. If hubble.tls.auto.method=cronJob, these values are used for the Kubernetes CronJob which will be scheduled regularly to (re)generate any certificates not provided manually.
      - object
-     - ``{"affinity":{},"annotations":{"cronJob":{},"job":{}},"extraVolumeMounts":[],"extraVolumes":[],"image":{"digest":"sha256:169d93fd8f2f9009db3b9d5ccd37c2b753d0989e1e7cd8fe79f9160c459eef4f","override":null,"pullPolicy":"Always","repository":"quay.io/cilium/certgen","tag":"v0.2.0","useDigest":true},"podLabels":{},"tolerations":[],"ttlSecondsAfterFinished":1800}``
+     - ``{"affinity":{},"annotations":{"cronJob":{},"job":{}},"extraVolumeMounts":[],"extraVolumes":[],"image":{"digest":"sha256:ab6b1928e9c5f424f6b0f51c68065b9fd85e2f8d3e5f21fbd1a3cb27e6fb9321","override":null,"pullPolicy":"Always","repository":"quay.io/cilium/certgen","tag":"v0.2.1","useDigest":true},"podLabels":{},"tolerations":[],"ttlSecondsAfterFinished":1800}``
    * - :spelling:ignore:`certgen.affinity`
      - Affinity for certgen
      - object
@@ -472,6 +472,10 @@
      - List of rate limit options to be used for the CiliumEndpointSlice controller. Each object in the list must have the following fields: nodes: Count of nodes at which to apply the rate limit. limit: The sustained request rate in requests per second. The maximum rate that can be configured is 50. burst: The burst request rate in requests per second. The maximum burst that can be configured is 100.
      - list
      - ``[{"burst":20,"limit":10,"nodes":0},{"burst":15,"limit":7,"nodes":100},{"burst":10,"limit":5,"nodes":500}]``
+   * - :spelling:ignore:`ciliumEndpointSlice.sliceMode`
+     - The slicing mode to use for CiliumEndpointSlices. identity groups together CiliumEndpoints that share the same identity. fcfs groups together CiliumEndpoints in a first-come-first-serve basis, filling in the largest non-full slice first.
+     - string
+     - ``"identity"``
    * - :spelling:ignore:`cleanBpfState`
      - Clean all eBPF datapath state from the initContainer of the cilium-agent DaemonSet.  WARNING: Use with care!
      - bool
@@ -1235,7 +1239,7 @@
    * - :spelling:ignore:`envoy.image`
      - Envoy container image.
      - object
-     - ``{"digest":"sha256:fe3cec76ecdd22c4c70e7643228850562e8b1f5122fc11021bc6725254190064","override":null,"pullPolicy":"Always","repository":"quay.io/cilium/cilium-envoy","tag":"v1.29.7-fb2df6ec59fed2589e65e924bd6eb7bfecbb5108","useDigest":true}``
+     - ``{"digest":"sha256:e1f46cc7ebffa3421913220f3c5d6d200fd61ef7c802f548b5b39634e099cd83","override":null,"pullPolicy":"Always","repository":"quay.io/cilium/cilium-envoy","tag":"v1.30.4-48fa07fc1729f182860151fbfe5a17132607bda2","useDigest":true}``
    * - :spelling:ignore:`envoy.livenessProbe.failureThreshold`
      - failure threshold of liveness probe
      - int
@@ -1549,7 +1553,7 @@
      - object
      - ``{}``
    * - :spelling:ignore:`hubble.dropEventEmitter`
-     - Emit v1.Events related to pods on detection of packet drops.
+     - Emit v1.Events related to pods on detection of packet drops.    This feature is alpha, please provide feedback at https://github.com/cilium/cilium/issues/33975.
      - object
      - ``{"enabled":false,"interval":"2m","reasons":["auth_required","policy_denied"]}``
    * - :spelling:ignore:`hubble.dropEventEmitter.interval`
@@ -1603,7 +1607,7 @@
    * - :spelling:ignore:`hubble.metrics`
      - Hubble metrics configuration. See https://docs.cilium.io/en/stable/observability/metrics/#hubble-metrics for more comprehensive documentation about Hubble metrics.
      - object
-     - ``{"dashboards":{"annotations":{},"enabled":false,"label":"grafana_dashboard","labelValue":"1","namespace":null},"enableOpenMetrics":false,"enabled":null,"port":9965,"serviceAnnotations":{},"serviceMonitor":{"annotations":{},"enabled":false,"interval":"10s","jobLabel":"","labels":{},"metricRelabelings":null,"relabelings":[{"replacement":"${1}","sourceLabels":["__meta_kubernetes_pod_node_name"],"targetLabel":"node"}],"tlsConfig":{}},"tls":{"enabled":false,"server":{"cert":"","extraDnsNames":[],"extraIpAddresses":[],"key":"","mtls":{"enabled":false,"key":"ca.crt","name":null,"useSecret":false}}}}``
+     - ``{"dashboards":{"annotations":{},"enabled":false,"label":"grafana_dashboard","labelValue":"1","namespace":null},"enableOpenMetrics":false,"enabled":null,"port":9965,"serviceAnnotations":{},"serviceMonitor":{"annotations":{},"enabled":false,"interval":"10s","jobLabel":"","labels":{},"metricRelabelings":null,"relabelings":[{"replacement":"${1}","sourceLabels":["__meta_kubernetes_pod_node_name"],"targetLabel":"node"}],"tlsConfig":{}},"tls":{"enabled":false,"server":{"cert":"","existingSecret":"","extraDnsNames":[],"extraIpAddresses":[],"key":"","mtls":{"enabled":false,"key":"ca.crt","name":null,"useSecret":false}}}}``
    * - :spelling:ignore:`hubble.metrics.dashboards`
      - Grafana dashboards for hubble grafana can import dashboards based on the label and value ref: https://github.com/grafana/helm-charts/tree/main/charts/grafana#sidecar-for-dashboards
      - object
@@ -1653,7 +1657,11 @@
      - list
      - ``[{"replacement":"${1}","sourceLabels":["__meta_kubernetes_pod_node_name"],"targetLabel":"node"}]``
    * - :spelling:ignore:`hubble.metrics.tls.server.cert`
-     - base64 encoded PEM values for the Hubble metrics server certificate.
+     - base64 encoded PEM values for the Hubble metrics server certificate (deprecated). Use existingSecret instead.
+     - string
+     - ``""``
+   * - :spelling:ignore:`hubble.metrics.tls.server.existingSecret`
+     - Name of the Secret containing the certificate and key for the Hubble metrics server. If specified, cert and key are ignored.
      - string
      - ``""``
    * - :spelling:ignore:`hubble.metrics.tls.server.extraDnsNames`
@@ -1665,7 +1673,7 @@
      - list
      - ``[]``
    * - :spelling:ignore:`hubble.metrics.tls.server.key`
-     - base64 encoded PEM values for the Hubble metrics server key.
+     - base64 encoded PEM values for the Hubble metrics server key (deprecated). Use existingSecret instead.
      - string
      - ``""``
    * - :spelling:ignore:`hubble.metrics.tls.server.mtls`
@@ -1883,15 +1891,35 @@
    * - :spelling:ignore:`hubble.relay.tls`
      - TLS configuration for Hubble Relay
      - object
-     - ``{"client":{"cert":"","key":""},"server":{"cert":"","enabled":false,"extraDnsNames":[],"extraIpAddresses":[],"key":"","mtls":false,"relayName":"ui.hubble-relay.cilium.io"}}``
+     - ``{"client":{"cert":"","existingSecret":"","key":""},"server":{"cert":"","enabled":false,"existingSecret":"","extraDnsNames":[],"extraIpAddresses":[],"key":"","mtls":false,"relayName":"ui.hubble-relay.cilium.io"}}``
    * - :spelling:ignore:`hubble.relay.tls.client`
-     - base64 encoded PEM values for the hubble-relay client certificate and private key This keypair is presented to Hubble server instances for mTLS authentication and is required when hubble.tls.enabled is true. These values need to be set manually if hubble.tls.auto.enabled is false.
+     - The hubble-relay client certificate and private key. This keypair is presented to Hubble server instances for mTLS authentication and is required when hubble.tls.enabled is true. These values need to be set manually if hubble.tls.auto.enabled is false.
      - object
-     - ``{"cert":"","key":""}``
+     - ``{"cert":"","existingSecret":"","key":""}``
+   * - :spelling:ignore:`hubble.relay.tls.client.cert`
+     - base64 encoded PEM values for the Hubble relay client certificate (deprecated). Use existingSecret instead.
+     - string
+     - ``""``
+   * - :spelling:ignore:`hubble.relay.tls.client.existingSecret`
+     - Name of the Secret containing the certificate and key for the Hubble metrics server. If specified, cert and key are ignored.
+     - string
+     - ``""``
+   * - :spelling:ignore:`hubble.relay.tls.client.key`
+     - base64 encoded PEM values for the Hubble relay client key (deprecated). Use existingSecret instead.
+     - string
+     - ``""``
    * - :spelling:ignore:`hubble.relay.tls.server`
-     - base64 encoded PEM values for the hubble-relay server certificate and private key
+     - The hubble-relay server certificate and private key
      - object
-     - ``{"cert":"","enabled":false,"extraDnsNames":[],"extraIpAddresses":[],"key":"","mtls":false,"relayName":"ui.hubble-relay.cilium.io"}``
+     - ``{"cert":"","enabled":false,"existingSecret":"","extraDnsNames":[],"extraIpAddresses":[],"key":"","mtls":false,"relayName":"ui.hubble-relay.cilium.io"}``
+   * - :spelling:ignore:`hubble.relay.tls.server.cert`
+     - base64 encoded PEM values for the Hubble relay server certificate (deprecated). Use existingSecret instead.
+     - string
+     - ``""``
+   * - :spelling:ignore:`hubble.relay.tls.server.existingSecret`
+     - Name of the Secret containing the certificate and key for the Hubble relay server. If specified, cert and key are ignored.
+     - string
+     - ``""``
    * - :spelling:ignore:`hubble.relay.tls.server.extraDnsNames`
      - extra DNS names added to certificate when its auto gen
      - list
@@ -1900,6 +1928,10 @@
      - extra IP addresses added to certificate when its auto gen
      - list
      - ``[]``
+   * - :spelling:ignore:`hubble.relay.tls.server.key`
+     - base64 encoded PEM values for the Hubble relay server key (deprecated). Use existingSecret instead.
+     - string
+     - ``""``
    * - :spelling:ignore:`hubble.relay.tolerations`
      - Node tolerations for pod assignment on nodes with taints ref: https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/
      - list
@@ -1923,7 +1955,7 @@
    * - :spelling:ignore:`hubble.tls`
      - TLS configuration for Hubble
      - object
-     - ``{"auto":{"certManagerIssuerRef":{},"certValidityDuration":1095,"enabled":true,"method":"helm","schedule":"0 0 1 */4 *"},"enabled":true,"server":{"cert":"","extraDnsNames":[],"extraIpAddresses":[],"key":""}}``
+     - ``{"auto":{"certManagerIssuerRef":{},"certValidityDuration":1095,"enabled":true,"method":"helm","schedule":"0 0 1 */4 *"},"enabled":true,"server":{"cert":"","existingSecret":"","extraDnsNames":[],"extraIpAddresses":[],"key":""}}``
    * - :spelling:ignore:`hubble.tls.auto`
      - Configure automatic TLS certificates generation.
      - object
@@ -1953,9 +1985,17 @@
      - bool
      - ``true``
    * - :spelling:ignore:`hubble.tls.server`
-     - base64 encoded PEM values for the Hubble server certificate and private key
+     - The Hubble server certificate and private key
      - object
-     - ``{"cert":"","extraDnsNames":[],"extraIpAddresses":[],"key":""}``
+     - ``{"cert":"","existingSecret":"","extraDnsNames":[],"extraIpAddresses":[],"key":""}``
+   * - :spelling:ignore:`hubble.tls.server.cert`
+     - base64 encoded PEM values for the Hubble server certificate (deprecated). Use existingSecret instead.
+     - string
+     - ``""``
+   * - :spelling:ignore:`hubble.tls.server.existingSecret`
+     - Name of the Secret containing the certificate and key for the Hubble server. If specified, cert and key are ignored.
+     - string
+     - ``""``
    * - :spelling:ignore:`hubble.tls.server.extraDnsNames`
      - Extra DNS names added to certificate when it's auto generated
      - list
@@ -1964,6 +2004,10 @@
      - Extra IP addresses added to certificate when it's auto generated
      - list
      - ``[]``
+   * - :spelling:ignore:`hubble.tls.server.key`
+     - base64 encoded PEM values for the Hubble server key (deprecated). Use existingSecret instead.
+     - string
+     - ``""``
    * - :spelling:ignore:`hubble.ui.affinity`
      - Affinity for hubble-ui
      - object
@@ -2112,10 +2156,18 @@
      - When deploying Hubble UI in standalone, with tls enabled for Hubble relay, it is required to provide a volume for mounting the client certificates.
      - object
      - ``{}``
-   * - :spelling:ignore:`hubble.ui.tls.client`
-     - base64 encoded PEM values used to connect to hubble-relay This keypair is presented to Hubble Relay instances for mTLS authentication and is required when hubble.relay.tls.server.enabled is true. These values need to be set manually if hubble.tls.auto.enabled is false.
-     - object
-     - ``{"cert":"","key":""}``
+   * - :spelling:ignore:`hubble.ui.tls.client.cert`
+     - base64 encoded PEM values for the Hubble UI client certificate (deprecated). Use existingSecret instead.
+     - string
+     - ``""``
+   * - :spelling:ignore:`hubble.ui.tls.client.existingSecret`
+     - Name of the Secret containing the client certificate and key for Hubble UI If specified, cert and key are ignored.
+     - string
+     - ``""``
+   * - :spelling:ignore:`hubble.ui.tls.client.key`
+     - base64 encoded PEM values for the Hubble UI client key (deprecated). Use existingSecret instead.
+     - string
+     - ``""``
    * - :spelling:ignore:`hubble.ui.tolerations`
      - Node tolerations for pod assignment on nodes with taints ref: https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/
      - list
@@ -2129,7 +2181,7 @@
      - object
      - ``{"rollingUpdate":{"maxUnavailable":1},"type":"RollingUpdate"}``
    * - :spelling:ignore:`identityAllocationMode`
-     - Method to use for identity allocation (\ ``crd`` or ``kvstore``\ ).
+     - Method to use for identity allocation (\ ``crd``\ , ``kvstore`` or ``doublewrite-readkvstore`` / ``doublewrite-readcrd`` for migrating between identity backends).
      - string
      - ``"crd"``
    * - :spelling:ignore:`identityChangeGracePeriod`
@@ -2325,23 +2377,43 @@
      - bool
      - ``false``
    * - :spelling:ignore:`k8sClientRateLimit`
-     - Configure the client side rate limit for the agent and operator  If the amount of requests to the Kubernetes API server exceeds the configured rate limit, the agent and operator will start to throttle requests by delaying them until there is budget or the request times out.
+     - Configure the client side rate limit for the agent  If the amount of requests to the Kubernetes API server exceeds the configured rate limit, the agent will start to throttle requests by delaying them until there is budget or the request times out.
      - object
-     - ``{"burst":null,"qps":null}``
+     - ``{"burst":null,"operator":{"burst":null,"qps":null},"qps":null}``
    * - :spelling:ignore:`k8sClientRateLimit.burst`
      - The burst request rate in requests per second. The rate limiter will allow short bursts with a higher rate.
      - int
-     - 10 for k8s up to 1.26. 20 for k8s version 1.27+
+     - 20
+   * - :spelling:ignore:`k8sClientRateLimit.operator`
+     - Configure the client side rate limit for the Cilium Operator
+     - object
+     - ``{"burst":null,"qps":null}``
+   * - :spelling:ignore:`k8sClientRateLimit.operator.burst`
+     - The burst request rate in requests per second. The rate limiter will allow short bursts with a higher rate.
+     - int
+     - 200
+   * - :spelling:ignore:`k8sClientRateLimit.operator.qps`
+     - The sustained request rate in requests per second.
+     - int
+     - 100
    * - :spelling:ignore:`k8sClientRateLimit.qps`
      - The sustained request rate in requests per second.
      - int
-     - 5 for k8s up to 1.26. 10 for k8s version 1.27+
+     - 10
    * - :spelling:ignore:`k8sNetworkPolicy.enabled`
      - Enable support for K8s NetworkPolicy
      - bool
      - ``true``
    * - :spelling:ignore:`k8sServiceHost`
-     - Kubernetes service host - use "auto" for automatic lookup from the cluster-info ConfigMap (kubeadm-based clusters only)
+     - Kubernetes service host - use "auto" for automatic lookup from the cluster-info ConfigMap
+     - string
+     - ``""``
+   * - :spelling:ignore:`k8sServiceLookupConfigMapName`
+     - When ``k8sServiceHost=auto``\ , allows to customize the configMap name. It defaults to ``cluster-info``.
+     - string
+     - ``""``
+   * - :spelling:ignore:`k8sServiceLookupNamespace`
+     - When ``k8sServiceHost=auto``\ , allows to customize the namespace that contains ``k8sServiceLookupConfigMapName``. It defaults to ``kube-public``.
      - string
      - ``""``
    * - :spelling:ignore:`k8sServicePort`
@@ -2407,11 +2479,15 @@
    * - :spelling:ignore:`loadBalancer`
      - Configure service load balancing
      - object
-     - ``{"acceleration":"disabled","l7":{"algorithm":"round_robin","backend":"disabled","ports":[]}}``
+     - ``{"acceleration":"disabled","experimental":false,"l7":{"algorithm":"round_robin","backend":"disabled","ports":[]}}``
    * - :spelling:ignore:`loadBalancer.acceleration`
      - acceleration is the option to accelerate service handling via XDP Applicable values can be: disabled (do not use XDP), native (XDP BPF program is run directly out of the networking driver's early receive path), or best-effort (use native mode XDP acceleration on devices that support it).
      - string
      - ``"disabled"``
+   * - :spelling:ignore:`loadBalancer.experimental`
+     - experimental enables support for the experimental load-balancing  control-plane.
+     - bool
+     - ``false``
    * - :spelling:ignore:`loadBalancer.l7`
      - L7 LoadBalancer
      - object
@@ -2452,6 +2528,14 @@
      - Agent container name.
      - string
      - ``"cilium"``
+   * - :spelling:ignore:`nat.mapStatsEntries`
+     - Number of the top-k SNAT map connections to track in Cilium statedb.
+     - int
+     - ``32``
+   * - :spelling:ignore:`nat.mapStatsInterval`
+     - Interval between how often SNAT map is counted for stats.
+     - string
+     - ``"30s"``
    * - :spelling:ignore:`nat46x64Gateway`
      - Configure standalone NAT46/NAT64 gateway
      - object

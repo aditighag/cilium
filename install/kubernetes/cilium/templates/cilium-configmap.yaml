@@ -125,7 +125,8 @@ data:
 {{- end }}
 
   # Identity allocation mode selects how identities are shared between cilium
-  # nodes by setting how they are stored. The options are "crd" or "kvstore".
+  # nodes by setting how they are stored. The options are "crd", "kvstore" or
+  # "doublewrite-readkvstore" / "doublewrite-readcrd".
   # - "crd" stores identities in kubernetes as CRDs (custom resource definition).
   #   These can be queried with:
   #     kubectl get ciliumid
@@ -134,7 +135,11 @@ data:
   #   backend. Upgrades from these older cilium versions should continue using
   #   the kvstore by commenting out the identity-allocation-mode below, or
   #   setting it to "kvstore".
+  # - "doublewrite" modes store identities in both the kvstore and CRDs. This is useful
+  #   for seamless migrations from the kvstore mode to the crd mode. Consult the
+  #   documentation for more information on how to perform the migration.
   identity-allocation-mode: {{ .Values.identityAllocationMode }}
+
   identity-heartbeat-timeout: {{ include "validateDuration" .Values.operator.identityHeartbeatTimeout | quote }}
   identity-gc-interval: {{ include "validateDuration" .Values.operator.identityGCInterval | quote }}
   cilium-endpoint-gc-interval: {{ include "validateDuration" .Values.operator.endpointGCInterval | quote }}
@@ -719,9 +724,13 @@ data:
 {{- if $socketLB }}
 {{- if hasKey $socketLB "enabled" }}
   bpf-lb-sock: {{ $socketLB.enabled | quote }}
+  bpf-lb-sock-terminate-pod-connections: {{ $socketLB.enabled | quote }}
 {{- end }}
 {{- if hasKey $socketLB "hostNamespaceOnly" }}
   bpf-lb-sock-hostns-only: {{ $socketLB.hostNamespaceOnly | quote }}
+{{- end }}
+{{- if hasKey $socketLB "terminatePodConnections" }}
+  bpf-lb-sock-terminate-pod-connections: {{ $socketLB.terminatePodConnections | quote }}
 {{- end }}
 {{- end }}
 
@@ -777,6 +786,10 @@ data:
 {{- end }}
 {{- if hasKey .Values.loadBalancer "serviceTopology" }}
   enable-service-topology: {{ .Values.loadBalancer.serviceTopology | quote }}
+# {{- end }}
+
+{{- if hasKey .Values.loadBalancer "experimental" }}
+  enable-experimental-lb: {{ .Values.loadBalancer.experimental | quote }}
 {{- end }}
 
 {{- end }}
@@ -1167,6 +1180,9 @@ data:
   {{- if .Values.ciliumEndpointSlice.rateLimits }}
   ces-rate-limits: {{ .Values.ciliumEndpointSlice.rateLimits | toJson | quote }}
   {{- end }}
+  {{- if .Values.ciliumEndpointSlice.sliceMode }}
+  ces-slice-mode: {{ .Values.ciliumEndpointSlice.sliceMode | quote }}
+  {{- end }}
 {{- end }}
 
 {{- if hasKey .Values "enableK8sTerminatingEndpoint" }}
@@ -1186,8 +1202,19 @@ data:
   annotate-k8s-node: "true"
 {{- end }}
 
-  k8s-client-qps: {{ .Values.k8sClientRateLimit.qps | default $defaultK8sClientQPS | quote}}
-  k8s-client-burst: {{ .Values.k8sClientRateLimit.burst | default $defaultK8sClientBurst | quote }}
+{{- with .Values.k8sClientRateLimit.qps }}
+  k8s-client-qps: {{ . | quote }}
+{{- end }}
+{{- with .Values.k8sClientRateLimit.burst }}
+  k8s-client-burst: {{ . | quote }}
+{{- end }}
+
+{{- with .Values.k8sClientRateLimit.operator.qps }}
+  operator-k8s-client-qps: {{ .| quote }}
+{{- end }}
+{{- with .Values.k8sClientRateLimit.operator.burst }}
+  operator-k8s-client-burst: {{ .| quote }}
+{{- end }}
 
 {{- if and .Values.operator.setNodeTaints (not .Values.operator.removeNodeTaints) -}}
   {{ fail "Cannot have operator.setNodeTaintsMaxNodes and not operator.removeNodeTaints = false" }}
@@ -1219,7 +1246,7 @@ data:
   # default DNS proxy to transparent mode in non-chaining modes
   dnsproxy-enable-transparent-mode: {{ $defaultDNSProxyEnableTransparentMode | quote }}
   {{- end }}
-  {{- if .Values.dnsProxy.socketLingerTimeout }}
+  {{- if (not (kindIs "invalid" .Values.dnsProxy.socketLingerTimeout)) }}
   dnsproxy-socket-linger-timeout: {{ .Values.dnsProxy.socketLingerTimeout | quote }}
   {{- end }}
   {{- if .Values.dnsProxy.dnsRejectResponseCode }}
@@ -1296,6 +1323,9 @@ data:
 {{- end }}
   clustermesh-enable-endpoint-sync: {{ .Values.clustermesh.enableEndpointSliceSynchronization | quote }}
   clustermesh-enable-mcs-api: {{ .Values.clustermesh.enableMCSAPISupport | quote }}
+
+  nat-map-stats-entries: {{ .Values.nat.mapStatsEntries | quote }}
+  nat-map-stats-interval: {{ .Values.nat.mapStatsInterval | quote }}
 
 # Extra config allows adding arbitrary properties to the cilium config.
 # By putting it at the end of the ConfigMap, it's also possible to override existing properties.

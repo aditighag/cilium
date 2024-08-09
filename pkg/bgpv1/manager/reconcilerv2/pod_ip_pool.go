@@ -76,6 +76,12 @@ func (r *PodIPPoolReconciler) Priority() int {
 	return 50
 }
 
+func (r *PodIPPoolReconciler) Init(_ *instance.BGPInstance) error {
+	return nil
+}
+
+func (r *PodIPPoolReconciler) Cleanup(_ *instance.BGPInstance) {}
+
 func (r *PodIPPoolReconciler) Reconcile(ctx context.Context, p ReconcileParams) error {
 	if p.DesiredConfig == nil {
 		return fmt.Errorf("BUG: PodIPPoolReconciler reconciler called with nil CiliumBGPNodeConfig")
@@ -399,7 +405,7 @@ func (r *PodIPPoolReconciler) getPodIPPoolPolicy(p ReconcileParams, peer string,
 		return nil, nil
 	}
 
-	policyName := PolicyName(peer, family.Afi.String(), fmt.Sprintf("%s-%s", pool.Name, pool.Namespace))
+	policyName := PolicyName(peer, family.Afi.String(), advert.AdvertisementType, pool.Name)
 	return CreatePolicy(policyName, peerAddr, v4Prefixes, v6Prefixes, advert)
 }
 

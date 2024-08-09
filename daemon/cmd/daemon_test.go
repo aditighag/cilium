@@ -29,6 +29,7 @@ import (
 	fqdnproxy "github.com/cilium/cilium/pkg/fqdn/proxy"
 	"github.com/cilium/cilium/pkg/fqdn/restore"
 	"github.com/cilium/cilium/pkg/hive"
+	"github.com/cilium/cilium/pkg/identity"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	k8sSynced "github.com/cilium/cilium/pkg/k8s/synced"
 	"github.com/cilium/cilium/pkg/kvstore"
@@ -301,12 +302,19 @@ func (ds *DaemonSuite) Datapath() datapath.Datapath {
 	return ds.d.datapath
 }
 
+func (ds *DaemonSuite) Loader() datapath.Loader {
+	return ds.d.loader
+}
+
 func (ds *DaemonSuite) GetDNSRules(epID uint16) restore.DNSRules {
 	return nil
 }
 
-func (ds *DaemonSuite) RemoveRestoredDNSRules(epID uint16) {
-}
+func (ds *DaemonSuite) RemoveRestoredDNSRules(epID uint16) {}
+
+func (ds *DaemonSuite) AddIdentity(id *identity.Identity)                   {}
+func (ds *DaemonSuite) RemoveIdentity(id *identity.Identity)                {}
+func (ds *DaemonSuite) RemoveOldAddNewIdentity(old, new *identity.Identity) {}
 
 func TestMemoryMap(t *testing.T) {
 	pid := os.Getpid()

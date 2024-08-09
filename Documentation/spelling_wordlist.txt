@@ -315,6 +315,7 @@ etcd
 eth
 ethernet
 ethtool
+existingSecret
 extTrafficPolicy
 extern
 externalIPs
@@ -322,6 +323,7 @@ externalTrafficPolicy
 extraConfig
 facto
 failover
+fcfs
 fec
 filesystem
 filesystems
@@ -432,6 +434,9 @@ jsgt
 jsle
 jslt
 json
+k8sServiceHost
+k8sServiceLookupConfigMapName
+k8sServiceLookupNamespace
 kTLS
 kafka
 kallsyms
@@ -734,6 +739,7 @@ toGroups
 tofqdns
 tolerations
 toolchain
+toto
 traceparent
 tracepoint
 tracepoints

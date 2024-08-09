@@ -63,13 +63,13 @@ func (e *Endpoint) policyMapPath() string {
 
 // callsMapPath returns the path to cilium tail calls map of an endpoint.
 func (e *Endpoint) callsMapPath() string {
-	return e.owner.Datapath().Loader().CallsMapPath(e.ID)
+	return e.owner.Loader().CallsMapPath(e.ID)
 }
 
 // callsCustomMapPath returns the path to cilium custom tail calls map of an
 // endpoint.
 func (e *Endpoint) customCallsMapPath() string {
-	return e.owner.Datapath().Loader().CustomCallsMapPath(e.ID)
+	return e.owner.Loader().CustomCallsMapPath(e.ID)
 }
 
 // writeInformationalComments writes annotations to the specified writer,
@@ -187,7 +187,7 @@ func (e *Endpoint) writeHeaderfile(prefix string) error {
 		return err
 	}
 
-	if err = e.owner.Datapath().Loader().WriteEndpointConfig(f, e); err != nil {
+	if err = e.owner.Datapath().Orchestrator().WriteEndpointConfig(f, e); err != nil {
 		return err
 	}
 
@@ -315,7 +315,7 @@ func (e *Endpoint) addNewRedirectsFromDesiredPolicy(ingress bool, desiredRedirec
 		}
 		e.proxyStatisticsMutex.Unlock()
 
-		e.desiredPolicy.GetPolicyMap().RevertChanges(changes)
+		e.desiredPolicy.RevertChanges(changes)
 		return nil
 	})
 
@@ -377,7 +377,7 @@ func (e *Endpoint) addVisibilityRedirects(ingress bool, desiredRedirects map[str
 
 		updatedStats = append(updatedStats, proxyStats)
 
-		e.desiredPolicy.GetPolicyMap().AddVisibilityKeys(e, redirectPort, visMeta, changes)
+		e.desiredPolicy.AddVisibilityKeys(e, redirectPort, visMeta, changes)
 	}
 
 	revertStack.Push(func() error {
@@ -389,7 +389,7 @@ func (e *Endpoint) addVisibilityRedirects(ingress bool, desiredRedirects map[str
 		e.proxyStatisticsMutex.Unlock()
 
 		// Restore the desired policy map state.
-		e.desiredPolicy.GetPolicyMap().RevertChanges(changes)
+		e.desiredPolicy.RevertChanges(changes)
 		return nil
 	})
 
@@ -533,6 +533,10 @@ func (e *Endpoint) regenerateBPF(regenContext *regenerationContext) (revnum uint
 	stats.waitingForLock.End(true)
 	defer e.owner.GetCompilationLock().RUnlock()
 
+	if err := e.aliveCtx.Err(); err != nil {
+		return 0, fmt.Errorf("endpoint was closed while waiting for datapath lock: %w", err)
+	}
+
 	datapathRegenCtxt.prepareForProxyUpdates(regenContext.parentContext)
 	defer datapathRegenCtxt.completionCancel()
 
@@ -645,6 +649,11 @@ func (e *Endpoint) regenerateBPF(regenContext *regenerationContext) (revnum uint
 		return 0, fmt.Errorf("unable to regenerate policy because PolicyMap synchronization failed: %w", err)
 	}
 
+	// Initialize (if not done yet) the DNS history trigger to allow DNS proxy to trigger
+	// updates to endpoint headers. The initialization happens here as at this point
+	// datapath is ready to process the trigger.
+	e.initDNSHistoryTrigger()
+
 	return datapathRegenCtxt.epInfoCache.revision, err
 }
 
@@ -666,7 +675,7 @@ func (e *Endpoint) realizeBPFState(regenContext *regenerationContext) (err error
 		}
 
 		// Compile and install BPF programs for this endpoint
-		templateHash, err := e.owner.Datapath().Loader().ReloadDatapath(datapathRegenCtxt.completionCtx, datapathRegenCtxt.epInfoCache, &stats.datapathRealization)
+		templateHash, err := e.owner.Datapath().Orchestrator().ReloadDatapath(datapathRegenCtxt.completionCtx, datapathRegenCtxt.epInfoCache, &stats.datapathRealization)
 		if err != nil {
 			if !errors.Is(err, context.Canceled) {
 				e.getLogger().WithError(err).Error("Error while reloading endpoint BPF program")
@@ -926,7 +935,7 @@ func (e *Endpoint) runPreCompilationSteps(regenContext *regenerationContext, rul
 
 	// Avoid BPF program compilation and installation if the headerfile for the endpoint
 	// or the node have not changed.
-	datapathRegenCtxt.bpfHeaderfilesHash, err = e.owner.Datapath().Loader().EndpointHash(e)
+	datapathRegenCtxt.bpfHeaderfilesHash, err = e.owner.Datapath().Orchestrator().EndpointHash(e)
 	if err != nil {
 		return fmt.Errorf("hash header file: %w", err)
 	}
@@ -1140,7 +1149,7 @@ func (e *Endpoint) deletePolicyKey(keyToDelete policy.Key, incremental bool) boo
 	entry, ok := e.realizedPolicy.GetPolicyMap().Get(keyToDelete)
 	// Operation was successful, remove from realized state.
 	if ok {
-		e.realizedPolicy.GetPolicyMap().Delete(keyToDelete)
+		e.realizedPolicy.DeleteMapState(keyToDelete)
 		e.updatePolicyMapPressureMetric()
 
 		e.PolicyDebug(logrus.Fields{
@@ -1172,7 +1181,7 @@ func (e *Endpoint) addPolicyKey(keyToAdd policy.Key, entry policy.MapStateEntry,
 	}
 
 	// Operation was successful, add to realized state.
-	e.realizedPolicy.GetPolicyMap().Insert(keyToAdd, entry)
+	e.realizedPolicy.InsertMapState(keyToAdd, entry)
 	e.updatePolicyMapPressureMetric()
 
 	e.PolicyDebug(logrus.Fields{
@@ -1248,13 +1257,13 @@ func (e *Endpoint) applyPolicyMapChanges() error {
 		for _, visMeta := range e.visibilityPolicy.Ingress {
 			proxyID := policy.ProxyID(e.ID, visMeta.Ingress, visMeta.Proto.String(), visMeta.Port, "")
 			if redirectPort, exists := realizedRedirects[proxyID]; exists && redirectPort != 0 {
-				e.desiredPolicy.GetPolicyMap().AddVisibilityKeys(e, redirectPort, visMeta, changes)
+				e.desiredPolicy.AddVisibilityKeys(e, redirectPort, visMeta, changes)
 			}
 		}
 		for _, visMeta := range e.visibilityPolicy.Egress {
 			proxyID := policy.ProxyID(e.ID, visMeta.Ingress, visMeta.Proto.String(), visMeta.Port, "")
 			if redirectPort, exists := realizedRedirects[proxyID]; exists && redirectPort != 0 {
-				e.desiredPolicy.GetPolicyMap().AddVisibilityKeys(e, redirectPort, visMeta, changes)
+				e.desiredPolicy.AddVisibilityKeys(e, redirectPort, visMeta, changes)
 			}
 		}
 	}
@@ -1381,7 +1390,7 @@ func (e *Endpoint) syncPolicyMapsWith(realized policy.MapState, withDiffs bool) 
 }
 
 func (e *Endpoint) dumpPolicyMapToMapState() (policy.MapState, error) {
-	currentMap := policy.NewMapState(nil)
+	currentMap, insert := policy.NewMapStateWithInsert()
 
 	cb := func(key bpf.MapKey, value bpf.MapValue) {
 		policymapKey := key.(*policymap.PolicyKey)
@@ -1400,7 +1409,7 @@ func (e *Endpoint) dumpPolicyMapToMapState() (policy.MapState, error) {
 			IsDeny:    policymapEntry.IsDeny(),
 			AuthType:  policy.AuthType(policymapEntry.AuthType),
 		}
-		currentMap.Insert(policyKey, policyEntry)
+		insert(policyKey, policyEntry)
 	}
 	err := e.policyMap.DumpWithCallback(cb)
 

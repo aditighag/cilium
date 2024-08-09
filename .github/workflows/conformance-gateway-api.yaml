@@ -122,10 +122,14 @@ jobs:
         id: vars
         run: |
           echo sha=${{ steps.default_vars.outputs.sha }} >> $GITHUB_OUTPUT
-          
+
           EXEMPT_FEATURES="GatewayStaticAddresses,HTTPRouteParentRefPort,MeshConsumerRoute"
           if [ ${{ matrix.crd-channel }} == "standard" ]; then
-            EXEMPT_FEATURES+=",HTTPRouteDestinationPortMatching,HTTPRouteRequestTimeout,HTTPRouteBackendTimeout"
+            EXEMPT_FEATURES+=",HTTPRouteDestinationPortMatching,HTTPRouteRequestTimeout,HTTPRouteBackendTimeout,GatewayInfrastructurePropagation"
+          fi
+
+          if [ ${{ matrix.conformance-profile }} == "true" ]; then
+            SKIPPED_TESTS+="GatewayStaticAddresses,MeshConsumerRoute,HTTPRouteListenerPortMatching"
           fi
 
           CILIUM_INSTALL_DEFAULTS="${{ steps.default_vars.outputs.cilium_install_defaults }} \
@@ -160,17 +164,17 @@ jobs:
           wait: 0 # The control-plane never becomes ready, since no CNI is present
 
       - name: Install Cilium CLI
-        uses: cilium/cilium-cli@9fffebfb38ad7ff1f80f1c1a366ec87730683bb4 # v0.16.12
+        uses: cilium/cilium-cli@99ff3d9edd4050d7b5c9d1f51dcf6ebeeb613d15 # v0.16.15
         with:
           skip-build: ${{ env.CILIUM_CLI_SKIP_BUILD }}
           image-repo: ${{ env.CILIUM_CLI_IMAGE_REPO }}
           image-tag: ${{ env.CILIUM_CLI_VERSION }}
 
       - name: Install Go
-        uses: actions/setup-go@cdcb36043654635271a94b9a6d1392de5bb323a7 # v5.0.1
+        uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
         with:
           # renovate: datasource=golang-version depName=go
-          go-version: 1.22.5
+          go-version: 1.22.6
 
       - name: Install tparse
         timeout-minutes: 15
@@ -234,7 +238,7 @@ jobs:
           EOF
           cat pool.yaml
           kubectl apply -f pool.yaml
-          
+
           echo "Deploying L2-Announcement Policy..."
           cat << 'EOF' > l2policy.yaml
           apiVersion: "cilium.io/v2alpha1"
@@ -262,7 +266,7 @@ jobs:
               -v ./operator/pkg/gateway-api \
               --gateway-class cilium \
               --all-features \
-              --exempt-features "${{ steps.vars.outputs.exempt-features }}" \
+              --skip-tests "${{ steps.vars.outputs.skipped_tests }}" \
               --allow-crds-mismatch \
               --conformance-profiles GATEWAY-HTTP,GATEWAY-TLS,GATEWAY-GRPC,MESH-HTTP,MESH-GRPC \
               --organization cilium \
@@ -272,7 +276,6 @@ jobs:
               --contact https://github.com/cilium/community/blob/main/roles/Maintainers.md \
               --report-output report.yaml \
               -test.run "TestConformance" \
-              -test.skip "${{ steps.vars.outputs.skipped_tests }}" \
               -json \
             | tparse -progress
           else
@@ -320,7 +323,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Set final commit status
-        uses: myrotvorets/set-commit-status-action@3730c0a348a2ace3c110851bed53331bc6406e9f # v2.0.1  
+        uses: myrotvorets/set-commit-status-action@3730c0a348a2ace3c110851bed53331bc6406e9f # v2.0.1
         with:
           sha: ${{ inputs.SHA || github.sha }}
           status: ${{ needs.gateway-api-conformance-test.result }}

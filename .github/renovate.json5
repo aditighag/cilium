@@ -318,9 +318,17 @@
       "matchPackageNames": [
         "docker.io/library/ubuntu"
       ],
-      "allowedVersions": "22.04",
+      "allowedVersions": "24.04",
       "matchBaseBranches": [
         "main",
+      ],
+    },
+    {
+      "matchPackageNames": [
+        "docker.io/library/ubuntu"
+      ],
+      "allowedVersions": "22.04",
+      "matchBaseBranches": [
         "v1.16",
         "v1.15",
         "v1.14",
@@ -334,26 +342,8 @@
       ],
       "allowedVersions": "<1.23",
       "matchBaseBranches": [
-        "v1.16"
-      ]
-    },
-    {
-      "matchPackageNames": [
-        "docker.io/library/golang",
-        "go"
-      ],
-      "allowedVersions": "<1.22",
-      "matchBaseBranches": [
-        "v1.15"
-      ]
-    },
-    {
-      "matchPackageNames": [
-        "docker.io/library/golang",
-        "go"
-      ],
-      "allowedVersions": "<1.22",
-      "matchBaseBranches": [
+        "v1.16",
+        "v1.15",
         "v1.14",
         "v1.13"
       ]
@@ -622,6 +612,15 @@
       "allowedVersions": "<1.30",
       "matchBaseBranches": [
         "v1.16",
+      ]
+    },
+    {
+      "matchDepNames": [
+        "quay.io/cilium/cilium-envoy"
+      ],
+      "versioning": "regex:v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-.*$",
+      "allowedVersions": "<1.31",
+      "matchBaseBranches": [
         "main",
       ]
     },
@@ -703,7 +702,7 @@
       // similar to the examples shown here:
       //   https://docs.renovatebot.com/modules/manager/regex/#advanced-capture
       "matchStrings": [
-        "# renovate: datasource=(?<datasource>.*?) depName=(?<depName>.*?)\\s+.+- \'v(?<currentValue>.*) or higher\'"
+        "# renovate: datasource=(?<datasource>.*?) depName=(?<depName>.*?)\\s+.+- \'higher than (?<currentValue>.*) and lower than.+"
       ],
     },
     {

@@ -315,6 +315,13 @@ spec:
         {{- end}}
         - name: cilium-run
           mountPath: /var/run/cilium
+        {{- /* mount the directory if socketLB.enabled is true and socketLB.terminatePodConnections is not explicitly set to false */ -}}
+        {{- if or (and (kindIs "invalid" .Values.socketLB.terminatePodConnections) .Values.socketLB.enabled)
+                  (and .Values.socketLB.enabled .Values.socketLB.terminatePodConnections)  }}
+        - name: cilium-netns
+          mountPath: /var/run/cilium/netns
+          mountPropagation: HostToContainer
+        {{- end}}
         - name: etc-cni-netd
           mountPath: {{ .Values.cni.hostConfDirMountPath }}
         {{- if .Values.etcd.enabled }}
@@ -790,6 +797,14 @@ spec:
         hostPath:
           path: {{ .Values.daemon.runPath }}
           type: DirectoryOrCreate
+      {{- if or (and (kindIs "invalid" .Values.socketLB.terminatePodConnections) .Values.socketLB.enabled)
+                (and .Values.socketLB.enabled .Values.socketLB.terminatePodConnections)  }}
+        # To exec into pod network namespaces
+      - name: cilium-netns
+        hostPath:
+          path: /var/run/netns
+          type: DirectoryOrCreate
+      {{- end }}
       {{- if .Values.bpf.autoMount.enabled }}
         # To keep state between restarts / upgrades for bpf maps
       - name: bpf-maps
@@ -969,7 +984,7 @@ spec:
           defaultMode: 0400
           sources:
           - secret:
-              name: hubble-server-certs
+              name: {{ .Values.hubble.tls.server.existingSecret | default "hubble-server-certs" }}
               optional: true
               items:
               - key: tls.crt
@@ -995,7 +1010,7 @@ spec:
           defaultMode: 0400
           sources:
           - secret:
-              name: hubble-metrics-server-certs
+              name: {{ .Values.hubble.tls.server.existingSecret | default "hubble-metrics-server-certs" }}
               optional: true
               items:
               - key: tls.crt

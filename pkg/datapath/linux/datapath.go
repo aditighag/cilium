@@ -8,9 +8,11 @@ import (
 
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	datapath "github.com/cilium/cilium/pkg/datapath/types"
+	"github.com/cilium/cilium/pkg/loadbalancer/experimental"
 	"github.com/cilium/cilium/pkg/maps/lbmap"
 	"github.com/cilium/cilium/pkg/maps/nodemap"
 	"github.com/cilium/cilium/pkg/node/manager"
+	"github.com/cilium/cilium/pkg/testutils/mockmaps"
 )
 
 // DatapathConfiguration is the static configuration of the datapath. The
@@ -27,10 +29,8 @@ type linuxDatapath struct {
 	datapath.ConfigWriter
 	datapath.IptablesManager
 	nodeHandler    datapath.NodeHandler
-	nodeIDHandler  datapath.NodeIDHandler
 	nodeNeighbors  datapath.NodeNeighbors
 	nodeAddressing datapath.NodeAddressing
-	loader         datapath.Loader
 	wgAgent        datapath.WireguardAgent
 	lbmap          datapath.LBMap
 	bwmgr          datapath.BandwidthManager
@@ -45,29 +45,35 @@ type DatapathParams struct {
 	BWManager      datapath.BandwidthManager
 	NodeAddressing datapath.NodeAddressing
 	MTU            datapath.MTUConfiguration
-	Loader         datapath.Loader
 	NodeManager    manager.NodeManager
 	DB             *statedb.DB
 	Devices        statedb.Table[*tables.Device]
 	Orchestrator   datapath.Orchestrator
 	NodeHandler    datapath.NodeHandler
-	NodeIDHandler  datapath.NodeIDHandler
 	NodeNeighbors  datapath.NodeNeighbors
+	ExpConfig      experimental.Config
 }
 
 // NewDatapath creates a new Linux datapath
 func NewDatapath(p DatapathParams) datapath.Datapath {
+	var lbm datapath.LBMap
+	if p.ExpConfig.EnableExperimentalLB {
+		// The experimental control-plane is enabled. Use a fake LBMap
+		// to effectively disable the other code paths writing to LBMaps.
+		lbm = mockmaps.NewLBMockMap()
+	} else {
+		lbm = lbmap.New()
+	}
+
 	dp := &linuxDatapath{
 		ConfigWriter:    p.ConfigWriter,
 		IptablesManager: p.RuleManager,
 		nodeAddressing:  p.NodeAddressing,
-		loader:          p.Loader,
 		wgAgent:         p.WGAgent,
-		lbmap:           lbmap.New(),
+		lbmap:           lbm,
 		bwmgr:           p.BWManager,
 		orchestrator:    p.Orchestrator,
 		nodeHandler:     p.NodeHandler,
-		nodeIDHandler:   p.NodeIDHandler,
 		nodeNeighbors:   p.NodeNeighbors,
 	}
 
@@ -83,10 +89,6 @@ func (l *linuxDatapath) Node() datapath.NodeHandler {
 	return l.nodeHandler
 }
 
-func (l *linuxDatapath) NodeIDs() datapath.NodeIDHandler {
-	return l.nodeIDHandler
-}
-
 func (l *linuxDatapath) NodeNeighbors() datapath.NodeNeighbors {
 	return l.nodeNeighbors
 }
@@ -95,10 +97,6 @@ func (l *linuxDatapath) NodeNeighbors() datapath.NodeNeighbors {
 // node
 func (l *linuxDatapath) LocalNodeAddressing() datapath.NodeAddressing {
 	return l.nodeAddressing
-}
-
-func (l *linuxDatapath) Loader() datapath.Loader {
-	return l.loader
 }
 
 func (l *linuxDatapath) WireguardAgent() datapath.WireguardAgent {

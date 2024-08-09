@@ -220,7 +220,10 @@ type L7LBInfo struct {
 // 'ports' is typically short for no point optimizing the search.
 func (i *L7LBInfo) isProtoAndPortMatch(fe *lb.L4Addr) bool {
 	// L7 LB redirect is only supported for TCP frontends
-	if fe.Protocol != lb.TCP {
+	// The below is to make sure that UDP and SCTP are not allowed instead of comparing with lb.TCP
+	// The reason is to avoid extra dependencies with ongoing work to differentiate protocols in datapath,
+	// which might add more values such as lb.Any, lb.None, etc.
+	if fe.Protocol == lb.UDP || fe.Protocol == lb.SCTP {
 		return false
 	}
 
@@ -278,11 +281,12 @@ type Service struct {
 
 	backendConnectionHandler sockets.SocketDestroyer
 
-	backendDiscovery datapathTypes.NodeNeighbors
+	backendDiscovery       datapathTypes.NodeNeighbors
+	k8sControlplaneEnabled bool
 }
 
 // newService creates a new instance of the service handler.
-func newService(monitorAgent monitorAgent.Agent, lbmap datapathTypes.LBMap, backendDiscoveryHandler datapathTypes.NodeNeighbors, healthCheckers []HealthChecker) *Service {
+func newService(monitorAgent monitorAgent.Agent, lbmap datapathTypes.LBMap, backendDiscoveryHandler datapathTypes.NodeNeighbors, healthCheckers []HealthChecker, k8sControlplaneEnabled bool) *Service {
 	var localHealthServer healthServer
 	if option.Config.EnableHealthCheckNodePort {
 		localHealthServer = healthserver.New()
@@ -300,6 +304,7 @@ func newService(monitorAgent monitorAgent.Agent, lbmap datapathTypes.LBMap, back
 		backendConnectionHandler: backendConnectionHandler{},
 		backendDiscovery:         backendDiscoveryHandler,
 		healthCheckers:           healthCheckers,
+		k8sControlplaneEnabled:   k8sControlplaneEnabled,
 	}
 	svc.lastUpdatedTs.Store(time.Now())
 
@@ -851,7 +856,7 @@ func (s *Service) upsertService(params *lb.SVC) (bool, lb.ID, error) {
 			// There is one special case is L7 proxy service, which never have any
 			// backends because the traffic will be redirected.
 			activeBackends := 0
-			if params.L7LBProxyPort != 0 {
+			if l7lbInfo != nil {
 				// Set this to 1 because Envoy will be running in this case.
 				getScopedLog().WithField(logfields.ServiceHealthCheckNodePort, svc.svcHealthCheckNodePort).
 					Debug("L7 service with HealthcheckNodePort enabled")
@@ -1184,6 +1189,19 @@ func (s *Service) GetDeepCopyServices() []*lb.SVC {
 	svcs := make([]*lb.SVC, 0, len(s.svcByHash))
 	for _, svc := range s.svcByHash {
 		svcs = append(svcs, svc.deepCopyToLBSVC())
+	}
+
+	return svcs
+}
+
+// GetServiceIDs returns a list of IDs of all installed services.
+func (s *Service) GetServiceIDs() []lb.ServiceID {
+	s.RLock()
+	defer s.RUnlock()
+
+	svcs := make([]lb.ServiceID, 0, len(s.svcByID))
+	for _, svc := range s.svcByID {
+		svcs = append(svcs, lb.ServiceID(svc.frontend.ID))
 	}
 
 	return svcs
@@ -1819,7 +1837,8 @@ func (s *Service) restoreServicesLocked(svcBackendsById map[lb.BackendID]struct{
 			svcBackendsById[backend.ID] = struct{}{}
 		}
 
-		if len(newSVC.backendByHash) > 0 {
+		// There is no way to synchronize backends in standalone L4LB case with external control plane, so don't block their removal
+		if len(newSVC.backendByHash) > 0 && s.k8sControlplaneEnabled {
 			// Indicate that these backends were restored from BPF maps,
 			// so that they are not removed until SyncWithK8sFinished()
 			// is executed (if not observed in the meanwhile) to prevent

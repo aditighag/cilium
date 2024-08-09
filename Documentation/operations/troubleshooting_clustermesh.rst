@@ -74,9 +74,9 @@ you may perform the following steps to troubleshoot ClusterMesh issues.
  #. Validate that ClusterMesh is healthy running ``cilium-dbg status --all-clusters`` inside each Cilium agent::
 
         ClusterMesh:   1/1 remote clusters ready, 10 global-services
-           k8s-c2: ready, 3 nodes, 25 endpoints, 8 identities, 10 services, 0 reconnections (last: never)
+           k8s-c2: ready, 3 nodes, 25 endpoints, 8 identities, 10 services, 0 MCS-API service exports, 0 reconnections (last: never)
            └  etcd: 1/1 connected, leases=0, lock lease-ID=7c028201b53de662, has-quorum=true: https://k8s-c2.mesh.cilium.io:2379 - 3.5.4 (Leader)
-           └  remote configuration: expected=true, retrieved=true, cluster-id=3, kvstoremesh=false, sync-canaries=true
+           └  remote configuration: expected=true, retrieved=true, cluster-id=3, kvstoremesh=false, sync-canaries=true, service-exports=disabled
            └  synchronization status: nodes=true, endpoints=true, identities=true, services=true
 
     When KVStoreMesh is enabled, additionally check its status and validate that
@@ -99,9 +99,9 @@ you may perform the following steps to troubleshoot ClusterMesh issues.
       containers in the clustermesh-apiserver deployment, to authenticate against the
       sidecar etcd instance. Not applicable if an external etcd cluster is used.
 
-    * ``clustermesh-apiserver-remote-cert``, which is used by Cilium agents, and
-      optionally the kvstoremesh container in the clustermesh-apiserver deployment,
-      to authenticate against remote etcd instances (either internal or external).
+    * ``clustermesh-apiserver-remote-cert``, which is used by Cilium agents, or
+      the kvstoremesh container in the clustermesh-apiserver deployment when
+      KVStoreMesh is enabled, to authenticate against remote etcd instances.
 
     * ``clustermesh-apiserver-local-cert``, which is used by Cilium agents to
       authenticate against the local etcd instance. Only applicable if KVStoreMesh

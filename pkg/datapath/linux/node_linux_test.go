@@ -131,6 +131,7 @@ func setupLinuxPrivilegedBaseTestSuite(tb testing.TB, addressing datapath.NodeAd
 
 	s.nodeConfigTemplate = datapath.LocalNodeConfiguration{
 		Devices:             []*tables.Device{devExt, devHost},
+		DirectRoutingDevice: devHost,
 		NodeIPv4:            addressing.IPv4().PrimaryExternal(),
 		NodeIPv6:            addressing.IPv6().PrimaryExternal(),
 		CiliumInternalIPv4:  addressing.IPv4().Router(),
@@ -196,7 +197,7 @@ func setupLinuxPrivilegedIPv4AndIPv6TestSuite(tb testing.TB) *linuxPrivilegedIPv
 }
 
 func tearDownTest(tb testing.TB) {
-	ipsec.DeleteXFRM(hivetest.Logger(tb))
+	ipsec.DeleteXFRM(hivetest.Logger(tb), ipsec.AllReqID)
 	node.UnsetTestLocalNodeStore()
 	removeDevice(dummyHostDeviceName)
 	removeDevice(dummyExternalDeviceName)
@@ -824,14 +825,14 @@ func TestNodeChurnXFRMLeaks(t *testing.T) {
 	option.Config.RoutingMode = option.RoutingModeNative
 
 	// Cover the XFRM configuration for subnet encryption: IPAM modes AKS and EKS.
-	_, ipv4PodSubnets, err := net.ParseCIDR("4.4.0.0/16")
+	ipv4PodSubnets, err := cidr.ParseCIDR("4.4.0.0/16")
 	require.NoError(t, err)
 	require.NotNil(t, ipv4PodSubnets)
-	config.IPv4PodSubnets = []*net.IPNet{ipv4PodSubnets}
-	_, ipv6PodSubnets, err := net.ParseCIDR("2001:aaaa::/64")
+	config.IPv4PodSubnets = []*cidr.CIDR{ipv4PodSubnets}
+	ipv6PodSubnets, err := cidr.ParseCIDR("2001:aaaa::/64")
 	require.NoError(t, err)
 	require.NotNil(t, ipv6PodSubnets)
-	config.IPv6PodSubnets = []*net.IPNet{ipv6PodSubnets}
+	config.IPv6PodSubnets = []*cidr.CIDR{ipv6PodSubnets}
 	s.testNodeChurnXFRMLeaksWithConfig(t, config)
 }
 
@@ -1465,9 +1466,6 @@ func TestArpPingHandlingIPv6(t *testing.T) {
 	prevRoutingMode := option.Config.RoutingMode
 	defer func() { option.Config.RoutingMode = prevRoutingMode }()
 	option.Config.RoutingMode = option.RoutingModeNative
-	prevDRDev := option.Config.DirectRoutingDevice
-	defer func() { option.Config.DirectRoutingDevice = prevDRDev }()
-	option.Config.DirectRoutingDevice = "veth0"
 	prevNP := option.Config.EnableNodePort
 	defer func() { option.Config.EnableNodePort = prevNP }()
 	option.Config.EnableNodePort = true
@@ -1483,6 +1481,7 @@ func TestArpPingHandlingIPv6(t *testing.T) {
 
 	nodeConfig := s.nodeConfigTemplate
 	nodeConfig.EnableEncapsulation = false
+	nodeConfig.DirectRoutingDevice = getDevice(t, "veth0")
 	err = linuxNodeHandler.NodeConfigurationChanged(nodeConfig)
 	require.NoError(t, err)
 
@@ -2217,9 +2216,6 @@ func TestArpPingHandlingForMultiDeviceIPv6(t *testing.T) {
 	prevRoutingMode := option.Config.RoutingMode
 	defer func() { option.Config.RoutingMode = prevRoutingMode }()
 	option.Config.RoutingMode = option.RoutingModeNative
-	prevDRDev := option.Config.DirectRoutingDevice
-	defer func() { option.Config.DirectRoutingDevice = prevDRDev }()
-	option.Config.DirectRoutingDevice = "veth0"
 	prevNP := option.Config.EnableNodePort
 	defer func() { option.Config.EnableNodePort = prevNP }()
 	option.Config.EnableNodePort = true
@@ -2235,6 +2231,7 @@ func TestArpPingHandlingForMultiDeviceIPv6(t *testing.T) {
 
 	nodeConfig := s.nodeConfigTemplate
 	nodeConfig.EnableEncapsulation = false
+	nodeConfig.DirectRoutingDevice = getDevice(t, "veth0")
 	nodeConfig.Devices = append(slices.Clone(nodeConfig.Devices),
 		getDevice(t, "veth0"),
 		getDevice(t, "veth2"),
@@ -2493,9 +2490,6 @@ func TestArpPingHandlingIPv4(t *testing.T) {
 	prevRoutingMode := option.Config.RoutingMode
 	defer func() { option.Config.RoutingMode = prevRoutingMode }()
 	option.Config.RoutingMode = option.RoutingModeNative
-	prevDRDev := option.Config.DirectRoutingDevice
-	defer func() { option.Config.DirectRoutingDevice = prevDRDev }()
-	option.Config.DirectRoutingDevice = "veth0"
 	prevNP := option.Config.EnableNodePort
 	defer func() { option.Config.EnableNodePort = prevNP }()
 	option.Config.EnableNodePort = true
@@ -2513,6 +2507,7 @@ func TestArpPingHandlingIPv4(t *testing.T) {
 	nodeConfig.Devices = []*tables.Device{
 		{Index: veth0.Attrs().Index, Name: "veth0", Selected: true},
 	}
+	nodeConfig.DirectRoutingDevice = getDevice(t, "veth0")
 	nodeConfig.EnableEncapsulation = false
 	err = linuxNodeHandler.NodeConfigurationChanged(nodeConfig)
 	require.NoError(t, err)
@@ -3243,9 +3238,6 @@ func TestArpPingHandlingForMultiDeviceIPv4(t *testing.T) {
 	prevRoutingMode := option.Config.RoutingMode
 	defer func() { option.Config.RoutingMode = prevRoutingMode }()
 	option.Config.RoutingMode = option.RoutingModeNative
-	prevDRDev := option.Config.DirectRoutingDevice
-	defer func() { option.Config.DirectRoutingDevice = prevDRDev }()
-	option.Config.DirectRoutingDevice = "veth0"
 	prevNP := option.Config.EnableNodePort
 	defer func() { option.Config.EnableNodePort = prevNP }()
 	option.Config.EnableNodePort = true
@@ -3265,6 +3257,7 @@ func TestArpPingHandlingForMultiDeviceIPv4(t *testing.T) {
 		getDevice(t, "veth0"),
 		getDevice(t, "veth2"),
 		getDevice(t, "veth4"))
+	nodeConfig.DirectRoutingDevice = getDevice(t, "veth0")
 	err = linuxNodeHandler.NodeConfigurationChanged(nodeConfig)
 	require.NoError(t, err)
 

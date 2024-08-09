@@ -104,7 +104,7 @@ var (
 func init() {
 	BugtoolRootCmd.Flags().BoolVar(&archive, "archive", true, "Create archive when false skips deletion of the output directory")
 	BugtoolRootCmd.Flags().BoolVar(&getPProf, "get-pprof", false, "When set, only gets the pprof traces from the cilium-agent binary")
-	BugtoolRootCmd.Flags().IntVar(&pprofDebug, "pprof-debug", 1, "Debug pprof args")
+	BugtoolRootCmd.Flags().IntVar(&pprofDebug, "pprof-debug", 0, "Debug pprof args")
 	BugtoolRootCmd.Flags().BoolVar(&envoyDump, "envoy-dump", true, "When set, dump envoy configuration from unix socket")
 	BugtoolRootCmd.Flags().BoolVar(&envoyMetrics, "envoy-metrics", true, "When set, dump envoy prometheus metrics from unix socket")
 	BugtoolRootCmd.Flags().IntVar(&pprofPort,
@@ -256,6 +256,17 @@ func runTool() {
 		if envoyDump {
 			if err := dumpEnvoy(cmdDir, "http://admin/config_dump?include_eds", "envoy-config.json", envoySecretMask); err != nil {
 				fmt.Fprintf(os.Stderr, "Unable to dump envoy config: %s\n", err)
+			}
+			if err := dumpEnvoy(cmdDir, "http://admin/listeners", "envoy-listeners.txt", nil); err != nil {
+				fmt.Fprintf(os.Stderr, "Unable to dump envoy listeners: %s\n", err)
+			}
+
+			if err := dumpEnvoy(cmdDir, "http://admin/clusters", "envoy-clusters.txt", nil); err != nil {
+				fmt.Fprintf(os.Stderr, "Unable to dump envoy clusters: %s\n", err)
+			}
+
+			if err := dumpEnvoy(cmdDir, "http://admin/server_info", "envoy-server-info.json", nil); err != nil {
+				fmt.Fprintf(os.Stderr, "Unable to dump envoy server info: %s\n", err)
 			}
 		}
 

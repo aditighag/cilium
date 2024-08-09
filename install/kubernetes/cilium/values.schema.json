@@ -782,6 +782,12 @@
             ]
           },
           "type": "array"
+        },
+        "sliceMode": {
+          "enum": [
+            "identity",
+            "fcfs"
+          ]
         }
       },
       "type": "object"
@@ -2629,6 +2635,9 @@
                     "cert": {
                       "type": "string"
                     },
+                    "existingSecret": {
+                      "type": "string"
+                    },
                     "extraDnsNames": {
                       "items": {},
                       "type": "array"
@@ -3004,6 +3013,9 @@
                     "cert": {
                       "type": "string"
                     },
+                    "existingSecret": {
+                      "type": "string"
+                    },
                     "key": {
                       "type": "string"
                     }
@@ -3017,6 +3029,9 @@
                     },
                     "enabled": {
                       "type": "boolean"
+                    },
+                    "existingSecret": {
+                      "type": "string"
                     },
                     "extraDnsNames": {
                       "items": {},
@@ -3108,6 +3123,9 @@
             "server": {
               "properties": {
                 "cert": {
+                  "type": "string"
+                },
+                "existingSecret": {
                   "type": "string"
                 },
                 "extraDnsNames": {
@@ -3396,6 +3414,9 @@
                 "client": {
                   "properties": {
                     "cert": {
+                      "type": "string"
+                    },
+                    "existingSecret": {
                       "type": "string"
                     },
                     "key": {
@@ -3731,6 +3752,23 @@
             "integer"
           ]
         },
+        "operator": {
+          "properties": {
+            "burst": {
+              "type": [
+                "null",
+                "integer"
+              ]
+            },
+            "qps": {
+              "type": [
+                "null",
+                "integer"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "qps": {
           "type": [
             "null",
@@ -3750,6 +3788,18 @@
     },
     "k8sServiceHost": {
       "type": "string"
+    },
+    "k8sServiceLookupConfigMapName": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "k8sServiceLookupNamespace": {
+      "type": [
+        "null",
+        "string"
+      ]
     },
     "k8sServicePort": {
       "type": [
@@ -3818,6 +3868,9 @@
         "acceleration": {
           "type": "string"
         },
+        "experimental": {
+          "type": "boolean"
+        },
         "l7": {
           "properties": {
             "algorithm": {
@@ -3855,6 +3908,17 @@
     },
     "name": {
       "type": "string"
+    },
+    "nat": {
+      "properties": {
+        "mapStatsEntries": {
+          "type": "integer"
+        },
+        "mapStatsInterval": {
+          "type": "string"
+        }
+      },
+      "type": "object"
     },
     "nat46x64Gateway": {
       "properties": {

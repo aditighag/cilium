@@ -62,6 +62,7 @@ import (
 	"github.com/cilium/cilium/pkg/hubble/exporter/exporteroption"
 	"github.com/cilium/cilium/pkg/hubble/observer/observeroption"
 	"github.com/cilium/cilium/pkg/identity"
+	"github.com/cilium/cilium/pkg/identity/identitymanager"
 	"github.com/cilium/cilium/pkg/ipam"
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	"github.com/cilium/cilium/pkg/ipcache"
@@ -248,9 +249,6 @@ func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
 	flags.StringSlice(option.DebugVerbose, []string{}, "List of enabled verbose debug groups")
 	option.BindEnv(vp, option.DebugVerbose)
 
-	flags.String(option.DirectRoutingDevice, "", "Device name used to connect nodes in direct routing mode (used by BPF NodePort, BPF host routing; if empty, automatically set to a device with k8s InternalIP/ExternalIP or with a default route)")
-	option.BindEnv(vp, option.DirectRoutingDevice)
-
 	flags.Bool(option.EnableRuntimeDeviceDetection, true, "Enable runtime device detection and datapath reconfiguration (experimental)")
 	option.BindEnv(vp, option.EnableRuntimeDeviceDetection)
 	flags.MarkDeprecated(option.EnableRuntimeDeviceDetection, "Runtime device detection and datapath reconfiguration is now the default and only mode of operation")
@@ -344,6 +342,10 @@ func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
 
 	flags.Bool(option.EnableSocketLB, false, "Enable socket-based LB for E/W traffic")
 	option.BindEnv(vp, option.EnableSocketLB)
+
+	flags.Bool(option.EnableSocketLBPodConnectionTermination, true, "Enable terminating connections to deleted service backends when socket-LB is enabled")
+	flags.MarkHidden(option.EnableSocketLBPodConnectionTermination)
+	option.BindEnv(vp, option.EnableSocketLBPodConnectionTermination)
 
 	flags.Bool(option.EnableSocketLBTracing, true, "Enable tracing for socket-based LB")
 	option.BindEnv(vp, option.EnableSocketLBTracing)
@@ -599,9 +601,6 @@ func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
 
 	flags.String(option.LoadBalancerRSSv6CIDR, "", "BPF load balancing RSS outer source IPv6 CIDR prefix for IPIP")
 	option.BindEnv(vp, option.LoadBalancerRSSv6CIDR)
-
-	flags.Bool(option.LoadBalancerExternalControlPlane, false, "BPF load balancer uses an externally-provided control plane")
-	option.BindEnv(vp, option.LoadBalancerExternalControlPlane)
 
 	flags.String(option.LoadBalancerAcceleration, option.NodePortAccelerationDisabled, fmt.Sprintf(
 		"BPF load balancing acceleration via XDP (\"%s\", \"%s\")",
@@ -982,7 +981,7 @@ func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
 	flags.StringSlice(option.HubbleRedactHttpHeadersDeny, []string{}, "HTTP headers to redact from flows")
 	option.BindEnv(vp, option.HubbleRedactHttpHeadersDeny)
 
-	flags.Bool(option.HubbleDropEvents, defaults.HubbleDropEventsEnabled, "Emit packet drop Events related to pods")
+	flags.Bool(option.HubbleDropEvents, defaults.HubbleDropEventsEnabled, "Emit packet drop Events related to pods (alpha)")
 	option.BindEnv(vp, option.HubbleDropEvents)
 
 	flags.Duration(option.HubbleDropEventsInterval, defaults.HubbleDropEventsInterval, "Minimum time between emitting same events")
@@ -1293,8 +1292,8 @@ func initEnv(vp *viper.Viper) {
 	if err := os.MkdirAll(globalsDir, defaults.StateDirRights); err != nil {
 		log.WithError(err).WithField(logfields.Path, globalsDir).Fatal("Could not create runtime directory")
 	}
-	if err := os.Chdir(option.Config.LibDir); err != nil {
-		log.WithError(err).WithField(logfields.Path, option.Config.LibDir).Fatal("Could not change to runtime directory")
+	if err := os.Chdir(option.Config.StateDir); err != nil {
+		log.WithError(err).WithField(logfields.Path, option.Config.StateDir).Fatal("Could not change to runtime directory")
 	}
 	if _, err := os.Stat(option.Config.BpfDir); os.IsNotExist(err) {
 		log.WithError(err).Fatalf("BPF template directory: NOT OK. Please run 'make install-bpf'")
@@ -1383,7 +1382,7 @@ func initEnv(vp *viper.Viper) {
 		}
 		option.Config.KubeProxyReplacement = option.KubeProxyReplacementFalse
 		option.Config.EnableSocketLB = true
-		option.Config.EnableSocketLBTracing = true
+		option.Config.EnableSocketLBPodConnectionTermination = true
 		option.Config.EnableHostPort = false
 		option.Config.EnableNodePort = true
 		option.Config.EnableExternalIPs = true
@@ -1632,6 +1631,7 @@ var daemonCell = cell.Module(
 	cell.Provide(
 		newDaemonPromise,
 		promise.New[endpointstate.Restorer],
+		promise.New[*option.DaemonConfig],
 		newSyncHostIPs,
 	),
 	// Provide a read-only copy of the current daemon settings to be consumed
@@ -1645,10 +1645,13 @@ var daemonCell = cell.Module(
 type daemonParams struct {
 	cell.In
 
+	CfgResolver promise.Resolver[*option.DaemonConfig]
+
 	Lifecycle              cell.Lifecycle
 	Health                 cell.Health
 	Clientset              k8sClient.Clientset
 	Datapath               datapath.Datapath
+	Loader                 datapath.Loader
 	WGAgent                *wireguard.Agent
 	LocalNodeStore         *node.LocalNodeStore
 	Shutdowner             hive.Shutdowner
@@ -1681,9 +1684,9 @@ type daemonParams struct {
 	APILimiterSet          *rate.APILimiterSet
 	AuthManager            *auth.AuthManager
 	Settings               cellSettings
-	DeviceManager          *linuxdatapath.DeviceManager `optional:"true"`
 	Devices                statedb.Table[*datapathTables.Device]
 	NodeAddrs              statedb.Table[datapathTables.NodeAddress]
+	DirectRoutingDevice    datapathTables.DirectRoutingDevice
 	// Grab the GC object so that we can start the CT/NAT map garbage collection.
 	// This is currently necessary because these maps have not yet been modularized,
 	// and because it depends on parameters which are not provided through hive.
@@ -1706,20 +1709,16 @@ type daemonParams struct {
 	Recorder            *recorder.Recorder
 	IPAM                *ipam.IPAM
 	CRDSyncPromise      promise.Promise[k8sSynced.CRDSync]
+	IdentityManager     *identitymanager.IdentityManager
 }
 
-func newDaemonPromise(params daemonParams) (promise.Promise[*Daemon], promise.Promise[*option.DaemonConfig], promise.Promise[policyK8s.PolicyManager]) {
+func newDaemonPromise(params daemonParams) (promise.Promise[*Daemon], promise.Promise[policyK8s.PolicyManager]) {
 	daemonResolver, daemonPromise := promise.New[*Daemon]()
-	cfgResolver, cfgPromise := promise.New[*option.DaemonConfig]()
 	policyManagerResolver, policyManagerPromise := promise.New[policyK8s.PolicyManager]()
 
 	// daemonCtx is the daemon-wide context cancelled when stopping.
 	daemonCtx, cancelDaemonCtx := context.WithCancel(context.Background())
 	cleaner := NewDaemonCleanup()
-
-	if option.Config.LoadBalancerExternalControlPlane {
-		params.Clientset.Disable()
-	}
 
 	var daemon *Daemon
 	var wg sync.WaitGroup
@@ -1729,7 +1728,7 @@ func newDaemonPromise(params daemonParams) (promise.Promise[*Daemon], promise.Pr
 			defer func() {
 				// Reject promises on error
 				if err != nil {
-					cfgResolver.Reject(err)
+					params.CfgResolver.Reject(err)
 					policyManagerResolver.Reject(err)
 					daemonResolver.Reject(err)
 				}
@@ -1767,7 +1766,7 @@ func newDaemonPromise(params daemonParams) (promise.Promise[*Daemon], promise.Pr
 
 			// 'option.Config' is assumed to be stable at this point, execpt for
 			// 'option.Config.Opts' that are explicitly deemed to be runtime-changeable
-			cfgResolver.Resolve(option.Config)
+			params.CfgResolver.Resolve(option.Config)
 			policyManagerResolver.Resolve(daemon)
 
 			if option.Config.DryMode {
@@ -1793,7 +1792,7 @@ func newDaemonPromise(params daemonParams) (promise.Promise[*Daemon], promise.Pr
 			return nil
 		},
 	})
-	return daemonPromise, cfgPromise, policyManagerPromise
+	return daemonPromise, policyManagerPromise
 }
 
 // startDaemon starts the old unmodular part of the cilium-agent.
@@ -1832,6 +1831,16 @@ func startDaemon(d *Daemon, restoredEndpoints *endpointRestoreState, cleaner *da
 
 	if params.WGAgent != nil {
 		go func() {
+			select {
+			case <-d.nodeDiscovery.Registered:
+				// Wait until the kvstore synchronization completed, to avoid
+				// causing connectivity blips due incorrectly removing
+				// WireGuard peers that have not yet been discovered. The
+				// Registered channel is immediately closed in CRD mode.
+			case <-d.ctx.Done():
+				return
+			}
+
 			if err := params.WGAgent.RestoreFinished(d.clustermesh); err != nil {
 				log.WithError(err).Error("Failed to set up WireGuard peers")
 			}
@@ -1977,7 +1986,11 @@ func startDaemon(d *Daemon, restoredEndpoints *endpointRestoreState, cleaner *da
 		controller.ControllerParams{
 			Group:  cfgGroup,
 			Health: params.Health,
-			DoFunc: option.Config.ValidateUnchanged,
+			DoFunc: func(context.Context) error {
+				// Validate that Daemon config has not changed, ignoring 'Opts'
+				// that may be modified via config patch events.
+				return option.Config.ValidateUnchanged()
+			},
 			// avoid synhronized run with other
 			// controllers started at same time
 			RunInterval: 61 * time.Second,
