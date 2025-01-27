@@ -5,8 +5,12 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/cilium/cilium/pkg/fswatcher"
+	"github.com/cilium/hive/job"
+	"github.com/fsnotify/fsnotify"
 	"math/rand"
 	"net"
 	"net/http"
@@ -53,7 +57,6 @@ import (
 	"github.com/cilium/cilium/pkg/k8s/testutils"
 	k8sversion "github.com/cilium/cilium/pkg/k8s/version"
 	"github.com/cilium/cilium/pkg/lock"
-	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/version"
 )
@@ -81,7 +84,12 @@ var ClientBuilderCell = cell.Module(
 	cell.Provide(NewClientBuilder),
 )
 
-var k8sHeartbeatControllerGroup = controller.NewGroup("k8s-heartbeat")
+var (
+	k8sHeartbeatControllerGroup = controller.NewGroup("k8s-heartbeat")
+	// The file path for storing k8sapi-server service and endpoints. This is periodically
+	// updated, and read on restart.
+	K8sAPIServerFilePath = "/run/cilium/state/k8sapi_server_state.json"
+)
 
 // Type aliases for the clientsets to avoid name collision on 'Clientset' when composing them.
 type (
@@ -140,17 +148,24 @@ type compositeClientset struct {
 	rt            *rotatingHttpRoundTripper
 
 	lock.RWMutex
+
+	isHAEnabled bool
+	jobs        job.Group
 }
 
-func newClientset(lc cell.Lifecycle, log logrus.FieldLogger, cfg Config) (Clientset, error) {
-	return newClientsetForUserAgent(lc, log, cfg, "")
+type K8sServiceEndpointMapping struct {
+	Service   string   `json:"service"`
+	Endpoints []string `json:"endpoints"`
 }
 
-func newClientsetForUserAgent(lc cell.Lifecycle, log logrus.FieldLogger, cfg Config, name string) (Clientset, error) {
+func newClientset(lc cell.Lifecycle, log logrus.FieldLogger, cfg Config, jobs job.Group) (Clientset, error) {
+	return newClientsetForUserAgent(lc, log, cfg, "", jobs)
+}
+
+func newClientsetForUserAgent(lc cell.Lifecycle, log logrus.FieldLogger, cfg Config, name string, jobs job.Group) (Clientset, error) {
 	if !cfg.isEnabled() {
 		return &compositeClientset{disabled: true}, nil
 	}
-
 
 	if cfg.K8sAPIServer != "" &&
 		!strings.HasPrefix(cfg.K8sAPIServer, "http") {
@@ -183,10 +198,14 @@ func newClientsetForUserAgent(lc cell.Lifecycle, log logrus.FieldLogger, cfg Con
 		log:        log,
 		controller: controller.NewManager(),
 		config:     cfg,
-		rt:         &rotatingHttpRoundTripper{
+		jobs:       jobs,
+		rt: &rotatingHttpRoundTripper{
 			log: log,
 		},
+	}
 
+	if len(cfg.K8sAPIServerURLs) != 0 {
+		client.isHAEnabled = true
 	}
 
 	cmdName := "cilium"
@@ -309,6 +328,10 @@ func (c *compositeClientset) onStart(startCtx cell.HookContext) error {
 		return nil
 	}
 
+	if err := c.startK8sAPIServerFileWatcher(); err != nil {
+		return err
+	}
+
 	if err := c.waitForConn(startCtx); err != nil {
 		return err
 	}
@@ -336,6 +359,81 @@ func (c *compositeClientset) onStop(stopCtx cell.HookContext) error {
 	}
 	c.started = false
 	return nil
+}
+
+func (c *compositeClientset) startK8sAPIServerFileWatcher() error {
+	if !c.isHAEnabled {
+		return nil
+	}
+
+	if _, err := os.Stat(K8sAPIServerFilePath); errors.Is(err, os.ErrNotExist) {
+		_, err := os.Create(K8sAPIServerFilePath)
+		if err != nil {
+			return fmt.Errorf("unable to create '%s': %w", K8sAPIServerFilePath, err)
+		}
+	}
+
+	watcher, err := fswatcher.New([]string{K8sAPIServerFilePath})
+	if err != nil {
+		return err
+	}
+
+	c.jobs.Add(job.OneShot("k8sapi-server-state-file-watcher", func(ctx context.Context, health cell.Health) error {
+		health.OK("Starting k8sapi-server state file watcher")
+		return c.k8sAPIServerFileWatcher(ctx, watcher, health)
+	}))
+
+	return nil
+}
+
+func (c *compositeClientset) k8sAPIServerFileWatcher(ctx context.Context, watcher *fswatcher.Watcher, health cell.Health) error {
+	for {
+		select {
+		case <-ctx.Done():
+			health.Stopped("Context done")
+			return nil
+		case event := <-watcher.Events:
+			if !event.Op.Has(fsnotify.Write) {
+				continue
+			}
+			c.log.Infof("Processing write event for %s", K8sAPIServerFilePath)
+			c.updateK8sAPIServerURL()
+		case err := <-watcher.Errors:
+			health.Degraded(fmt.Sprintf("Failed to load  %q", K8sAPIServerFilePath), err)
+			c.log.WithError(err).Error("Unexpected error while watching k8sapi-server state file")
+			return err
+		}
+
+	}
+}
+
+func (c *compositeClientset) updateK8sAPIServerURL() {
+	f, err := os.Open(K8sAPIServerFilePath)
+	if err != nil {
+		c.log.WithError(err).Errorf("unable to open %s, agent may not be able to fail over to an active "+
+			"k8sapi-server", K8sAPIServerFilePath)
+	}
+	defer f.Close()
+
+	var mapping K8sServiceEndpointMapping
+	if err = json.NewDecoder(f).Decode(&mapping); err != nil {
+		c.log.WithError(err).Errorf("failed to decode %s, agent may not be able to fail over to an active "+
+			"k8sapi-server", K8sAPIServerFilePath)
+	}
+	c.log.Infof("Updating k8s api server url host %s", mapping.Service)
+	c.RLock()
+	if mapping.Service == c.rt.apiServerURL.Host {
+		return
+	}
+	// TODO: fall back to physical addresses
+	if err = c.checkConn(mapping.Service); err == nil {
+		c.closeAllConns()
+	}
+	// TODO: consolidate configs
+	c.rt.apiServerURL.Host = mapping.Service
+	c.restConfig.Host = mapping.Service
+	c.startHeartbeat()
+	c.RUnlock()
 }
 
 func (c *compositeClientset) startHeartbeat() {
@@ -421,7 +519,7 @@ type rotatingHttpRoundTripper struct {
 }
 
 func (rt *rotatingHttpRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	rt.log.Infof("RoundTrip using %s", rt.apiServerURL.Host)
+	rt.log.Infof("Kubernetes api server host set to %s", rt.apiServerURL.Host)
 	req.URL.Host = rt.apiServerURL.Host
 	return rt.delegate.RoundTrip(req)
 }
@@ -510,6 +608,40 @@ func (c *compositeClientset) waitForConn(ctx context.Context) error {
 		c.log.Info("Connected to apiserver")
 	}
 	return err
+}
+
+func (c *compositeClientset) checkConn(host string) error {
+	stop := make(chan struct{})
+	timeout := time.NewTimer(time.Minute)
+	defer timeout.Stop()
+	var err error
+	wait.Until(func() {
+		c.log.WithField("host", host).Info("Checking connection to apiserver")
+		config := c.restConfig
+		config.Host = host
+		httpClient, _ := rest.HTTPClientFor(config)
+
+		cs, _ := kubernetes.NewForConfigAndClient(config, httpClient)
+		err = isConnReady(cs)
+		if err == nil {
+			close(stop)
+			return
+		}
+
+		select {
+		case <-timeout.C:
+		default:
+			c.log.WithError(err).WithField(logfields.IPAddr, host).Error("k8s api-server not ready yet")
+			return
+		}
+
+		close(stop)
+	}, 5*time.Second, stop)
+	if err == nil {
+		c.log.Infof("Connected to apiserver %s", host)
+	}
+	return err
+
 }
 
 func setDialer(cfg Config, restConfig *rest.Config) func() {
@@ -690,9 +822,9 @@ type ClientBuilderFunc func(name string) (Clientset, error)
 // NewClientBuilder returns a function that creates a new Clientset with the given
 // name appended to the user agent, or returns an error if the Clientset cannot be
 // created.
-func NewClientBuilder(lc cell.Lifecycle, log logrus.FieldLogger, cfg Config) ClientBuilderFunc {
+func NewClientBuilder(lc cell.Lifecycle, log logrus.FieldLogger, cfg Config, jobs job.Group) ClientBuilderFunc {
 	return func(name string) (Clientset, error) {
-		c, err := newClientsetForUserAgent(lc, log, cfg, name)
+		c, err := newClientsetForUserAgent(lc, log, cfg, name, jobs)
 		if err != nil {
 			return nil, err
 		}

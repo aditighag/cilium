@@ -5,9 +5,12 @@ package watchers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/cilium/cilium/pkg/k8s/client"
 	"net"
+	"os"
 	"sync/atomic"
 
 	"github.com/cilium/hive/cell"
@@ -577,6 +580,30 @@ func (k *K8sServiceWatcher) addK8sSVCs(svcID k8s.ServiceID, oldSvc, svc *k8s.Ser
 				scopedLog.WithError(err).Error("Error while inserting service in LB map")
 			}
 		}
+		k.writeServiceMappings(p)
+	}
+}
+
+func (k *K8sServiceWatcher) writeServiceMappings(svc *loadbalancer.SVC) {
+	if svc.Name.Name != "kubernetes" || svc.Name.Namespace != "default" {
+		return
+	}
+	f, err := os.OpenFile(client.K8sAPIServerFilePath, os.O_RDWR, 0644)
+	if err != nil {
+		log.WithError(err).Errorf("failed to open %s", client.K8sAPIServerFilePath)
+	}
+	defer f.Close()
+
+	var mapping client.K8sServiceEndpointMapping
+	mapping.Endpoints = make([]string, len(svc.Backends))
+	mapping.Service = svc.Frontend.L3n4Addr.AddrString()
+	for i := range mapping.Endpoints {
+		mapping.Endpoints[i] = svc.Backends[i].AddrString()
+	}
+	log.Infof("writing k8s serive mappings to %s %v", client.K8sAPIServerFilePath, mapping)
+	if err = json.NewEncoder(f).Encode(mapping); err != nil {
+		log.WithError(err).Errorf("Failed to write kubernetes service entry %v, agent may not be able "+
+			"to fail over to an active k8sapi-server", mapping)
 	}
 }
 
