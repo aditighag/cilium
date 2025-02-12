@@ -250,9 +250,8 @@ func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
 	flags.MarkDeprecated(option.EnableRuntimeDeviceDetection, "Runtime device detection and datapath reconfiguration is now the default and only mode of operation")
 
 	flags.String(option.DatapathMode, defaults.DatapathMode,
-		fmt.Sprintf("Datapath mode name (%s, %s, %s, %s)",
-			datapathOption.DatapathModeVeth, datapathOption.DatapathModeNetkit,
-			datapathOption.DatapathModeNetkitL2, datapathOption.DatapathModeLBOnly))
+		fmt.Sprintf("Datapath mode name (%s, %s, %s)",
+			datapathOption.DatapathModeVeth, datapathOption.DatapathModeNetkit, datapathOption.DatapathModeNetkitL2))
 	option.BindEnv(vp, option.DatapathMode)
 
 	flags.Bool(option.EnableEndpointRoutes, defaults.EnableEndpointRoutes, "Use per endpoint routes instead of routing via cilium_host")
@@ -487,9 +486,6 @@ func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
 	option.BindEnv(vp, option.K8sServiceCacheSize)
 	flags.MarkHidden(option.K8sServiceCacheSize)
 
-	flags.String(option.K8sWatcherEndpointSelector, defaults.K8sWatcherEndpointSelector, "K8s endpoint watcher will watch for these k8s endpoints")
-	option.BindEnv(vp, option.K8sWatcherEndpointSelector)
-
 	flags.Bool(option.KeepConfig, false, "When restoring state, keeps containers' configuration in place")
 	option.BindEnv(vp, option.KeepConfig)
 
@@ -607,6 +603,10 @@ func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
 
 	flags.Bool(option.LoadBalancerProtocolDifferentiation, true, "Enable support for service protocol differentiation (TCP, UDP, SCTP)")
 	option.BindEnv(vp, option.LoadBalancerProtocolDifferentiation)
+
+	flags.Bool(option.LoadBalancerOnly, false, "Enable support for legacy lb-only mode")
+	option.BindEnv(vp, option.LoadBalancerOnly)
+	flags.MarkDeprecated(option.LoadBalancerOnly, "Future releases might require to pick individual KPR flags instead")
 
 	flags.Bool(option.EnableAutoProtectNodePortRange, true,
 		"Append NodePort range to net.ipv4.ip_local_reserved_ports if it overlaps "+
@@ -1053,6 +1053,9 @@ func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
 	flags.MarkHidden(option.BootIDFilename)
 	option.BindEnv(vp, option.BootIDFilename)
 
+	flags.Float64(option.ConnectivityProbeFrequencyRatio, defaults.ConnectivityProbeFrequencyRatio, "Ratio of the connectivity probe frequency vs resource usage, a float in [0, 1]. 0 will give more frequent probing, 1 will give less frequent probing. Probing frequency is dynamically adjusted based on the cluster size.")
+	option.BindEnv(vp, option.ConnectivityProbeFrequencyRatio)
+
 	if err := vp.BindPFlags(flags); err != nil {
 		log.Fatalf("BindPFlags failed: %s", err)
 	}
@@ -1273,6 +1276,15 @@ func initEnv(vp *viper.Viper) {
 		log.WithError(err).Fatal("Unable to parse Label prefix configuration")
 	}
 
+	// Legacy / compatibility setting. This one has been remapped into the
+	// option.Config.LoadBalancerOnly flag.
+	if option.Config.DatapathMode == datapathOption.DatapathModeLBOnly {
+		option.Config.DatapathMode = datapathOption.DatapathModeVeth
+		option.Config.LoadBalancerOnly = true
+		log.Warnf("Value --%s=%s has been deprecated, Future releases might require to pick individual KPR flags instead",
+			option.DatapathMode, datapathOption.DatapathModeLBOnly)
+	}
+
 	switch option.Config.DatapathMode {
 	case datapathOption.DatapathModeVeth:
 	case datapathOption.DatapathModeNetkit, datapathOption.DatapathModeNetkitL2:
@@ -1284,7 +1296,11 @@ func initEnv(vp *viper.Viper) {
 		if err := probes.HaveNetkit(); err != nil {
 			log.Fatal("netkit devices need kernel 6.7.0 or newer and CONFIG_NETKIT")
 		}
-	case datapathOption.DatapathModeLBOnly:
+	default:
+		log.WithField(logfields.DatapathMode, option.Config.DatapathMode).Fatal("Invalid datapath mode")
+	}
+
+	if option.Config.LoadBalancerOnly {
 		log.Info("Running in LB-only mode")
 		if option.Config.NodePortAcceleration != option.NodePortAccelerationDisabled {
 			option.Config.EnablePMTUDiscovery = true
@@ -1301,8 +1317,6 @@ func initEnv(vp *viper.Viper) {
 		option.Config.EnableIPv6Masquerade = false
 		option.Config.InstallIptRules = false
 		option.Config.EnableL7Proxy = false
-	default:
-		log.WithField(logfields.DatapathMode, option.Config.DatapathMode).Fatal("Invalid datapath mode")
 	}
 
 	if option.Config.EnableL7Proxy && !option.Config.InstallIptRules {
@@ -1850,7 +1864,7 @@ func startDaemon(d *Daemon, restoredEndpoints *endpointRestoreState, cleaner *da
 	// Watches for node neighbors link updates.
 	d.nodeDiscovery.Manager.StartNodeNeighborLinkUpdater(params.NodeNeighbors)
 
-	if option.Config.DatapathMode != datapathOption.DatapathModeLBOnly {
+	if !option.Config.LoadBalancerOnly {
 		if !params.NodeNeighbors.NodeNeighDiscoveryEnabled() {
 			// Remove all non-GC'ed neighbor entries that might have previously set
 			// by a Cilium instance.

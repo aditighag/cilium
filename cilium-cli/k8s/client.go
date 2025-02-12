@@ -239,6 +239,10 @@ func (c *Client) GetDeployment(ctx context.Context, namespace, name string, opts
 	return c.Clientset.AppsV1().Deployments(namespace).Get(ctx, name, opts)
 }
 
+func (c *Client) ListDeployment(ctx context.Context, namespace string, options metav1.ListOptions) (*appsv1.DeploymentList, error) {
+	return c.Clientset.AppsV1().Deployments(namespace).List(ctx, options)
+}
+
 func (c *Client) DeleteDeployment(ctx context.Context, namespace, name string, opts metav1.DeleteOptions) error {
 	return c.Clientset.AppsV1().Deployments(namespace).Delete(ctx, name, opts)
 }
@@ -323,9 +327,9 @@ func (c *Client) PodLogs(namespace, name string, opts *corev1.PodLogOptions) *re
 	return c.Clientset.CoreV1().Pods(namespace).GetLogs(name, opts)
 }
 
-func (c *Client) CiliumLogs(ctx context.Context, namespace, pod string, since time.Time, previous bool) (string, error) {
+func (c *Client) ContainerLogs(ctx context.Context, namespace, pod, containerName string, since time.Time, previous bool) (string, error) {
 	opts := &corev1.PodLogOptions{
-		Container:  defaults.AgentContainerName,
+		Container:  containerName,
 		Timestamps: true,
 		SinceTime:  &metav1.Time{Time: since},
 		Previous:   previous,

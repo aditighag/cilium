@@ -60,7 +60,8 @@ jobs:
             --helm-set=cni.chainingMode=portmap \
             --helm-set-string=kubeProxyReplacement=true \
             --helm-set=loadBalancer.l7.backend=envoy \
-            --helm-set=tls.secretsBackend=k8s \
+            --helm-set=tls.readSecretsOnlyFromSecretsNamespace=true \
+            --helm-set=tls.secretSync.enabled=true \
             --helm-set=envoy.enabled=false \
             --helm-set=ipv6.enabled=true \
             --wait=false"
@@ -79,7 +80,7 @@ jobs:
           wait: 0 # The control-plane never becomes ready, since no CNI is present
 
       - name: Install Cilium CLI
-        uses: cilium/cilium-cli@f313219850d324b516748ff7b00a6f9fa30d34ae # v0.16.23
+        uses: cilium/cilium-cli@a4936ec2afa58bf755162928456190344a179207 # v0.16.24
         with:
           skip-build: ${{ env.CILIUM_CLI_SKIP_BUILD }}
           image-repo: ${{ env.CILIUM_CLI_IMAGE_REPO }}
@@ -100,7 +101,7 @@ jobs:
 
       - name: Wait for Cilium status to be ready
         run: |
-          cilium status --wait
+          cilium status --wait --interactive=false
           kubectl -n kube-system get pods
 
       - name: Make JUnit report directory
@@ -125,6 +126,7 @@ jobs:
           helm upgrade cilium ./install/kubernetes/cilium \
             --namespace kube-system \
             --reuse-values \
+            --set=tls.readSecretsOnlyFromSecretsNamespace=false \
             --set=tls.secretSync.enabled=false
 
           kubectl -n kube-system rollout restart ds/cilium deployment/cilium-operator

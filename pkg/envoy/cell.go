@@ -146,7 +146,7 @@ func newEnvoyXDSServer(params xdsServerParams) (XDSServer, error) {
 	// the xDS ConfigSource is used for CEC/CCEC.
 	CiliumXDSConfigSource.InitialFetchTimeout.Seconds = int64(params.EnvoyProxyConfig.ProxyInitialFetchTimeout)
 
-	xdsServer, err := newXDSServer(
+	xdsServer := newXDSServer(
 		params.RestorerPromise,
 		params.IPCache,
 		params.LocalEndpointStore,
@@ -165,9 +165,6 @@ func newEnvoyXDSServer(params xdsServerParams) (XDSServer, error) {
 			proxyXffNumTrustedHopsEgress:  params.EnvoyProxyConfig.ProxyXffNumTrustedHopsEgress,
 		},
 		params.SecretManager)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Envoy xDS server: %w", err)
-	}
 
 	if !option.Config.EnableL7Proxy {
 		log.Debug("L7 proxies are disabled - not starting Envoy xDS server")
@@ -330,7 +327,7 @@ type syncerParams struct {
 }
 
 func registerSecretSyncer(params syncerParams) error {
-	if !params.K8sClientset.IsEnabled() {
+	if !params.K8sClientset.IsEnabled() || !option.Config.EnableL7Proxy {
 		return nil
 	}
 

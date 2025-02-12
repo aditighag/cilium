@@ -66,7 +66,7 @@ env:
   contextName2: kind-cluster2-${{ github.run_id }}
 
   # renovate: datasource=github-releases depName=cert-manager/cert-manager
-  CERT_MANAGER_VERSION: v1.16.3
+  CERT_MANAGER_VERSION: v1.17.0
 
 jobs:
   echo-inputs:
@@ -387,7 +387,7 @@ jobs:
           wait: 0 # The control-plane never becomes ready, since no CNI is present
 
       - name: Install Cilium CLI
-        uses: cilium/cilium-cli@f313219850d324b516748ff7b00a6f9fa30d34ae # v0.16.23
+        uses: cilium/cilium-cli@a4936ec2afa58bf755162928456190344a179207 # v0.16.24
         with:
           skip-build: ${{ env.CILIUM_CLI_SKIP_BUILD }}
           image-repo: ${{ env.CILIUM_CLI_IMAGE_REPO }}
@@ -548,8 +548,8 @@ jobs:
 
       - name: Wait for cluster mesh status to be ready
         run: |
-          cilium --context ${{ env.contextName1 }} status --wait
-          cilium --context ${{ env.contextName2 }} status --wait
+          cilium --context ${{ env.contextName1 }} status --wait --interactive=false
+          cilium --context ${{ env.contextName2 }} status --wait --interactive=false
           cilium --context ${{ env.contextName1 }} clustermesh status --wait
           cilium --context ${{ env.contextName2 }} clustermesh status --wait
 
@@ -561,8 +561,8 @@ jobs:
       - name: Wait for cluster mesh status to be ready
         if: matrix.mode != 'external'
         run: |
-          cilium --context ${{ env.contextName1 }} status --wait
-          cilium --context ${{ env.contextName2 }} status --wait
+          cilium --context ${{ env.contextName1 }} status --wait --interactive=false
+          cilium --context ${{ env.contextName2 }} status --wait --interactive=false
           cilium --context ${{ env.contextName1 }} clustermesh status --wait
           cilium --context ${{ env.contextName2 }} clustermesh status --wait
 
