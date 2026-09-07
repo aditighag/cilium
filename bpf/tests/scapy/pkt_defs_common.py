@@ -45,6 +45,7 @@ v4_pod_three_on_node_two = "192.168.1.3"
 
 v4_pod_cidr_size = 24
 
+# IPv4 service loopback
 v4_svc_loopback = "10.245.255.31"
 
 v4_all = "0.0.0.0"
@@ -64,6 +65,10 @@ v6_svc_one    = "fd10::1"
 
 # External IPv6 addrs
 v6_ext_node_one = "2001::1"
+v6_ext_node_two = "2001::2"
+
+# IPv6 service loopback
+v6_svc_loopback = "fd05::1"
 
 v6_all = "::"
 
@@ -80,7 +85,14 @@ tcp_svc_one   = 80
 tcp_svc_two   = 443
 tcp_svc_three = 53
 
-default_data = "Should not change!!"
+# Other default properties for TCP
+tcp_default_seq = 123456
+tcp_default_win = 65535
+
+# Default payload data for tests. Note this includes a trailing
+# NUL-terminating byte for consistency with the C macro. This is
+# to ensure consistency in things like IP checksum values.
+default_data = b"Should not change!!\x00"
 
 # Utility functions
 def v6_get_ns_addr(v6_addr:str) -> str:

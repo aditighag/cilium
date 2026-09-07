@@ -159,8 +159,7 @@ func WithContext(ctx context.Context, f func(ctx context.Context) (bool, error),
 }
 
 // GetAppPods fetches app pod names for a namespace.
-// For Http based tests, we identify pods with format id=<pod_name>, while
-// for Kafka based tests, we identify pods with the format app=<pod_name>.
+// For Http based tests, we identify pods with format id=<pod_name>.
 func GetAppPods(apps []string, namespace string, kubectl *Kubectl, appFmt string) map[string]string {
 	appPods := make(map[string]string)
 	for _, v := range apps {
@@ -260,36 +259,6 @@ func WriteToReportFile(data []byte, filename string) error {
 		return err
 	}
 	return nil
-}
-
-// reportMap saves the output of the given commands to the specified filename.
-// Function needs a directory path where the files are going to be written and
-// a *SSHMeta instance to execute the commands
-func reportMap(path string, reportCmds map[string]string, node *SSHMeta) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	reportMapContext(ctx, path, reportCmds, node)
-}
-
-// reportMap saves the output of the given commands to the specified filename.
-// Function needs a directory path where the files are going to be written and
-// a *SSHMeta instance to execute the commands
-func reportMapContext(ctx context.Context, path string, reportCmds map[string]string, node *SSHMeta) {
-	if node == nil {
-		log.Errorf("cannot execute reportMap due invalid node instance")
-		return
-	}
-
-	for cmd, logfile := range reportCmds {
-		res := node.ExecContext(ctx, cmd, ExecOptions{SkipLog: true})
-		err := os.WriteFile(
-			fmt.Sprintf("%s/%s", path, logfile),
-			res.CombineOutput().Bytes(),
-			LogPerm)
-		if err != nil {
-			log.WithError(err).Errorf("cannot create test results for command '%s'", cmd)
-		}
-	}
 }
 
 // ManifestGet returns the full path of the given manifest.

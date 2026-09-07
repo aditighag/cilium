@@ -7,10 +7,14 @@
 
 #include "common.h"
 #include "dbg.h"
+#include "drop_reasons.h"
+#include "identity.h"
 
 DECLARE_CONFIG(bool, allow_icmp_frag_needed,
 	       "Allow ICMP_FRAG_NEEDED messages when applying Network Policy")
 DECLARE_CONFIG(bool, enable_icmp_rule, "Apply Network Policy for ICMP packets")
+DECLARE_CONFIG(bool, enable_policy_accounting,
+	       "Maintain packet and byte counters for every policy entry")
 
 #ifndef EFFECTIVE_EP_ID
 #define EFFECTIVE_EP_ID 0
@@ -60,8 +64,8 @@ struct policy_key {
 };
 
 /* POLICY_FULL_PREFIX gets full prefix length of policy_key */
-#define POLICY_FULL_PREFIX						\
-  (8 * (sizeof(struct policy_key) - sizeof(struct bpf_lpm_trie_key)))
+#define POLICY_FULL_PREFIX	(8 * (sizeof(struct policy_key) \
+				      - sizeof(struct bpf_lpm_trie_key)))
 
 struct policy_entry {
 	__be16		proxy_port;
@@ -164,7 +168,7 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 	__uint(max_entries, POLICY_MAP_SIZE);
 	__uint(map_flags, BPF_F_NO_PREALLOC | BPF_F_RDONLY_PROG_COND);
-} cilium_policy_v2 __section_maps_btf;
+} cilium_policy __section_maps_btf;
 
 /* Return a verdict for the chosen 'policy', possibly propagating the auth type from 'policy2', if
  * non-NULL and of the same precedence.
@@ -213,14 +217,21 @@ __policy_check(const struct policy_entry *policy, const struct policy_entry *pol
 
 /* Allow experimental access to the @map parameter. */
 static __always_inline int
-__policy_can_access(const void *map, struct __ctx_buff *ctx, __u32 local_id,
+__policy_can_access(const void *map, const struct __ctx_buff *ctx, __u32 local_id,
 		    __u32 remote_id, __u16 ethertype, __be16 dport, __u8 proto,
 		    int off, int dir, bool is_untracked_fragment,
 		    __u8 *match_type, __s8 *ext_err, __u16 *proxy_port,
 		    __u32 *cookie)
 {
-	const struct policy_entry *policy;
-	const struct policy_entry *l4policy;
+	/*
+	 * Perform two policy lookups:
+	 * - with the specific ID, and
+	 * - with the aggregated (wildcard) ID.
+	 * Select the entry with the highest precedence or longest match.
+	 */
+
+	const struct policy_entry *policy = NULL; /* The possible policy entry with specific ID */
+	const struct policy_entry *agg_policy = NULL; /* The policy entry with the aggregated ID */
 	struct policy_key key = {
 		.lpm_key = { POLICY_FULL_PREFIX, {} }, /* always look up with unwildcarded data */
 		.sec_label = remote_id,
@@ -270,48 +281,63 @@ __policy_can_access(const void *map, struct __ctx_buff *ctx, __u32 local_id,
 		}
 	}
 
-	/* Policy match precedence when both L3 and L4-only lookups find a matching policy:
+	/* Policy match precedence when both specific and aggregated lookups
+	 * find a matching policy:
 	 *
-	 * 1. Policy with the higher precedence value is selected. This includes giving precedence
-	 *    to deny over allow, proxy redirect over non-proxy redirect, and proxy port priority.
-	 * 2. The entry with longer prefix length is selected out of the two entries with the same
-	 *    precedence.
-	 * 3. Otherwise the allow entry with non-wildcard L3 is chosen.
+	 * 1. Policy with the higher precedence value is selected. This
+	 *    includes giving precedence to deny over allow, proxy redirect
+	 *    over non-proxy redirect, and proxy port priority.
+	 * 2. The entry with longer prefix length is selected out of the two
+	 *    entries with the same precedence.
+	 * 3. Otherwise the allow entry with non-aggregate ID is chosen.
 	 */
 
-	/* Note: Untracked fragments always have zero ports in the tuple so they can
-	 * only match entries that have fully wildcarded ports.
+	/* Note: Untracked fragments always have zero ports in the tuple so
+	 * they can only match entries that have fully wildcarded ports.
 	 */
 
-	/* L3 lookup: an exact match on L3 identity and LPM match on L4 proto and port. */
+	/* Specific lookup: an exact match on L3 identity and LPM match on
+	 * L4 proto and port.
+	 */
 	policy = map_lookup_elem(map, &key);
 
-	/* L3 policy can be chosen without the 2nd lookup if it has the highest possible precedence
-	 * value (which implies that it is a deny).
+	/* Specific-ID policy can be chosen without the 2nd lookup if it has the
+	 * highest possible precedence value (which implies that it is a deny).
 	 */
 	if (likely(policy && policy->precedence == MAX_PRECEDENCE)) {
-		l4policy = NULL;
+		agg_policy = NULL;
 		goto check_policy;
 	}
 
-	/* L4-only lookup: a wildcard match on L3 identity and LPM match on L4 proto and port. */
-	key.sec_label = 0;
-	l4policy = map_lookup_elem(map, &key);
+	/* Aggregate lookup: an aggregate match on L3 identity and
+	 * LPM match on L4 proto and port.
+	 */
+	key.sec_label = aggregate_for_identity(remote_id);
+	if (likely(key.sec_label != remote_id))
+		agg_policy = map_lookup_elem(map, &key);
 
-	/* The found l4policy is chosen if:
-	 * - only l4 policy was found, or if both policies are found, and:
+	/* fallback: we have no policy, but the aggregated ID was not 0.
+	 * Try an ID-0 lookup too.
+	 */
+	if (unlikely(!agg_policy && !policy && key.sec_label != 0)) {
+		key.sec_label = 0;
+		agg_policy = map_lookup_elem(map, &key);
+	}
+
+	/* The found aggregate policy is chosen if:
+	 * - only aggregate policy was found, or if both policies are found, and:
 	 * 1. It has higher precedence value, or
 	 * 2. Precedence is equal (which implies both are denys or both are allows) and
-	 *    L4-only policy has longer LPM prefix length than the L3 policy
+	 *    aggregate policy has longer LPM prefix length than the specific-id policy
 	 */
-	if (l4policy &&
+	if (agg_policy &&
 	    (!policy ||
-	     l4policy->precedence > policy->precedence ||
-	     (l4policy->precedence == policy->precedence &&
-	      l4policy->lpm_prefix_length > policy->lpm_prefix_length)))
-		goto check_l4_policy;
+	     agg_policy->precedence > policy->precedence ||
+	     (agg_policy->precedence == policy->precedence &&
+	      agg_policy->lpm_prefix_length > policy->lpm_prefix_length)))
+		goto check_agg_policy;
 
-	/* 4. Otherwise select L3 policy if found. */
+	/* 4. Otherwise select specific policy if found. */
 	if (likely(policy))
 		goto check_policy;
 
@@ -323,34 +349,34 @@ __policy_can_access(const void *map, struct __ctx_buff *ctx, __u32 local_id,
 check_policy:
 	cilium_dbg3(ctx, DBG_L4_CREATE, remote_id, local_id, dport << 16 | proto);
 	p_len = policy->lpm_prefix_length;
-#ifdef POLICY_ACCOUNTING
-	__policy_account(remote_id, key.egress, proto, dport, p_len, ctx_full_len(ctx));
-#endif
+	if (CONFIG(enable_policy_accounting))
+		__policy_account(remote_id, key.egress, proto, dport, p_len, ctx_full_len(ctx));
+
 	*match_type =
 		p_len > LPM_PROTO_PREFIX_BITS ? POLICY_MATCH_L3_L4 :	/* 1. id/proto/port */
 		p_len > 0 ? POLICY_MATCH_L3_PROTO :			/* 3. id/proto/ANY */
 		POLICY_MATCH_L3_ONLY;					/* 5. id/ANY/ANY */
-	return __policy_check(policy, l4policy, ext_err, proxy_port, cookie);
+	return __policy_check(policy, agg_policy, ext_err, proxy_port, cookie);
 
-check_l4_policy:
-	p_len = l4policy->lpm_prefix_length;
-#ifdef POLICY_ACCOUNTING
-	__policy_account(0, key.egress, proto, dport, p_len, ctx_full_len(ctx));
-#endif
+check_agg_policy:
+	p_len = agg_policy->lpm_prefix_length;
+	if (CONFIG(enable_policy_accounting))
+		__policy_account(key.sec_label, key.egress, proto, dport, p_len, ctx_full_len(ctx));
+
 	*match_type =
 		p_len == 0 ? POLICY_MATCH_ALL :					/* 6. ANY/ANY/ANY */
 		p_len <= LPM_PROTO_PREFIX_BITS ? POLICY_MATCH_PROTO_ONLY :	/* 4. ANY/proto/ANY */
 		POLICY_MATCH_L4_ONLY;						/* 2. ANY/proto/port */
-	return __policy_check(l4policy, policy, ext_err, proxy_port, cookie);
+	return __policy_check(agg_policy, policy, ext_err, proxy_port, cookie);
 }
 
 static __always_inline int
-policy_can_access(struct __ctx_buff *ctx, __u32 local_id, __u32 remote_id,
+policy_can_access(const struct __ctx_buff *ctx, __u32 local_id, __u32 remote_id,
 		  __u16 ethertype, __be16 dport, __u8 proto, int off, int dir,
 		  bool is_untracked_fragment, __u8 *match_type, __s8 *ext_err,
 		  __u16 *proxy_port, __u32 *cookie)
 {
-	return __policy_can_access(&cilium_policy_v2, ctx, local_id, remote_id,
+	return __policy_can_access(&cilium_policy, ctx, local_id, remote_id,
 				   ethertype, dport, proto, off, dir,
 				   is_untracked_fragment, match_type, ext_err,
 				   proxy_port, cookie);
@@ -378,7 +404,7 @@ policy_can_access(struct __ctx_buff *ctx, __u32 local_id, __u32 remote_id,
  *   - Negative error code if the packet should be dropped
  */
 static __always_inline int
-policy_can_ingress(struct __ctx_buff *ctx, __u32 src_id, __u32 dst_id,
+policy_can_ingress(const struct __ctx_buff *ctx, __u32 src_id, __u32 dst_id,
 		   __u16 ethertype, __be16 dport, __u8 proto, int l4_off,
 		   bool is_untracked_fragment, __u8 *match_type, __u8 *audited,
 		   __s8 *ext_err, __u16 *proxy_port, __u32 *cookie)
@@ -404,7 +430,7 @@ policy_can_ingress(struct __ctx_buff *ctx, __u32 src_id, __u32 dst_id,
 	return ret;
 }
 
-static __always_inline int policy_can_ingress6(struct __ctx_buff *ctx,
+static __always_inline int policy_can_ingress6(const struct __ctx_buff *ctx,
 					       const struct ipv6_ct_tuple *tuple,
 					       int l4_off, bool is_untracked_fragment,
 					       __u32 src_id, __u32 dst_id,
@@ -417,7 +443,7 @@ static __always_inline int policy_can_ingress6(struct __ctx_buff *ctx,
 				 match_type, audited, ext_err, proxy_port, cookie);
 }
 
-static __always_inline int policy_can_ingress4(struct __ctx_buff *ctx,
+static __always_inline int policy_can_ingress4(const struct __ctx_buff *ctx,
 					       const struct ipv4_ct_tuple *tuple,
 					       int l4_off, bool is_untracked_fragment,
 					       __u32 src_id, __u32 dst_id,
@@ -433,12 +459,12 @@ static __always_inline int policy_can_ingress4(struct __ctx_buff *ctx,
 #ifdef HAVE_ENCAP
 static __always_inline bool is_encap(__be16 dport, __u8 proto)
 {
-	return proto == IPPROTO_UDP && dport == bpf_htons(TUNNEL_PORT);
+	return proto == IPPROTO_UDP && dport == bpf_htons(CONFIG(tunnel_port));
 }
 #endif
 
 static __always_inline int
-policy_can_egress(struct __ctx_buff *ctx, __u32 src_id, __u32 dst_id,
+policy_can_egress(const struct __ctx_buff *ctx, __u32 src_id, __u32 dst_id,
 		  __u16 ethertype, __be16 dport, __u8 proto, int l4_off, __u8 *match_type,
 		  __u8 *audited, __s8 *ext_err, __u16 *proxy_port, __u32 *cookie)
 {
@@ -464,7 +490,7 @@ policy_can_egress(struct __ctx_buff *ctx, __u32 src_id, __u32 dst_id,
 	return ret;
 }
 
-static __always_inline int policy_can_egress6(struct __ctx_buff *ctx,
+static __always_inline int policy_can_egress6(const struct __ctx_buff *ctx,
 					      const struct ipv6_ct_tuple *tuple,
 					      int l4_off, __u32 src_id, __u32 dst_id,
 					      __u8 *match_type, __u8 *audited, __s8 *ext_err,
@@ -475,7 +501,7 @@ static __always_inline int policy_can_egress6(struct __ctx_buff *ctx,
 				 ext_err, proxy_port, cookie);
 }
 
-static __always_inline int policy_can_egress4(struct __ctx_buff *ctx,
+static __always_inline int policy_can_egress4(const struct __ctx_buff *ctx,
 					      const struct ipv4_ct_tuple *tuple,
 					      int l4_off, __u32 src_id, __u32 dst_id,
 					      __u8 *match_type, __u8 *audited, __s8 *ext_err,

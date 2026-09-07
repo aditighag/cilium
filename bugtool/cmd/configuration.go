@@ -7,11 +7,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 
 	"github.com/cilium/cilium/pkg/components"
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/mountinfo"
 )
@@ -103,7 +103,7 @@ var bpfMapsPath = []string{
 	"tc/globals/cilium_ipv6_frag_datagrams",
 	"tc/globals/cilium_throttle",
 	"tc/globals/cilium_encrypt_state",
-	"tc/globals/cilium_egress_gw_policy_v4",
+	"tc/globals/cilium_egress_gw_policy_v4_v2",
 	"tc/globals/cilium_egress_gw_policy_v6",
 	"tc/globals/cilium_srv6_vrf_v4",
 	"tc/globals/cilium_srv6_vrf_v6",
@@ -159,14 +159,20 @@ func defaultCommands(confDir string, cmdDir string) []string {
 	commands = append(commands, copyStateDirCommand(cmdDir)...)
 	commands = append(commands, tcInterfaceCommands()...)
 
-	// We want to collect this twice: at the very beginning and at the
+	// We want to collect these twice: at the very beginning and at the
 	// very end of the bugtool collection, to see if the counters are
 	// increasing.
 	// The commands end up being the names of the files where their output
 	// is stored, so we can't have the two commands be the exact same or the
 	// second would overwrite. To avoid that, we use the -u flag in this second
 	// command; that flag is documented as being ignored.
-	commands = append(commands, "cat -u /proc/net/xfrm_stat")
+	commands = append(commands,
+		"cat -u /proc/net/xfrm_stat",
+		"cat -u /proc/net/softnet_stat",
+		"cat -u /proc/net/snmp",
+		"cat -u /proc/net/netstat",
+		"cat -u /proc/net/snmp6",
+	)
 
 	return commands
 }
@@ -177,6 +183,25 @@ func miscSystemCommands() []string {
 		// very end of the bugtool collection, to see if the counters are
 		// increasing.
 		"cat /proc/net/xfrm_stat",
+		// Host packet-drop counters, collected at the start and, via the -u
+		// variants in defaultCommands, at the end so the delta over the
+		// collection window is visible. softnet_stat is the only place a packet
+		// dropped before it reaches a netdev or socket queue is counted: column
+		// 2 is the per-CPU backlog drop count (netdev_max_backlog exceeded) and
+		// column 3 is time_squeeze (softirq ran out of budget, i.e. the CPU
+		// could not keep up). snmp and netstat add the IP/TCP layer drop
+		// counters (e.g. ListenDrops, ListenOverflows, TCPBacklogDrop) that tell
+		// a socket accept-queue drop apart from a backlog drop. snmp6 and
+		// dev_snmp6 are the IPv6 counterparts: they carry Ip6InDiscards,
+		// Ip6InAddrErrors, Ip6InNoRoutes, Ip6InHdrErrors, Ip6InTruncatedPkts,
+		// Ip6InUnknownProtos and the Tcp6/Udp6 error counters, i.e. the one
+		// place an IPv6 packet dropped in the host IP stack is recorded. The
+		// dev_snmp6 glob is expanded by bash -c into the per-interface files.
+		"cat /proc/net/softnet_stat",
+		"cat /proc/net/snmp",
+		"cat /proc/net/netstat",
+		"cat /proc/net/snmp6",
+		"cat -v -A /proc/net/dev_snmp6/*",
 		// Host and misc
 		"ps auxfw",
 		"hostname",
@@ -289,18 +314,19 @@ func loadConfigFile(path string) (*BugtoolConfiguration, error) {
 // Listing tc filter/chain/classes requires specific interface names.
 // Commands are generated per-interface.
 func tcInterfaceCommands() []string {
-	ifaces, err := net.Interfaces()
+	links, err := safenetlink.LinkList()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to generate per interface tc commands: %s\n", fmt.Errorf("could not list network interfaces: %w", err))
 		return nil
 	}
 	commands := []string{}
-	for _, iface := range ifaces {
+	for _, link := range links {
+		name := link.Attrs().Name
 		commands = append(commands,
-			fmt.Sprintf("tc filter show dev %s ingress", iface.Name),
-			fmt.Sprintf("tc filter show dev %s egress", iface.Name),
-			fmt.Sprintf("tc chain show dev %s", iface.Name),
-			fmt.Sprintf("tc class show dev %s", iface.Name))
+			fmt.Sprintf("tc filter show dev %s ingress", name),
+			fmt.Sprintf("tc filter show dev %s egress", name),
+			fmt.Sprintf("tc chain show dev %s", name),
+			fmt.Sprintf("tc class show dev %s", name))
 	}
 	return commands
 }
@@ -385,15 +411,16 @@ func ciliumDbgCommands(cmdDir string) []string {
 		fmt.Sprintf("cilium-dbg debuginfo --output=markdown,json -f --output-directory=%s", cmdDir),
 		"cilium-dbg metrics list",
 		"cilium-dbg shell -- metrics/html",
+		"cilium-dbg shell -- health/history",
 		"cilium-dbg bpf metrics list",
 		"cilium-dbg fqdn cache list",
 		"cilium-dbg config -a",
 		"cilium-dbg encrypt status",
 		"cilium-dbg endpoint list",
+		"cilium-dbg endpoint list -o json",
 		"cilium-dbg bpf auth list",
 		"cilium-dbg bpf bandwidth list",
 		"cilium-dbg bpf config list",
-		"cilium-dbg bpf tunnel list",
 		"cilium-dbg bpf lb list",
 		"cilium-dbg bpf lb list --revnat",
 		"cilium-dbg bpf lb list --frontends",
@@ -429,13 +456,17 @@ func ciliumDbgCommands(cmdDir string) []string {
 		"cilium-dbg lrp list",
 		"cilium-dbg cgroups list -o json",
 		"cilium-dbg statedb",
-		"cilium-dbg bgp peers",
-		"cilium-dbg bgp peers --capabilities",
-		"cilium-dbg bgp routes available ipv4 unicast",
-		"cilium-dbg bgp routes available ipv6 unicast",
-		"cilium-dbg bgp routes advertised ipv4 unicast",
-		"cilium-dbg bgp routes advertised ipv6 unicast",
-		"cilium-dbg bgp route-policies",
+		"cilium-dbg shell -- bgp/peers",
+		"cilium-dbg shell -- bgp/peers -f detailed",
+		"cilium-dbg shell -- bgp/routes -a in ipv4 unicast",
+		"cilium-dbg shell -- bgp/routes -a in ipv6 unicast",
+		"cilium-dbg shell -- bgp/routes -a loc ipv4 unicast",
+		"cilium-dbg shell -- bgp/routes -a loc ipv6 unicast",
+		"cilium-dbg shell -- bgp/routes -a out ipv4 unicast",
+		"cilium-dbg shell -- bgp/routes -a out ipv6 unicast",
+		"cilium-dbg shell -- bgp/route-policies",
+		"cilium-dbg shell -- policy/mapstate/entries",
+		"cilium-dbg shell -- policy/mapstate/topk",
 		"cilium-dbg troubleshoot kvstore",
 		"cilium-dbg troubleshoot clustermesh",
 		"cilium-dbg bpf frag list",

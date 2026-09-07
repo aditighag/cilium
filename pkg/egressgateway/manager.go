@@ -15,16 +15,19 @@ import (
 	"sync/atomic"
 
 	"github.com/cilium/hive/cell"
+	"github.com/cilium/statedb"
 	"github.com/spf13/pflag"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/util/workqueue"
 
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/datapath/linux/config/defines"
 	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
 	"github.com/cilium/cilium/pkg/identity"
 	identityCache "github.com/cilium/cilium/pkg/identity/cache"
+	"github.com/cilium/cilium/pkg/k8s"
 	cilium_api_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	k8sTypes "github.com/cilium/cilium/pkg/k8s/types"
@@ -53,21 +56,6 @@ var (
 	// EgressIPNotFoundIPv6 is a special IP value used as egressIP in the BPF policy map
 	// to indicate no egressIP was found for the given policy
 	EgressIPNotFoundIPv6 = netip.IPv6Unspecified()
-)
-
-// Cell provides a [Manager] for consumption with hive.
-var Cell = cell.Module(
-	"egressgateway",
-	"Egress Gateway allows originating traffic from specific IPv4 addresses",
-	cell.Config(defaultConfig),
-	cell.Provide(NewEgressGatewayManager),
-	cell.Provide(newPolicyResource),
-	cell.Provide(func(dcfg *option.DaemonConfig) tunnel.EnablerOut {
-		if !dcfg.EnableEgressGateway {
-			return tunnel.EnablerOut{}
-		}
-		return tunnel.NewEnabler(true)
-	}),
 )
 
 type eventType int
@@ -103,6 +91,8 @@ func (def Config) Flags(flags *pflag.FlagSet) {
 type Manager struct {
 	logger *slog.Logger
 
+	clusterInfo cmtypes.ClusterInfo
+
 	lock.Mutex
 
 	// allCachesSynced is true when all k8s objects we depend on have had
@@ -134,10 +124,10 @@ type Manager struct {
 	identityAllocator identityCache.IdentityAllocator
 
 	// policyMap4 communicates the active IPv4 policies to the datapath.
-	policyMap4 *egressmap.PolicyMap4
+	policyMap4V2 egressmap.PolicyMap4V2
 
 	// policyMap6 communicates the active IPv6 policies to the datapath.
-	policyMap6 *egressmap.PolicyMap6
+	policyMap6 egressmap.PolicyMap6
 
 	// reconciliationTriggerInterval is the amount of time between triggers
 	// of reconciliations are invoked
@@ -158,6 +148,10 @@ type Manager struct {
 	reconciliationEventsCount atomic.Uint64
 
 	sysctl sysctl.Sysctl
+
+	db            *statedb.DB
+	deviceTable   statedb.Table[*tables.Device]
+	nodeAddrTable statedb.Table[tables.NodeAddress]
 }
 
 type Params struct {
@@ -167,14 +161,19 @@ type Params struct {
 
 	Config            Config
 	DaemonConfig      *option.DaemonConfig
+	ClusterInfo       cmtypes.ClusterInfo
 	TunnelConfig      tunnel.Config
 	IdentityAllocator identityCache.IdentityAllocator
-	PolicyMap4        *egressmap.PolicyMap4
-	PolicyMap6        *egressmap.PolicyMap6
+	PolicyMap4V2      egressmap.PolicyMap4V2
+	PolicyMap6        egressmap.PolicyMap6
 	Policies          resource.Resource[*Policy]
 	Nodes             resource.Resource[*cilium_api_v2.CiliumNode]
 	Endpoints         resource.Resource[*k8sTypes.CiliumEndpoint]
 	Sysctl            sysctl.Sysctl
+
+	DB            *statedb.DB
+	DeviceTable   statedb.Table[*tables.Device]
+	NodeAddrTable statedb.Table[tables.NodeAddress]
 
 	Lifecycle cell.Lifecycle
 }
@@ -228,16 +227,20 @@ func NewEgressGatewayManager(p Params) (out struct {
 func newEgressGatewayManager(p Params) (*Manager, error) {
 	manager := &Manager{
 		logger:                        p.Logger,
+		clusterInfo:                   p.ClusterInfo,
 		policyConfigs:                 make(map[policyID]*PolicyConfig),
 		epDataStore:                   make(map[endpointID]*endpointMetadata),
 		identityAllocator:             p.IdentityAllocator,
 		reconciliationTriggerInterval: p.Config.EgressGatewayReconciliationTriggerInterval,
-		policyMap4:                    p.PolicyMap4,
+		policyMap4V2:                  p.PolicyMap4V2,
 		policyMap6:                    p.PolicyMap6,
 		policies:                      p.Policies,
 		ciliumNodes:                   p.Nodes,
 		endpoints:                     p.Endpoints,
 		sysctl:                        p.Sysctl,
+		db:                            p.DB,
+		deviceTable:                   p.DeviceTable,
+		nodeAddrTable:                 p.NodeAddrTable,
 		nodesAddresses2Labels:         make(map[string]map[string]string),
 	}
 
@@ -264,11 +267,9 @@ func newEgressGatewayManager(p Params) (*Manager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	p.Lifecycle.Append(cell.Hook{
 		OnStart: func(hc cell.HookContext) error {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				manager.processEvents(ctx)
-			}()
+			})
 
 			return nil
 		},
@@ -352,7 +353,11 @@ func (manager *Manager) processEvents(ctx context.Context) {
 		case <-ctx.Done():
 			return
 
-		case event := <-policyEvents:
+		case event, ok := <-policyEvents:
+			if !ok {
+				policyEvents = nil
+				continue
+			}
 			if event.Kind == resource.Sync {
 				policySync = true
 				maybeTriggerReconcile()
@@ -361,7 +366,11 @@ func (manager *Manager) processEvents(ctx context.Context) {
 				manager.handlePolicyEvent(event)
 			}
 
-		case event := <-nodeEvents:
+		case event, ok := <-nodeEvents:
+			if !ok {
+				nodeEvents = nil
+				continue
+			}
 			if event.Kind == resource.Sync {
 				nodeSync = true
 				maybeTriggerReconcile()
@@ -370,7 +379,11 @@ func (manager *Manager) processEvents(ctx context.Context) {
 				manager.handleNodeEvent(event)
 			}
 
-		case event := <-endpointEvents:
+		case event, ok := <-endpointEvents:
+			if !ok {
+				endpointEvents = nil
+				continue
+			}
 			if event.Kind == resource.Sync {
 				endpointSync = true
 				maybeTriggerReconcile()
@@ -547,7 +560,7 @@ func (manager *Manager) handleEndpointEvent(event resource.Event[*k8sTypes.Ciliu
 func (manager *Manager) handleNodeEvent(event resource.Event[*cilium_api_v2.CiliumNode]) {
 	defer event.Done(nil)
 
-	node := nodeTypes.ParseCiliumNode(event.Object)
+	node := k8s.ParseCiliumNode(event.Object, manager.clusterInfo)
 
 	manager.Lock()
 	defer manager.Unlock()
@@ -626,13 +639,13 @@ func (manager *Manager) relaxRPFilter() error {
 }
 
 func (manager *Manager) updateEgressRules4() {
-	if manager.policyMap4 == nil {
+	if manager.policyMap4V2 == nil {
 		return
 	}
 
-	egressPolicies := map[egressmap.EgressPolicyKey4]egressmap.EgressPolicyVal4{}
-	manager.policyMap4.IterateWithCallback(
-		func(key *egressmap.EgressPolicyKey4, val *egressmap.EgressPolicyVal4) {
+	egressPolicies := map[egressmap.EgressPolicyKey4]egressmap.EgressPolicyVal4V2{}
+	manager.policyMap4V2.IterateWithCallback(
+		func(key *egressmap.EgressPolicyKey4, val *egressmap.EgressPolicyVal4V2) {
 			egressPolicies[*key] = *val
 		})
 
@@ -658,17 +671,18 @@ func (manager *Manager) updateEgressRules4() {
 			gatewayIP = ExcludedCIDRIPv4
 		}
 
-		if policyPresent && policyVal.Match(gwc.egressIP4, gatewayIP) {
+		if policyPresent && policyVal.Match(gwc.egressIP4, gatewayIP, gwc.egressIfindex) {
 			return
 		}
 
-		if err := manager.policyMap4.Update(endpointIP, dstCIDR, gwc.egressIP4, gatewayIP); err != nil {
+		if err := manager.policyMap4V2.Update(endpointIP, dstCIDR, gwc.egressIP4, gatewayIP, gwc.egressIfindex); err != nil {
 			manager.logger.Error(
 				"Error applying IPv4 egress gateway policy",
 				logfields.Error, err,
 				logfields.SourceIP, endpointIP,
 				logfields.DestinationCIDR, dstCIDR,
 				logfields.EgressIP, gwc.egressIP4,
+				logfields.LinkIndex, gwc.egressIfindex,
 				logfields.GatewayIP, gatewayIP,
 			)
 		} else {
@@ -687,7 +701,7 @@ func (manager *Manager) updateEgressRules4() {
 
 	// Remove all the entries marked as stale.
 	for policyKey := range stale {
-		if err := manager.policyMap4.Delete(policyKey.GetSourceIP(), policyKey.GetDestCIDR()); err != nil {
+		if err := manager.policyMap4V2.Delete(policyKey.GetSourceIP(), policyKey.GetDestCIDR()); err != nil {
 			manager.logger.Error(
 				"Error removing IPv4 egress gateway policy",
 				logfields.Error, err,

@@ -8,13 +8,21 @@ import (
 	"net"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	envoy_config_core_v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	envoy_config_route_v3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	envoy_extensions_filters_http_cors_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/cors/v3"
+	extauthzv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
+
+	statefulsessionv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/stateful_session/v3"
+	cookiev3 "github.com/envoyproxy/go-control-plane/envoy/extensions/http/stateful_session/cookie/v3"
+	envoy_type_http_v3 "github.com/envoyproxy/go-control-plane/envoy/type/http/v3"
 	envoy_type_matcher_v3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	envoy_type_v3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	"k8s.io/utils/ptr"
@@ -29,6 +37,7 @@ const (
 	starDot        = "*."
 	dotRegex       = "[.]"
 	notDotRegex    = "[^.]"
+	dotStar        = ".*"
 )
 
 type VirtualHostMutator func(*envoy_config_route_v3.VirtualHost) *envoy_config_route_v3.VirtualHost
@@ -71,10 +80,6 @@ func (s SortableRoute) Less(i, j int) bool {
 	// There are two types of prefix match, so get whichever one is bigger
 	prefixMatch1 := max(len(s[i].Match.GetPathSeparatedPrefix()), len(s[i].Match.GetPrefix()))
 	prefixMatch2 := max(len(s[j].Match.GetPathSeparatedPrefix()), len(s[j].Match.GetPrefix()))
-	headerMatch1 := len(s[i].Match.GetHeaders())
-	headerMatch2 := len(s[j].Match.GetHeaders())
-	queryMatch1 := len(s[i].Match.GetQueryParameters())
-	queryMatch2 := len(s[j].Match.GetQueryParameters())
 
 	// Next up, sort by prefix match length
 	if prefixMatch1 != prefixMatch2 {
@@ -96,12 +101,36 @@ func (s SortableRoute) Less(i, j int) bool {
 	}
 
 	// If that's the same, then sort by header length
+	headerMatch1 := countMatchingHeaders(s[i].Match.GetHeaders())
+	headerMatch2 := countMatchingHeaders(s[j].Match.GetHeaders())
 	if headerMatch1 != headerMatch2 {
 		return headerMatch1 > headerMatch2
 	}
 
 	// lastly, sort by query match length
+	queryMatch1 := len(s[i].Match.GetQueryParameters())
+	queryMatch2 := len(s[j].Match.GetQueryParameters())
 	return queryMatch1 > queryMatch2
+}
+
+// countMatchingHeaders returns the number of Gateway API header matches that
+// contribute to HTTPRoute precedence.
+func countMatchingHeaders(headers []*envoy_config_route_v3.HeaderMatcher) int {
+	count := 0
+	for _, header := range headers {
+		sm := header.GetStringMatch()
+		// Cilium adds an inverted X-Forwarded-Proto match to prevent redirect loops.
+		// Since this is an internal scheme redirect guard rather than a Gateway API
+		// header match, ignore it when counting headers for route precedence. Only
+		// Cilium-generated redirect guards set IgnoreCase here, which lets us
+		// distinguish them from user-defined X-Forwarded-Proto matches.
+		if header.Name == "X-Forwarded-Proto" && header.GetInvertMatch() && sm != nil && sm.IgnoreCase {
+			continue
+		}
+		count++
+	}
+
+	return count
 }
 
 func getMethod(headers []*envoy_config_route_v3.HeaderMatcher) *string {
@@ -119,9 +148,13 @@ func (s SortableRoute) Swap(i, j int) {
 
 // VirtualHostParameter is the parameter for NewVirtualHost
 type VirtualHostParameter struct {
-	HostNames     []string
-	HTTPSRedirect bool
-	ListenerPort  uint32
+	HostNames                    []string
+	HTTPSRedirect                bool
+	ListenerPort                 uint32
+	StatefulSessionFilterEnabled bool
+	// AllAuthFilters is the deduplicated list of external auth filters active on this listener.
+	// It is used to build per-route TypedPerFilterConfig entries that enable/disable each filter.
+	AllAuthFilters []*model.HTTPExternalAuthFilter
 }
 
 // desiredVirtualHost creates a new VirtualHost with the given HTTP routes, set of pre-defined params as well mutator
@@ -129,9 +162,9 @@ type VirtualHostParameter struct {
 func (i *cecTranslator) desiredVirtualHost(httpRoutes []model.HTTPRoute, param VirtualHostParameter, mutators ...VirtualHostMutator) *envoy_config_route_v3.VirtualHost {
 	var routes SortableRoute
 	if param.HTTPSRedirect {
-		routes = envoyHTTPSRoutes(httpRoutes, param.HostNames, i.Config.RouteConfig.HostNameSuffixMatch)
+		routes = envoyHTTPSRoutes(httpRoutes, param.HostNames, i.Config.RouteConfig.HostNameSuffixMatch, param.AllAuthFilters, param.StatefulSessionFilterEnabled)
 	} else {
-		routes = envoyHTTPRoutes(httpRoutes, param.HostNames, i.Config.RouteConfig.HostNameSuffixMatch, param.ListenerPort)
+		routes = envoyHTTPRoutes(httpRoutes, param.HostNames, i.Config.RouteConfig.HostNameSuffixMatch, param.ListenerPort, param.AllAuthFilters, param.StatefulSessionFilterEnabled)
 	}
 
 	// This is to make sure that the Exact match is always having higher priority.
@@ -166,15 +199,133 @@ func (i *cecTranslator) desiredVirtualHost(httpRoutes []model.HTTPRoute, param V
 	return res
 }
 
-func envoyHTTPSRoutes(httpRoutes []model.HTTPRoute, hostnames []string, hostNameSuffixMatch bool) []*envoy_config_route_v3.Route {
+func getCORSStringMatcher(origin string) *envoy_type_matcher_v3.StringMatcher {
+	if !strings.Contains(origin, wildCard) {
+		return &envoy_type_matcher_v3.StringMatcher{
+			MatchPattern: &envoy_type_matcher_v3.StringMatcher_Exact{
+				Exact: origin,
+			},
+		}
+	}
+
+	regex := dotStar
+	if origin != wildCard {
+		regex = regexp.QuoteMeta(origin)
+		regex = strings.ReplaceAll(regex, regexp.QuoteMeta(wildCard), "[A-Za-z0-9.-]+")
+	}
+
+	return &envoy_type_matcher_v3.StringMatcher{
+		MatchPattern: &envoy_type_matcher_v3.StringMatcher_SafeRegex{
+			SafeRegex: &envoy_type_matcher_v3.RegexMatcher{
+				Regex: "^" + regex + "$",
+			},
+		},
+	}
+}
+
+func getCORS(cors *model.HTTPCORSFilter) *anypb.Any {
+	ao := make([]*envoy_type_matcher_v3.StringMatcher, 0, len(cors.AllowOrigins))
+	for _, o := range cors.AllowOrigins {
+		ao = append(ao, getCORSStringMatcher(o))
+	}
+
+	return toAny(&envoy_extensions_filters_http_cors_v3.CorsPolicy{
+		AllowOriginStringMatch: ao,
+		AllowCredentials:       wrapperspb.Bool(cors.AllowCredentials),
+		AllowMethods:           strings.Join(cors.AllowMethods, ", "),
+		AllowHeaders:           strings.Join(cors.AllowHeaders, ", "),
+		ExposeHeaders:          strings.Join(cors.ExposeHeaders, ", "),
+		MaxAge:                 strconv.Itoa(int(cors.MaxAge)),
+		// Gateway API implementation is expected to be the final authority on a CORS preflight request,
+		// so any path containing a CORS filter MUST NOT pass the request to the upstream.
+		ForwardNotMatchingPreflights: wrapperspb.Bool(false),
+	})
+}
+
+func getStatefulSession(sp *model.HTTPSessionPersistence) *anypb.Any {
+	if sp == nil || sp.Cookie == nil {
+		return toAny(&statefulsessionv3.StatefulSessionPerRoute{
+			Override: &statefulsessionv3.StatefulSessionPerRoute_Disabled{
+				Disabled: true,
+			},
+		})
+	}
+
+	return toAny(&statefulsessionv3.StatefulSessionPerRoute{
+		Override: &statefulsessionv3.StatefulSessionPerRoute_StatefulSession{
+			StatefulSession: &statefulsessionv3.StatefulSession{
+				SessionState: &envoy_config_core_v3.TypedExtensionConfig{
+					Name: "envoy.http.stateful_session.cookie",
+					TypedConfig: toAny(&cookiev3.CookieBasedSessionState{
+						Cookie: &envoy_type_http_v3.Cookie{
+							Name: sp.Cookie.Name,
+							Path: sp.Cookie.Path,
+							Ttl:  durationpb.New(0),
+							Attributes: []*envoy_type_http_v3.CookieAttribute{
+								{Name: "Secure"},
+								{Name: "HttpOnly"},
+								{Name: "SameSite", Value: "Strict"},
+							},
+						},
+					}),
+				},
+				Strict: false,
+			},
+		},
+	})
+}
+
+// getTypedPerFilterConfig returns the TypedPerFilterConfig map for a route.
+func getTypedPerFilterConfig(routeAuth *model.HTTPExternalAuthFilter, allAuthFilters []*model.HTTPExternalAuthFilter, route model.HTTPRoute, statefulSessionFilterEnabled bool) map[string]*anypb.Any {
+	var activeKey string
+	if routeAuth != nil {
+		activeKey = extAuthzFilterKey(routeAuth)
+	}
+
+	config := make(map[string]*anypb.Any, len(allAuthFilters))
+	// For each ext_authz filter active on the listener:
+	//   - If this route's ExternalAuth uses that filter's cluster: no entry (enabled by default).
+	//   - Otherwise: disabled via ExtAuthzPerRoute{Disabled: true}.
+	for _, af := range allAuthFilters {
+		filterKey := extAuthzFilterKey(af)
+		filterName := ExtAuthzFilterName(filterKey)
+		if filterKey == activeKey {
+			// This filter is enabled for this route; no per-route override needed.
+			continue
+		}
+		// Disable this filter for this route.
+		disabled := toAny(&extauthzv3.ExtAuthzPerRoute{
+			Override: &extauthzv3.ExtAuthzPerRoute_Disabled{Disabled: true},
+		})
+		config[filterName] = disabled
+	}
+
+	if route.CORS != nil {
+		config["envoy.filters.http.cors"] = getCORS(route.CORS)
+	}
+
+	if statefulSessionFilterEnabled {
+		config["envoy.filters.http.stateful_session"] = getStatefulSession(route.SessionPersistence)
+	}
+
+	if len(config) == 0 {
+		return nil
+	}
+
+	return config
+}
+
+func envoyHTTPSRoutes(httpRoutes []model.HTTPRoute, hostnames []string, hostNameSuffixMatch bool, allAuthFilters []*model.HTTPExternalAuthFilter, statefulSessionFilterEnabled bool) []*envoy_config_route_v3.Route {
 	matchBackendMap := make(map[string][]model.HTTPRoute)
 	for _, r := range httpRoutes {
-		matchBackendMap[r.GetMatchKey()] = append(matchBackendMap[r.GetMatchKey()], r)
+		key := r.GetBackendAggregationKey()
+		matchBackendMap[key] = append(matchBackendMap[key], r)
 	}
 
 	routes := make([]*envoy_config_route_v3.Route, 0, len(matchBackendMap))
 	for _, r := range httpRoutes {
-		hRoutes, exists := matchBackendMap[r.GetMatchKey()]
+		key := r.GetBackendAggregationKey()
+		hRoutes, exists := matchBackendMap[key]
 		// if not exists, it means this route is already added to the routes
 		if !exists {
 			continue
@@ -186,6 +337,9 @@ func envoyHTTPSRoutes(httpRoutes []model.HTTPRoute, hostnames []string, hostName
 				},
 			},
 		}
+
+		// always disable session persistence for HTTPS redirects, since Envoy does not route to a backend.
+		r.SessionPersistence = nil
 		route := envoy_config_route_v3.Route{
 			Match: getRouteMatch(hostnames,
 				hostNameSuffixMatch,
@@ -193,23 +347,26 @@ func envoyHTTPSRoutes(httpRoutes []model.HTTPRoute, hostnames []string, hostName
 				hRoutes[0].QueryParamsMatch,
 				hRoutes[0].HeadersMatch,
 				hRoutes[0].Method),
-			Action: rRedirect,
+			Action:               rRedirect,
+			TypedPerFilterConfig: getTypedPerFilterConfig(nil, allAuthFilters, r, statefulSessionFilterEnabled),
 		}
 		routes = append(routes, &route)
-		delete(matchBackendMap, r.GetMatchKey())
+		delete(matchBackendMap, key)
 	}
 	return routes
 }
 
-func envoyHTTPRoutes(httpRoutes []model.HTTPRoute, hostnames []string, hostNameSuffixMatch bool, listenerPort uint32) []*envoy_config_route_v3.Route {
+func envoyHTTPRoutes(httpRoutes []model.HTTPRoute, hostnames []string, hostNameSuffixMatch bool, listenerPort uint32, allAuthFilters []*model.HTTPExternalAuthFilter, statefulSessionFilterEnabled bool) []*envoy_config_route_v3.Route {
 	matchBackendMap := make(map[string][]model.HTTPRoute)
 	for _, r := range httpRoutes {
-		matchBackendMap[r.GetMatchKey()] = append(matchBackendMap[r.GetMatchKey()], r)
+		key := r.GetBackendAggregationKey()
+		matchBackendMap[key] = append(matchBackendMap[key], r)
 	}
 
 	routes := make([]*envoy_config_route_v3.Route, 0, len(matchBackendMap))
 	for _, r := range httpRoutes {
-		hRoutes, exists := matchBackendMap[r.GetMatchKey()]
+		key := r.GetBackendAggregationKey()
+		hRoutes, exists := matchBackendMap[key]
 		if !exists {
 			continue
 		}
@@ -218,9 +375,16 @@ func envoyHTTPRoutes(httpRoutes []model.HTTPRoute, hostnames []string, hostNameS
 			backends = append(backends, r.Backends...)
 		}
 
-		if len(backends) == 0 && hRoutes[0].RequestRedirect == nil {
-			routes = append(routes, envoyHTTPRouteNoBackend(hRoutes[0], hostnames, hostNameSuffixMatch))
+		if hRoutes[0].DirectResponse != nil {
+			noBackendRoute := envoyHTTPRouteDirectResponse(hRoutes[0], hostnames, hostNameSuffixMatch, allAuthFilters, statefulSessionFilterEnabled)
+			routes = append(routes, noBackendRoute)
+			delete(matchBackendMap, key)
 			continue
+		}
+
+		if hRoutes[0].RequestRedirect != nil {
+			// redirects don't select an upstream backend.
+			r.SessionPersistence = nil
 		}
 
 		route := envoy_config_route_v3.Route{
@@ -234,9 +398,13 @@ func envoyHTTPRoutes(httpRoutes []model.HTTPRoute, hostnames []string, hostNameS
 			RequestHeadersToRemove:  getHeadersToRemove(hRoutes[0].RequestHeaderFilter),
 			ResponseHeadersToAdd:    getHeadersToAdd(hRoutes[0].ResponseHeaderModifier),
 			ResponseHeadersToRemove: getHeadersToRemove(hRoutes[0].ResponseHeaderModifier),
+			TypedPerFilterConfig:    getTypedPerFilterConfig(hRoutes[0].ExternalAuth, allAuthFilters, r, statefulSessionFilterEnabled),
 		}
 
 		if hRoutes[0].RequestRedirect != nil {
+			if hRoutes[0].RequestRedirect.Scheme != nil {
+				route.Match.Headers = append(route.Match.Headers, getRouteRedirectMatch(*hRoutes[0].RequestRedirect.Scheme))
+			}
 			route.Action = getRouteRedirect(hRoutes[0].RequestRedirect, listenerPort)
 		} else {
 			route.Action = getRouteAction(&r, backends, r.BackendHTTPFilters, r.Rewrite, r.RequestMirrors)
@@ -251,7 +419,7 @@ func envoyHTTPRoutes(httpRoutes []model.HTTPRoute, hostnames []string, hostNameS
 			}
 		}
 		routes = append(routes, &route)
-		delete(matchBackendMap, r.GetMatchKey())
+		delete(matchBackendMap, key)
 	}
 	return routes
 }
@@ -286,6 +454,13 @@ func pathPrefixMutation(rewrite *model.HTTPURLRewriteFilter, httpRoute *model.HT
 				// hold `/` in case the entire path is removed
 				Substitution: `/\2`,
 			}
+		} else if httpRoute.PathMatch.Prefix == "/" {
+			route.Route.RegexRewrite = &envoy_type_matcher_v3.RegexMatchAndSubstitute{
+				Pattern: &envoy_type_matcher_v3.RegexMatcher{
+					Regex: `^/(.*)`,
+				},
+				Substitution: strings.ReplaceAll(strings.TrimSuffix(rewrite.Path.Prefix, "/"), `\`, `\\`) + `/\1`,
+			}
 		} else {
 			route.Route.PrefixRewrite = rewrite.Path.Prefix
 		}
@@ -302,7 +477,7 @@ func pathFullReplaceMutation(rewrite *model.HTTPURLRewriteFilter) routeActionMut
 			Pattern: &envoy_type_matcher_v3.RegexMatcher{
 				Regex: "^/.*$",
 			},
-			Substitution: rewrite.Path.Exact,
+			Substitution: strings.ReplaceAll(rewrite.Path.Exact, `\`, `\\`),
 		}
 		return route
 	}
@@ -334,6 +509,15 @@ func requestMirrorMutation(mirrors []*model.HTTPRequestMirror) routeActionMutati
 	}
 }
 
+// defaultRetryOn is the Envoy retry_on policy applied whenever an HTTPRoute
+// retry stanza is configured. "retriable-status-codes" is required for the
+// route's RetriableStatusCodes to take effect (Envoy ignores them otherwise,
+// and an empty retry_on disables retries entirely). connect-failure, reset and
+// refused-stream cover connection errors, which GEP-1731 recommends retrying
+// when a retry stanza is set. Note that, like any Envoy retry policy, this
+// applies to all HTTP methods, including non-idempotent ones.
+const defaultRetryOn = "retriable-status-codes,connect-failure,reset,refused-stream"
+
 func retryMutation(retry *model.HTTPRetry) routeActionMutation {
 	return func(route *envoy_config_route_v3.Route_Route) *envoy_config_route_v3.Route_Route {
 		if retry == nil {
@@ -341,6 +525,7 @@ func retryMutation(retry *model.HTTPRetry) routeActionMutation {
 		}
 
 		rp := &envoy_config_route_v3.RetryPolicy{
+			RetryOn:              defaultRetryOn,
 			RetriableStatusCodes: retry.Codes,
 		}
 
@@ -495,10 +680,27 @@ func getRouteRedirect(redirect *model.HTTPRequestRedirectFilter, listenerPort ui
 	}
 }
 
-func envoyHTTPRouteNoBackend(route model.HTTPRoute, hostnames []string, hostNameSuffixMatch bool) *envoy_config_route_v3.Route {
+func getRouteRedirectMatch(match string) *envoy_config_route_v3.HeaderMatcher {
+	return &envoy_config_route_v3.HeaderMatcher{
+		Name: "X-Forwarded-Proto",
+		HeaderMatchSpecifier: &envoy_config_route_v3.HeaderMatcher_StringMatch{
+			StringMatch: &envoy_type_matcher_v3.StringMatcher{
+				MatchPattern: &envoy_type_matcher_v3.StringMatcher_Exact{
+					Exact: match,
+				},
+				IgnoreCase: true,
+			},
+		},
+		InvertMatch: true,
+	}
+}
+
+func envoyHTTPRouteDirectResponse(route model.HTTPRoute, hostnames []string, hostNameSuffixMatch bool, allAuthFilters []*model.HTTPExternalAuthFilter, statefulSessionFilterEnabled bool) *envoy_config_route_v3.Route {
 	if route.DirectResponse == nil {
 		return nil
 	}
+
+	route.SessionPersistence = nil
 
 	return &envoy_config_route_v3.Route{
 		Match: getRouteMatch(hostnames,
@@ -517,12 +719,13 @@ func envoyHTTPRouteNoBackend(route model.HTTPRoute, hostnames []string, hostName
 				},
 			},
 		},
+		TypedPerFilterConfig: getTypedPerFilterConfig(route.ExternalAuth, allAuthFilters, route, statefulSessionFilterEnabled),
 	}
 }
 
 func getRouteMatch(hostnames []string, hostNameSuffixMatch bool, pathMatch model.StringMatch, headers []model.KeyValueMatch, query []model.KeyValueMatch, method *string) *envoy_config_route_v3.RouteMatch {
-	headerMatchers := getHeaderMatchers(hostnames, hostNameSuffixMatch, headers, method)
-	queryMatchers := getQueryMatchers(query)
+	headerMatchers := getHeaderMatchers(hostnames, hostNameSuffixMatch, sortedKeyValueMatches(headers), method)
+	queryMatchers := getQueryMatchers(sortedKeyValueMatches(query))
 
 	switch {
 	case pathMatch.Exact != "":
@@ -568,6 +771,14 @@ func getRouteMatch(hostnames []string, hostNameSuffixMatch bool, pathMatch model
 			QueryParameters: queryMatchers,
 		}
 	}
+}
+
+func sortedKeyValueMatches(matches []model.KeyValueMatch) []model.KeyValueMatch {
+	sorted := append([]model.KeyValueMatch(nil), matches...)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].String() < sorted[j].String()
+	})
+	return sorted
 }
 
 func getQueryMatchers(query []model.KeyValueMatch) []*envoy_config_route_v3.QueryParameterMatcher {

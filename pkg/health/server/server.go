@@ -111,34 +111,34 @@ func (s *Server) getNodes() (nodeMap, nodeMap, error) {
 	}
 	s.RWMutex.Unlock()
 
-	nodesAdded := nodeElementSliceToNodeMap(resp.Payload.NodesAdded)
-	nodesRemoved := nodeElementSliceToNodeMap(resp.Payload.NodesRemoved)
+	nodesAdded := nodeElementSliceToNodeMap(resp.Payload.NodesAdded, option.Config.PreferIpv6)
+	nodesRemoved := nodeElementSliceToNodeMap(resp.Payload.NodesRemoved, option.Config.PreferIpv6)
 
 	return nodesAdded, nodesRemoved, nil
 }
 
 // nodeElementSliceToNodeMap returns a slice of models.NodeElement into a
 // nodeMap.
-func nodeElementSliceToNodeMap(nodeElements []*models.NodeElement) nodeMap {
+func nodeElementSliceToNodeMap(nodeElements []*models.NodeElement, preferIpv6 bool) nodeMap {
 	nodes := make(nodeMap)
 	for _, n := range nodeElements {
 		if n.PrimaryAddress != nil {
-			if n.PrimaryAddress.IPV4 != nil {
-				nodes[ipString(n.PrimaryAddress.IPV4.IP)] = NewHealthNode(n)
+			if n.PrimaryAddress.IPv4 != nil {
+				nodes[ipString(n.PrimaryAddress.IPv4.IP)] = NewHealthNode(n, preferIpv6)
 			}
-			if n.PrimaryAddress.IPV6 != nil {
-				nodes[ipString(n.PrimaryAddress.IPV6.IP)] = NewHealthNode(n)
+			if n.PrimaryAddress.IPv6 != nil {
+				nodes[ipString(n.PrimaryAddress.IPv6.IP)] = NewHealthNode(n, preferIpv6)
 			}
 		}
 		for _, addr := range n.SecondaryAddresses {
-			nodes[ipString(addr.IP)] = NewHealthNode(n)
+			nodes[ipString(addr.IP)] = NewHealthNode(n, preferIpv6)
 		}
 		if n.HealthEndpointAddress != nil {
-			if n.HealthEndpointAddress.IPV4 != nil {
-				nodes[ipString(n.HealthEndpointAddress.IPV4.IP)] = NewHealthNode(n)
+			if n.HealthEndpointAddress.IPv4 != nil {
+				nodes[ipString(n.HealthEndpointAddress.IPv4.IP)] = NewHealthNode(n, preferIpv6)
 			}
-			if n.HealthEndpointAddress.IPV6 != nil {
-				nodes[ipString(n.HealthEndpointAddress.IPV6.IP)] = NewHealthNode(n)
+			if n.HealthEndpointAddress.IPv6 != nil {
+				nodes[ipString(n.HealthEndpointAddress.IPv6.IP)] = NewHealthNode(n, preferIpv6)
 			}
 		}
 	}
@@ -415,7 +415,7 @@ func (s *Server) newServer(logger *slog.Logger, spec *healthApi.Spec) *healthApi
 }
 
 // NewServer creates a server to handle health requests.
-func NewServer(logger *slog.Logger, config Config, enableActiveChecks bool) (*Server, error) {
+func NewServer(logger *slog.Logger, config Config, enableActiveChecks bool, localNode node.LocalNode) (*Server, error) {
 	server := &Server{
 		logger:             logger,
 		startTime:          time.Now(),
@@ -433,18 +433,18 @@ func NewServer(logger *slog.Logger, config Config, enableActiveChecks bool) (*Se
 	server.Client = cl
 	server.Server = *server.newServer(logger, config.HealthAPISpec)
 
-	server.httpPathServer = responder.NewServers(getAddresses(logger), config.HTTPPathPort)
+	server.httpPathServer = responder.NewServers(getAddresses(localNode), config.HTTPPathPort)
 
 	return server, nil
 }
 
 // Get internal node ipv4/ipv6 addresses based on config enabled.
 // If it fails to get either of internal node address, it returns "0.0.0.0" if ipv4 or "::" if ipv6.
-func getAddresses(logger *slog.Logger) []string {
+func getAddresses(localNode node.LocalNode) []string {
 	addresses := make([]string, 0, 2)
 
 	if option.Config.EnableIPv4 {
-		if ip := node.GetInternalIPv4(logger); ip != nil {
+		if ip := localNode.GetNodeInternalIPv4(); ip != nil {
 			addresses = append(addresses, ip.String())
 		} else {
 			// if Get ipv4 fails, then listen on all addresses.
@@ -453,7 +453,7 @@ func getAddresses(logger *slog.Logger) []string {
 	}
 
 	if option.Config.EnableIPv6 {
-		if ip := node.GetInternalIPv6(logger); ip != nil {
+		if ip := localNode.GetNodeInternalIPv6(); ip != nil {
 			addresses = append(addresses, ip.String())
 		} else {
 			// if Get ipv6 fails, then listen on all addresses.

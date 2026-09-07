@@ -12,11 +12,15 @@ import (
 
 	"github.com/cilium/cilium/daemon/cmd/cni"
 	"github.com/cilium/cilium/pkg/auth"
+	bgpConfig "github.com/cilium/cilium/pkg/bgp/config"
 	"github.com/cilium/cilium/pkg/ciliumenvoyconfig"
 	"github.com/cilium/cilium/pkg/clustermesh"
+	"github.com/cilium/cilium/pkg/datapath/connector"
 	"github.com/cilium/cilium/pkg/datapath/gneigh"
+	"github.com/cilium/cilium/pkg/datapath/linux/bandwidth"
+	"github.com/cilium/cilium/pkg/datapath/linux/bigtcp"
+	ipsec "github.com/cilium/cilium/pkg/datapath/linux/ipsec/types"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
-	"github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/dynamicconfig"
 	"github.com/cilium/cilium/pkg/kpr"
 	"github.com/cilium/cilium/pkg/loadbalancer"
@@ -27,12 +31,17 @@ import (
 	k8s2 "github.com/cilium/cilium/pkg/policy/k8s"
 	policytypes "github.com/cilium/cilium/pkg/policy/types"
 	"github.com/cilium/cilium/pkg/promise"
+	"github.com/cilium/cilium/pkg/version"
 	wgTypes "github.com/cilium/cilium/pkg/wireguard/types"
 )
 
 var (
 	// withDefaults will set enable all default metrics in the agent.
 	withDefaults = os.Getenv("CILIUM_FEATURE_METRICS_WITH_DEFAULTS")
+
+	// withoutEnvVersion can be used to disable any metric that expresses
+	// host-specific data, such as kernel version.
+	withoutEnvVersion = os.Getenv("CILIUM_FEATURE_METRICS_WITHOUT_ENV_VERSION")
 )
 
 // Cell will retrieve information from all other cells /
@@ -67,10 +76,9 @@ var Cell = cell.Module(
 		},
 	),
 	metrics.Metric(func() Metrics {
-		if withDefaults != "" {
-			return NewMetrics(true)
-		}
-		return NewMetrics(false)
+		showDefaults := withDefaults != ""
+		showEnvVersion := withoutEnvVersion == ""
+		return NewMetrics(showDefaults, showEnvVersion)
 	}),
 )
 
@@ -89,12 +97,14 @@ type featuresParams struct {
 	TunnelConfig        tunnel.Config
 	CNIConfigManager    cni.CNIConfigManager
 	MutualAuth          auth.MeshAuthConfig
-	BandwidthManager    types.BandwidthManager
-	BigTCP              types.BigTCPConfig
+	BandwidthManager    bandwidth.Manager
+	BigTCP              bigtcp.Features
 	L2PodAnnouncement   gneigh.L2PodAnnouncementConfig
 	DynamicConfigSource dynamicconfig.ConfigSource
-	WgConfig            wgTypes.WireguardConfig
-	IPsecConfig         types.IPsecConfig
+	WgConfig            wgTypes.Config
+	IPsecConfig         ipsec.Config
+	ConnectorConfig     connector.Config
+	BGPConfig           bgpConfig.BGPConfig
 }
 
 func (fp *featuresParams) TunnelProtocol() tunnel.EncapProtocol {
@@ -113,7 +123,7 @@ func (fp *featuresParams) IsBandwidthManagerEnabled() bool {
 	return fp.BandwidthManager.Enabled()
 }
 
-func (fp *featuresParams) BigTCPConfig() types.BigTCPConfig {
+func (fp *featuresParams) BigTCPFeatures() bigtcp.Features {
 	return fp.BigTCP
 }
 
@@ -125,12 +135,31 @@ func (fp *featuresParams) IsDynamicConfigSourceKindNodeConfig() bool {
 	return fp.DynamicConfigSource.IsKindNodeConfig()
 }
 
+func (fp *featuresParams) DatapathConfiguredMode() string {
+	return fp.ConnectorConfig.GetConfiguredMode().String()
+}
+
+func (fp *featuresParams) DatapathOperationalMode() string {
+	return fp.ConnectorConfig.GetOperationalMode().String()
+}
+
+func (fp *featuresParams) KernelVersion() string {
+	kernelVersion, err := version.GetKernelVersion()
+	if err != nil {
+		return kernelVersionUnknown
+	}
+	return kernelVersion.String()
+}
+
 type enabledFeatures interface {
 	TunnelProtocol() tunnel.EncapProtocol
 	GetChainingMode() string
 	IsMutualAuthEnabled() bool
 	IsBandwidthManagerEnabled() bool
-	BigTCPConfig() types.BigTCPConfig
+	BigTCPFeatures() bigtcp.Features
 	IsL2PodAnnouncementEnabled() bool
 	IsDynamicConfigSourceKindNodeConfig() bool
+	DatapathConfiguredMode() string
+	DatapathOperationalMode() string
+	KernelVersion() string
 }

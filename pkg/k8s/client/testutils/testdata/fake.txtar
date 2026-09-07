@@ -45,12 +45,17 @@ grep 'kind: LimitRange' actual.yaml
 grep 'name: foo' actual.yaml
 
 # Verify that we can retrieve the service export from the MCS clientset
-k8s/get multicluster.x-k8s.io.v1alpha1.serviceexports test -o actual.yaml
+k8s/get multicluster.x-k8s.io.v1beta1.serviceexports test -o actual.yaml
 grep 'kind: ServiceExport' actual.yaml
 grep 'name: test' actual.yaml
 
 # Validate the table output of 'k8s-object-tracker'
 db/cmp k8s-object-tracker object-tracker.table
+
+# Test the resync command against services (without watchers).
+k8s/resync v1.services service-alt.yaml
+k8s/get v1.services test/echo -o actual.yaml
+grep 'clusterIP: 10.96.50.105' actual.yaml
 
 # Delete objects from each clientset
 k8s/delete service.yaml limitrange.yaml ciliumenvoyconfig.yaml apiext_crd.yaml mcs_svcexport.yaml
@@ -66,7 +71,7 @@ ID                                                                              
 *;apiextensions.k8s.io/v1, Resource=customresourcedefinitions;/ciliumenvoyconfigs.cilium.io  *v1.CustomResourceDefinition  false
 *;cilium.io/v2, Resource=ciliumenvoyconfigs;default/cec                                      *v2.CiliumEnvoyConfig         false
 *;cilium.io/v2, Resource=ciliumnodes;/test                                                   *v2.CiliumNode                false
-*;multicluster.x-k8s.io/v1alpha1, Resource=serviceexports;/test                              *v1alpha1.ServiceExport       false
+*;multicluster.x-k8s.io/v1beta1, Resource=serviceexports;/test                               *v1beta1.ServiceExport        false
 k8s;/v1, Resource=limitranges;bar/foo                                                        *v1.LimitRange                false
 k8s;/v1, Resource=services;test/echo                                                         *v1.Service                   false
 
@@ -76,7 +81,7 @@ ID                                                                              
 *;apiextensions.k8s.io/v1, Resource=customresourcedefinitions;/ciliumenvoyconfigs.cilium.io  true
 *;cilium.io/v2, Resource=ciliumenvoyconfigs;default/cec                                      true
 *;cilium.io/v2, Resource=ciliumnodes;/test                                                   false
-*;multicluster.x-k8s.io/v1alpha1, Resource=serviceexports;/test                              true
+*;multicluster.x-k8s.io/v1beta1, Resource=serviceexports;/test                               true
 k8s;/v1, Resource=limitranges;bar/foo                                                        true
 k8s;/v1, Resource=services;test/echo                                                         true
 
@@ -86,7 +91,7 @@ k8s;/v1, Resource=services;test/echo                                            
 - apiextensions.k8s.io.v1.customresourcedefinitions: 1
 - cilium.io.v2.ciliumenvoyconfigs: 1
 - cilium.io.v2.ciliumnodes: 1
-- multicluster.x-k8s.io.v1alpha1.serviceexports: 1
+- multicluster.x-k8s.io.v1beta1.serviceexports: 1
 - v1.limitranges: 0
 k8s:
 - v1.services: 1
@@ -97,7 +102,7 @@ k8s:
 - apiextensions.k8s.io.v1.customresourcedefinitions: 0
 - cilium.io.v2.ciliumenvoyconfigs: 0
 - cilium.io.v2.ciliumnodes: 1
-- multicluster.x-k8s.io.v1alpha1.serviceexports: 0
+- multicluster.x-k8s.io.v1beta1.serviceexports: 0
 - v1.limitranges: 0
 k8s:
 - v1.services: 0
@@ -112,6 +117,15 @@ metadata:
   uid: a49fe99c-3564-4754-acc4-780f2331a49b
 spec:
   clusterIP: 10.96.50.104
+
+-- service-alt.yaml --
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo
+  namespace: test
+spec:
+  clusterIP: 10.96.50.105
 
 -- limitrange.yaml --
 apiVersion: v1
@@ -131,6 +145,9 @@ metadata:
 spec:
   backendServices:
   - name: foo
+  resources:
+  - "@type": type.googleapis.com/envoy.config.listener.v3.Listener
+    name: listener
 
 -- apiext_crd.yaml --
 apiVersion: apiextensions.k8s.io/v1
@@ -151,7 +168,7 @@ spec:
   scope: Namespaced
 
 -- mcs_svcexport.yaml --
-apiVersion: multicluster.x-k8s.io/v1alpha1
+apiVersion: multicluster.x-k8s.io/v1beta1
 kind: ServiceExport
 metadata:
   name: test

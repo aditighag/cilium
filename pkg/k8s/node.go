@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"strconv"
 
 	"github.com/cilium/cilium/pkg/annotation"
-	"github.com/cilium/cilium/pkg/cidr"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
+	iputil "github.com/cilium/cilium/pkg/ip"
+	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	"github.com/cilium/cilium/pkg/labelsfilter"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -42,7 +45,7 @@ type nodeAddressGroup struct {
 }
 
 // ParseNode parses a kubernetes node to a cilium node
-func ParseNode(logger *slog.Logger, k8sNode *slim_corev1.Node, source source.Source) *nodeTypes.Node {
+func ParseNode(logger *slog.Logger, k8sNode *slim_corev1.Node, source source.Source, clusterInfo cmtypes.ClusterInfo) *nodeTypes.Node {
 	addrGroups := make(map[nodeAddressGroup]struct{})
 	scopedLog := logger.With(
 		logfields.NodeName, k8sNode.Name,
@@ -105,7 +108,8 @@ func ParseNode(logger *slog.Logger, k8sNode *slim_corev1.Node, source source.Sou
 	}
 	newNode := &nodeTypes.Node{
 		Name:        k8sNode.Name,
-		Cluster:     option.Config.ClusterName,
+		Cluster:     clusterInfo.Name,
+		ClusterID:   clusterInfo.ID,
 		IPAddresses: addrs,
 		Source:      source,
 	}
@@ -119,33 +123,33 @@ func ParseNode(logger *slog.Logger, k8sNode *slim_corev1.Node, source source.Sou
 			)
 		} else {
 			for _, podCIDR := range k8sNode.Spec.PodCIDRs {
-				if allocCIDR, err := cidr.ParseCIDR(podCIDR); err != nil {
+				if allocCIDR, err := netip.ParsePrefix(podCIDR); err != nil {
 					scopedLog.Warn(
 						"Invalid PodCIDR value for node",
 						logfields.Error, err,
 						logfields.PodCIDRs, k8sNode.Spec.PodCIDRs,
 					)
 				} else {
-					if allocCIDR.IP.To4() != nil {
-						newNode.IPv4AllocCIDR = allocCIDR
+					if allocCIDR.Addr().Is4() {
+						newNode.IPv4AllocCIDR = nodeTypes.PrefixFrom(allocCIDR)
 					} else {
-						newNode.IPv6AllocCIDR = allocCIDR
+						newNode.IPv6AllocCIDR = nodeTypes.PrefixFrom(allocCIDR)
 					}
 				}
 			}
 		}
 	} else if len(k8sNode.Spec.PodCIDR) != 0 {
-		if allocCIDR, err := cidr.ParseCIDR(k8sNode.Spec.PodCIDR); err != nil {
+		if allocCIDR, err := netip.ParsePrefix(k8sNode.Spec.PodCIDR); err != nil {
 			scopedLog.Warn(
 				"Invalid PodCIDR value for node",
 				logfields.Error, err,
 				logfields.V4Prefix, k8sNode.Spec.PodCIDR,
 			)
 		} else {
-			if allocCIDR.IP.To4() != nil {
-				newNode.IPv4AllocCIDR = allocCIDR
+			if allocCIDR.Addr().Is4() {
+				newNode.IPv4AllocCIDR = nodeTypes.PrefixFrom(allocCIDR)
 			} else {
-				newNode.IPv6AllocCIDR = allocCIDR
+				newNode.IPv6AllocCIDR = nodeTypes.PrefixFrom(allocCIDR)
 			}
 		}
 	}
@@ -204,13 +208,13 @@ func ParseNode(logger *slog.Logger, k8sNode *slim_corev1.Node, source source.Sou
 	// Spec.PodCIDR takes precedence since it's
 	// the CIDR assigned by k8s controller manager
 	// In case it's invalid or empty then we fall back to our annotations.
-	if newNode.IPv4AllocCIDR == nil {
+	if !newNode.IPv4AllocCIDR.IsValid() {
 		if ipv4CIDR, ok := annotation.Get(k8sNode, annotation.V4CIDRName, annotation.V4CIDRNameAlias); !ok || ipv4CIDR == "" {
 			scopedLog.Debug(
 				"Empty IPv4 CIDR annotation in node",
 			)
 		} else {
-			allocCIDR, err := cidr.ParseCIDR(ipv4CIDR)
+			allocCIDR, err := netip.ParsePrefix(ipv4CIDR)
 			if err != nil {
 				scopedLog.Error(
 					"BUG, invalid IPv4 annotation CIDR in node",
@@ -218,18 +222,18 @@ func ParseNode(logger *slog.Logger, k8sNode *slim_corev1.Node, source source.Sou
 					logfields.V4Prefix, ipv4CIDR,
 				)
 			} else {
-				newNode.IPv4AllocCIDR = allocCIDR
+				newNode.IPv4AllocCIDR = nodeTypes.PrefixFrom(allocCIDR)
 			}
 		}
 	}
 
-	if newNode.IPv6AllocCIDR == nil {
+	if !newNode.IPv6AllocCIDR.IsValid() {
 		if ipv6CIDR, ok := annotation.Get(k8sNode, annotation.V6CIDRName, annotation.V6CIDRNameAlias); !ok || ipv6CIDR == "" {
 			scopedLog.Debug(
 				"Empty IPv6 CIDR annotation in node",
 			)
 		} else {
-			allocCIDR, err := cidr.ParseCIDR(ipv6CIDR)
+			allocCIDR, err := netip.ParsePrefix(ipv6CIDR)
 			if err != nil {
 				scopedLog.Error(
 					"BUG, invalid IPv6 annotation CIDR in node",
@@ -237,70 +241,142 @@ func ParseNode(logger *slog.Logger, k8sNode *slim_corev1.Node, source source.Sou
 					logfields.V6Prefix, ipv6CIDR,
 				)
 			} else {
-				newNode.IPv6AllocCIDR = allocCIDR
+				newNode.IPv6AllocCIDR = nodeTypes.PrefixFrom(allocCIDR)
 			}
 		}
 	}
 
-	if newNode.IPv4HealthIP == nil {
+	if !newNode.IPv4HealthIP.IsValid() {
 		if healthIP, ok := annotation.Get(k8sNode, annotation.V4HealthName, annotation.V4HealthNameAlias); !ok || healthIP == "" {
 			scopedLog.Debug(
 				"Empty IPv4 health endpoint annotation in node",
 			)
-		} else if ip := net.ParseIP(healthIP); ip == nil {
+		} else if addr, err := netip.ParseAddr(healthIP); err != nil {
 			scopedLog.Error(
 				"BUG, invalid IPv4 health endpoint annotation in node",
 				logfields.V4HealthIP, healthIP,
+				logfields.Error, err,
 			)
 		} else {
-			newNode.IPv4HealthIP = ip
+			newNode.IPv4HealthIP = iputil.AddrFrom(addr)
 		}
 	}
 
-	if newNode.IPv6HealthIP == nil {
+	if !newNode.IPv6HealthIP.IsValid() {
 		if healthIP, ok := annotation.Get(k8sNode, annotation.V6HealthName, annotation.V6HealthNameAlias); !ok || healthIP == "" {
 			scopedLog.Debug(
 				"Empty IPv6 health endpoint annotation in node",
 			)
-		} else if ip := net.ParseIP(healthIP); ip == nil {
+		} else if addr, err := netip.ParseAddr(healthIP); err != nil {
 			scopedLog.Error(
 				"BUG, invalid IPv6 health endpoint annotation in node",
 				logfields.V6HealthIP, healthIP,
+				logfields.Error, err,
 			)
 		} else {
-			newNode.IPv6HealthIP = ip
+			newNode.IPv6HealthIP = iputil.AddrFrom(addr)
 		}
 	}
 
-	if newNode.IPv4IngressIP == nil {
+	if !newNode.IPv4IngressIP.IsValid() {
 		if ingressIP, ok := annotation.Get(k8sNode, annotation.V4IngressName, annotation.V4IngressNameAlias); !ok || ingressIP == "" {
 			scopedLog.Debug(
 				"Empty IPv4 Ingress annotation in node",
 			)
-		} else if ip := net.ParseIP(ingressIP); ip == nil {
+		} else if addr, err := netip.ParseAddr(ingressIP); err != nil {
 			scopedLog.Error(
 				"BUG, invalid IPv4 Ingress annotation in node",
 				logfields.V4IngressIP, ingressIP,
+				logfields.Error, err,
 			)
 		} else {
-			newNode.IPv4IngressIP = ip
+			newNode.IPv4IngressIP = iputil.AddrFrom(addr)
 		}
 	}
 
-	if newNode.IPv6IngressIP == nil {
+	if !newNode.IPv6IngressIP.IsValid() {
 		if ingressIP, ok := annotation.Get(k8sNode, annotation.V6IngressName, annotation.V6IngressNameAlias); !ok || ingressIP == "" {
 			scopedLog.Debug(
 				"Empty IPv6 Ingress annotation in node",
 			)
-		} else if ip := net.ParseIP(ingressIP); ip == nil {
+		} else if addr, err := netip.ParseAddr(ingressIP); err != nil {
 			scopedLog.Error(
 				"BUG, invalid IPv6 Ingress annotation in node",
 				logfields.V6IngressIP, ingressIP,
+				logfields.Error, err,
 			)
 		} else {
-			newNode.IPv6IngressIP = ip
+			newNode.IPv6IngressIP = iputil.AddrFrom(addr)
 		}
 	}
 
 	return newNode
+}
+
+// ParseCiliumNode parses a CiliumNode custom resource and returns a Node
+// instance. Invalid IP and CIDRs are silently ignored
+func ParseCiliumNode(n *ciliumv2.CiliumNode, clusterInfo cmtypes.ClusterInfo) (node nodeTypes.Node) {
+	var appendAllocCIDR = func(node *nodeTypes.Node, podCIDR netip.Prefix) {
+		prefix := nodeTypes.PrefixFrom(podCIDR)
+		if podCIDR.Addr().Is4() {
+			if !node.IPv4AllocCIDR.IsValid() {
+				node.IPv4AllocCIDR = prefix
+			} else {
+				node.IPv4SecondaryAllocCIDRs = append(node.IPv4SecondaryAllocCIDRs, prefix)
+			}
+		} else {
+			if !node.IPv6AllocCIDR.IsValid() {
+				node.IPv6AllocCIDR = prefix
+			} else {
+				node.IPv6SecondaryAllocCIDRs = append(node.IPv6SecondaryAllocCIDRs, prefix)
+			}
+		}
+	}
+
+	wireguardPubKey, _ := annotation.Get(n, annotation.WireguardPubKey, annotation.WireguardPubKeyAlias)
+	node = nodeTypes.Node{
+		Name:            n.Name,
+		EncryptionKey:   uint8(n.Spec.Encryption.Key),
+		Cluster:         clusterInfo.Name,
+		ClusterID:       clusterInfo.ID,
+		Source:          source.CustomResource,
+		Labels:          n.ObjectMeta.Labels,
+		Annotations:     n.ObjectMeta.Annotations,
+		WireguardPubKey: wireguardPubKey,
+		BootID:          n.Spec.BootID,
+	}
+
+	for _, podCIDR := range n.Spec.IPAM.PodCIDRs {
+		if !podCIDR.IsValid() {
+			continue
+		}
+		appendAllocCIDR(&node, podCIDR.Prefix)
+	}
+
+	for _, pool := range n.Spec.IPAM.Pools.Allocated {
+		for _, podCIDR := range pool.CIDRs {
+			if !podCIDR.IsValid() {
+				continue
+			}
+			appendAllocCIDR(&node, podCIDR.Prefix)
+		}
+	}
+
+	v4HealthIP, _ := netip.ParseAddr(n.Spec.HealthAddressing.IPv4)
+	v6HealthIP, _ := netip.ParseAddr(n.Spec.HealthAddressing.IPv6)
+	node.IPv4HealthIP = iputil.AddrFrom(v4HealthIP)
+	node.IPv6HealthIP = iputil.AddrFrom(v6HealthIP)
+
+	v4IngressIP, _ := netip.ParseAddr(n.Spec.IngressAddressing.IPV4)
+	v6IngressIP, _ := netip.ParseAddr(n.Spec.IngressAddressing.IPV6)
+	node.IPv4IngressIP = iputil.AddrFrom(v4IngressIP)
+	node.IPv6IngressIP = iputil.AddrFrom(v6IngressIP)
+
+	for _, address := range n.Spec.Addresses {
+		if ip := net.ParseIP(address.IP); ip != nil {
+			node.IPAddresses = append(node.IPAddresses, nodeTypes.Address{Type: address.Type, IP: ip})
+		}
+	}
+
+	return
 }

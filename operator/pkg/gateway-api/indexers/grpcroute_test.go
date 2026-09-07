@@ -4,15 +4,20 @@
 package indexers
 
 import (
-	"reflect"
+	"log/slog"
 	"slices"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	mcsapiv1beta1 "sigs.k8s.io/mcs-api/pkg/apis/v1beta1"
+
+	"github.com/cilium/cilium/operator/pkg/gateway-api/helpers"
 )
 
 func TestIndexGRPCRouteByGateway(t *testing.T) {
@@ -93,6 +98,139 @@ func TestIndexGRPCRouteByGateway(t *testing.T) {
 				t.Errorf("IndexGRPCRouteByGateway() = %#v, want %#v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestIndexGRPCRouteByBackendServiceImport(t *testing.T) {
+	tests := []struct {
+		name string
+		obj  client.Object
+		want []string
+	}{
+		{
+			name: "Has ServiceImport backend and request mirror refs",
+			obj: &gatewayv1.GRPCRoute{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "has-serviceimport",
+					Namespace: "default",
+				},
+				Spec: gatewayv1.GRPCRouteSpec{
+					Rules: []gatewayv1.GRPCRouteRule{
+						{
+							BackendRefs: []gatewayv1.GRPCBackendRef{
+								{
+									BackendRef: gatewayv1.BackendRef{
+										BackendObjectReference: gatewayv1.BackendObjectReference{
+											Group:     ptr.To[gatewayv1.Group](mcsapiv1beta1.GroupName),
+											Kind:      ptr.To[gatewayv1.Kind]("ServiceImport"),
+											Name:      "backend-import",
+											Namespace: ptr.To[gatewayv1.Namespace]("backend-ns"),
+										},
+									},
+								},
+							},
+							Filters: []gatewayv1.GRPCRouteFilter{
+								{
+									Type: gatewayv1.GRPCRouteFilterRequestMirror,
+									RequestMirror: &gatewayv1.HTTPRequestMirrorFilter{
+										BackendRef: gatewayv1.BackendObjectReference{
+											Group: ptr.To[gatewayv1.Group](mcsapiv1beta1.GroupName),
+											Kind:  ptr.To[gatewayv1.Kind]("ServiceImport"),
+											Name:  "mirror-import",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			want: []string{
+				"backend-ns/backend-import",
+				"default/mirror-import",
+			},
+		},
+		{
+			name: "Has no ServiceImport refs",
+			obj: &gatewayv1.GRPCRoute{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "no-serviceimport",
+					Namespace: "default",
+				},
+				Spec: gatewayv1.GRPCRouteSpec{
+					Rules: []gatewayv1.GRPCRouteRule{
+						{
+							BackendRefs: []gatewayv1.GRPCBackendRef{
+								{
+									BackendRef: gatewayv1.BackendRef{
+										BackendObjectReference: gatewayv1.BackendObjectReference{
+											Name: "backend-svc",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			want: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IndexGRPCRouteByBackendServiceImport(tt.obj); !slices.Equal(got, tt.want) {
+				t.Errorf("IndexGRPCRouteByBackendServiceImport() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGenerateIndexerGRPCRoutebyBackendServiceIncludesRequestMirror(t *testing.T) {
+	indexer := GenerateIndexerGRPCRoutebyBackendService(
+		fake.NewClientBuilder().WithScheme(helpers.TestScheme(nil)).Build(),
+		slog.New(slog.DiscardHandler),
+	)
+
+	route := &gatewayv1.GRPCRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mirror-route",
+			Namespace: "default",
+		},
+		Spec: gatewayv1.GRPCRouteSpec{
+			Rules: []gatewayv1.GRPCRouteRule{
+				{
+					BackendRefs: []gatewayv1.GRPCBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "primary-svc",
+								},
+							},
+						},
+					},
+					Filters: []gatewayv1.GRPCRouteFilter{
+						{
+							Type: gatewayv1.GRPCRouteFilterRequestMirror,
+							RequestMirror: &gatewayv1.HTTPRequestMirrorFilter{
+								BackendRef: gatewayv1.BackendObjectReference{
+									Name:      "mirror-svc",
+									Namespace: ptr.To[gatewayv1.Namespace]("other-ns"),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	want := []string{
+		"default/primary-svc",
+		"other-ns/mirror-svc",
+	}
+	if got := indexer(route); !slices.Equal(got, want) {
+		t.Errorf("GenerateIndexerGRPCRoutebyBackendService() = %v, want %v", got, want)
 	}
 }
 
@@ -206,7 +344,7 @@ func Test_IndexGRPCRouteByGammaService(t *testing.T) {
 			},
 		},
 		{
-			name: "not a HTTPRoute",
+			name: "not a GRPCRoute",
 			args: args{
 				obj: &corev1.Service{},
 			},
@@ -217,9 +355,8 @@ func Test_IndexGRPCRouteByGammaService(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			parentIndexFunc := IndexGRPCRouteByGammaService
 
-			if got := parentIndexFunc(tt.args.obj); !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("getGammaHTTPRouteParentIndexFunc() = %#v, want %#v", got, tt.want)
-			}
+			got := parentIndexFunc(tt.args.obj)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }

@@ -155,11 +155,13 @@ linked, either choice is valid.
 ::
 
         CONFIG_BPF=y
+        CONFIG_BPF_EVENTS=y
         CONFIG_BPF_SYSCALL=y
         CONFIG_NET_CLS_BPF=y
         CONFIG_BPF_JIT=y
         CONFIG_NET_CLS_ACT=y
         CONFIG_NET_SCH_INGRESS=y
+        CONFIG_DEBUG_INFO_BTF=y
         CONFIG_CRYPTO_SHA1=y
         CONFIG_CRYPTO_USER_API_HASH=y
         CONFIG_CGROUPS=y
@@ -233,16 +235,14 @@ modes. Since some notable kernels (e.g., COS) are shipping without
 to allow L7 policies and visibility to be used with those
 kernels. Currently this fallback disables ``ip_early_demux`` kernel
 feature in non-tunneled datapath modes, which may decrease system
-networking performance. This guarantees HTTP and Kafka redirection
-works as intended.  However, if HTTP or Kafka enforcement policies are
+networking performance. This guarantees HTTP redirection
+works as intended.  However, if HTTP enforcement policies are
 never used, this behavior can be turned off by adding the following to
 the helm configuration command line:
 
-.. parsed-literal::
-
-   helm install cilium |CHART_RELEASE| \\
-     ...
-     --set enableXTSocketFallback=false
+.. cilium-helm-install::
+   :set: enableXTSocketFallback=false
+   :extra-args: ...
 
 .. _features_kernel_matrix:
 
@@ -311,6 +311,7 @@ Cilium Feature                                         Minimum Kernel Version
 IPv6 BIG TCP support                                   >= 5.19
 :ref:`enable_multicast` (AArch64)                      >= 6.0
 IPv4 BIG TCP support                                   >= 6.3
+:ref:`netkit`                                          >= 6.8
 ====================================================== ===============================
 
 .. _req_kvstore:

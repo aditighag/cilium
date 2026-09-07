@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync"
 
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
@@ -17,7 +18,6 @@ import (
 	mcsapi_fake "sigs.k8s.io/mcs-api/pkg/client/clientset/versioned/fake"
 
 	cilium_fake "github.com/cilium/cilium/pkg/k8s/client/clientset/versioned/fake"
-	slim_apiextclientsetscheme "github.com/cilium/cilium/pkg/k8s/slim/k8s/apiextensions-client/clientset/versioned/scheme"
 	slim_fake "github.com/cilium/cilium/pkg/k8s/slim/k8s/client/clientset/versioned/fake"
 )
 
@@ -37,11 +37,17 @@ var (
 
 	kubernetesDecoderOnce sync.Once
 	kubernetesDecoder     runtime.Decoder
+
+	strictDecoderOnce sync.Once
+	strictDecoder     runtime.Decoder
 )
 
 // Decoder returns an object decoder for Cilium and Slim objects.
 // The [DecodeObject] and [DecodeFile] functions are provided as
 // shorthands for decoding from bytes and files respectively.
+//
+// Not strict, as the slim types leave out fields that are valid in the full
+// Kubernetes ones. See [StrictDecoder].
 func Decoder() runtime.Decoder {
 	decoderOnce.Do(func() {
 		decoder = serializer.NewCodecFactory(Scheme).UniversalDeserializer()
@@ -49,11 +55,23 @@ func Decoder() runtime.Decoder {
 	return decoder
 }
 
+// KubernetesDecoder returns a decoder for the core Kubernetes objects. Unlike
+// [Decoder] it rejects unknown fields, which the full types can afford as they
+// are not trimmed the way the slim ones are.
 func KubernetesDecoder() runtime.Decoder {
 	kubernetesDecoderOnce.Do(func() {
-		kubernetesDecoder = serializer.NewCodecFactory(KubernetesScheme).UniversalDeserializer()
+		kubernetesDecoder = serializer.NewCodecFactory(KubernetesScheme, serializer.EnableStrict).UniversalDeserializer()
 	})
 	return kubernetesDecoder
+}
+
+// StrictDecoder is like [Decoder], but rejects unknown fields instead of
+// dropping them.
+func StrictDecoder() runtime.Decoder {
+	strictDecoderOnce.Do(func() {
+		strictDecoder = serializer.NewCodecFactory(Scheme, serializer.EnableStrict).UniversalDeserializer()
+	})
+	return strictDecoder
 }
 
 func init() {
@@ -61,7 +79,7 @@ func init() {
 	slim_fake.AddToScheme(Scheme)
 
 	// Add apiextensionsv1
-	slim_apiextclientsetscheme.AddToScheme(Scheme)
+	apiextensionsv1.AddToScheme(Scheme)
 
 	// Add ciliumv2 and ciliumv2alpha1
 	cilium_fake.AddToScheme(Scheme)
@@ -71,7 +89,7 @@ func init() {
 	gatewayv1alpha2.Install(Scheme)
 	gatewayv1beta1.Install(Scheme)
 
-	// Add multiclusterv1alpha1
+	// Add mcsapi
 	mcsapi_fake.AddToScheme(Scheme)
 
 	fake.AddToScheme(KubernetesScheme)
@@ -86,6 +104,10 @@ func DecodeObjectGVK(bytes []byte) (runtime.Object, *schema.GroupVersionKind, er
 	obj, gvk, err := Decoder().Decode(bytes, nil, nil)
 	if err == nil {
 		return obj, gvk, err
+	} else if !runtime.IsNotRegisteredError(err) {
+		// If we get a legitimate parse error in a CRD, surface that instead of a generic "unknown
+		// kind" from the fallback below.
+		return nil, nil, err
 	}
 	return DecodeKubernetesObject(bytes)
 }

@@ -10,29 +10,36 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
-	gatewayv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
-	mcsapiv1alpha1 "sigs.k8s.io/mcs-api/pkg/apis/v1alpha1"
+	mcsapiv1beta1 "sigs.k8s.io/mcs-api/pkg/apis/v1beta1"
 )
 
 const (
 	kindGateway       = "Gateway"
+	kindListenerSet   = "ListenerSet"
 	kindService       = "Service"
 	kindServiceImport = "ServiceImport"
 	kindSecret        = "Secret"
+	kindConfigMap     = "ConfigMap"
 
-	GatewayClassKind      string = "gatewayclasses"
-	GatewayKind           string = "gateways"
-	HTTPRouteKind         string = "httproutes"
-	GRPCRouteKind         string = "grpcroutes"
-	ReferenceGrantKind    string = "referencegrants"
-	TLSRouteKind          string = "tlsroutes"
-	TLSRouteListKind      string = "tlsroutelists"
-	ServiceImportKind     string = "serviceimports"
-	ServiceImportListKind string = "serviceimportlists"
+	GatewayClassKind     string = "gatewayclasses"
+	GatewayKind          string = "gateways"
+	HTTPRouteKind        string = "httproutes"
+	GRPCRouteKind        string = "grpcroutes"
+	ReferenceGrantKind   string = "referencegrants"
+	BackendTLSPolicyKind string = "backendtlspolicies"
+	TLSRouteKind         string = "tlsroutes"
+	TCPRouteKind         string = "tcproutes"
+	UDPRouteKind         string = "udproutes"
+	ListenerSetKind      string = "listenersets"
+	ServiceImportKind    string = "serviceimports"
 )
 
 func IsGateway(parent gatewayv1.ParentReference) bool {
 	return (parent.Kind == nil || *parent.Kind == kindGateway) && (parent.Group == nil || *parent.Group == gatewayv1.GroupName)
+}
+
+func IsListenerSet(parent gatewayv1.ParentReference) bool {
+	return parent.Kind != nil && *parent.Kind == kindListenerSet && (parent.Group == nil || *parent.Group == gatewayv1.GroupName)
 }
 
 func IsGammaService(parent gatewayv1.ParentReference) bool {
@@ -79,11 +86,19 @@ func IsService(be gatewayv1.BackendObjectReference) bool {
 }
 
 func IsServiceImport(be gatewayv1.BackendObjectReference) bool {
-	return be.Kind != nil && *be.Kind == kindServiceImport && be.Group != nil && *be.Group == mcsapiv1alpha1.GroupName
+	return be.Kind != nil && *be.Kind == kindServiceImport && be.Group != nil && *be.Group == mcsapiv1beta1.GroupName
 }
 
 func IsSecret(secret gatewayv1.SecretObjectReference) bool {
 	return (secret.Kind == nil || *secret.Kind == kindSecret) && (secret.Group == nil || *secret.Group == corev1.GroupName)
+}
+
+func IsConfigMap(certRef gatewayv1.LocalObjectReference) bool {
+	return certRef.Kind == kindConfigMap && certRef.Group == corev1.GroupName
+}
+
+func IsServiceTargetRef(tr gatewayv1.LocalPolicyTargetReferenceWithSectionName) bool {
+	return tr.Kind == kindService && tr.Group == corev1.GroupName
 }
 
 // getConcreteObject returns an instance of a concrete object type based on the
@@ -92,16 +107,68 @@ func GetConcreteObject(schemaType schema.GroupVersionKind) runtime.Object {
 	kind := schemaType.Kind
 
 	switch kind {
+	case GatewayClassKind:
+		return &gatewayv1.GatewayClass{}
+	case GatewayKind:
+		return &gatewayv1.Gateway{}
 	case TLSRouteKind:
-		return &gatewayv1alpha2.TLSRoute{}
-	case TLSRouteListKind:
-		return &gatewayv1alpha2.TLSRouteList{}
+		return &gatewayv1.TLSRoute{}
+	case HTTPRouteKind:
+		return &gatewayv1.HTTPRoute{}
+	case GRPCRouteKind:
+		return &gatewayv1.GRPCRoute{}
+	case ReferenceGrantKind:
+		return &gatewayv1.ReferenceGrant{}
+	case BackendTLSPolicyKind:
+		return &gatewayv1.BackendTLSPolicy{}
+	case TCPRouteKind:
+		return &gatewayv1.TCPRoute{}
+	case UDPRouteKind:
+		return &gatewayv1.UDPRoute{}
+	case ListenerSetKind:
+		return &gatewayv1.ListenerSet{}
 	case ServiceImportKind:
-		return &mcsapiv1alpha1.ServiceImport{}
-	case ServiceImportListKind:
-		return &mcsapiv1alpha1.ServiceImportList{}
+		return &mcsapiv1beta1.ServiceImport{}
 	default:
 		// panic is okay here because this is a progammer error
 		panic(fmt.Sprintf("Tried to get a concrete type that is not implemented, %s", schemaType.Kind))
 	}
+}
+
+// getConcreteListObject returns a list instance of a concrete object type based on the
+// given GroupVersionKind.
+func GetConcreteListObject(schemaType schema.GroupVersionKind) runtime.Object {
+	kind := schemaType.Kind
+
+	switch kind {
+	case GatewayClassKind:
+		return &gatewayv1.GatewayClassList{}
+	case GatewayKind:
+		return &gatewayv1.GatewayList{}
+	case TLSRouteKind:
+		return &gatewayv1.TLSRouteList{}
+	case HTTPRouteKind:
+		return &gatewayv1.HTTPRouteList{}
+	case GRPCRouteKind:
+		return &gatewayv1.GRPCRouteList{}
+	case ReferenceGrantKind:
+		return &gatewayv1.ReferenceGrantList{}
+	case BackendTLSPolicyKind:
+		return &gatewayv1.BackendTLSPolicyList{}
+	case TCPRouteKind:
+		return &gatewayv1.TCPRouteList{}
+	case UDPRouteKind:
+		return &gatewayv1.UDPRouteList{}
+	case ListenerSetKind:
+		return &gatewayv1.ListenerSetList{}
+	case ServiceImportKind:
+		return &mcsapiv1beta1.ServiceImportList{}
+	default:
+		// panic is okay here because this is a progammer error
+		panic(fmt.Sprintf("Tried to get a concrete list type that is not implemented, %s", schemaType.Kind))
+	}
+}
+
+func IsValidGammaService(svc *corev1.Service) bool {
+	return svc.Spec.Type == corev1.ServiceTypeClusterIP
 }

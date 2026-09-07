@@ -19,6 +19,7 @@ import (
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy/api"
+	"github.com/cilium/cilium/pkg/policy/types"
 )
 
 func GenerateL3IngressDenyRules(numRules int) (api.Rules, identity.IdentityMap) {
@@ -191,11 +192,11 @@ func BenchmarkRegenerateCIDRDenyPolicyRules(b *testing.B) {
 
 	for b.Loop() {
 		epPolicy := ip.DistillPolicy(logger, owner, nil)
-		owner.mapStateSize = epPolicy.policyMapState.Len()
+		owner.previousMap = epPolicy.GetMapState()
 		epPolicy.Ready()
 	}
-	ip.detach(true, 0)
-	assert.Equal(b, 117515, owner.mapStateSize)
+	ip.Detach()
+	assert.Equal(b, 117519, owner.previousMap.Len())
 }
 
 func TestRegenerateCIDRDenyPolicyRules(t *testing.T) {
@@ -207,10 +208,10 @@ func TestRegenerateCIDRDenyPolicyRules(t *testing.T) {
 	owner := DummyOwner{logger: logger}
 
 	epPolicy := ip.DistillPolicy(logger, owner, nil)
-	owner.mapStateSize = epPolicy.policyMapState.Len()
+	owner.previousMap = epPolicy.GetMapState()
 	epPolicy.Ready()
-	ip.detach(true, 0)
-	assert.Equal(t, 117515, owner.mapStateSize)
+	ip.Detach()
+	assert.Equal(t, 117519, owner.previousMap.Len())
 }
 
 func TestL3WithIngressDenyWildcard(t *testing.T) {
@@ -256,13 +257,14 @@ func TestL3WithIngressDenyWildcard(t *testing.T) {
 				Revision: repo.GetRevision(),
 				Ingress: L4DirectionPolicy{PortRules: NewL4PolicyMapWithValues(map[string]*L4Filter{
 					"80/TCP": {
+						Tier:     types.Normal,
 						Port:     80,
 						Protocol: api.ProtoTCP,
 						U8Proto:  0x6,
 						wildcard: td.wildcardCachedSelector,
 						Ingress:  true,
 						PerSelectorPolicies: L7DataMap{
-							td.wildcardCachedSelector: &PerSelectorPolicy{IsDeny: true},
+							td.wildcardCachedSelector: denyPerSelectorPolicy,
 						},
 						RuleOrigin: OriginForTest(map[CachedSelector]labels.LabelArrayList{td.wildcardCachedSelector: {nil}}),
 					},
@@ -274,7 +276,7 @@ func TestL3WithIngressDenyWildcard(t *testing.T) {
 		PolicyOwner: DummyOwner{logger: hivetest.Logger(t)},
 	}
 
-	require.EqualExportedValues(t, &expectedEndpointPolicy, policy)
+	td.assertEqualPolicies(t, &expectedEndpointPolicy, policy)
 }
 
 func TestL3WithLocalHostWildcardd(t *testing.T) {
@@ -289,9 +291,9 @@ func TestL3WithLocalHostWildcardd(t *testing.T) {
 	td.addIdentity(fooIdentity)
 
 	// Emulate Kubernetes mode with allow from localhost
-	oldLocalhostOpt := option.Config.AllowLocalhost
-	option.Config.AllowLocalhost = option.AllowLocalhostAlways
-	defer func() { option.Config.AllowLocalhost = oldLocalhostOpt }()
+	oldLocalhostOpt := option.Config.UnsafeDaemonConfigOption.AllowLocalhost
+	option.Config.UnsafeDaemonConfigOption.AllowLocalhost = option.AllowLocalhostAlways
+	defer func() { option.Config.UnsafeDaemonConfigOption.AllowLocalhost = oldLocalhostOpt }()
 
 	selFoo := api.NewESFromLabels(labels.ParseSelectLabel("id=foo"))
 	rule1 := api.Rule{
@@ -319,9 +321,6 @@ func TestL3WithLocalHostWildcardd(t *testing.T) {
 	policy := selPolicy.DistillPolicy(logger, DummyOwner{logger: logger}, nil)
 	policy.Ready()
 
-	cachedSelectorHost := td.sc.findCachedIdentitySelector(api.ReservedEndpointSelectors[labels.IDNameHost])
-	require.NotNil(t, cachedSelectorHost)
-
 	expectedEndpointPolicy := EndpointPolicy{
 		SelectorPolicy: &selectorPolicy{
 			Revision:      repo.GetRevision(),
@@ -329,14 +328,27 @@ func TestL3WithLocalHostWildcardd(t *testing.T) {
 			L4Policy: L4Policy{
 				Revision: repo.GetRevision(),
 				Ingress: L4DirectionPolicy{PortRules: NewL4PolicyMapWithValues(map[string]*L4Filter{
+					api.PortProtocolAny: {
+						Tier:     types.DefaultPolicy,
+						Protocol: api.ProtoAny,
+						Ingress:  true,
+						PerSelectorPolicies: L7DataMap{
+							td.cachedSelectorHost: &PerSelectorPolicy{
+								Verdict:  types.Allow,
+								Priority: 10,
+							},
+						},
+						RuleOrigin: OriginForTest(map[CachedSelector]labels.LabelArrayList{td.cachedSelectorHost: {nil}}),
+					},
 					"80/TCP": {
+						Tier:     types.Normal,
 						Port:     80,
 						Protocol: api.ProtoTCP,
 						U8Proto:  0x6,
 						wildcard: td.wildcardCachedSelector,
 						Ingress:  true,
 						PerSelectorPolicies: L7DataMap{
-							td.wildcardCachedSelector: &PerSelectorPolicy{IsDeny: true},
+							td.wildcardCachedSelector: denyPerSelectorPolicy,
 						},
 						RuleOrigin: OriginForTest(map[CachedSelector]labels.LabelArrayList{td.wildcardCachedSelector: {nil}}),
 					},
@@ -350,7 +362,7 @@ func TestL3WithLocalHostWildcardd(t *testing.T) {
 		PolicyOwner: DummyOwner{logger: logger},
 	}
 
-	require.EqualExportedValues(t, &expectedEndpointPolicy, policy)
+	td.assertEqualPolicies(t, &expectedEndpointPolicy, policy)
 }
 
 func TestMapStateWithIngressDenyWildcard(t *testing.T) {
@@ -406,13 +418,14 @@ func TestMapStateWithIngressDenyWildcard(t *testing.T) {
 				Revision: repo.GetRevision(),
 				Ingress: L4DirectionPolicy{PortRules: NewL4PolicyMapWithValues(map[string]*L4Filter{
 					"80/TCP": {
+						Tier:     types.Normal,
 						Port:     80,
 						Protocol: api.ProtoTCP,
 						U8Proto:  0x6,
 						wildcard: td.wildcardCachedSelector,
 						Ingress:  true,
 						PerSelectorPolicies: L7DataMap{
-							td.wildcardCachedSelector: &PerSelectorPolicy{IsDeny: true},
+							td.wildcardCachedSelector: denyPerSelectorPolicy,
 						},
 						RuleOrigin: OriginForTest(map[CachedSelector]labels.LabelArrayList{td.wildcardCachedSelector: {ruleLabel}}),
 					},
@@ -446,7 +459,7 @@ func TestMapStateWithIngressDenyWildcard(t *testing.T) {
 	// compare policyMapState separately
 	require.Truef(t, policy.policyMapState.Equal(&expectedEndpointPolicy.policyMapState), policy.policyMapState.diff(&expectedEndpointPolicy.policyMapState))
 
-	require.EqualExportedValues(t, &expectedEndpointPolicy, policy)
+	td.assertEqualPolicies(t, &expectedEndpointPolicy, policy)
 }
 
 func TestMapStateWithIngressDeny(t *testing.T) {
@@ -536,6 +549,9 @@ func TestMapStateWithIngressDeny(t *testing.T) {
 	cachedSelectorWorldV6 := td.sc.findCachedIdentitySelector(api.ReservedEndpointSelectors[labels.IDNameWorldIPv6])
 	require.NotNil(t, cachedSelectorWorldV6)
 
+	cachedSelectorAggregateWorld := td.sc.findCachedIdentitySelector(api.EntitySelectorMapping[api.EntityWorld][3])
+	require.NotNil(t, cachedSelectorAggregateWorld)
+
 	cachedSelectorTest := td.sc.findCachedIdentitySelector(api.NewESFromLabels(lblTest))
 	require.NotNil(t, cachedSelectorTest)
 
@@ -550,21 +566,24 @@ func TestMapStateWithIngressDeny(t *testing.T) {
 				Revision: repo.GetRevision(),
 				Ingress: L4DirectionPolicy{PortRules: NewL4PolicyMapWithValues(map[string]*L4Filter{
 					"80/TCP": {
+						Tier:     types.Normal,
 						Port:     80,
 						Protocol: api.ProtoTCP,
 						U8Proto:  0x6,
 						Ingress:  true,
 						PerSelectorPolicies: L7DataMap{
-							cachedSelectorWorld:   &PerSelectorPolicy{IsDeny: true},
-							cachedSelectorWorldV4: &PerSelectorPolicy{IsDeny: true},
-							cachedSelectorWorldV6: &PerSelectorPolicy{IsDeny: true},
-							cachedSelectorTest:    &PerSelectorPolicy{IsDeny: true},
+							cachedSelectorWorld:          denyPerSelectorPolicy,
+							cachedSelectorWorldV4:        denyPerSelectorPolicy,
+							cachedSelectorWorldV6:        denyPerSelectorPolicy,
+							cachedSelectorAggregateWorld: denyPerSelectorPolicy,
+							cachedSelectorTest:           denyPerSelectorPolicy,
 						},
 						RuleOrigin: OriginForTest(map[CachedSelector]labels.LabelArrayList{
-							cachedSelectorWorld:   {ruleLabel},
-							cachedSelectorWorldV4: {ruleLabel},
-							cachedSelectorWorldV6: {ruleLabel},
-							cachedSelectorTest:    {ruleLabel},
+							cachedSelectorWorld:          {ruleLabel},
+							cachedSelectorWorldV4:        {ruleLabel},
+							cachedSelectorWorldV6:        {ruleLabel},
+							cachedSelectorAggregateWorld: {ruleLabel},
+							cachedSelectorTest:           {ruleLabel},
 						}),
 					},
 				}),
@@ -579,11 +598,12 @@ func TestMapStateWithIngressDeny(t *testing.T) {
 			// Although we have calculated deny policies, the overall policy
 			// will still allow egress to world.
 			EgressKey(): allowEgressMapStateEntry,
-			IngressKey().WithIdentity(identity.ReservedIdentityWorld).WithTCPPort(80):     rule1MapStateEntry,
-			IngressKey().WithIdentity(identity.ReservedIdentityWorldIPv4).WithTCPPort(80): rule1MapStateEntry,
-			IngressKey().WithIdentity(identity.ReservedIdentityWorldIPv6).WithTCPPort(80): rule1MapStateEntry,
-			IngressKey().WithIdentity(192).WithTCPPort(80):                                rule1MapStateEntry,
-			IngressKey().WithIdentity(194).WithTCPPort(80):                                rule1MapStateEntry,
+			IngressKey().WithIdentity(identity.ReservedIdentityAggregateWorld).WithTCPPort(80): rule1MapStateEntry,
+			IngressKey().WithIdentity(identity.ReservedIdentityWorld).WithTCPPort(80):          rule1MapStateEntry,
+			IngressKey().WithIdentity(identity.ReservedIdentityWorldIPv4).WithTCPPort(80):      rule1MapStateEntry,
+			IngressKey().WithIdentity(identity.ReservedIdentityWorldIPv6).WithTCPPort(80):      rule1MapStateEntry,
+			IngressKey().WithIdentity(192).WithTCPPort(80):                                     rule1MapStateEntry,
+			IngressKey().WithIdentity(194).WithTCPPort(80):                                     rule1MapStateEntry,
 		}),
 	}
 
@@ -599,12 +619,12 @@ func TestMapStateWithIngressDeny(t *testing.T) {
 
 	// Verify that cached selector is not found after Detach().
 	// Note that this depends on the other tests NOT using the same selector concurrently!
-	policy.SelectorPolicy.detach(true, 0)
+	policy.SelectorPolicy.Detach()
 	cachedSelectorTest = td.sc.findCachedIdentitySelector(api.NewESFromLabels(lblTest))
 	require.Nil(t, cachedSelectorTest)
 
 	// compare policyMapState separately
 	require.Truef(t, policy.policyMapState.Equal(&expectedEndpointPolicy.policyMapState), policy.policyMapState.diff(&expectedEndpointPolicy.policyMapState))
 
-	require.EqualExportedValues(t, &expectedEndpointPolicy, policy)
+	td.assertEqualPolicies(t, &expectedEndpointPolicy, policy)
 }

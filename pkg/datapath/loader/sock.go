@@ -6,14 +6,13 @@ package loader
 import (
 	"fmt"
 	"log/slog"
-	"net"
+	"net/netip"
 
 	"github.com/cilium/cilium/pkg/bpf"
 	bpfgen "github.com/cilium/cilium/pkg/datapath/bpf"
 	"github.com/cilium/cilium/pkg/loadbalancer/maps"
 
 	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/btf"
 )
 
 const (
@@ -24,7 +23,7 @@ const (
 	filterVarName = "cilium_sock_term_filter"
 )
 
-type FilterSetter func(af uint8, addr net.IP, port uint16) error
+type FilterSetter func(af uint8, addr netip.Addr, port uint16) error
 
 // LoadSockTerm loads the cil_sock_udp_destroy_v4, cil_sock_tcp_destroy_v4,
 // cil_sock_tcp_destroy_v6, and cil_sock_udp_destroy_v6 programs. It returns a
@@ -61,15 +60,6 @@ func LoadSockTerm(l *slog.Logger, sockRevNat4, sockRevNat6 *bpf.Map) (*bpfgen.So
 		mapReplacements[maps.SockRevNat6MapName] = sockRevNat6
 	}
 
-	// Since the programs use the bpf_sock_destroy() kfunc, the loader
-	// parses and caches BTF from vmlinux on the first go to be reused
-	// by subsequent program loads. For now, only bpf_sock_term uses kfuncs,
-	// and we only load this at the start, so flush this cache after loading
-	// is done to avoid holding onto an extra ~15MB of memory.
-	//
-	// See GH-37907 for discussion
-	defer btf.FlushKernelSpec()
-
 	// We can't assign directly to a sock_termObjects, since some maps and
 	// programs may be missing.
 	coll, commit, err := bpf.LoadCollection(l, spec, &bpf.CollectionOptions{
@@ -88,16 +78,17 @@ func LoadSockTerm(l *slog.Logger, sockRevNat4, sockRevNat6 *bpf.Map) (*bpfgen.So
 	}
 
 	return &bpfgen.SockTermPrograms{
-			CilSockUdpDestroyV4: coll.Programs[v4UDPProgName],
-			CilSockTcpDestroyV4: coll.Programs[v4TCPProgName],
-			CilSockUdpDestroyV6: coll.Programs[v6UDPProgName],
-			CilSockTcpDestroyV6: coll.Programs[v6TCPProgName],
-		}, func(af uint8, addr net.IP, port uint16) error {
-			var value bpfgen.SockTermSockTermFilter
-			value.AddressFamily = af
-			value.Port = port
-			copy(value.Address.Addr6.Addr[:], addr.To16())
+		CilSockUdpDestroyV4: coll.Programs[v4UDPProgName],
+		CilSockTcpDestroyV4: coll.Programs[v4TCPProgName],
+		CilSockUdpDestroyV6: coll.Programs[v6UDPProgName],
+		CilSockTcpDestroyV6: coll.Programs[v6TCPProgName],
+	}, func(af uint8, addr netip.Addr, port uint16) error {
+		var value bpfgen.SockTermSockTermFilter
+		value.AddressFamily = af
+		value.Port = port
+		a16 := addr.As16()
+		copy(value.Address.Addr6.Addr[:], a16[:])
 
-			return coll.Variables[filterVarName].Set(&value)
-		}, nil
+		return coll.Variables[filterVarName].Set(&value)
+	}, nil
 }

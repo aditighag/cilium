@@ -26,6 +26,7 @@ import (
 	"github.com/cilium/cilium/standalone-dns-proxy/pkg/defaults"
 	"github.com/cilium/cilium/standalone-dns-proxy/pkg/lookup"
 	"github.com/cilium/cilium/standalone-dns-proxy/pkg/messagehandler"
+	"github.com/cilium/cilium/standalone-dns-proxy/pkg/metrics"
 	sdpshell "github.com/cilium/cilium/standalone-dns-proxy/pkg/shell"
 )
 
@@ -50,13 +51,23 @@ var (
 		// includes the message handler for receiving messages from the proxy and sending messages to the gRPC client which in turn sends them to the cilium agent
 		messagehandler.Cell,
 
+		// Prometheus metrics registry and HTTP server for standalone DNS proxy
+		metrics.Cell,
+
 		// Shell for inspecting the standalone DNS proxy. Listens on the Unix domain socket.
 		shell.ServerCell(defaults.ShellSockPath),
+
+		// Readiness check commands
+		ReadinessCell,
 
 		cell.Provide(func() *option.DaemonConfig {
 			return option.Config
 		}),
 		cell.Config(service.DefaultConfig),
+		cell.Provide(
+			NewStandaloneDNSProxy,
+			NewReadinessStatusProvider,
+		),
 		cell.Invoke(registerStandaloneDNSProxyHooks),
 	)
 
@@ -119,29 +130,34 @@ type standaloneDNSProxyParams struct {
 	Logger            *slog.Logger
 	AgentConfig       *option.DaemonConfig
 	FQDNConfig        service.FQDNConfig
-	Lifecycle         cell.Lifecycle
 	JobGroup          job.Group
 	ConnectionHandler client.ConnectionHandler
 	DNSProxier        proxy.DNSProxier
 	DNSRulesTable     statedb.RWTable[client.DNSRules]
 	DB                *statedb.DB
+	Metrics           *metrics.Metrics
 }
 
-func registerStandaloneDNSProxyHooks(params standaloneDNSProxyParams) error {
-	sdp := NewStandaloneDNSProxy(params)
+type hooksParams struct {
+	cell.In
 
-	if params.AgentConfig.EnableL7Proxy && params.FQDNConfig.EnableStandaloneDNSProxy {
-		sdp.logger.Info("Standalone DNS proxy is enabled")
+	Lifecycle cell.Lifecycle
+	SDP       *StandaloneDNSProxy
+}
+
+func registerStandaloneDNSProxyHooks(params hooksParams) error {
+	if params.SDP.enableL7Proxy && params.SDP.enableStandaloneDNSProxy {
+		params.SDP.logger.Info("Standalone DNS proxy is enabled")
 	} else {
 		return fmt.Errorf("standalone DNS proxy requires L7 proxy and standalone DNS proxy to be enabled in the configuration")
 	}
 
 	params.Lifecycle.Append(cell.Hook{
 		OnStart: func(cell.HookContext) error {
-			return sdp.StartStandaloneDNSProxy()
+			return params.SDP.StartStandaloneDNSProxy()
 		},
 		OnStop: func(cell.HookContext) error {
-			return sdp.StopStandaloneDNSProxy()
+			return params.SDP.StopStandaloneDNSProxy()
 		},
 	})
 	return nil

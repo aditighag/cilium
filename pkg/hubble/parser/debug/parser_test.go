@@ -14,7 +14,6 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	flowpb "github.com/cilium/cilium/api/v1/flow"
-	"github.com/cilium/cilium/pkg/byteorder"
 	"github.com/cilium/cilium/pkg/hubble/parser/getters"
 	"github.com/cilium/cilium/pkg/hubble/parser/options"
 	"github.com/cilium/cilium/pkg/hubble/testutils"
@@ -24,7 +23,7 @@ import (
 
 func encodeDebugEvent(msg *monitor.DebugMsg) []byte {
 	buf := &bytes.Buffer{}
-	if err := binary.Write(buf, byteorder.Native, msg); err != nil {
+	if err := binary.Write(buf, binary.NativeEndian, msg); err != nil {
 		panic(fmt.Sprintf("failed to encode debug event: %s", err))
 	}
 	return buf.Bytes()
@@ -39,6 +38,7 @@ func TestDecodeDebugEvent(t *testing.T) {
 					Identity:     5678,
 					PodName:      "hubble-ui",
 					PodNamespace: "kube-system",
+					PodUID:       "hubble-ui-uid",
 					Labels: []string{
 						"k8s:io.cilium.k8s.policy.cluster=default",
 						"k8s:io.kubernetes.pod.namespace=kube-system",
@@ -69,6 +69,7 @@ func TestDecodeDebugEvent(t *testing.T) {
 				Source:  0,
 				Arg1:    1,
 				Arg2:    2,
+				Arg3:    3,
 			}),
 			cpu: 0,
 			ev: &flowpb.DebugEvent{
@@ -76,8 +77,8 @@ func TestDecodeDebugEvent(t *testing.T) {
 				Hash:    wrapperspb.UInt32(0),
 				Arg1:    wrapperspb.UInt32(1),
 				Arg2:    wrapperspb.UInt32(2),
-				Arg3:    wrapperspb.UInt32(0),
-				Message: "No message, arg1=1 (0x1) arg2=2 (0x2)",
+				Arg3:    wrapperspb.UInt32(3),
+				Message: "No message, arg1=1 (0x1) arg2=2 (0x2) arg3=3 (0x3)",
 				Cpu:     wrapperspb.Int32(0),
 			},
 		},
@@ -98,6 +99,7 @@ func TestDecodeDebugEvent(t *testing.T) {
 					ID:          1234,
 					Identity:    5678,
 					PodName:     "hubble-ui",
+					PodUid:      "hubble-ui-uid",
 					ClusterName: "default",
 					Namespace:   "kube-system",
 					Labels: []string{
@@ -133,6 +135,7 @@ func TestDecodeDebugEvent(t *testing.T) {
 					ID:          1234,
 					Identity:    5678,
 					PodName:     "hubble-ui",
+					PodUid:      "hubble-ui-uid",
 					ClusterName: "default",
 					Namespace:   "kube-system",
 					Labels: []string{
@@ -205,6 +208,7 @@ func TestDecodeDebugEvent(t *testing.T) {
 						Source:  0,
 						Arg1:    13,
 						Arg2:    37,
+						Arg3:    42,
 					}, nil
 				}),
 			},
@@ -213,8 +217,8 @@ func TestDecodeDebugEvent(t *testing.T) {
 				Hash:    wrapperspb.UInt32(0),
 				Arg1:    wrapperspb.UInt32(13),
 				Arg2:    wrapperspb.UInt32(37),
-				Arg3:    wrapperspb.UInt32(0),
-				Message: "No message, arg1=13 (0xd) arg2=37 (0x25)",
+				Arg3:    wrapperspb.UInt32(42),
+				Message: "No message, arg1=13 (0xd) arg2=37 (0x25) arg3=42 (0x2a)",
 				Cpu:     wrapperspb.Int32(0),
 			},
 		},

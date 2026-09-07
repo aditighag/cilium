@@ -4,13 +4,18 @@
 package sysdump
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -62,6 +67,65 @@ func TestSysdumpCollector(t *testing.T) {
 	assert.Equal(t, path.Join(collector.sysdumpDir, "my-file-"+timestamp), tempFile)
 	_, err = os.Stat(path.Join(collector.sysdumpDir, sysdumpLogFile))
 	assert.NoError(t, err)
+}
+
+func TestWithFileSinkContainment(t *testing.T) {
+	client := fakeClient{
+		nodeList: &corev1.NodeList{
+			Items: []corev1.Node{
+				{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}},
+			},
+		},
+	}
+	collector, err := NewCollector(&client, Options{
+		OutputFileName: "my-sysdump-<ts>",
+		Writer:         io.Discard,
+	}, &nopHooks{}, time.Unix(946713600, 0))
+	assert.NoError(t, err)
+
+	// A name that escapes the sysdump directory, e.g. a CNI config filename
+	// listed by a compromised pod.
+	outside := filepath.Join(t.TempDir(), "escape.txt")
+	escaping, err := filepath.Rel(collector.sysdumpDir, outside)
+	assert.NoError(t, err)
+
+	tests := []struct {
+		name     string
+		filename string
+		// wantPath is checked after the write: it must exist for an accepted
+		// sink and must not exist for a rejected one.
+		wantPath string
+		wantErr  bool
+	}{
+		{
+			name:     "contained filename is written",
+			filename: "cniconf-bridge.conf-pod",
+			wantPath: path.Join(collector.sysdumpDir, "cniconf-bridge.conf-pod"),
+		},
+		{
+			name:     "escaping filename is rejected",
+			filename: escaping,
+			wantPath: outside,
+			wantErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := collector.WithFileSink(tt.filename, func(w io.Writer) error {
+				_, werr := io.WriteString(w, "data")
+				return werr
+			})
+			_, statErr := os.Stat(tt.wantPath)
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.True(t, os.IsNotExist(statErr))
+				return
+			}
+			assert.NoError(t, err)
+			assert.NoError(t, statErr)
+		})
+	}
 }
 
 func TestNodeList(t *testing.T) {
@@ -406,11 +470,11 @@ func (c *fakeClient) ListCiliumBGPNodeConfigOverrides(ctx context.Context, opts 
 	panic("implement me")
 }
 
-func (c *fakeClient) ListCiliumNodeConfigs(_ context.Context, _ string, _ metav1.ListOptions) (*ciliumv2alpha1.CiliumNodeConfigList, error) {
+func (c *fakeClient) ListCiliumNodeConfigs(_ context.Context, _ string, _ metav1.ListOptions) (*ciliumv2.CiliumNodeConfigList, error) {
 	panic("implement me")
 }
 
-func (c *fakeClient) ListCiliumPodIPPools(_ context.Context, _ metav1.ListOptions) (*ciliumv2alpha1.CiliumPodIPPoolList, error) {
+func (c *fakeClient) ListCiliumL2AnnouncementPolicies(_ context.Context, _ metav1.ListOptions) (*ciliumv2alpha1.CiliumL2AnnouncementPolicyList, error) {
 	panic("implement me")
 }
 
@@ -510,6 +574,10 @@ func (c *fakeClient) GetCronJob(_ context.Context, _, _ string, _ metav1.GetOpti
 
 func (c *fakeClient) GetDeployment(_ context.Context, _, _ string, _ metav1.GetOptions) (*appsv1.Deployment, error) {
 	return nil, nil
+}
+
+func (c *fakeClient) ListDeployment(_ context.Context, _ string, _ metav1.ListOptions) (*appsv1.DeploymentList, error) {
+	return &appsv1.DeploymentList{}, nil
 }
 
 func (c *fakeClient) GetLogs(_ context.Context, _, _, _ string, _ corev1.PodLogOptions, _ io.Writer) error {
@@ -678,13 +746,142 @@ func (c *fakeClient) GetNamespace(_ context.Context, ns string, _ metav1.GetOpti
 
 func Test_removeTopDirectory(t *testing.T) {
 	result, err := removeTopDirectory("/")
-	assert.NoError(t, err)
 	assert.Empty(t, result)
+	assert.Error(t, err)
 
 	result, err = removeTopDirectory("a/b/c")
 	assert.NoError(t, err)
-	assert.Equal(t, "b/c", result)
+	assert.Equal(t, filepath.Join("b", "c"), result)
 
 	_, err = removeTopDirectory("")
 	assert.Error(t, err)
+
+	_, err = removeTopDirectory("/a/b")
+	assert.Error(t, err)
+
+	_, err = removeTopDirectory("a/../../b")
+	assert.Error(t, err)
+}
+
+// makeTarGz creates a .tar.gz archive at archivePath containing members with
+// the given names and the provided content in each.
+func makeTarGz(t *testing.T, archivePath string, members map[string]string) {
+	t.Helper()
+
+	f, err := os.Create(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	gz := gzip.NewWriter(f)
+	defer gz.Close()
+	tw := tar.NewWriter(gz)
+	defer tw.Close()
+	for _, name := range slices.Sorted(maps.Keys(members)) {
+		body := []byte(members[name])
+		if err := tw.WriteHeader(&tar.Header{
+			Typeflag: tar.TypeReg,
+			Name:     name,
+			Mode:     0600,
+			Size:     int64(len(body)),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(body); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func Test_untar(t *testing.T) {
+	t.Run("normal member extracted", func(t *testing.T) {
+		dir := t.TempDir()
+		archivePath := filepath.Join(dir, "bugtool.tar.gz")
+		dst := filepath.Join(dir, "extract")
+		makeTarGz(t, archivePath, map[string]string{
+			"bugtool/sysdump/agent.log": "log data",
+		})
+		err := untar(archivePath, dst)
+		assert.NoError(t, err)
+		got, err := os.ReadFile(filepath.Join(dst, "sysdump", "agent.log"))
+		assert.NoError(t, err)
+		assert.Equal(t, "log data", string(got))
+	})
+
+	t.Run("path traversal is rejected", func(t *testing.T) {
+		dir := t.TempDir()
+		archivePath := filepath.Join(dir, "bugtool.tar.gz")
+		dst := filepath.Join(dir, "extract")
+		makeTarGz(t, archivePath, map[string]string{
+			"bugtool/../cilium-sysdump-untar-marker":       "should not be written",
+			"bugtool/../../cilium-sysdump-untar-marker":    "should also not be written",
+			"bugtool/../../../cilium-sysdump-untar-marker": "neither should this",
+		})
+		err := untar(archivePath, dst)
+		assert.ErrorContains(t, err, "invalid path in tar entry")
+		// Confirm the marker was not created outside the extraction directory.
+		markerPath := filepath.Join(filepath.Dir(dir), "cilium-sysdump-untar-marker")
+		_, statErr := os.Stat(markerPath)
+		assert.True(t, os.IsNotExist(statErr), "marker file must not exist outside dst")
+	})
+
+	t.Run("absolute path is rejected", func(t *testing.T) {
+		dir := t.TempDir()
+		archivePath := filepath.Join(dir, "bugtool.tar.gz")
+		dst := filepath.Join(dir, "extract")
+		makeTarGz(t, archivePath, map[string]string{
+			"/etc/passwd": "should not be written",
+		})
+		err := untar(archivePath, dst)
+		assert.ErrorContains(t, err, "invalid path in tar entry")
+	})
+}
+
+func TestFormatNodeDiskUsageRow(t *testing.T) {
+	// Shape and field names as served by kubelet's /stats/summary, trimmed to
+	// the disk fields. Sizes are those of the AKS 30 GB OS disk nodes.
+	summary := `{
+	  "node": {
+	    "nodeName": "aks-nodepool1-16135303-vmss000003",
+	    "fs": {
+	      "availableBytes": 3221225472,
+	      "capacityBytes": 30089314304,
+	      "usedBytes": 26868088832,
+	      "inodesFree": 1835008
+	    },
+	    "runtime": {
+	      "imageFs": {
+	        "availableBytes": 3221225472,
+	        "capacityBytes": 30089314304,
+	        "usedBytes": 20401094656
+	      }
+	    }
+	  }
+	}`
+
+	row := formatNodeDiskUsageRow("aks-nodepool1-16135303-vmss000003", summary, "True")
+	fields := strings.Split(row, "\t")
+	assert.Len(t, fields, 8)
+	assert.Equal(t, "aks-nodepool1-16135303-vmss000003", fields[0])
+	assert.Equal(t, "25623Mi", fields[1])
+	assert.Equal(t, "28695Mi", fields[2])
+	assert.Equal(t, "89%", fields[3])
+	assert.Equal(t, "19456Mi", fields[4])
+	assert.Equal(t, "28695Mi", fields[5])
+	assert.Equal(t, "1835008", fields[6])
+	assert.Equal(t, "True", fields[7])
+
+	// Missing stats must not panic or drop the node from the table.
+	row = formatNodeDiskUsageRow("node-without-stats", `{"node":{"nodeName":"node-without-stats"}}`, "False")
+	fields = strings.Split(row, "\t")
+	assert.Len(t, fields, 8)
+	assert.Equal(t, "<unknown>", fields[1])
+	assert.Equal(t, "<unknown>", fields[3])
+	assert.Equal(t, "False", fields[7])
+
+	// A garbage payload keeps the node and its condition visible.
+	row = formatNodeDiskUsageRow("node-broken", "not json", "Unknown")
+	assert.Contains(t, row, "node-broken")
+	assert.Contains(t, row, "unparseable")
+	assert.Contains(t, row, "Unknown")
 }

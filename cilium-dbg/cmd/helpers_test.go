@@ -82,7 +82,6 @@ func TestExpandNestedJSON(t *testing.T) {
       "label-configuration": {},
       "options": {
         "Conntrack": "Enabled",
-        "ConntrackAccounting": "Enabled",
         "Debug": "Enabled",
         "DebugLB": "Enabled",
         "DebugPolicy": "Enabled",
@@ -149,8 +148,6 @@ func TestExpandNestedJSON(t *testing.T) {
       "external-identifiers": {
         "container-id": "1968a48396a0e42f3faad360a7ffa23d8629faddee7f828408bf177d3eeac47a",
         "container-name": "client",
-        "docker-endpoint-id": "05a27bef9f339e5ae25a191108b91ee1e7fdc2696d2c46908645157a62438ccd",
-        "docker-network-id": "e3ea8f2e1df2250df6702fd802ea0d3706091c1b374db998d48e7327bf9bd0fe",
         "pod-name": "/"
       },
       "health": {
@@ -162,14 +159,14 @@ func TestExpandNestedJSON(t *testing.T) {
       "identity": {
         "id": 62004,
         "labels": [
-          "container:id.client"
+          "k8s:id=client"
         ],
         "labelsSHA256": "c2e7b3482b5e9e1abca840b8cc5568ff876c7524d723b3068683f539008537dc"
       },
       "labels": {
         "realized": {},
         "security-relevant": [
-          "container:id.client"
+          "k8s:id=client"
         ]
       },
       "log": [
@@ -270,7 +267,6 @@ func TestExpandNestedJSON(t *testing.T) {
         "label-configuration": {},
         "options": {
           "Conntrack": "Enabled",
-          "ConntrackAccounting": "Enabled",
           "Debug": "Enabled",
           "DebugLB": "Enabled",
           "DebugPolicy": "Enabled",
@@ -292,7 +288,6 @@ func TestExpandNestedJSON(t *testing.T) {
       "label-configuration": {},
       "options": {
         "Conntrack": "Enabled",
-        "ConntrackAccounting": "Enabled",
         "Debug": "Enabled",
         "DebugLB": "Enabled",
         "DebugPolicy": "Enabled",
@@ -359,8 +354,6 @@ func TestExpandNestedJSON(t *testing.T) {
       "external-identifiers": {
         "container-id": "1968a48396a0e42f3faad360a7ffa23d8629faddee7f828408bf177d3eeac47a",
         "container-name": "client",
-        "docker-endpoint-id": "05a27bef9f339e5ae25a191108b91ee1e7fdc2696d2c46908645157a62438ccd",
-        "docker-network-id": "e3ea8f2e1df2250df6702fd802ea0d3706091c1b374db998d48e7327bf9bd0fe",
         "pod-name": "/"
       },
       "health": {
@@ -372,14 +365,14 @@ func TestExpandNestedJSON(t *testing.T) {
       "identity": {
         "id": 62004,
         "labels": [
-          "container:id.client"
+          "k8s:id=client"
         ],
         "labelsSHA256": "c2e7b3482b5e9e1abca840b8cc5568ff876c7524d723b3068683f539008537dc"
       },
       "labels": {
         "realized": {},
         "security-relevant": [
-          "container:id.client"
+          "k8s:id=client"
         ]
       },
       "log": [
@@ -510,7 +503,6 @@ func TestExpandNestedJSON(t *testing.T) {
         "label-configuration": {},
         "options": {
           "Conntrack": "Enabled",
-          "ConntrackAccounting": "Enabled",
           "Debug": "Enabled",
           "DebugLB": "Enabled",
           "DebugPolicy": "Enabled",
@@ -574,7 +566,7 @@ func TestParsePolicyUpdateArgsHelper(t *testing.T) {
 		{
 			args:             []string{labels.IDNameHost, "ingress", "12345"},
 			invalid:          false,
-			mapBaseName:      "cilium_policy_v2_reserved_1",
+			mapBaseName:      "cilium_policy_v3_reserved_1",
 			trafficDirection: trafficdirection.Ingress,
 			peerLbl:          12345,
 			port:             0,
@@ -583,7 +575,7 @@ func TestParsePolicyUpdateArgsHelper(t *testing.T) {
 		{
 			args:             []string{"123", "egress", "12345", "1/tcp"},
 			invalid:          false,
-			mapBaseName:      "cilium_policy_v2_00123",
+			mapBaseName:      "cilium_policy_v3_00123",
 			trafficDirection: trafficdirection.Egress,
 			peerLbl:          12345,
 			port:             1,
@@ -592,7 +584,7 @@ func TestParsePolicyUpdateArgsHelper(t *testing.T) {
 		{
 			args:             []string{"123", "ingress", "12345", "1"},
 			invalid:          false,
-			mapBaseName:      "cilium_policy_v2_00123",
+			mapBaseName:      "cilium_policy_v3_00123",
 			trafficDirection: trafficdirection.Ingress,
 			peerLbl:          12345,
 			port:             1,
@@ -613,7 +605,7 @@ func TestParsePolicyUpdateArgsHelper(t *testing.T) {
 			invalid:          false,
 			isDeny:           true,
 			cookie:           0x010203,
-			mapBaseName:      "cilium_policy_v2_reserved_1",
+			mapBaseName:      "cilium_policy_v3_reserved_1",
 			trafficDirection: trafficdirection.Ingress,
 			peerLbl:          12345,
 			port:             0,
@@ -624,7 +616,7 @@ func TestParsePolicyUpdateArgsHelper(t *testing.T) {
 			invalid:          false,
 			isDeny:           true,
 			cookie:           0x010203,
-			mapBaseName:      "cilium_policy_v2_00123",
+			mapBaseName:      "cilium_policy_v3_00123",
 			trafficDirection: trafficdirection.Egress,
 			peerLbl:          12345,
 			port:             1,
@@ -635,7 +627,7 @@ func TestParsePolicyUpdateArgsHelper(t *testing.T) {
 			invalid:          false,
 			isDeny:           true,
 			cookie:           0x010203,
-			mapBaseName:      "cilium_policy_v2_00123",
+			mapBaseName:      "cilium_policy_v3_00123",
 			trafficDirection: trafficdirection.Ingress,
 			peerLbl:          12345,
 			port:             1,

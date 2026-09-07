@@ -4,11 +4,11 @@
 package table
 
 import (
-	"github.com/cilium/cilium/daemon/k8s"
-
 	"github.com/cilium/statedb"
 	"github.com/cilium/statedb/index"
 	"github.com/cilium/statedb/reconciler"
+
+	k8sTables "github.com/cilium/cilium/pkg/k8s/tables"
 )
 
 type EnrolledNamespace struct {
@@ -47,27 +47,31 @@ func (ns *EnrolledNamespace) Clone() *EnrolledNamespace {
 	return &e
 }
 
-// EnrolledNamespacesNameIndex allows looking up EnrolledNamespace by its name.
-var EnrolledNamespacesNameIndex = statedb.Index[*EnrolledNamespace, string]{
-	Name: "name",
-	FromObject: func(ns *EnrolledNamespace) index.KeySet {
-		return index.NewKeySet(index.String(ns.Name))
-	},
-	FromKey: index.String,
-	Unique:  true,
-}
+var (
+	enrolledNamespacesNameIndex = statedb.Index[*EnrolledNamespace, string]{
+		Name: "name",
+		FromObject: func(ns *EnrolledNamespace) index.KeySet {
+			return index.NewKeySet(index.String(ns.Name))
+		},
+		FromKey: index.String,
+		Unique:  true,
+	}
+
+	// EnrolledNamespaceByName queries the enrolled namespaces table by name.
+	EnrolledNamespaceByName = enrolledNamespacesNameIndex.Query
+)
 
 func NewEnrolledNamespacesTable(db *statedb.DB) (statedb.RWTable[*EnrolledNamespace], error) {
 	return statedb.NewTable(
 		db,
 		"mtls-enrolled-namespaces",
-		EnrolledNamespacesNameIndex,
+		enrolledNamespacesNameIndex,
 	)
 }
 
-func K8sNamespaceToEnrolledNamespace(ns k8s.Namespace, deleted bool) (*EnrolledNamespace, statedb.DeriveResult) {
+func K8sNamespaceToEnrolledNamespace(ns k8sTables.Namespace, deleted bool) (*EnrolledNamespace, statedb.DeriveResult) {
 	enrolled := true
-	if mtlsValue, exists := ns.Labels["mtls-enabled"]; !exists || mtlsValue != "true" {
+	if mtlsValue, exists := ns.Labels["io.cilium/mtls-enabled"]; !exists || mtlsValue != "true" {
 		enrolled = false
 	}
 	if deleted || !enrolled {

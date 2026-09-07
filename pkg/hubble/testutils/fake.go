@@ -422,6 +422,7 @@ type FakeEndpointInfo struct {
 	IPv6         net.IP
 	PodName      string
 	PodNamespace string
+	PodUID       string
 	Labels       []string
 	Pod          *slim_corev1.Pod
 
@@ -449,6 +450,17 @@ func (e *FakeEndpointInfo) GetK8sNamespace() string {
 	return e.PodNamespace
 }
 
+// GetK8sPodUID returns the Pod UID of the endpoint.
+func (e *FakeEndpointInfo) GetK8sPodUID() string {
+	if e.PodUID != "" {
+		return e.PodUID
+	}
+	if e.Pod != nil {
+		return string(e.Pod.UID)
+	}
+	return ""
+}
+
 // GetLabels returns the labels of the endpoint.
 func (e *FakeEndpointInfo) GetLabels() labels.Labels {
 	return labels.NewLabelsFromModel(e.Labels)
@@ -463,9 +475,32 @@ func (e *FakeEndpointInfo) GetPolicyCorrelationInfoForKey(key policyTypes.Key) (
 	info policyTypes.PolicyCorrelationInfo,
 	ok bool,
 ) {
-	info.RuleLabels, ok = e.PolicyMap[key]
 	info.Revision = e.PolicyRevision
-	return info, ok
+	if rl, hit := e.PolicyMap[key]; hit {
+		info.RuleLabels = rl
+		return info, true
+	}
+
+	var bestKey policyTypes.Key
+	var bestRules labels.LabelArrayListString
+	found := false
+	for storedKey, rl := range e.PolicyMap {
+		if !storedKey.Covers(key) {
+			continue
+		}
+		if !found ||
+			storedKey.PrefixLength() > bestKey.PrefixLength() ||
+			(storedKey.PrefixLength() == bestKey.PrefixLength() && storedKey.Identity != 0 && bestKey.Identity == 0) {
+			bestKey = storedKey
+			bestRules = rl
+			found = true
+		}
+	}
+	if !found {
+		return info, false
+	}
+	info.RuleLabels = bestRules
+	return info, true
 }
 
 // FakePodMetadataGetter is used for unit tests that need a PodMetadataGetter.

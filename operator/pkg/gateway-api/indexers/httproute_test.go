@@ -4,16 +4,20 @@
 package indexers
 
 import (
-	"reflect"
+	"log/slog"
 	"slices"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
-	mcsapiv1alpha1 "sigs.k8s.io/mcs-api/pkg/apis/v1alpha1"
+	mcsapiv1beta1 "sigs.k8s.io/mcs-api/pkg/apis/v1beta1"
+
+	"github.com/cilium/cilium/operator/pkg/gateway-api/helpers"
 )
 
 func TestIndexHTTPRouteByGateway(t *testing.T) {
@@ -125,7 +129,7 @@ func TestIndexHTTPRouteByBackendServiceImport(t *testing.T) {
 								{
 									BackendRef: gatewayv1.BackendRef{
 										BackendObjectReference: gatewayv1.BackendObjectReference{
-											Group:     ptr.To[gatewayv1.Group](mcsapiv1alpha1.GroupName),
+											Group:     ptr.To[gatewayv1.Group](mcsapiv1beta1.GroupName),
 											Kind:      ptr.To[gatewayv1.Kind]("ServiceImport"),
 											Name:      "valid-serviceImport",
 											Namespace: ptr.To[gatewayv1.Namespace]("default"),
@@ -163,7 +167,7 @@ func TestIndexHTTPRouteByBackendServiceImport(t *testing.T) {
 								{
 									BackendRef: gatewayv1.BackendRef{
 										BackendObjectReference: gatewayv1.BackendObjectReference{
-											Group: ptr.To[gatewayv1.Group](mcsapiv1alpha1.GroupName),
+											Group: ptr.To[gatewayv1.Group](mcsapiv1beta1.GroupName),
 											Kind:  ptr.To[gatewayv1.Kind]("ServiceImport"),
 											Name:  "valid-serviceImport",
 										},
@@ -212,6 +216,48 @@ func TestIndexHTTPRouteByBackendServiceImport(t *testing.T) {
 			},
 			want: []string(nil),
 		},
+		{
+			name: "Has ServiceImport filter refs",
+			obj: &gatewayv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "has-serviceimport-filters",
+					Namespace: "default",
+				},
+				Spec: gatewayv1.HTTPRouteSpec{
+					Rules: []gatewayv1.HTTPRouteRule{
+						{
+							Filters: []gatewayv1.HTTPRouteFilter{
+								{
+									Type: gatewayv1.HTTPRouteFilterRequestMirror,
+									RequestMirror: &gatewayv1.HTTPRequestMirrorFilter{
+										BackendRef: gatewayv1.BackendObjectReference{
+											Group:     ptr.To[gatewayv1.Group](mcsapiv1beta1.GroupName),
+											Kind:      ptr.To[gatewayv1.Kind]("ServiceImport"),
+											Name:      "mirror-import",
+											Namespace: ptr.To[gatewayv1.Namespace]("mirror-ns"),
+										},
+									},
+								},
+								{
+									Type: gatewayv1.HTTPRouteFilterExternalAuth,
+									ExternalAuth: &gatewayv1.HTTPExternalAuthFilter{
+										BackendRef: gatewayv1.BackendObjectReference{
+											Group: ptr.To[gatewayv1.Group](mcsapiv1beta1.GroupName),
+											Kind:  ptr.To[gatewayv1.Kind]("ServiceImport"),
+											Name:  "auth-import",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			want: []string{
+				"mirror-ns/mirror-import",
+				"default/auth-import",
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -219,6 +265,64 @@ func TestIndexHTTPRouteByBackendServiceImport(t *testing.T) {
 				t.Errorf("IndexHTTPRouteByBackendServiceImport() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestGenerateIndexerHTTPRouteByBackendServiceIncludesFilterBackends(t *testing.T) {
+	indexer := GenerateIndexerHTTPRouteByBackendService(
+		fake.NewClientBuilder().WithScheme(helpers.TestScheme(nil)).Build(),
+		slog.New(slog.DiscardHandler),
+	)
+
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mirror-route",
+			Namespace: "default",
+		},
+		Spec: gatewayv1.HTTPRouteSpec{
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "primary-svc",
+								},
+							},
+						},
+					},
+					Filters: []gatewayv1.HTTPRouteFilter{
+						{
+							Type: gatewayv1.HTTPRouteFilterRequestMirror,
+							RequestMirror: &gatewayv1.HTTPRequestMirrorFilter{
+								BackendRef: gatewayv1.BackendObjectReference{
+									Name:      "mirror-svc",
+									Namespace: ptr.To[gatewayv1.Namespace]("other-ns"),
+								},
+							},
+						},
+						{
+							Type: gatewayv1.HTTPRouteFilterExternalAuth,
+							ExternalAuth: &gatewayv1.HTTPExternalAuthFilter{
+								BackendRef: gatewayv1.BackendObjectReference{
+									Name:      "auth-svc",
+									Namespace: ptr.To[gatewayv1.Namespace]("auth-ns"),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	want := []string{
+		"default/primary-svc",
+		"other-ns/mirror-svc",
+		"auth-ns/auth-svc",
+	}
+	if got := indexer(route); !slices.Equal(got, want) {
+		t.Errorf("GenerateIndexerHTTPRouteByBackendService() = %v, want %v", got, want)
 	}
 }
 
@@ -371,9 +475,8 @@ func Test_IndexHTTPRouteByGammaService(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			parentIndexFunc := IndexHTTPRouteByGammaService
 
-			if got := parentIndexFunc(tt.args.obj); !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("getGammaHTTPRouteParentIndexFunc() = %#v, want %#v", got, tt.want)
-			}
+			got := parentIndexFunc(tt.args.obj)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }

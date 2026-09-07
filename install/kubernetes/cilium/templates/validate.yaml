@@ -202,6 +202,18 @@
   {{- end }}
 {{- end }}
 
+{{- if and
+  .Values.clustermesh.useAPIServer
+  (not .Values.clustermesh.apiserver.tls.auto.enabled)
+  (or
+    (dig "server" "cert" "" .Values.clustermesh.apiserver.tls )
+    (dig "admin" "cert" "" .Values.clustermesh.apiserver.tls )
+    (dig "remote" "cert" "" .Values.clustermesh.apiserver.tls )
+  )
+}}
+  {{- fail "The support for providing Cluster Mesh certs and keys as helm values has been removed. You must enable auto-generation or pre-create the corresponding secrets" }}
+{{- end }}
+
 {{/* validate ClusterMesh */}}
 {{- if and (ne (int .Values.clustermesh.maxConnectedClusters) 255) (ne (int .Values.clustermesh.maxConnectedClusters) 511) }}
   {{- fail "max-connected-clusters must be set to 255 or 511" }}
@@ -219,4 +231,33 @@
       {{ fail "k8sClientExponentialBackoff cannot be enabled when extraEnv contains KUBE_CLIENT_BACKOFF_BASE or KUBE_CLIENT_BACKOFF_DURATION" }}
     {{- end }}
   {{- end }}
+{{- end }}
+
+{{/* validate Standalone DNS Proxy */}}
+{{- if .Values.standaloneDnsProxy.enabled }}
+  {{- if not .Values.dnsProxy.proxyPort }}
+    {{ fail "standaloneDnsProxy requires dnsProxy.proxyPort to be explicitly set (e.g., 10094)" }}
+  {{- end }}
+  {{- if eq (int .Values.dnsProxy.proxyPort) 0 }}
+    {{ fail "standaloneDnsProxy requires dnsProxy.proxyPort to be set to a non-zero value (e.g., 10094). The standalone DNS proxy uses the same DNS configuration as the agent." }}
+  {{- end }}
+{{- end }}
+
+{{/* validate we don't run tproxy with netkit - see GH issue 39892 */}}
+{{- if hasKey .Values "bpf" }}
+  {{- if and (hasKey .Values.bpf "tproxy") (hasKey .Values.bpf "datapathMode") }}
+    {{- if and (.Values.bpf.tproxy) (list "netkit" "netkit-l2" | has .Values.bpf.datapathMode) }}
+      {{ fail ".Values.bpf.tproxy cannot be enabled with .Values.bpf.datapathMode=netkit or .Values.bpf.datapathMode=netkit-l2" }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+
+{{/* validate IPAM ENI */}}
+{{- if and (eq .Values.ipam.mode "eni") (not .Values.eni.enabled) }}
+  {{ fail "ipam.mode=eni requires eni.enabled=true" }}
+{{- end }}
+
+{{/* validate networkDriver.enabled flag requires kubernetes >= v1.34 */}}
+{{- if and (.Values.networkDriver.enabled) (semverCompare "<1.34.0" (printf "%d.%d.0" (semver .Capabilities.KubeVersion.Version).Major (semver .Capabilities.KubeVersion.Version).Minor)) }}
+  {{ fail ".Values.networkDriver.enabled requires kubernetes version 1.34 or greater" }}
 {{- end }}

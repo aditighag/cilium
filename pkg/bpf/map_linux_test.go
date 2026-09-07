@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -253,8 +254,8 @@ func TestPrivilegedBasicManipulation(t *testing.T) {
 
 	dumpEvents := func() []*Event {
 		es := []*Event{}
-		existingMap.DumpAndSubscribe(func(e *Event) {
-			es = append(es, e)
+		existingMap.DumpAndSubscribe(t.Context(), func(e Event) {
+			es = append(es, &e)
 		}, false)
 		return es
 	}
@@ -434,31 +435,21 @@ func TestPrivilegedSubscribe(t *testing.T) {
 		WithCache().
 		WithEvents(option.BPFEventBufferConfig{Enabled: true, MaxSize: 10})
 
-	subHandle, err := existingMap.DumpAndSubscribe(nil, true)
-	require.NoError(t, err)
-
-	collect := 0
-	done := make(chan struct{})
-	go func(collect *int) {
-		defer subHandle.Close()
-		for range subHandle.C() {
-			*collect++
-		}
-		close(done)
-	}(&collect)
+	var collect atomic.Int32
+	existingMap.DumpAndSubscribe(t.Context(), func(e Event) {
+		collect.Add(1)
+	}, true)
 
 	key1 := &TestKey{Key: 103}
 	value1 := &TestValue{Value: 203}
-	err = existingMap.Update(key1, value1)
+	err := existingMap.Update(key1, value1)
 	require.NoError(t, err)
 	err = existingMap.Update(key1, value1)
 	require.NoError(t, err)
 	err = existingMap.Delete(key1)
 	require.NoError(t, err)
 
-	subHandle.Close()
-	<-done
-	require.Equal(t, 3, collect)
+	require.Equal(t, 3, int(collect.Load()))
 
 	// cleanup
 	err = existingMap.DeleteAll()
@@ -624,12 +615,10 @@ func TestPrivilegedDumpReliablyWithCallbackOverlapping(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	wg := sync.WaitGroup{}
-	wg.Add(1)
 	// This goroutine will continuously delete and reinsert even keys.
 	// Thus, when this is running in parallel with DumpReliablyWithCallback
 	// it is unclear whether any even key will be iterated.
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		<-start
 		for {
 			select {
@@ -644,12 +633,12 @@ func TestPrivilegedDumpReliablyWithCallbackOverlapping(t *testing.T) {
 				require.NoError(t, err)
 			}
 		}
-	}()
+	})
 
 	// We expect that DumpReliablyWithCallback will iterate all odd key/value pairs
 	// even if the even keys are being deleted and reinserted.
 	expect := map[string]string{}
-	for i := uint32(0); i < maxEntries; i++ {
+	for i := range maxEntries {
 		if i%2 != 0 {
 			expect[fmt.Sprintf("key=%d", i)] = fmt.Sprintf("value=%d", i+200)
 		}
@@ -709,12 +698,10 @@ func TestPrivilegedDumpReliablyWithCallback(t *testing.T) {
 	started := make(chan struct{}, 1)
 	done := make(chan struct{}, 1)
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		started <- struct{}{}
 		for {
-			for i := uint32(0); i < 4; i++ {
+			for i := range uint32(4) {
 				if i < 3 {
 					err := m.Update(&TestKey{Key: i}, &TestValue{Value: i + 100})
 					// avoid assert to ensure we call wg.Done
@@ -732,11 +719,9 @@ func TestPrivilegedDumpReliablyWithCallback(t *testing.T) {
 			default:
 			}
 		}
-	}()
+	})
 	<-started // wait until the routine has started to start the actual tests
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		expect := map[string]string{}
 		for i := uint32(4); i < maxEntries; i++ {
 			expect[fmt.Sprintf("key=%d", i)] = fmt.Sprintf("custom-value=%d", i+100)
@@ -765,7 +750,7 @@ func TestPrivilegedDumpReliablyWithCallback(t *testing.T) {
 			}
 		}
 		done <- struct{}{}
-	}()
+	})
 	wg.Wait()
 }
 

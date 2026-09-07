@@ -25,9 +25,6 @@
 #define BACKEND_IP		v4_pod_two
 #define BACKEND_PORT		__bpf_htons(8080)
 
-#define ENCAP4_IFINDEX		42
-#define ENCAP6_IFINDEX		42
-
 #define SOCKET_COOKIE		1
 
 static volatile const __u8 *client_mac = mac_one;
@@ -44,13 +41,7 @@ __u64 mock_get_socket_cookie(const struct __sk_buff *ctx __maybe_unused)
 
 static __always_inline __maybe_unused int
 mock_ctx_redirect(const struct __sk_buff *ctx __maybe_unused,
-		  int ifindex __maybe_unused, __u32 flags __maybe_unused)
-{
-	if (ifindex == ENCAP4_IFINDEX)
-		return CTX_ACT_REDIRECT;
-
-	return CTX_ACT_DROP;
-}
+		  int ifindex __maybe_unused, __u32 flags __maybe_unused);
 
 #define skb_set_tunnel_key mock_skb_set_tunnel_key
 
@@ -70,8 +61,21 @@ int mock_skb_set_tunnel_key(__maybe_unused struct __sk_buff *skb,
 
 #include "lib/bpf_host.h"
 
+ASSIGN_CONFIG(__u32, encap4_ifindex, 42)
+ASSIGN_CONFIG(__u32, encap6_ifindex, 42)
+
+static __always_inline __maybe_unused int
+mock_ctx_redirect(const struct __sk_buff *ctx __maybe_unused,
+		  int ifindex __maybe_unused, __u32 flags __maybe_unused)
+{
+	if (ifindex == (int)CONFIG(encap4_ifindex))
+		return CTX_ACT_REDIRECT;
+
+	return CTX_ACT_DROP;
+}
+
 /* Test that a health-check request to a remote backend is IPIP-encapsulated. */
-PKTGEN("tc", "l4lb_health_check_host")
+PKTGEN(PROG_TYPE, "l4lb_health_check_host")
 int l4lb_health_check_host_pktgen(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -98,7 +102,7 @@ int l4lb_health_check_host_pktgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("tc", "l4lb_health_check_host")
+SETUP(PROG_TYPE, "l4lb_health_check_host")
 int l4lb_health_check_host_setup(struct __ctx_buff *ctx)
 {
 	__sock_cookie key = SOCKET_COOKIE;
@@ -113,7 +117,7 @@ int l4lb_health_check_host_setup(struct __ctx_buff *ctx)
 	return netdev_send_packet(ctx);
 }
 
-CHECK("tc", "l4lb_health_check_host")
+CHECK(PROG_TYPE, "l4lb_health_check_host")
 int l4lb_health_check_host_check(const struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -166,8 +170,8 @@ int l4lb_health_check_host_check(const struct __ctx_buff *ctx)
 	if (l4->dest != FRONTEND_PORT)
 		test_fatal("dst port has changed");
 
-	if (l4->check != bpf_htons(0xba00))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+	if (l4->check != bpf_htons(0x19a1))
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_ntohs(0x19a1));
 
 	test_finish();
 }

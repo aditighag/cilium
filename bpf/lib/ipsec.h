@@ -83,11 +83,10 @@ set_ipsec_encrypt(struct __ctx_buff *ctx,
 		  __u32 seclabel, bool use_meta)
 {
 	/* IPSec is performed by the stack on any packets with the
-	 * MARK_MAGIC_ENCRYPT bit set. During the process though we
-	 * lose the lxc context (seclabel and tunnel endpoint). The
-	 * tunnel endpoint can be looked up from daddr but the sec
-	 * label is stashed in the mark or cb, and extracted in
-	 * bpf_host to send ctx onto tunnel for encap.
+	 * MARK_MAGIC_ENCRYPT bit set.
+	 *
+	 * The source's security identity in CB_ENCRYPT_IDENTITY is
+	 * preserved across the XFRM traversal.
 	 */
 
 	const struct node_value *node_value = NULL;
@@ -102,7 +101,7 @@ set_ipsec_encrypt(struct __ctx_buff *ctx,
 
 	mark = ipsec_encode_encryption_mark(spi, node_value->id);
 
-	set_identity_meta(ctx, seclabel);
+	set_encrypt_identity_meta(ctx, seclabel);
 	if (use_meta)
 		ctx->cb[CB_ENCRYPT_MAGIC] = mark;
 	ctx->mark = mark;
@@ -111,7 +110,7 @@ set_ipsec_encrypt(struct __ctx_buff *ctx,
 }
 
 static __always_inline int
-do_decrypt(struct __ctx_buff *ctx, __u16 proto)
+do_decrypt(struct __ctx_buff *ctx, __be16 proto)
 {
 	struct ipv6hdr __maybe_unused *ip6;
 	struct iphdr __maybe_unused *ip4;
@@ -168,24 +167,11 @@ do_decrypt(struct __ctx_buff *ctx, __u16 proto)
 		return CTX_ACT_OK;
 	}
 	ctx->mark = 0;
-#ifdef ENABLE_ENDPOINT_ROUTES
-	return CTX_ACT_OK;
-#else
-	return ctx_redirect(ctx, CILIUM_HOST_IFINDEX, 0);
-#endif /* ENABLE_ENDPOINT_ROUTES */
-}
 
-/* checks whether a IPsec redirect should be performed for the source
- */
-static __always_inline int
-ipsec_redirect_sec_id_ok(__u32 src_sec_id) {
-	if (src_sec_id == HOST_ID)
-		return 0;
-	if (!identity_is_cluster(src_sec_id))
-		return 0;
-	if (identity_is_remote_node(src_sec_id))
-		return 0;
-	return 1;
+	if (CONFIG(enable_endpoint_routes))
+		return CTX_ACT_OK;
+
+	return ctx_redirect(ctx, CONFIG(cilium_host_ifindex), 0);
 }
 
 static __always_inline int
@@ -199,7 +185,7 @@ ipsec_maybe_redirect_to_encrypt(struct __ctx_buff *ctx, __be16 proto,
 	struct iphdr __maybe_unused *ip4;
 	struct ipv6hdr __maybe_unused *ip6;
 	int ret = 0;
-	union macaddr dst_mac = CILIUM_NET_MAC;
+	union macaddr dst_mac = CONFIG(cilium_net_mac);
 
 	if (!eth_is_supported_ethertype(proto))
 		return DROP_UNSUPPORTED_L2;
@@ -222,7 +208,7 @@ ipsec_maybe_redirect_to_encrypt(struct __ctx_buff *ctx, __be16 proto,
 		 * set_ipsec_encrypt to obtain the correct node ID and spi.
 		 */
 		if (ctx_is_overlay(ctx)) {
-			fake_info.tunnel_endpoint.ip4 = ip4->daddr;
+			fake_info.tunnel_endpoint.ip4.be32 = ip4->daddr;
 			fake_info.flag_has_tunnel_ep = true;
 
 			dst = &fake_info;
@@ -282,7 +268,7 @@ ipsec_maybe_redirect_to_encrypt(struct __ctx_buff *ctx, __be16 proto,
 	if (!dst || !dst->flag_has_tunnel_ep || !dst->key)
 		return CTX_ACT_OK;
 
-	if (!ipsec_redirect_sec_id_ok(src_sec_identity))
+	if (!encrypt_src_matches_policy(src_sec_identity))
 		return CTX_ACT_OK;
 
 #  if defined(TUNNEL_MODE)
@@ -311,14 +297,14 @@ overlay_encrypt:
 	if (eth_store_daddr(ctx, (const __u8 *)&dst_mac, 0) != 0)
 		return DROP_WRITE_ERROR;
 
-	ret = ctx_redirect(ctx, CILIUM_NET_IFINDEX, BPF_F_INGRESS);
+	ret = ctx_redirect(ctx, CONFIG(cilium_net_ifindex), BPF_F_INGRESS);
 	if (ret != CTX_ACT_REDIRECT)
 		return DROP_INVALID;
 	return ret;
 }
 #else
 static __always_inline int
-do_decrypt(struct __ctx_buff __maybe_unused *ctx, __u16 __maybe_unused proto)
+do_decrypt(struct __ctx_buff __maybe_unused *ctx, __be16 __maybe_unused proto)
 {
 	return CTX_ACT_OK;
 }

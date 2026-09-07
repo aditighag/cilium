@@ -5,18 +5,22 @@ package endpointmanager
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/netip"
 	"sync"
 
 	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/job"
 
 	"github.com/cilium/cilium/api/v1/models"
 	endpointapi "github.com/cilium/cilium/api/v1/server/restapi/endpoint"
 	"github.com/cilium/cilium/pkg/container/set"
 	"github.com/cilium/cilium/pkg/endpoint"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
+	"github.com/cilium/cilium/pkg/endpointstate"
 	"github.com/cilium/cilium/pkg/identity"
+	"github.com/cilium/cilium/pkg/ipcache"
 	cilium_v2a1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/k8s/resource"
@@ -25,6 +29,7 @@ import (
 	monitoragent "github.com/cilium/cilium/pkg/monitor/agent"
 	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
+	"github.com/cilium/cilium/pkg/promise"
 )
 
 // Cell provides the EndpointManager which maintains the collection of locally
@@ -35,13 +40,29 @@ var Cell = cell.Module(
 	"endpoint-manager",
 	"Manages the collection of local endpoints",
 
+	defaultGroup,
+	cell.Invoke(
+		registerNamespaceUpdater,
+		func(ipc *ipcache.IPCache, epMgr EndpointManager, daemonConfig *option.DaemonConfig) {
+			if daemonConfig.PolicyCIDRMatchesPods() {
+				ipc.AddCIDRSelectorAllocator(epMgr)
+			}
+		},
+	),
+)
+
+var TestCell = cell.Module(
+	"test-endpoint-manager",
+	"Manages the collection of local endpoints",
+
+	defaultGroup,
+)
+
+var defaultGroup = cell.Group(
 	cell.Config(defaultEndpointManagerConfig),
 	cell.Provide(newDefaultEndpointManager),
 	cell.Provide(endpoint.NewEndpointBuildQueue),
 	cell.ProvidePrivate(newEndpointSynchronizer),
-	cell.Invoke(
-		registerNamespaceUpdater,
-	),
 )
 
 type EndpointsLookup interface {
@@ -128,11 +149,11 @@ type EndpointManager interface {
 	// Unsubscribe from endpoint events.
 	Unsubscribe(s Subscriber)
 
-	// UpdatePolicyMaps returns a WaitGroup which is signaled upon once all endpoints
-	// have had their PolicyMaps updated against the Endpoint's desired policy state.
-	//
-	// Endpoints will wait on the 'notifyWg' parameter before updating policy maps.
-	UpdatePolicyMaps(ctx context.Context, notifyWg *sync.WaitGroup) *sync.WaitGroup
+	// UpdatePolicyMaps updates policy maps and proxy network policies for all endpoints
+	// against the Endpoint's desired policy state.
+	// Waits for the policy updates to be completed before returning.
+	// Returns an error if the proxy policy update fails, times out, or is cancelled.
+	UpdatePolicyMaps(ctx context.Context) error
 
 	// RegenerateAllEndpoints calls a setState for each endpoint and
 	// regenerates if state transaction is valid. During this process, the endpoint
@@ -145,6 +166,17 @@ type EndpointManager interface {
 	// Returns immediately.
 	TriggerRegenerateAllEndpoints()
 
+	// RegenerateAllForPolicy regenerates all endpoints against the given policy
+	// revision. Each endpoint's regeneration waits for the compute cell to
+	// publish its identity's SelectorPolicy at waitFor before proceeding.
+	// Returns immediately.
+	RegenerateAllForPolicy(waitFor uint64)
+
+	// WaitForEndpointsAtPolicyRev waits for all endpoints which existed at the time
+	// this function is called to be at a given policy revision.
+	// New endpoints appearing while waiting are ignored.
+	WaitForEndpointsAtPolicyRev(ctx context.Context, rev uint64) error
+
 	// OverrideEndpointOpts applies the given options to all endpoints.
 	OverrideEndpointOpts(om option.OptionMap)
 
@@ -156,6 +188,15 @@ type EndpointManager interface {
 	// Endpoints with security IDs in provided set will be regenerated. Otherwise, the endpoint's
 	// policy revision will be bumped to toRev.
 	UpdatePolicy(idsToRegen *set.Set[identity.NumericIdentity], fromRev, toRev uint64)
+
+	// UpdateCIDRLabels triggers identity resolution for all pod endpoints
+	// whose IPs are contained within the given prefix.
+	//
+	// If the prefix represents a single IP address (e.g. /32 or /128), it performs
+	// an optimized O(1) lookup and returns true if a matching local endpoint was found
+	// and had its identity resolution triggered.
+	// Otherwise, it performs a linear O(N) scan over all endpoints and returns false.
+	UpdateCIDRLabels(ctx context.Context, prefix netip.Prefix) bool
 }
 
 // EndpointResourceSynchronizer is an interface which synchronizes CiliumEndpoint
@@ -176,6 +217,7 @@ type endpointManagerParams struct {
 
 	Logger *slog.Logger
 
+	JobGroup        job.Group
 	Lifecycle       cell.Lifecycle
 	Config          EndpointManagerConfig
 	Clientset       client.Clientset
@@ -184,6 +226,8 @@ type endpointManagerParams struct {
 	EPSynchronizer  EndpointResourceSynchronizer
 	LocalNodeStore  *node.LocalNodeStore
 	MonitorAgent    monitoragent.Agent
+
+	EPRestorerPromise promise.Promise[endpointstate.Restorer]
 }
 
 type endpointManagerOut struct {
@@ -210,21 +254,39 @@ func newDefaultEndpointManager(p endpointManagerParams) endpointManagerOut {
 		},
 	})
 
-	if p.Config.EndpointGCInterval > 0 {
-		ctx, cancel := context.WithCancel(context.Background())
-		p.Lifecycle.Append(cell.Hook{
-			OnStart: func(cell.HookContext) error {
-				mgr.WithPeriodicEndpointGC(ctx, checker, p.Config.EndpointGCInterval)
-				mgr.WithPeriodicEndpointRegeneration(ctx, p.Config.EndpointRegenInterval)
-				return nil
-			},
-			OnStop: func(cell.HookContext) error {
-				cancel()
-				mgr.controllers.RemoveAllAndWait()
-				return nil
-			},
-		})
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	p.JobGroup.Add(job.OneShot("init-periodic-endpoint-controllers", func(jobCtx context.Context, health cell.Health) error {
+		p.Logger.Debug("Waiting for endpoint restoration before registering periodic endpoint controllers (GC/regeneration)")
+		epRestorer, err := p.EPRestorerPromise.Await(jobCtx)
+		if err != nil {
+			return fmt.Errorf("failed to wait for endpoint restorer: %w", err)
+		}
+
+		if err := epRestorer.WaitForEndpointRestore(jobCtx); err != nil {
+			return fmt.Errorf("failed to wait for endpoint restoration: %w", err)
+		}
+
+		if p.Config.EndpointGCInterval > 0 {
+			p.Logger.Debug("Registering periodic endpoint GC controller")
+			mgr.WithPeriodicEndpointGC(ctx, checker, p.Config.EndpointGCInterval)
+		}
+
+		if p.Config.EndpointRegenInterval > 0 {
+			p.Logger.Debug("Registering periodic endpoint regeneration controller")
+			mgr.WithPeriodicEndpointRegeneration(ctx, p.Config.EndpointRegenInterval)
+		}
+
+		return nil
+	}, job.WithShutdown()))
+
+	p.Lifecycle.Append(cell.Hook{
+		OnStop: func(cell.HookContext) error {
+			cancel()
+			mgr.controllers.RemoveAllAndWait()
+			return nil
+		},
+	})
 
 	mgr.InitMetrics(p.MetricsRegistry)
 
@@ -242,6 +304,7 @@ type endpointSynchronizerParams struct {
 	Clientset           client.Clientset
 	CiliumEndpoint      resource.Resource[*types.CiliumEndpoint]
 	CiliumEndpointSlice resource.Resource[*cilium_v2a1.CiliumEndpointSlice]
+	LocalNodeStore      *node.LocalNodeStore
 }
 
 func newEndpointSynchronizer(p endpointSynchronizerParams) EndpointResourceSynchronizer {
@@ -249,5 +312,6 @@ func newEndpointSynchronizer(p endpointSynchronizerParams) EndpointResourceSynch
 		Clientset:           p.Clientset,
 		CiliumEndpoint:      p.CiliumEndpoint,
 		CiliumEndpointSlice: p.CiliumEndpointSlice,
+		localNodeStore:      p.LocalNodeStore,
 	}
 }

@@ -32,13 +32,11 @@ Installation
         Cilium BGP Control Plane can be enabled with Helm flag ``bgpControlPlane.enabled``
         set as true.
 
-        .. parsed-literal::
-
-            $ helm upgrade cilium |CHART_RELEASE| \\
-                --namespace kube-system \\
-                --reuse-values \\
-                --set bgpControlPlane.enabled=true
-            $ kubectl -n kube-system rollout restart ds/cilium
+        .. cilium-helm-upgrade::
+           :namespace: kube-system
+           :extra-args: --reuse-values
+           :set: bgpControlPlane.enabled=true
+           :post-commands: kubectl -n kube-system rollout restart ds/cilium
 
   .. group-tab:: Cilium CLI
 
@@ -48,7 +46,7 @@ Installation
 
         .. parsed-literal::
 
-            $ cilium install |CHART_VERSION| --set bgpControlPlane.enabled=true
+            $ cilium install --version |CHART_VERSION| --set bgpControlPlane.enabled=true
 
 IPv4/IPv6 single-stack and dual-stack setup are supported. Note that the BGP
 Control Plane can only advertise the route of the address family that the

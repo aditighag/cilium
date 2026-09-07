@@ -13,7 +13,6 @@ import (
 
 	policyapi "github.com/cilium/cilium/api/v1/server/restapi/policy"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
-	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/endpointstate"
 	"github.com/cilium/cilium/pkg/identity/cache"
 	identitycell "github.com/cilium/cilium/pkg/identity/cache/cell"
@@ -25,6 +24,7 @@ import (
 	ipcachemap "github.com/cilium/cilium/pkg/maps/ipcache"
 	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/option"
+	"github.com/cilium/cilium/pkg/policy"
 	policycell "github.com/cilium/cilium/pkg/policy/cell"
 	"github.com/cilium/cilium/pkg/promise"
 	"github.com/cilium/cilium/pkg/time"
@@ -56,7 +56,17 @@ var Cell = cell.Module(
 		// Register a job to associate default/kubernetes backend IPs with the
 		// 'reserved:kube-apiserver' label.
 		registerAPIServerBackendWatcher,
+
+		// Late-bind IPCache as the policy named-port getter from this cell.
+		// Wiring this through policy/cell would make policy repository
+		// construction depend on IPCache, while IPCache itself depends on the
+		// repository for identity updates.
+		func(ipc *ipcache.IPCache, policyRepo policy.PolicyRepository) {
+			policyRepo.SetNamedPortsGetter(ipc)
+		},
 	),
+
+	cell.Provide(func(ipc *ipcache.IPCache) ipcache.MetadataBatchAPI { return ipc }),
 )
 
 type ipCacheParams struct {
@@ -70,7 +80,6 @@ type ipCacheParams struct {
 	IdentityRestorer       *restoration.LocalIdentityRestorer
 	CacheIdentityAllocator cache.IdentityAllocator
 	IdentityUpdater        policycell.IdentityUpdater
-	EndpointManager        endpointmanager.EndpointManager
 	EndpointRestorePromise promise.Promise[endpointstate.Restorer]
 	CacheStatus            synced.CacheStatus
 }

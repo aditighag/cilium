@@ -18,8 +18,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	policyv1alpha2 "sigs.k8s.io/network-policy-api/apis/v1alpha2"
 
 	flowpb "github.com/cilium/cilium/api/v1/flow"
+	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/cilium-cli/defaults"
 	"github.com/cilium/cilium/cilium-cli/k8s"
 	"github.com/cilium/cilium/cilium-cli/utils/features"
@@ -93,12 +95,69 @@ func getCiliumPolicyRevision(ctx context.Context, pod Pod) (int, error) {
 	return revision, nil
 }
 
-// waitCiliumPolicyRevision waits for a Cilium pod to reach atleast a given policy revision.
+// waitCiliumPolicyRevision waits until every endpoint managed by the given
+// Cilium pod has realized at least the given policy revision.
+//
+// This intentionally does not use "cilium policy wait", which additionally
+// requires every endpoint to be in the Ready state at the same instant. Under
+// concurrent tests (--test-concurrency>1) the shared node's endpoints are
+// continuously regenerated as sibling test namespaces apply their own policies,
+// so that node-wide "all endpoints ready at revision N" condition may never
+// hold within the timeout even though our policy has long been realized
+// everywhere. The realized revision is monotonic, so concurrent churn only
+// pushes it further ahead of our target, never out of reach.
 func waitCiliumPolicyRevision(ctx context.Context, pod Pod, rev int, timeout time.Duration) error {
-	timeoutStr := strconv.Itoa(int(timeout.Seconds()))
-	_, err := pod.K8sClient.ExecInPod(ctx, pod.Pod.Namespace, pod.Pod.Name,
-		defaults.AgentContainerName, []string{"cilium", "policy", "wait", strconv.Itoa(rev), "--max-wait-time", timeoutStr})
-	return err
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var lastErr error
+	for {
+		notReady, err := endpointsBelowPolicyRevision(ctx, pod, rev)
+		if err != nil {
+			lastErr = err
+		} else if notReady == 0 {
+			return nil
+		} else {
+			lastErr = fmt.Errorf("%d endpoints have not yet realized policy revision %d", notReady, rev)
+		}
+
+		select {
+		case <-time.After(defaults.WaitRetryInterval):
+		case <-ctx.Done():
+			return lastErr
+		}
+	}
+}
+
+// endpointsBelowPolicyRevision returns how many endpoints managed by the given
+// Cilium pod have not yet realized the given policy revision.
+func endpointsBelowPolicyRevision(ctx context.Context, pod Pod, rev int) (int, error) {
+	eps, err := pod.K8sClient.CiliumDbgEndpoints(ctx, pod.Pod.Namespace, pod.Pod.Name)
+	if err != nil {
+		return 0, err
+	}
+	return countEndpointsBelowPolicyRevision(eps, rev), nil
+}
+
+// countEndpointsBelowPolicyRevision counts endpoints that have not yet realized
+// the given policy revision. Endpoints without a security identity yet are
+// skipped: they have computed no policy at all, so they enforce no revision we
+// could be waiting on, and once they get an identity regeneration computes
+// policy at the current revision. Endpoints that do have an identity but a
+// missing or older realized revision are counted as not ready.
+func countEndpointsBelowPolicyRevision(eps []*models.Endpoint, rev int) int {
+	notReady := 0
+	for _, ep := range eps {
+		if ep.Status == nil || ep.Status.Identity == nil {
+			continue
+		}
+		if ep.Status.Policy == nil ||
+			ep.Status.Policy.Realized == nil ||
+			ep.Status.Policy.Realized.PolicyRevision < int64(rev) {
+			notReady++
+		}
+	}
+	return notReady
 }
 
 type policy interface {
@@ -248,7 +307,7 @@ var policyApplyDeleteLock = lock.Mutex{}
 // isPolicy returns true if the object is a network policy, and thus
 // should bump the policy revision.
 //
-// This is true if the object is a known policy type (CNP / CCNP / KNP)
+// This is true if the object is a known policy type (CNP / CCNP / KNP / KCNP)
 // or if the object has the annotation cli.cilium.io/bump-policy
 func isPolicy(obj k8s.Object) bool {
 	if _, ok := obj.GetAnnotations()[policyBumpAnnotation]; ok {
@@ -257,6 +316,7 @@ func isPolicy(obj k8s.Object) bool {
 	gk := obj.GetObjectKind().GroupVersionKind().GroupKind()
 	return (gk == schema.GroupKind{Group: ciliumv2.CustomResourceDefinitionGroup, Kind: ciliumv2.CNPKindDefinition} ||
 		gk == schema.GroupKind{Group: ciliumv2.CustomResourceDefinitionGroup, Kind: ciliumv2.CCNPKindDefinition} ||
+		gk == schema.GroupKind{Group: policyv1alpha2.GroupName, Kind: "ClusterNetworkPolicy"} ||
 		gk == schema.GroupKind{Group: networkingv1.GroupName, Kind: "NetworkPolicy"})
 }
 
@@ -425,6 +485,7 @@ func (t *Test) tweakPolicy(in *unstructured.Unstructured) *unstructured.Unstruct
 			t.Fatalf("could not parse CiliumClusterwideNetworkPolicy: %v", err)
 			return nil
 		}
+		ccnp.Namespace = ""
 		configureNamespaceInPolicySpec(ccnp.Spec, t.ctx.params.TestNamespace)
 		tweaked = &ccnp
 	}
@@ -438,6 +499,18 @@ func (t *Test) tweakPolicy(in *unstructured.Unstructured) *unstructured.Unstruct
 		}
 		configureNamespaceInKNP(&knp, t.ctx.params.TestNamespace)
 		tweaked = &knp
+	}
+
+	if group == policyv1alpha2.GroupName && kind == "ClusterNetworkPolicy" {
+		t.WithFeatureRequirements(features.RequireEnabled(features.KCNP))
+		kcnp := policyv1alpha2.ClusterNetworkPolicy{}
+		if err := convertInto(in, &kcnp); err != nil {
+			t.Fatalf("could not parse ClusterNetworkPolicy: %v", err)
+			return nil
+		}
+		kcnp.Namespace = ""
+		configureNamespaceInKCNP(&kcnp, t.ctx.params.TestNamespace)
+		tweaked = &kcnp
 	}
 
 	if tweaked == nil {
@@ -529,6 +602,63 @@ func configureNamespaceInKNP(pol *networkingv1.NetworkPolicy, namespace string) 
 						if n, ok := es.NamespaceSelector.MatchLabels[k]; ok && n == defaults.ConnectivityCheckNamespace {
 							es.NamespaceSelector.MatchLabels[k] = namespace
 						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func configureNamespaceInKCNP(pol *policyv1alpha2.ClusterNetworkPolicy, namespace string) {
+	for _, k := range []string{
+		k8sConst.LabelMetadataName,
+		k8sConst.PodNamespaceLabel,
+		KubernetesSourcedLabelPrefix + k8sConst.PodNamespaceLabel,
+		AnySourceLabelPrefix + k8sConst.PodNamespaceLabel,
+	} {
+		if pol.Spec.Subject.Pods != nil {
+			if n, ok := pol.Spec.Subject.Pods.PodSelector.MatchLabels[k]; ok && n == defaults.ConnectivityCheckNamespace {
+				pol.Spec.Subject.Pods.PodSelector.MatchLabels[k] = namespace
+			}
+			if n, ok := pol.Spec.Subject.Pods.NamespaceSelector.MatchLabels[k]; ok && n == defaults.ConnectivityCheckNamespace {
+				pol.Spec.Subject.Pods.NamespaceSelector.MatchLabels[k] = namespace
+			}
+		}
+		if pol.Spec.Subject.Namespaces != nil {
+			if n, ok := pol.Spec.Subject.Namespaces.MatchLabels[k]; ok && n == defaults.ConnectivityCheckNamespace {
+				pol.Spec.Subject.Namespaces.MatchLabels[k] = namespace
+			}
+		}
+		for _, e := range pol.Spec.Egress {
+			for _, es := range e.To {
+				if es.Pods != nil {
+					if n, ok := es.Pods.PodSelector.MatchLabels[k]; ok && n == defaults.ConnectivityCheckNamespace {
+						es.Pods.PodSelector.MatchLabels[k] = namespace
+					}
+					if n, ok := es.Pods.NamespaceSelector.MatchLabels[k]; ok && n == defaults.ConnectivityCheckNamespace {
+						es.Pods.NamespaceSelector.MatchLabels[k] = namespace
+					}
+				}
+				if es.Namespaces != nil {
+					if n, ok := es.Namespaces.MatchLabels[k]; ok && n == defaults.ConnectivityCheckNamespace {
+						es.Namespaces.MatchLabels[k] = namespace
+					}
+				}
+			}
+		}
+		for _, e := range pol.Spec.Ingress {
+			for _, es := range e.From {
+				if es.Pods != nil {
+					if n, ok := es.Pods.PodSelector.MatchLabels[k]; ok && n == defaults.ConnectivityCheckNamespace {
+						es.Pods.PodSelector.MatchLabels[k] = namespace
+					}
+					if n, ok := es.Pods.NamespaceSelector.MatchLabels[k]; ok && n == defaults.ConnectivityCheckNamespace {
+						es.Pods.NamespaceSelector.MatchLabels[k] = namespace
+					}
+				}
+				if es.Namespaces != nil {
+					if n, ok := es.Namespaces.MatchLabels[k]; ok && n == defaults.ConnectivityCheckNamespace {
+						es.Namespaces.MatchLabels[k] = namespace
 					}
 				}
 			}

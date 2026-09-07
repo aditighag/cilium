@@ -9,8 +9,6 @@ import (
 	"net"
 	"net/netip"
 
-	"github.com/cilium/dns"
-
 	"github.com/cilium/cilium/pkg/endpoint"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/proxy/accesslog"
@@ -24,9 +22,9 @@ type LookupEndpointIDByIPFunc func(ip netip.Addr) (endpoint *endpoint.Endpoint, 
 
 // NotifyOnDNSMsgFunc handles propagating DNS response data
 // See DNSProxy.LookupEndpointIDByIP for usage.
-type NotifyOnDNSMsgFunc func(lookupTime time.Time, ep *endpoint.Endpoint, epIPPort string, serverID identity.NumericIdentity, serverAddr netip.AddrPort, msg *dns.Msg, protocol string, allowed bool, stat *ProxyRequestContext) error
+type NotifyOnDNSMsgFunc func(lookupTime time.Time, ep *endpoint.Endpoint, epIPPort string, serverID identity.NumericIdentity, serverAddr netip.AddrPort, details *MsgDetails, protocol string, allowed bool, stat *ProxyRequestContext) error
 
-// ErrFailedAcquireSemaphore is an an error representing the DNS proxy's
+// ErrFailedAcquireSemaphore is an error representing the DNS proxy's
 // failure to acquire the semaphore. This is error is treated like a timeout.
 type ErrFailedAcquireSemaphore struct {
 	parallel int
@@ -44,7 +42,7 @@ func (e ErrFailedAcquireSemaphore) Error() string {
 	)
 }
 
-// ErrTimedOutAcquireSemaphore is an an error representing the DNS proxy timing
+// ErrTimedOutAcquireSemaphore is an error representing the DNS proxy timing
 // out when acquiring the semaphore. It is treated the same as
 // ErrTimedOutAcquireSemaphore.
 type ErrTimedOutAcquireSemaphore struct {
@@ -90,8 +88,7 @@ type ProxyRequestContext struct {
 
 // IsTimeout return true if the ProxyRequest timeout
 func (proxyStat *ProxyRequestContext) IsTimeout() bool {
-	var neterr net.Error
-	if errors.As(proxyStat.Err, &neterr) {
+	if neterr, ok := errors.AsType[net.Error](proxyStat.Err); ok {
 		return neterr.Timeout()
 	}
 	return false

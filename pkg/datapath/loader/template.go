@@ -8,7 +8,7 @@ import (
 	"math"
 	"net/netip"
 
-	datapath "github.com/cilium/cilium/pkg/datapath/types"
+	eptypes "github.com/cilium/cilium/pkg/endpoint/types"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/mac"
 )
@@ -25,7 +25,7 @@ var (
 	templateIPv4 = [4]byte{192, 0, 2, 3}
 	templateIPv6 = [16]byte{0x20, 0x01, 0xdb, 0x8, 0x0b, 0xad, 0xca, 0xfe, 0x60, 0x0d, 0xbe, 0xe2, 0x0b, 0xad, 0xca, 0xfe}
 
-	templateMAC = mac.MAC([]byte{0x02, 0x00, 0x60, 0x0D, 0xF0, 0x0D})
+	templateMAC = mac.MAC{0x02, 0x00, 0x60, 0x0D, 0xF0, 0x0D}
 )
 
 // templateCfg wraps a real configuration from an endpoint to pass through its
@@ -46,7 +46,7 @@ type templateCfg struct {
 	// CompileTimeConfiguration passes through directly to the underlying
 	// endpoint configuration, while the rest of the EndpointConfiguration
 	// interface is implemented directly here through receiver functions.
-	datapath.CompileTimeConfiguration
+	eptypes.CompileTimeConfig
 }
 
 // GetID returns a uint64, but in practice on the datapath side it is
@@ -109,16 +109,24 @@ func (t *templateCfg) GetPolicyVerdictLogFilter() uint32 {
 	return templatePolicyVerdictFilter
 }
 
+func (*templateCfg) GetRTInfo() (uint32, eptypes.RTInfoEncoding) {
+	return 0, eptypes.RTInfoNone
+}
+
 func (*templateCfg) GetPropertyValue(key string) any {
 	return nil
+}
+
+func (*templateCfg) RequireARPPassthrough() bool {
+	return false
 }
 
 // wrap takes an endpoint configuration and optional stats tracker and wraps
 // it inside a templateCfg which hides static data from callers that wish to
 // generate header files based on the configuration, substituting it for
 // template data.
-func wrap(cfg datapath.CompileTimeConfiguration) *templateCfg {
+func wrap(cfg eptypes.CompileTimeConfig) *templateCfg {
 	return &templateCfg{
-		CompileTimeConfiguration: cfg,
+		CompileTimeConfig: cfg,
 	}
 }

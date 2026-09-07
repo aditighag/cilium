@@ -6,6 +6,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -16,16 +17,26 @@ import (
 	cilium "github.com/cilium/proxy/go/cilium/api"
 	envoy_config_core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	envoy_config_route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	envoy_service_discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	envoy_type_matcher "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/encoding/prototext"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 	"k8s.io/utils/ptr"
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/common"
 	"github.com/cilium/cilium/pkg/endpoint"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
+	endpointtypes "github.com/cilium/cilium/pkg/endpoint/types"
+	"github.com/cilium/cilium/pkg/envoy"
+	envoyutil "github.com/cilium/cilium/pkg/envoy/util"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/labels"
+	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy/api"
 	"github.com/cilium/cilium/pkg/testutils"
 )
@@ -169,9 +180,88 @@ var (
 // getXDSNetworkPolicies returns the representation of the xDS network policies
 // as a map of IP addresses to NetworkPolicy objects
 func (ds *DaemonSuite) getXDSNetworkPolicies(t *testing.T, resourceNames []string) map[string]*cilium.NetworkPolicy {
-	networkPolicies, err := ds.envoyXdsServer.GetNetworkPolicies(resourceNames)
-	require.NoError(t, err)
-	return networkPolicies
+	socketPath := filepath.Join(envoyutil.GetSocketDir(option.Config.RunDir), "xds.sock")
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	var lastErr error
+	for ctx.Err() == nil {
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, time.Second)
+		networkPolicies, err := func() (map[string]*cilium.NetworkPolicy, error) {
+			conn, err := grpc.DialContext(attemptCtx, "passthrough:///xds",
+				grpc.WithBlock(),
+				grpc.WithTransportCredentials(insecure.NewCredentials()),
+				grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+					var d net.Dialer
+					return d.DialContext(ctx, "unix", socketPath)
+				}))
+			if err != nil {
+				return nil, err
+			}
+			defer conn.Close()
+
+			stream, err := cilium.NewNetworkPolicyDiscoveryServiceClient(conn).StreamNetworkPolicies(attemptCtx)
+			if err != nil {
+				return nil, err
+			}
+			defer stream.CloseSend()
+
+			err = stream.Send(&envoy_service_discovery.DiscoveryRequest{
+				TypeUrl:       envoy.NetworkPolicyTypeURL,
+				ResourceNames: resourceNames,
+				Node: &envoy_config_core.Node{
+					Id: "host~127.0.0.1~no-id~localdomain",
+				},
+			})
+			if err != nil {
+				return nil, err
+			}
+
+			resp, err := stream.Recv()
+			if err != nil {
+				return nil, err
+			}
+
+			networkPolicies := make(map[string]*cilium.NetworkPolicy, len(resp.Resources))
+			for _, anyResource := range resp.Resources {
+				networkPolicy := &cilium.NetworkPolicy{}
+				err = anypb.UnmarshalTo(anyResource, networkPolicy, proto.UnmarshalOptions{})
+				if err != nil {
+					return nil, err
+				}
+				for _, ip := range networkPolicy.EndpointIps {
+					networkPolicies[ip] = networkPolicy
+				}
+			}
+			return networkPolicies, nil
+		}()
+		attemptCancel()
+		if err == nil {
+			return networkPolicies
+		}
+		lastErr = err
+
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+		case <-timer.C:
+		}
+	}
+
+	require.NoError(t, lastErr)
+	return nil
+}
+
+func logNetworkPolicy(t *testing.T, title string, policy *cilium.NetworkPolicy) {
+	t.Helper()
+
+	if policy == nil {
+		t.Logf("%s: <nil>", title)
+		return
+	}
+
+	t.Logf("%s:\n%s", title, prototext.Format(policy))
 }
 
 func prepareEndpointDirs() (cleanup func(), err error) {
@@ -206,14 +296,14 @@ func (ds *DaemonSuite) prepareEndpoint(t *testing.T, identity *identity.Identity
 		ID:    int64(testEndpointID),
 		State: ptr.To(models.EndpointState(endpoint.StateWaitingForIdentity)),
 	}
-	e, err := ds.endpointCreator.NewEndpointFromChangeModel(t.Context(), model)
+	e, err := ds.endpointCreator.NewEndpointFromChangeModel(model)
 	require.NoError(t, err)
 
 	e.Start(testEndpointID)
 	t.Cleanup(e.Stop)
 
-	e.SetPropertyValue(endpoint.PropertyWithouteBPFDatapath, true)
-	e.SetPropertyValue(endpoint.PropertySkipBPFPolicy, true)
+	e.SetPropertyValue(endpointtypes.PropertyWithouteBPFDatapath, true)
+	e.SetPropertyValue(endpointtypes.PropertySkipBPFPolicy, true)
 	if qa {
 		e.IPv6 = QAIPv6Addr
 		e.IPv4 = QAIPv4Addr
@@ -311,13 +401,14 @@ func (ds *DaemonSuite) testUpdateConsumerMap(t *testing.T) {
 	require.False(t, eQABar.Allows(qaBarSecLblsCtx.ID))
 	require.False(t, eQABar.Allows(prodBarSecLblsCtx.ID))
 	require.True(t, eQABar.Allows(qaFooSecLblsCtx.ID))
-	require.False(t, eQABar.Allows(prodFooSecLblsCtx.ID))
+	require.True(t, eQABar.Allows(prodFooSecLblsCtx.ID))
+	require.True(t, eQABar.Allows(prodFooJoeSecLblsCtx.ID))
 
 	eProdBar := ds.prepareEndpoint(t, prodBarSecLblsCtx, false)
 	require.False(t, eProdBar.Allows(0))
 	require.False(t, eProdBar.Allows(qaBarSecLblsCtx.ID))
 	require.False(t, eProdBar.Allows(prodBarSecLblsCtx.ID))
-	require.False(t, eProdBar.Allows(qaFooSecLblsCtx.ID))
+	require.True(t, eProdBar.Allows(qaFooSecLblsCtx.ID))
 	require.True(t, eProdBar.Allows(prodFooSecLblsCtx.ID))
 	require.True(t, eProdBar.Allows(prodFooJoeSecLblsCtx.ID))
 
@@ -330,16 +421,13 @@ func (ds *DaemonSuite) testUpdateConsumerMap(t *testing.T) {
 	require.NotNil(t, qaBarNetworkPolicy)
 	expectedRemotePolicies := []uint32{
 		uint32(qaFooSecLblsCtx.ID),
-		// The prodFoo* identities are allowed by FromEndpoints but rejected by
-		// FromRequires, so they are not included in the remote policies:
-		// uint32(prodFooSecLblsCtx.ID),
-		// uint32(prodFooJoeSecLblsCtx.ID),
+		uint32(prodFooSecLblsCtx.ID),
+		uint32(prodFooJoeSecLblsCtx.ID),
 	}
 	slices.Sort(expectedRemotePolicies)
 	expectedNetworkPolicy := &cilium.NetworkPolicy{
-		EndpointIps:      []string{QAIPv6Addr.String(), QAIPv4Addr.String()},
-		EndpointId:       uint64(eQABar.ID),
-		ConntrackMapName: "global",
+		EndpointIps: []string{QAIPv6Addr.String(), QAIPv4Addr.String()},
+		EndpointId:  uint64(eQABar.ID),
 		IngressPerPortPolicies: []*cilium.PortNetworkPolicy{
 			{
 				Port:     0,
@@ -347,6 +435,7 @@ func (ds *DaemonSuite) testUpdateConsumerMap(t *testing.T) {
 				Rules: []*cilium.PortNetworkPolicyRule{
 					{
 						RemotePolicies: expectedRemotePolicies,
+						Precedence:     4294967041,
 					},
 				},
 			},
@@ -357,6 +446,7 @@ func (ds *DaemonSuite) testUpdateConsumerMap(t *testing.T) {
 					{
 						RemotePolicies: expectedRemotePolicies,
 						L7:             &PNPAllowGETbar,
+						Precedence:     4294967194,
 					},
 				},
 			},
@@ -371,18 +461,15 @@ func (ds *DaemonSuite) testUpdateConsumerMap(t *testing.T) {
 	prodBarNetworkPolicy := networkPolicies[ProdIPv4Addr.String()]
 	require.NotNil(t, prodBarNetworkPolicy)
 	expectedRemotePolicies = []uint32{
-		// The qaFoo identity is allowed by FromEndpoints but rejected by
-		// FromRequires, so it is not included in the remote policies:
-		// uint64(qaFooSecLblsCtx.ID),
+		uint32(qaFooSecLblsCtx.ID),
 		uint32(prodFooSecLblsCtx.ID),
 		uint32(prodFooJoeSecLblsCtx.ID),
 	}
 	slices.Sort(expectedRemotePolicies)
 
 	expectedNetworkPolicy = &cilium.NetworkPolicy{
-		EndpointIps:      []string{ProdIPv6Addr.String(), ProdIPv4Addr.String()},
-		EndpointId:       uint64(eProdBar.ID),
-		ConntrackMapName: "global",
+		EndpointIps: []string{ProdIPv6Addr.String(), ProdIPv4Addr.String()},
+		EndpointId:  uint64(eProdBar.ID),
 		IngressPerPortPolicies: []*cilium.PortNetworkPolicy{
 			{
 				Port:     0,
@@ -390,6 +477,7 @@ func (ds *DaemonSuite) testUpdateConsumerMap(t *testing.T) {
 				Rules: []*cilium.PortNetworkPolicyRule{
 					{
 						RemotePolicies: expectedRemotePolicies,
+						Precedence:     4294967041,
 					},
 				},
 			},
@@ -400,6 +488,7 @@ func (ds *DaemonSuite) testUpdateConsumerMap(t *testing.T) {
 					{
 						RemotePolicies: expectedRemotePolicies,
 						L7:             &PNPAllowGETbar,
+						Precedence:     4294967194,
 					},
 				},
 			},
@@ -476,18 +565,20 @@ func (ds *DaemonSuite) testL4L7Shadowing(t *testing.T) {
 
 	qaBarNetworkPolicy := networkPolicies[QAIPv4Addr.String()]
 	expectedNetworkPolicy := &cilium.NetworkPolicy{
-		EndpointIps:      []string{QAIPv6Addr.String(), QAIPv4Addr.String()},
-		EndpointId:       uint64(eQABar.ID),
-		ConntrackMapName: "global",
+		EndpointIps: []string{QAIPv6Addr.String(), QAIPv4Addr.String()},
+		EndpointId:  uint64(eQABar.ID),
 		IngressPerPortPolicies: []*cilium.PortNetworkPolicy{
 			{
 				Port:     80,
 				Protocol: envoy_config_core.SocketAddress_TCP,
 				Rules: []*cilium.PortNetworkPolicyRule{
-					{},
 					{
 						RemotePolicies: []uint32{uint32(qaFooSecLblsCtx.ID)},
 						L7:             &PNPAllowGETbarLog,
+						Precedence:     4294967194,
+					},
+					{
+						Precedence: 4294967041,
 					},
 				},
 			},
@@ -567,14 +658,22 @@ func (ds *DaemonSuite) testL4L7ShadowingShortCircuit(t *testing.T) {
 
 	qaBarNetworkPolicy := networkPolicies[QAIPv4Addr.String()]
 	expectedNetworkPolicy := &cilium.NetworkPolicy{
-		EndpointIps:      []string{QAIPv6Addr.String(), QAIPv4Addr.String()},
-		EndpointId:       uint64(eQABar.ID),
-		ConntrackMapName: "global",
+		EndpointIps: []string{QAIPv6Addr.String(), QAIPv4Addr.String()},
+		EndpointId:  uint64(eQABar.ID),
 		IngressPerPortPolicies: []*cilium.PortNetworkPolicy{
 			{
 				Port:     80,
 				Protocol: envoy_config_core.SocketAddress_TCP,
-				Rules:    nil,
+				Rules: []*cilium.PortNetworkPolicyRule{
+					{
+						RemotePolicies: []uint32{uint32(qaFooSecLblsCtx.ID)},
+						L7:             &PNPAllowGETbar,
+						Precedence:     4294967194,
+					},
+					{
+						Precedence: 4294967041,
+					},
+				},
 			},
 		},
 		EgressPerPortPolicies: []*cilium.PortNetworkPolicy{ // Allow-all policy.
@@ -660,9 +759,8 @@ func (ds *DaemonSuite) testL3DependentL7(t *testing.T) {
 
 	qaBarNetworkPolicy := networkPolicies[QAIPv4Addr.String()]
 	expectedNetworkPolicy := &cilium.NetworkPolicy{
-		EndpointIps:      []string{QAIPv6Addr.String(), QAIPv4Addr.String()},
-		EndpointId:       uint64(eQABar.ID),
-		ConntrackMapName: "global",
+		EndpointIps: []string{QAIPv6Addr.String(), QAIPv4Addr.String()},
+		EndpointId:  uint64(eQABar.ID),
 		IngressPerPortPolicies: []*cilium.PortNetworkPolicy{
 			{
 				Port:     0,
@@ -670,6 +768,7 @@ func (ds *DaemonSuite) testL3DependentL7(t *testing.T) {
 				Rules: []*cilium.PortNetworkPolicyRule{
 					{
 						RemotePolicies: []uint32{uint32(qaJoeSecLblsCtx.ID)},
+						Precedence:     4294967041,
 					},
 				},
 			},
@@ -680,6 +779,7 @@ func (ds *DaemonSuite) testL3DependentL7(t *testing.T) {
 					{
 						RemotePolicies: []uint32{uint32(qaFooSecLblsCtx.ID)},
 						L7:             &PNPAllowGETbar,
+						Precedence:     4294967194,
 					},
 				},
 			},
@@ -753,6 +853,7 @@ func (ds *DaemonSuite) testRemovePolicy(t *testing.T) {
 	require.NotNil(t, qaBarNetworkPolicy)
 
 	// Delete the endpoint.
+	e.SetPropertyValue(endpointtypes.PropertyFakeEndpoint, true) // prevent panic during e.Delete
 	e.Delete(endpoint.DeleteConfig{})
 
 	// Check that the policy has been removed from the xDS cache.
@@ -845,11 +946,14 @@ func (ds *DaemonSuite) testIncrementalPolicy(t *testing.T) {
 		qaBarNetworkPolicy = networkPolicies[QAIPv4Addr.String()]
 		return qaBarNetworkPolicy != nil && len(qaBarNetworkPolicy.IngressPerPortPolicies) == 2
 	}, time.Second*1)
+	if err != nil {
+		networkPolicies = ds.getXDSNetworkPolicies(t, nil)
+		logNetworkPolicy(t, "Timed out waiting for incremental projected NPDS policy", networkPolicies[QAIPv4Addr.String()])
+	}
 	require.NoError(t, err)
 	require.EqualExportedValues(t, &cilium.NetworkPolicy{
-		EndpointIps:      []string{QAIPv6Addr.String(), QAIPv4Addr.String()},
-		EndpointId:       uint64(eQABar.ID),
-		ConntrackMapName: "global",
+		EndpointIps: []string{QAIPv6Addr.String(), QAIPv4Addr.String()},
+		EndpointId:  uint64(eQABar.ID),
 		IngressPerPortPolicies: []*cilium.PortNetworkPolicy{
 			{
 				Port:     0,
@@ -857,6 +961,7 @@ func (ds *DaemonSuite) testIncrementalPolicy(t *testing.T) {
 				Rules: []*cilium.PortNetworkPolicyRule{
 					{
 						RemotePolicies: []uint32{uint32(qaFooID.ID)},
+						Precedence:     4294967041,
 					},
 				},
 			},
@@ -867,6 +972,7 @@ func (ds *DaemonSuite) testIncrementalPolicy(t *testing.T) {
 					{
 						RemotePolicies: []uint32{uint32(qaFooID.ID)},
 						L7:             &PNPAllowGETbar,
+						Precedence:     4294967194,
 					},
 				},
 			},
@@ -877,6 +983,7 @@ func (ds *DaemonSuite) testIncrementalPolicy(t *testing.T) {
 	}, qaBarNetworkPolicy)
 
 	// Delete the endpoint.
+	eQABar.SetPropertyValue(endpointtypes.PropertyFakeEndpoint, true) // prevent panic during e.Delete
 	eQABar.Delete(endpoint.DeleteConfig{})
 
 	// Check that the policy has been removed from the xDS cache.

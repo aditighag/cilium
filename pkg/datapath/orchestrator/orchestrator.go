@@ -16,12 +16,23 @@ import (
 	"github.com/cilium/stream"
 	"github.com/spf13/pflag"
 
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
+	"github.com/cilium/cilium/pkg/datapath/config"
+	"github.com/cilium/cilium/pkg/datapath/connector"
+	"github.com/cilium/cilium/pkg/datapath/iptables"
+	"github.com/cilium/cilium/pkg/datapath/linux/bigtcp"
+	"github.com/cilium/cilium/pkg/datapath/linux/device"
+	ipsec "github.com/cilium/cilium/pkg/datapath/linux/ipsec/types"
+	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
 	"github.com/cilium/cilium/pkg/datapath/loader/metrics"
+	loader "github.com/cilium/cilium/pkg/datapath/loader/types"
+	plugin "github.com/cilium/cilium/pkg/datapath/plugins/types"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
-	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/datapath/xdp"
+	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
+	endpoint "github.com/cilium/cilium/pkg/endpoint/types"
 	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/kpr"
 	"github.com/cilium/cilium/pkg/loadbalancer"
@@ -76,7 +87,7 @@ type orchestrator struct {
 	initDone              bool
 	dpInitialized         chan struct{}
 	trigger               chan reinitializeRequest
-	latestLocalNodeConfig atomic.Pointer[datapath.LocalNodeConfiguration]
+	latestLocalNodeConfig atomic.Pointer[config.Config]
 }
 
 type reinitializeRequest struct {
@@ -89,15 +100,17 @@ type orchestratorParams struct {
 
 	Config              Config
 	Log                 *slog.Logger
-	Loader              datapath.Loader
+	Loader              loader.Loader
+	ClusterInfo         cmtypes.ClusterInfo
 	TunnelConfig        tunnel.Config
 	OldMTU              mtu.MTU
 	MTU                 statedb.Table[mtu.RouteMTU]
-	IPTablesManager     datapath.IptablesManager
+	IPTablesManager     iptables.Manager
 	Proxy               *proxy.Proxy
 	DB                  *statedb.DB
 	Devices             statedb.Table[*tables.Device]
 	NodeAddresses       statedb.Table[tables.NodeAddress]
+	Sysctl              sysctl.Sysctl
 	DirectRoutingDevice tables.DirectRoutingDevice
 	LocalNodeStore      *node.LocalNodeStore
 	NodeDiscovery       *nodediscovery.NodeDiscovery
@@ -110,8 +123,11 @@ type orchestratorParams struct {
 	KPRConfig           kpr.KPRConfig
 	SvcRouteConfig      svcrouteconfig.RoutesConfig
 	MaglevConfig        maglev.Config
-	WgAgent             wgTypes.WireguardAgent
-	IPsecConfig         datapath.IPsecConfig
+	WgAgent             wgTypes.Agent
+	IPsecConfig         ipsec.Config
+	BIGTCPConfig        bigtcp.Config
+	ConnectorConfig     connector.Config
+	PluginRegistry      plugin.Registry
 }
 
 func newOrchestrator(params orchestratorParams) *orchestrator {
@@ -125,7 +141,7 @@ func newOrchestrator(params orchestratorParams) *orchestrator {
 		OnStart: func(ctx cell.HookContext) error {
 			for {
 				rxt := params.DB.ReadTxn()
-				mtuRoute, _, watch, found := params.MTU.GetWatch(rxt, mtu.MTURouteIndex.Query(mtu.DefaultPrefixV4))
+				mtuRoute, _, watch, found := params.MTU.GetWatch(rxt, mtu.MTURouteByPrefix(mtu.DefaultPrefixV4))
 				if !found {
 					select {
 					case <-ctx.Done():
@@ -167,15 +183,15 @@ func (o *orchestrator) reconciler(ctx context.Context, health cell.Health) error
 		stream.Filter(o.params.LocalNodeStore,
 			func(n node.LocalNode) bool {
 				if agentConfig.EnableIPv4 {
-					loopback := n.Local.ServiceLoopbackIPv4 != nil
+					loopback := n.Local.ServiceLoopbackIPv4.IsValid()
 					ipv4GW := n.GetCiliumInternalIP(false) != nil
-					ipv4Range := n.IPv4AllocCIDR != nil
+					ipv4Range := n.IPv4AllocCIDR.IsValid()
 					if !ipv4GW || !ipv4Range || !loopback {
 						return false
 					}
 				}
 				if agentConfig.EnableIPv6 {
-					loopback := n.Local.ServiceLoopbackIPv6 != nil
+					loopback := n.Local.ServiceLoopbackIPv6.IsValid()
 					ipv6GW := n.GetCiliumInternalIP(true) != nil
 					if !ipv6GW || !loopback {
 						return false
@@ -189,61 +205,95 @@ func (o *orchestrator) reconciler(ctx context.Context, health cell.Health) error
 		return nil
 	}
 
+	health.OK("Waiting for plugin registry")
+	if err := o.params.PluginRegistry.Sync(ctx); err != nil {
+		return fmt.Errorf("waiting for plugin registry: %w", err)
+	}
+
 	health.OK("Initializing")
 	limiter := rate.NewLimiter(minReinitInterval, 1)
+	if err := o.waitForHostDevices(ctx, health, limiter); err != nil {
+		return err
+	}
+
 	var (
-		request   reinitializeRequest
+		request   = reinitializeRequest{ctx: ctx}
 		retryChan <-chan time.Time
 	)
 	for {
-		localNodeConfig, localNodeConfigWatch, err := newLocalNodeConfig(
-			ctx,
-			option.Config,
-			localNode,
-			o.params.DB.ReadTxn(),
-			o.params.DirectRoutingDevice,
-			o.params.Devices,
-			o.params.NodeAddresses,
-			o.params.Config.DeriveMasqIPAddrFromDevice,
-			o.params.XDPConfig,
-			o.params.LBConfig,
-			o.params.KPRConfig,
-			o.params.SvcRouteConfig,
-			o.params.MaglevConfig,
-			o.params.MTU,
-			o.params.WgAgent,
-			o.params.IPsecConfig,
+		var (
+			localNodeConfig      config.Config
+			localNodeConfigWatch <-chan struct{}
 		)
+
+		// Re-run this on every reconciliation to update the tunnel MTU or
+		// recreate IPIP devices if they disappear.
+		ipipWatch, err := o.ensureIPIPDevices(agentConfig)
 		if err != nil {
-			health.Degraded("failed to get local node configuration", err)
-		}
-
-		// Reinitializeing is expensive, only do so if the configuration has changed.
-		prevConfig := o.latestLocalNodeConfig.Load()
-		if prevConfig == nil || !prevConfig.DeepEqual(&localNodeConfig) {
-			if err := o.reinitialize(ctx, request, &localNodeConfig); err != nil {
-				o.params.Log.Warn("Failed to initialize datapath, retrying later",
-					logfields.Error, err,
-					logfields.RetryDelay, reinitRetryDuration,
-				)
-				health.Degraded("Failed to reinitialize datapath", err)
-				retryChan = time.After(reinitRetryDuration)
-			} else {
-				retryChan = nil
-				health.OK("OK")
-			}
+			o.params.Log.Warn("Failed to ensure IPIP devices, retrying later",
+				logfields.Error, err,
+				logfields.RetryDelay, reinitRetryDuration,
+			)
+			health.Degraded("Failed to ensure IPIP devices", err)
+			retryChan = time.After(reinitRetryDuration)
 		} else {
-			// We don't need to reinitialize, but we still need to unblock the requestor if there is one.
-			if request.errChan != nil {
-				close(request.errChan)
+			localNodeConfig, localNodeConfigWatch, err = newLocalNodeConfig(
+				ctx,
+				option.Config,
+				localNode,
+				o.params.Sysctl,
+				o.params.ClusterInfo,
+				o.params.TunnelConfig,
+				o.params.DB.ReadTxn(),
+				o.params.DirectRoutingDevice,
+				o.params.Devices,
+				o.params.NodeAddresses,
+				o.params.Config.DeriveMasqIPAddrFromDevice,
+				o.params.XDPConfig,
+				o.params.LBConfig,
+				o.params.KPRConfig,
+				o.params.SvcRouteConfig,
+				o.params.MaglevConfig,
+				o.params.MTU,
+				o.params.WgAgent,
+				o.params.IPsecConfig,
+				o.params.ConnectorConfig,
+				o.params.PluginRegistry.Plugins(),
+			)
+			if err != nil {
+				health.Degraded("failed to get local node configuration", err)
+				o.params.Log.Warn("Failed to construct local node configuration", logfields.Error, err)
+			} else {
+				// Reinitializing is expensive, only do so if the configuration has changed.
+				prevConfig := o.latestLocalNodeConfig.Load()
+				if prevConfig == nil || !prevConfig.DeepEqual(&localNodeConfig) {
+					err = o.reinitialize(request.ctx, &localNodeConfig)
+					if err != nil {
+						o.params.Log.Warn("Failed to initialize datapath, retrying later",
+							logfields.Error, err,
+							logfields.RetryDelay, reinitRetryDuration,
+						)
+						health.Degraded("Failed to reinitialize datapath", err)
+						retryChan = time.After(reinitRetryDuration)
+					}
+				}
+				if err == nil {
+					retryChan = nil
+					health.OK("OK")
+				}
 			}
 		}
 
-		request = reinitializeRequest{}
+		if request.errChan != nil {
+			request.errChan <- err
+			close(request.errChan)
+		}
+		request = reinitializeRequest{ctx: ctx}
 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-ipipWatch:
 		case <-localNodeConfigWatch:
 		case <-retryChan:
 		case localNode = <-localNodes:
@@ -258,10 +308,65 @@ func (o *orchestrator) reconciler(ctx context.Context, health cell.Health) error
 	}
 }
 
+// waitForHostDevices blocks until cilium_host and cilium_net are present in the devices table.
+func (o *orchestrator) waitForHostDevices(ctx context.Context, health cell.Health, limiter *rate.Limiter) error {
+	// Avoid a startup race with the devices controller.
+	health.OK("Waiting for host devices")
+	for {
+		rxt := o.params.DB.ReadTxn()
+		_, _, hostWatch, hostOK := o.params.Devices.GetWatch(rxt, tables.DeviceByName(defaults.HostDevice))
+		_, _, netWatch, netOK := o.params.Devices.GetWatch(rxt, tables.DeviceByName(defaults.SecondHostDevice))
+		if hostOK && netOK {
+			return nil
+		}
+		if hostWatch == nil && netWatch == nil {
+			if err := limiter.Wait(ctx); err != nil {
+				return err
+			}
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-hostWatch:
+		case <-netWatch:
+		}
+	}
+}
+
+func (o *orchestrator) ensureIPIPDevices(agentConfig *option.DaemonConfig) (<-chan struct{}, error) {
+	if !agentConfig.UnsafeDaemonConfigOption.EnableIPIPDevices {
+		return nil, nil
+	}
+
+	mtuRoute, _, mtuWatch, found := o.params.MTU.GetWatch(
+		o.params.DB.ReadTxn(),
+		mtu.MTURouteByPrefix(mtu.DefaultPrefixV4),
+	)
+	if !found {
+		return mtuWatch, fmt.Errorf("default route MTU is not available")
+	}
+
+	err := device.SetupIPIPDevices(
+		o.params.Log,
+		o.params.Sysctl,
+		agentConfig.IPv4Enabled(),
+		agentConfig.IPv6Enabled(),
+		mtuRoute.DeviceMTU,
+	)
+	if err != nil {
+		return mtuWatch, fmt.Errorf("reconciling IPIP devices: %w", err)
+	}
+	return mtuWatch, nil
+}
+
 func (o *orchestrator) DatapathInitialized() <-chan struct{} {
 	return o.dpInitialized
 }
 
+// Reinitialize makes one attempt to reinitialize the datapath. If that attempt
+// is usuccessful, it returns the error that occurred but the orchestrator will
+// continue to attempt datapath (re)initiailization until it is successful.
 func (o *orchestrator) Reinitialize(ctx context.Context) error {
 	errChan := make(chan error)
 	o.trigger <- reinitializeRequest{
@@ -271,26 +376,19 @@ func (o *orchestrator) Reinitialize(ctx context.Context) error {
 	return <-errChan
 }
 
-func (o *orchestrator) reinitialize(ctx context.Context, req reinitializeRequest, localNodeConfig *datapath.LocalNodeConfiguration) error {
-	if req.ctx != nil {
-		ctx = req.ctx
-	}
-
+func (o *orchestrator) reinitialize(ctx context.Context, localNodeConfig *config.Config) error {
 	err := o.params.Loader.Reinitialize(
 		ctx,
 		localNodeConfig,
 		o.params.TunnelConfig,
 		o.params.IPTablesManager,
 		o.params.Proxy,
+		o.params.BIGTCPConfig,
 	)
+	if err == nil {
+		err = o.params.ConnectorConfig.Reinitialize()
+	}
 	if err != nil {
-		if req.errChan != nil {
-			select {
-			case req.errChan <- err:
-			default:
-			}
-			close(req.errChan)
-		}
 		return err
 	}
 
@@ -309,7 +407,8 @@ func (o *orchestrator) reinitialize(ctx context.Context, req reinitializeRequest
 	// the devices and addresses. It's guaranteed that it will use a LoaderContext
 	// equal to or newer than what we saw here.
 	regenRequest := &regeneration.ExternalRegenerationMetadata{
-		Reason:            "Configuration or devices changed",
+		Reason:            regeneration.ReasonDeviceConfigurationChanged,
+		Message:           "Configuration or devices changed",
 		RegenerationLevel: regeneration.RegenerateWithDatapath,
 		ParentContext:     ctx,
 	}
@@ -317,7 +416,7 @@ func (o *orchestrator) reinitialize(ctx context.Context, req reinitializeRequest
 	return nil
 }
 
-func (o *orchestrator) ReloadDatapath(ctx context.Context, ep datapath.Endpoint, stats *metrics.SpanStat) (string, error) {
+func (o *orchestrator) ReloadDatapath(ctx context.Context, ep endpoint.Endpoint, stats *metrics.SpanStat) (string, error) {
 	select {
 	case <-o.dpInitialized:
 	case <-ctx.Done():
@@ -327,17 +426,17 @@ func (o *orchestrator) ReloadDatapath(ctx context.Context, ep datapath.Endpoint,
 	return o.params.Loader.ReloadDatapath(ctx, ep, o.latestLocalNodeConfig.Load(), stats)
 }
 
-func (o *orchestrator) EndpointHash(cfg datapath.EndpointConfiguration) (string, error) {
+func (o *orchestrator) EndpointHash(cfg endpoint.Config) (string, error) {
 	<-o.dpInitialized
 	return o.params.Loader.EndpointHash(cfg, o.latestLocalNodeConfig.Load())
 }
 
-func (o *orchestrator) Unload(ep datapath.Endpoint) {
+func (o *orchestrator) Unload(ep endpoint.Endpoint) {
 	<-o.dpInitialized
 	o.params.Loader.Unload(ep)
 }
 
-func (o *orchestrator) WriteEndpointConfig(w io.Writer, cfg datapath.EndpointConfiguration) error {
+func (o *orchestrator) WriteEndpointConfig(w io.Writer, cfg endpoint.Config) error {
 	<-o.dpInitialized
-	return o.params.Loader.WriteEndpointConfig(w, cfg, o.latestLocalNodeConfig.Load())
+	return o.params.Loader.WriteEndpointConfig(w, cfg)
 }

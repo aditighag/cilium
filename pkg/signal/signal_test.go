@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -14,7 +15,6 @@ import (
 	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/require"
 
-	"github.com/cilium/cilium/pkg/byteorder"
 	"github.com/cilium/cilium/pkg/logging"
 	fakesignalmap "github.com/cilium/cilium/pkg/maps/signalmap/fake"
 )
@@ -54,7 +54,7 @@ func (r *testReader) Close() error {
 
 func TestSignalSet(t *testing.T) {
 	buf := new(bytes.Buffer)
-	binary.Write(buf, byteorder.Native, SignalNatFillUp)
+	binary.Write(buf, binary.NativeEndian, SignalNatFillUp)
 
 	events := &testReader{cpu: 1, data: buf.Bytes()}
 	sm := &signalManager{events: events}
@@ -160,16 +160,16 @@ func (d SignalData) String() string {
 }
 
 func TestLifeCycle(t *testing.T) {
-	logging.SetLogLevelToDebug()
+	logging.SetLogLevel(slog.LevelDebug)
 	logger := hivetest.Logger(t)
 
 	buf1 := new(bytes.Buffer)
-	binary.Write(buf1, byteorder.Native, SignalNatFillUp)
-	binary.Write(buf1, byteorder.Native, SignalProtoV4)
+	binary.Write(buf1, binary.NativeEndian, SignalNatFillUp)
+	binary.Write(buf1, binary.NativeEndian, SignalProtoV4)
 
 	buf2 := new(bytes.Buffer)
-	binary.Write(buf2, byteorder.Native, SignalCTFillUp)
-	binary.Write(buf2, byteorder.Native, SignalProtoV4)
+	binary.Write(buf2, binary.NativeEndian, SignalCTFillUp)
+	binary.Write(buf2, binary.NativeEndian, SignalProtoV4)
 
 	messages := [][]byte{buf1.Bytes(), buf2.Bytes()}
 

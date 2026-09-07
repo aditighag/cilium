@@ -22,7 +22,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 
 	operatorK8s "github.com/cilium/cilium/operator/k8s"
-	operatorOption "github.com/cilium/cilium/operator/option"
+	"github.com/cilium/cilium/operator/pkg/ciliumpod"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/hive"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client/testutils"
@@ -31,32 +31,28 @@ import (
 	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/kvstore/store"
 	"github.com/cilium/cilium/pkg/logging"
-	"github.com/cilium/cilium/pkg/testutils"
 	"github.com/cilium/cilium/pkg/time"
 )
 
 var debug = flag.Bool("debug", false, "Enable debug logging")
 
 func TestScript(t *testing.T) {
-	defer testutils.GoleakVerifyNone(t)
-
 	version.Force(k8sTestutils.DefaultVersion)
 
 	var opts []hivetest.LogOption
 	if *debug {
 		opts = append(opts, hivetest.LogLevel(slog.LevelDebug))
-		logging.SetLogLevelToDebug()
+		logging.SetLogLevel(slog.LevelDebug)
 	}
 	log := hivetest.Logger(t, opts...)
 
 	// Override the settings for testing purposes
 	wqRateLimiter = workqueue.NewTypedItemExponentialFailureRateLimiter[nodeName](10*time.Millisecond, 10*time.Millisecond)
 	kvstoreUpsertQueueDelay = 0 * time.Second
-	operatorOption.Config.CiliumPodLabels = "k8s-app=cilium"
 
 	setup := func(t testing.TB, args []string) *script.Engine {
 		h := hive.New(
-			cell.Config(cmtypes.DefaultClusterInfo),
+			cmtypes.ClusterInfoCell,
 
 			cell.Provide(
 				func() store.Factory { return store.NewFactory(hivetest.Logger(t), store.MetricsProvider()) },
@@ -69,6 +65,7 @@ func TestScript(t *testing.T) {
 
 			k8sClient.FakeClientCell(),
 			operatorK8s.ResourcesCell,
+			ciliumpod.Cell,
 
 			Cell,
 		)

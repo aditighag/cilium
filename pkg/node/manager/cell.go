@@ -11,15 +11,13 @@ import (
 	"github.com/cilium/statedb"
 
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
-	"github.com/cilium/cilium/pkg/datapath/iptables/ipset"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
-	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/ipcache"
 	"github.com/cilium/cilium/pkg/metrics"
+	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
-	"github.com/cilium/cilium/pkg/time"
 	wgTypes "github.com/cilium/cilium/pkg/wireguard/types"
 )
 
@@ -29,7 +27,6 @@ var Cell = cell.Module(
 	"node-manager",
 	"Manages the collection of Cilium nodes",
 	cell.Provide(newAllNodeManager),
-	cell.Provide(newGetClusterNodesRestAPIHandler),
 	cell.Provide(newNodeConfigNotifier),
 	metrics.Metric(NewNodeMetrics),
 )
@@ -42,10 +39,10 @@ type Notifier interface {
 	// notified of node changes. Upon call to this method, the NodeHandler is
 	// being notified of all nodes that are already in the cluster by calling
 	// the NodeHandler's NodeAdd callback.
-	Subscribe(datapath.NodeHandler)
+	Subscribe(node.Handler)
 
 	// Unsubscribe removes the given NodeHandler from the list of subscribers.
-	Unsubscribe(datapath.NodeHandler)
+	Unsubscribe(node.Handler)
 }
 
 type NodeManager interface {
@@ -70,35 +67,43 @@ type NodeManager interface {
 	// MeshNodeSync is called when the store completes the initial nodes listing including meshed nodes
 	MeshNodeSync()
 
-	// ClusterSizeDependantInterval returns a time.Duration that is dependent on
-	// the cluster size, i.e. the number of nodes that have been discovered. This
-	// can be used to control sync intervals of shared or centralized resources to
-	// avoid overloading these resources as the cluster grows.
-	ClusterSizeDependantInterval(baseInterval time.Duration) time.Duration
-
 	// SetPrefixClusterMutatorFn allows to inject a custom prefix cluster mutator.
-	// The mutator may then be applied to the PrefixCluster(s) using cmtypes.PrefixClusterFrom,
-	// cmtypes.PrefixClusterFromCIDR and the like.
-	SetPrefixClusterMutatorFn(mutator func(*types.Node) []cmtypes.PrefixClusterOpts)
+	// The mutator may then be applied to the PrefixCluster(s) using cmtypes.PrefixClusterFrom.
+	SetPrefixClusterMutatorFn(mutator node.PrefixClusterMutatorFn)
 }
 
 func newAllNodeManager(in struct {
 	cell.In
-	Logger      *slog.Logger
-	TunnelConf  tunnel.Config
-	Lifecycle   cell.Lifecycle
-	IPCache     *ipcache.IPCache
-	IPSetMgr    ipset.Manager
-	IPSetFilter IPSetFilterFn `optional:"true"`
-	NodeMetrics *nodeMetrics
-	Health      cell.Health
-	JobGroup    job.Group
-	DB          *statedb.DB
-	Devices     statedb.Table[*tables.Device]
-	WGConfig    wgTypes.WireguardConfig
+	Logger                       *slog.Logger
+	ClusterInfo                  cmtypes.ClusterInfo
+	TunnelConf                   tunnel.Config
+	Lifecycle                    cell.Lifecycle
+	IPCache                      *ipcache.IPCache
+	NodeMetrics                  *nodeMetrics
+	Health                       cell.Health
+	JobGroup                     job.Group
+	DB                           *statedb.DB
+	Devices                      statedb.Table[*tables.Device]
+	WGConfig                     wgTypes.Config
+	Writer                       *node.Writer
+	ClusterSizeDependantInterval node.ClusterSizeDependantIntervalFunc
 },
 ) (NodeManager, error) {
-	mngr, err := New(in.Logger, option.Config, in.TunnelConf, in.IPCache, in.IPSetMgr, in.IPSetFilter, in.NodeMetrics, in.Health, in.JobGroup, in.DB, in.Devices, in.WGConfig)
+	mngr, err := New(
+		in.Logger,
+		option.Config,
+		in.ClusterInfo,
+		in.TunnelConf,
+		in.IPCache,
+		in.NodeMetrics,
+		in.Health,
+		in.JobGroup,
+		in.DB,
+		in.Devices,
+		in.WGConfig,
+		in.Writer,
+		in.ClusterSizeDependantInterval,
+	)
 	if err != nil {
 		return nil, err
 	}

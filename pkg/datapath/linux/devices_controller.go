@@ -419,6 +419,7 @@ func populateFromLink(d *tables.Device, link netlink.Link) {
 	d.Index = a.Index
 	d.MTU = a.MTU
 	d.Name = a.Name
+	d.AltNames = slices.Clone(a.AltNames)
 	d.HardwareAddr = tables.HardwareAddr(a.HardwareAddr)
 	d.Flags = a.Flags
 	d.RawFlags = a.RawFlags
@@ -433,7 +434,7 @@ func populateFromLink(d *tables.Device, link netlink.Link) {
 func (dc *devicesController) processBatch(txn statedb.WriteTxn, batch map[int][]any) {
 	before := dc.deviceNameSet(txn)
 	for index, updates := range batch {
-		d, _, _ := dc.params.DeviceTable.Get(txn, tables.DeviceIDIndex.Query(index))
+		d, _, _ := dc.params.DeviceTable.Get(txn, tables.DeviceByIndex(index))
 		if d == nil {
 			// Unseen device. We may receive address updates before link updates
 			// and thus the only thing we know at this point is the index.
@@ -452,6 +453,14 @@ func (dc *devicesController) processBatch(txn statedb.WriteTxn, batch map[int][]
 			switch u := u.(type) {
 			case netlink.AddrUpdate:
 				if dc.deadLinkIndexes.Has(u.LinkIndex) {
+					continue
+				}
+				// Skip addresses that are not usable yet. Tentative addresses
+				// are still going through DAD and dadfailed ones never will,
+				// so populating Device.Addrs with them would surface unusable
+				// addresses to downstream features. A later AddrUpdate emitted
+				// by the kernel when DAD completes will add the address.
+				if u.NewAddr && u.Flags&(unix.IFA_F_TENTATIVE|unix.IFA_F_DADFAILED) != 0 {
 					continue
 				}
 				addr := deviceAddressFromAddrUpdate(u)
@@ -575,13 +584,13 @@ func (dc *devicesController) processBatch(txn statedb.WriteTxn, batch map[int][]
 
 			// Remove all routes for the device. For a deleted device netlink does not
 			// send complete set of route delete messages.
-			routes := dc.params.RouteTable.List(txn, tables.RouteLinkIndex.Query(d.Index))
+			routes := dc.params.RouteTable.List(txn, tables.RoutesByLinkIndex(d.Index))
 			for r := range routes {
 				dc.params.RouteTable.Delete(txn, r)
 			}
 			// Remove all neighbors for the device. For a deleted device netlink does not
 			// always send complete set of neighbor delete messages.
-			neighbors := dc.params.NeighborTable.List(txn, tables.NeighborLinkIndex.Query(d.Index))
+			neighbors := dc.params.NeighborTable.List(txn, tables.NeighborsByLinkIndex(d.Index))
 			for n := range neighbors {
 				dc.params.NeighborTable.Delete(txn, n)
 			}
@@ -624,6 +633,15 @@ func (dc *devicesController) isSelectedDevice(d *tables.Device, txn statedb.Writ
 	// If the device does not match and user requested auto detection, then continue to further checks.
 	if dc.filter.NonEmpty() {
 		matched, reverse := dc.filter.Match(d.Name)
+		if !matched {
+			// Also try to match against alternative names.
+			for _, altName := range d.AltNames {
+				matched, reverse = dc.filter.Match(altName)
+				if matched {
+					break
+				}
+			}
+		}
 		if matched {
 			return !reverse, ""
 		}
@@ -646,9 +664,17 @@ func (dc *devicesController) isSelectedDevice(d *tables.Device, txn statedb.Writ
 		return false, fmt.Sprintf("excluded flag set (mask=0x%x, flags=0x%x)", excludedIfFlagsMask, d.RawFlags)
 	}
 
-	// Ignore bridge and bonding slave devices
+	// Ignore bridge and bonding children devices, but allow VRF device children.
 	if d.MasterIndex != 0 {
-		return false, fmt.Sprintf("bridged or bonded to ifindex %d", d.MasterIndex)
+		masterDevice, _, ok := dc.params.DeviceTable.Get(txn, tables.DeviceByIndex(d.MasterIndex))
+		if !ok {
+			return false, fmt.Sprintf("device has parent but parent device could not be found: %d", d.MasterIndex)
+		}
+
+		// allow VRF children devices.
+		if masterDevice.Type != "vrf" {
+			return false, fmt.Sprintf("bridged or bonded to ifindex %d", d.MasterIndex)
+		}
 	}
 
 	// Never consider devices with any of the excluded devices.
@@ -689,7 +715,7 @@ func (dc *devicesController) isSelectedDevice(d *tables.Device, txn statedb.Writ
 }
 
 func hasGlobalRoute(devIndex int, tbl statedb.Table[*tables.Route], rxn statedb.ReadTxn) bool {
-	routes := tbl.List(rxn, tables.RouteLinkIndex.Query(devIndex))
+	routes := tbl.List(rxn, tables.RoutesByLinkIndex(devIndex))
 	hasGlobal := false
 	for r := range routes {
 		if r.Dst.Addr().IsGlobalUnicast() {
@@ -718,7 +744,7 @@ type netlinkFuncs struct {
 // makeNetlinkFuncs returns a *netlinkFuncs containing netlink accessors to the
 // network namespace of the calling goroutine's OS thread.
 func makeNetlinkFuncs() (*netlinkFuncs, error) {
-	netlinkHandle, err := netlink.NewHandle(unix.NETLINK_ROUTE)
+	netlinkHandle, err := safenetlink.NewHandle(&safenetlink.HandleConfig{NLFamilies: []int{unix.NETLINK_ROUTE}})
 	if err != nil {
 		return nil, fmt.Errorf("creating netlink handle: %w", err)
 	}

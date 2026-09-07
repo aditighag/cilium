@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"strconv"
 
+	endpoint "github.com/cilium/cilium/pkg/endpoint/types"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/mac"
 	"github.com/cilium/cilium/pkg/option"
@@ -28,7 +29,7 @@ type epInfoCache struct {
 	id     uint64
 	ifName string
 
-	// For datapath.EndpointConfiguration
+	// For endpoint.Config
 	identity               identity.NumericIdentity
 	mac                    mac.MAC
 	ipv4                   netip.Addr
@@ -44,7 +45,10 @@ type epInfoCache struct {
 	ifIndex                int
 	parentIfIndex          int
 	netNsCookie            uint64
+	rtInfo                 uint32
 	properties             map[string]any
+	k8sNamespace           string
+	k8sPodName             string
 
 	// endpoint is used to get the endpoint's logger.
 	//
@@ -57,24 +61,26 @@ type epInfoCache struct {
 
 // Must be called when endpoint is still locked.
 func (e *Endpoint) createEpInfoCache(epdir string) *epInfoCache {
-	if e.isProperty(PropertyAtHostNS) {
+	if e.isPropertyLocked(endpoint.PropertyAtHostNS) {
 		return &epInfoCache{
-			revision: e.nextPolicyRevision,
+			revision: e.desiredPolicyRevision,
 
-			id:         e.GetID(),
-			identity:   e.getIdentity(),
-			ifIndex:    e.GetIfIndex(),
-			mac:        e.GetNodeMAC(),
-			ipv4:       e.IPv4Address(),
-			ipv6:       e.IPv6Address(),
-			atHostNS:   true,
-			properties: maps.Clone(e.properties),
+			id:           e.GetID(),
+			identity:     e.getIdentity(),
+			ifIndex:      e.GetIfIndex(),
+			mac:          e.GetNodeMAC(),
+			ipv4:         e.IPv4Address(),
+			ipv6:         e.IPv6Address(),
+			atHostNS:     true,
+			properties:   maps.Clone(e.properties),
+			k8sNamespace: e.GetK8sNamespace(),
+			k8sPodName:   e.GetK8sPodName(),
 
 			endpoint: e,
 		}
 	}
 	return &epInfoCache{
-		revision: e.nextPolicyRevision,
+		revision: e.desiredPolicyRevision,
 
 		epdir:                  epdir,
 		id:                     e.GetID(),
@@ -93,10 +99,18 @@ func (e *Endpoint) createEpInfoCache(epdir string) *epInfoCache {
 		ifIndex:                e.ifIndex,
 		parentIfIndex:          e.parentIfIndex,
 		netNsCookie:            e.NetNsCookie,
+		rtInfo:                 e.rtInfo,
 		properties:             maps.Clone(e.properties),
+		k8sNamespace:           e.GetK8sNamespace(),
+		k8sPodName:             e.GetK8sPodName(),
 
 		endpoint: e,
 	}
+}
+
+func (ep *epInfoCache) GetRTInfo() (uint32, endpoint.RTInfoEncoding) {
+	enc, _ := ep.properties[endpoint.PropertyRTInfo].(string)
+	return ep.rtInfo, endpoint.RTInfoEncoding(enc)
 }
 
 func (ep *epInfoCache) GetIfIndex() int {
@@ -196,11 +210,11 @@ func (ep *epInfoCache) IsAtHostNS() bool {
 }
 
 func (ep *epInfoCache) SkipMasqueradeV4() bool {
-	return ep.isProperty(PropertySkipMasqueradeV4)
+	return ep.isProperty(endpoint.PropertySkipMasqueradeV4)
 }
 
 func (ep *epInfoCache) SkipMasqueradeV6() bool {
-	return ep.isProperty(PropertySkipMasqueradeV6)
+	return ep.isProperty(endpoint.PropertySkipMasqueradeV6)
 }
 
 // isProperty checks if the value of the properties map is set, it's a boolean
@@ -215,4 +229,12 @@ func (ep *epInfoCache) isProperty(propertyKey string) bool {
 
 func (ep *epInfoCache) GetPropertyValue(key string) any {
 	return ep.properties[key]
+}
+
+func (ep *epInfoCache) GetK8sNamespace() string {
+	return ep.k8sNamespace
+}
+
+func (ep *epInfoCache) GetK8sPodName() string {
+	return ep.k8sPodName
 }

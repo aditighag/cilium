@@ -14,12 +14,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 
+	iputil "github.com/cilium/cilium/pkg/ip"
 	cilium_api_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	slimv1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
 	k8sTypes "github.com/cilium/cilium/pkg/k8s/types"
-	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/policy/api"
 	policyTypes "github.com/cilium/cilium/pkg/policy/types"
 )
@@ -90,6 +90,7 @@ type policyGatewayParams struct {
 type policyParams struct {
 	name             string
 	endpointLabels   map[string]string
+	namespaceLabels  map[string]string
 	nodeSelectors    map[string]string
 	destinationCIDRs []string
 	excludedCIDRs    []string
@@ -97,16 +98,22 @@ type policyParams struct {
 }
 
 func newCEGP(params *policyParams) (*v2.CiliumEgressGatewayPolicy, *PolicyConfig) {
+	// Create destination CIDRs list
+	var destinationCIDRs []iputil.Prefix
 	parsedDestinationCIDRs := make([]netip.Prefix, 0, len(params.destinationCIDRs))
 	for _, destCIDR := range params.destinationCIDRs {
 		parsedDestinationCIDR, _ := netip.ParsePrefix(destCIDR)
 		parsedDestinationCIDRs = append(parsedDestinationCIDRs, parsedDestinationCIDR)
+		destinationCIDRs = append(destinationCIDRs, iputil.PrefixFrom(parsedDestinationCIDR))
 	}
 
+	// Create excluded CIDRs list
+	excludedCIDRs := []iputil.Prefix{}
 	parsedExcludedCIDRs := make([]netip.Prefix, 0, len(params.excludedCIDRs))
 	for _, excludedCIDR := range params.excludedCIDRs {
 		parsedExcludedCIDR, _ := netip.ParsePrefix(excludedCIDR)
 		parsedExcludedCIDRs = append(parsedExcludedCIDRs, parsedExcludedCIDR)
+		excludedCIDRs = append(excludedCIDRs, iputil.PrefixFrom(parsedExcludedCIDR))
 	}
 
 	policy := &PolicyConfig{
@@ -157,30 +164,11 @@ func newCEGP(params *policyParams) (*v2.CiliumEgressGatewayPolicy, *PolicyConfig
 		}
 	}
 
-	// Create destination CIDRs list
-	var destinationCIDRs []v2.CIDR
-	for _, destCIDR := range params.destinationCIDRs {
-		destinationCIDRs = append(destinationCIDRs, v2.CIDR(destCIDR))
-	}
-
-	// Create excluded CIDRs list
-	excludedCIDRs := []v2.CIDR{}
-	for _, excludedCIDR := range params.excludedCIDRs {
-		excludedCIDRs = append(excludedCIDRs, v2.CIDR(excludedCIDR))
-	}
-
 	cegp := &v2.CiliumEgressGatewayPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: params.name,
 		},
 		Spec: v2.CiliumEgressGatewayPolicySpec{
-			Selectors: []v2.EgressRule{
-				{
-					PodSelector: &slimv1.LabelSelector{
-						MatchLabels: params.endpointLabels,
-					},
-				},
-			},
 			DestinationCIDRs: destinationCIDRs,
 			ExcludedCIDRs:    excludedCIDRs,
 			EgressGateway: &v2.EgressGateway{
@@ -191,6 +179,24 @@ func newCEGP(params *policyParams) (*v2.CiliumEgressGatewayPolicy, *PolicyConfig
 				EgressIP:  params.policyGwParams[0].egressIP,
 			},
 		},
+	}
+
+	if len(params.namespaceLabels) != 0 {
+		cegp.Spec.Selectors = []v2.EgressRule{
+			{
+				NamespaceSelector: &slimv1.LabelSelector{
+					MatchLabels: params.namespaceLabels,
+				},
+			},
+		}
+	} else {
+		cegp.Spec.Selectors = []v2.EgressRule{
+			{
+				PodSelector: &slimv1.LabelSelector{
+					MatchLabels: params.endpointLabels,
+				},
+			},
+		}
 	}
 
 	// Only populate the list if there is more than one gateway.
@@ -243,11 +249,11 @@ func deleteEndpoint(tb testing.TB, endpoints fakeResource[*k8sTypes.CiliumEndpoi
 	})
 }
 
-func addNodeAndReconcile(tb testing.TB, k *EgressGatewayTestSuite, egressGatewayManager *Manager, node *nodeTypes.Node) {
+func addNodeAndReconcile(tb testing.TB, k *EgressGatewayTestSuite, egressGatewayManager *Manager, node *cilium_api_v2.CiliumNode) {
 	currentRun := egressGatewayManager.reconciliationEventsCount.Load()
 	k.nodes.process(tb, resource.Event[*cilium_api_v2.CiliumNode]{
 		Kind:   resource.Upsert,
-		Object: node.ToCiliumNode(),
+		Object: node,
 	})
 	waitForReconciliationRun(tb, egressGatewayManager, currentRun)
 }

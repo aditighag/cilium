@@ -27,7 +27,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"golang.org/x/sync/errgroup"
 )
@@ -49,10 +48,15 @@ func extractBackendName(podName string) string {
 	// We need to remove the last two dash-separated components
 	parts := strings.Split(podName, "-")
 	if len(parts) < 3 {
-		return podName // fallback to original name if pattern doesn't match
+		return podName // fall back to original name if pattern doesn't match
 	}
 	// Remove last two components (deployment hash and pod hash)
 	return strings.Join(parts[:len(parts)-2], "-")
+}
+
+// BatchRequestSender defines an interface for sending batch requests
+type BatchRequestSender interface {
+	SendBatchRequest(count int) ([]string, error)
 }
 
 // TestWeightedDistribution tests that requests are distributed according to expected weights
@@ -70,7 +74,7 @@ func TestWeightedDistribution(sender RequestSender, expectedWeights map[string]f
 	)
 
 	g.SetLimit(concurrentRequests)
-	for i := 0; i < totalRequests; i++ {
+	for range totalRequests {
 		g.Go(func() error {
 			podName, err := sender.SendRequest()
 			if err != nil {
@@ -135,44 +139,92 @@ func TestWeightedDistribution(sender RequestSender, expectedWeights map[string]f
 	return errors.Join(errs...)
 }
 
-// Entropy utilities
+// TestWeightedDistributionBatch tests that requests are distributed according to expected weights
+// using batch request execution for improved performance
+func TestWeightedDistributionBatch(sender BatchRequestSender, expectedWeights map[string]float64) error {
+	const (
+		tolerancePercentage = 0.05
+		totalRequests       = 500
+	)
 
-// addRandomDelay adds a random delay up to the specified limit in milliseconds
-func addRandomDelay(limit int) {
-	n, err := rand.Int(rand.Reader, big.NewInt(int64(limit)))
+	// Execute all requests in a single batch
+	podNames, err := sender.SendBatchRequest(totalRequests)
 	if err != nil {
-		// Fallback to no delay if crypto/rand fails
-		return
+		return fmt.Errorf("error while sending batch request: %w", err)
 	}
-	randomSleepDuration := n.Int64()
-	time.Sleep(time.Duration(randomSleepDuration) * time.Millisecond)
+
+	if len(podNames) != totalRequests {
+		return fmt.Errorf("expected %d responses but got %d", totalRequests, len(podNames))
+	}
+
+	// Count the distribution
+	seen := make(map[string]float64, len(expectedWeights))
+	for _, podName := range podNames {
+		backendName := extractBackendName(podName)
+
+		if _, exists := expectedWeights[backendName]; exists {
+			seen[backendName]++
+		} else {
+			return fmt.Errorf("request was handled by an unexpected pod %q (extracted backend: %q)", podName, backendName)
+		}
+	}
+
+	// Count how many backends should receive traffic (weight > 0)
+	expectedActiveBackends := 0
+	for _, weight := range expectedWeights {
+		if weight > 0.0 {
+			expectedActiveBackends++
+		}
+	}
+
+	var errs []error
+	if len(seen) != expectedActiveBackends {
+		errs = append(errs, fmt.Errorf("expected %d backends to receive traffic, but got %d", expectedActiveBackends, len(seen)))
+	}
+
+	for wantBackend, wantPercent := range expectedWeights {
+		gotCount, ok := seen[wantBackend]
+
+		if !ok && wantPercent != 0.0 {
+			errs = append(errs, fmt.Errorf("expect traffic to hit backend %q - but none was received", wantBackend))
+			continue
+		}
+
+		gotPercent := gotCount / float64(totalRequests)
+
+		if math.Abs(gotPercent-wantPercent) > tolerancePercentage {
+			errs = append(errs, fmt.Errorf("backend %q weighted traffic of %v not within tolerance %v (+/-%f)",
+				wantBackend,
+				gotPercent,
+				wantPercent,
+				tolerancePercentage,
+			))
+		}
+	}
+
+	slices.SortFunc(errs, func(a, b error) int {
+		return cmp.Compare(a.Error(), b.Error())
+	})
+	return errors.Join(errs...)
 }
 
-// AddRandomEntropy randomly chooses to add delay, random value, or both
+// Entropy utilities
+
+// AddRandomEntropy randomly chooses to add a random value.
 // The addRandomValue function should be provided by the caller to handle
 // protocol-specific ways of adding the random value (HTTP headers, gRPC metadata, etc.)
 func AddRandomEntropy(addRandomValue func(string) error) error {
-	n, err := rand.Int(rand.Reader, big.NewInt(3))
+	n, err := rand.Int(rand.Reader, big.NewInt(2))
 	if err != nil {
-		// Fallback to case 0 if crypto/rand fails
-		addRandomDelay(1000)
 		return err
 	}
 	random := n.Int64()
 
 	switch random {
 	case 0:
-		addRandomDelay(1000)
+		// Do nothing
 		return nil
 	case 1:
-		valueN, err := rand.Int(rand.Reader, big.NewInt(10000))
-		if err != nil {
-			return fmt.Errorf("failed to generate random value: %w", err)
-		}
-		randomValue := valueN.Int64()
-		return addRandomValue(strconv.FormatInt(randomValue, 10))
-	case 2:
-		addRandomDelay(1000)
 		valueN, err := rand.Int(rand.Reader, big.NewInt(10000))
 		if err != nil {
 			return fmt.Errorf("failed to generate random value: %w", err)

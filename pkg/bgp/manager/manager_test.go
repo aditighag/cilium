@@ -44,8 +44,8 @@ var (
 	safiUnicast           = "unicast"
 )
 
-// TestGetRoutes tests GetRoutes API of the Manager.
-func TestGetRoutes(t *testing.T) {
+// TestGetRoutesLegacy tests GetRoutes API of the Manager.
+func TestGetRoutesLegacy(t *testing.T) {
 
 	var table = []struct {
 		// name of the test case
@@ -191,13 +191,13 @@ func TestGetRoutes(t *testing.T) {
 			// advertise test-provided prefixes
 			for _, cidr := range tt.advertisedPrefixes {
 				_, err := testInstance.Router.AdvertisePath(context.Background(), types.PathRequest{
-					Path: types.NewPathForPrefix(cidr),
+					Path: types.MustNewPathForPrefix(cidr),
 				})
 				require.NoError(t, err)
 			}
 
 			// retrieve routes from server's local RIB and
-			routes, err := brm.GetRoutes(context.Background(), restapi.GetBgpRoutesParams{
+			routes, err := brm.GetRoutesLegacy(context.Background(), restapi.GetBgpRoutesParams{
 				RouterAsn: tt.routerASN,
 				TableType: tt.tableType,
 				Afi:       tt.afi,

@@ -29,6 +29,10 @@ type CiliumBGPPeerConfigListerExpansion interface{}
 // CiliumCIDRGroupLister.
 type CiliumCIDRGroupListerExpansion interface{}
 
+// CiliumDatapathPluginListerExpansion allows custom methods to be added to
+// CiliumDatapathPluginLister.
+type CiliumDatapathPluginListerExpansion interface{}
+
 // CiliumEndpointSliceListerExpansion allows custom methods to be added to
 // CiliumEndpointSliceLister.
 type CiliumEndpointSliceListerExpansion interface{}
@@ -49,14 +53,18 @@ type CiliumL2AnnouncementPolicyListerExpansion interface{}
 // CiliumLoadBalancerIPPoolLister.
 type CiliumLoadBalancerIPPoolListerExpansion interface{}
 
-// CiliumNodeConfigListerExpansion allows custom methods to be added to
-// CiliumNodeConfigLister.
-type CiliumNodeConfigListerExpansion interface{}
+// CiliumNetworkDriverClusterConfigListerExpansion allows custom methods to be added to
+// CiliumNetworkDriverClusterConfigLister.
+type CiliumNetworkDriverClusterConfigListerExpansion interface{}
 
-// CiliumNodeConfigNamespaceListerExpansion allows custom methods to be added to
-// CiliumNodeConfigNamespaceLister.
-type CiliumNodeConfigNamespaceListerExpansion interface{}
+// CiliumNetworkDriverNodeConfigListerExpansion allows custom methods to be added to
+// CiliumNetworkDriverNodeConfigLister.
+type CiliumNetworkDriverNodeConfigListerExpansion interface{}
 
 // CiliumPodIPPoolListerExpansion allows custom methods to be added to
 // CiliumPodIPPoolLister.
 type CiliumPodIPPoolListerExpansion interface{}
+
+// CiliumResourceIPPoolListerExpansion allows custom methods to be added to
+// CiliumResourceIPPoolLister.
+type CiliumResourceIPPoolListerExpansion interface{}

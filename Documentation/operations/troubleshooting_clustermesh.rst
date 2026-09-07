@@ -7,6 +7,8 @@ Install the Cilium CLI
 
 .. include:: /installation/cli-download.rst
 
+.. _troubleshooting_clustermesh_automatic_verification:
+
 Automatic Verification
 ----------------------
 
@@ -51,6 +53,8 @@ Automatic Verification
       command to run the checks only towards a subset of remote clusters.
 
 
+.. _troubleshooting_clustermesh_manual_verification:
+
 Manual Verification
 -------------------
 
@@ -74,9 +78,9 @@ you may perform the following steps to troubleshoot ClusterMesh issues.
  #. Validate that ClusterMesh is healthy running ``cilium-dbg status --all-clusters`` inside each Cilium agent::
 
         ClusterMesh:   1/1 remote clusters ready
-           k8s-c2: ready, 3 nodes, 25 endpoints, 8 identities, 10 services, 0 MCS-API service exports, 0 reconnections (last: never)
+           k8s-c2: ready, 3 nodes, 25 endpoints, 8 identities, 10 services, 0 endpoint slices, 0 MCS-API service exports, 0 reconnections (last: never)
            └  etcd: 1/1 connected, leases=0, lock lease-ID=7c028201b53de662, has-quorum=true: https://k8s-c2.mesh.cilium.io:2379 - 3.5.4 (Leader)
-           └  remote configuration: expected=true, retrieved=true, cluster-id=3, kvstoremesh=false, sync-canaries=true, service-exports=disabled
+           └  remote configuration: expected=true, retrieved=true, cluster-id=3, kvstoremesh=false, sync-canaries=true, service-exports=disabled, endpoint-slice-export-mode=services-only
            └  synchronization status: nodes=true, endpoints=true, identities=true, services=true
 
     When KVStoreMesh is enabled, additionally check its status and validate that
@@ -87,25 +91,7 @@ you may perform the following steps to troubleshoot ClusterMesh issues.
       $ kubectl --context $CLUSTER1 exec -it -n kube-system deploy/clustermesh-apiserver \
           -c kvstoremesh -- clustermesh-apiserver kvstoremesh-dbg status --verbose
 
- #. Validate that the required TLS secrets are set up properly. By default, the
-    following TLS secrets must be available in the namespace in which Cilium is
-    installed:
-
-    * ``clustermesh-apiserver-server-cert``, which is used by the etcd container
-      in the clustermesh-apiserver deployment. Not applicable if an external etcd
-      cluster is used.
-
-    * ``clustermesh-apiserver-admin-cert``, which is used by the apiserver/kvstoremesh
-      containers in the clustermesh-apiserver deployment, to authenticate against the
-      sidecar etcd instance. Not applicable if an external etcd cluster is used.
-
-    * ``clustermesh-apiserver-remote-cert``, which is used by Cilium agents, or
-      the kvstoremesh container in the clustermesh-apiserver deployment when
-      KVStoreMesh is enabled, to authenticate against remote etcd instances.
-
-    * ``clustermesh-apiserver-local-cert``, which is used by Cilium agents to
-      authenticate against the local etcd instance. Only applicable if KVStoreMesh
-      is enabled.
+ #. For TLS-related manual checks, see :ref:`troubleshooting_clustermesh_tls`.
 
  #. Validate that the configuration for remote clusters is picked up correctly.
     For each remote cluster, an info log message ``New remote cluster
@@ -145,28 +131,30 @@ you may perform the following steps to troubleshoot ClusterMesh issues.
 
     If the connection fails, check the following:
 
-    * When KVStoreMesh is disabled, validate that the ``hostAliases`` section in the Cilium DaemonSet maps
-      each remote cluster to the IP of the LoadBalancer that makes the remote
-      control plane available; When KVStoreMesh is enabled,
-      validate the ``hostAliases`` section in the clustermesh-apiserver Deployment.
+    * When KVStoreMesh is disabled, validate that the ``cilium-host-aliases``
+      section in the ``cilium-clustermesh`` secret maps each remote cluster
+      to the IP of the LoadBalancer that makes the remote control plane
+      available; When KVStoreMesh is enabled, validate the
+      ``cilium-host-aliases`` section in the ``cilium-kvstoremesh`` secret.
 
-    * Validate that a local node in the source cluster can reach the IP
-      specified in the ``hostAliases`` section. When KVStoreMesh is disabled, the ``cilium-clustermesh``
-      secret contains a configuration file for each remote cluster, it will
-      point to a logical name representing the remote cluster;
-      When KVStoreMesh is enabled, it exists in the ``cilium-kvstoremesh`` secret.
+    * Validate that a local node in the source cluster can reach the IPs
+      specified in the ``cilium-host-aliases`` section. When KVStoreMesh
+      is disabled, those aliases are configured in the ``cilium-clustermesh``
+      secret. When KVStoreMesh is enabled, they are configured in the
+      ``cilium-kvstoremesh`` secret.
 
       .. code-block:: yaml
 
          endpoints:
          - https://cluster1.mesh.cilium.io:2379
+         cilium-host-aliases:
+         - hostname: cluster1.mesh.cilium.io
+           ips:
+           - 192.0.2.10
 
       The name will *NOT* be resolvable via DNS outside the Cilium agent pods.
-      The name is mapped to an IP using ``hostAliases``. Run ``kubectl -n
-      kube-system get daemonset cilium -o yaml`` when KVStoreMesh is disabled,
-      or run ``kubectl -n kube-system get deployment clustermesh-apiserver -o yaml`` when KVStoreMesh is enabled,
-      grep for the FQDN to retrieve the IP that is configured. Then use ``curl`` to validate that the port is
-      reachable.
+      Internally, the name is mapped to an IP using ``cilium-host-aliases``.
+      You can use ``curl`` to validate that those IPs and port are reachable.
 
     * A firewall between the local cluster and the remote cluster may drop the
       control plane connection. Ensure that port 2379/TCP is allowed.
@@ -202,39 +190,146 @@ State Propagation
     that the initial IPs synchronization from all clusters has completed.
 
  #. When using global services, ensure that global services are configured with
-    endpoints from all clusters. Run ``cilium-dbg service list`` in any Cilium pod
-    and validate that the backend IPs consist of pod IPs from all clusters
-    running relevant backends. You can further validate the correct datapath
-    plumbing by running ``cilium-dbg bpf lb list`` to inspect the state of the eBPF
-    maps.
+    endpoints from all clusters. Run ``cilium-dbg shell -- db/show backends``
+    (or ``cilium-dbg service list``) in any Cilium pod and validate that the
+    backend IPs consist of pod IPs from all clusters running relevant backends.
+    You can further validate the correct datapath plumbing by running
+    ``cilium-dbg bpf lb list`` to inspect the state of the eBPF maps.
 
-    If this fails:
+.. _troubleshooting_clustermesh_tls:
 
-    * Run ``cilium-dbg debuginfo`` and look for the section ``k8s-service-cache``. In
-      that section, you will find the contents of the service correlation
-      cache. It will list the Kubernetes services and endpoints of the local
-      cluster.  It will also have a section ``externalEndpoints`` which must
-      list all endpoints of remote clusters.
+TLS Certificate Troubleshooting
+-------------------------------
 
-      ::
+If you encounter issues after enabling Cluster Mesh TLS, use the following
+instructions to help diagnose the problem. First, refer to
+:ref:`troubleshooting_clustermesh_automatic_verification` and run the
+troubleshoot commands. They validate TLS authentication and display certificate
+information in a human-readable format.
 
-          #### k8s-service-cache
+The following checks apply regardless of the certificate management method:
 
-          (*k8s.ServiceCache)(0xc00000c500)({
-          [...]
-           services: (map[k8s.ServiceID]*k8s.Service) (len=2) {
-             (k8s.ServiceID) default/kubernetes: (*k8s.Service)(0xc000cd11d0)(frontend:172.20.0.1/ports=[https]/selector=map[]),
-             (k8s.ServiceID) kube-system/kube-dns: (*k8s.Service)(0xc000cd1220)(frontend:172.20.0.10/ports=[metrics dns dns-tcp]/selector=map[k8s-app:kube-dns])
-           },
-           endpoints: (map[k8s.ServiceID]*k8s.Endpoints) (len=2) {
-             (k8s.ServiceID) kube-system/kube-dns: (*k8s.Endpoints)(0xc0000103c0)(10.16.127.105:53/TCP,10.16.127.105:53/UDP,10.16.127.105:9153/TCP),
-             (k8s.ServiceID) default/kubernetes: (*k8s.Endpoints)(0xc0000103f8)(192.168.60.11:6443/TCP)
-           },
-           externalEndpoints: (map[k8s.ServiceID]k8s.externalEndpoints) {
-           }
-          })
+* Verify that certificates have not expired and that their CN and SANs match
+  the expected values.
+* Verify that each client trusts the CA that signed the server certificate.
+* By default, the following TLS Secrets must be available in the namespace in
+  which Cilium is installed:
 
-      The sections ``services`` and ``endpoints`` represent the services of the
-      local cluster, the section ``externalEndpoints`` lists all remote
-      services and will be correlated with services matching the same
-      ``ServiceID``.
+   * ``clustermesh-apiserver-server-cert``, which is used by the etcd container
+     in the clustermesh-apiserver deployment. Not applicable if an external etcd
+     cluster is used.
+
+   * ``clustermesh-apiserver-admin-cert``, which is used by the apiserver/kvstoremesh
+     containers in the clustermesh-apiserver deployment, to authenticate against the
+     sidecar etcd instance. Not applicable if an external etcd cluster is used.
+
+   * ``clustermesh-apiserver-remote-cert``, which is used by Cilium agents, or
+     the kvstoremesh container in the clustermesh-apiserver deployment when
+     KVStoreMesh is enabled, to authenticate against remote etcd instances.
+
+   * ``clustermesh-apiserver-local-cert``, which is used by Cilium agents to
+     authenticate against the local etcd instance. Only applicable if KVStoreMesh
+     is enabled.
+
+The following checks depend on the specific method used to provision the
+certificates:
+
+.. tabs::
+
+    .. group-tab:: cert-manager
+
+        While installing Cilium or cert-manager you may get the following error::
+
+            Error: Internal error occurred: failed calling webhook "webhook.cert-manager.io": Post "https://cert-manager-webhook.cert-manager.svc:443/mutate?timeout=10s": dial tcp x.x.x.x:443: connect: connection refused
+
+        This happens when cert-manager's webhook (which is used to verify the
+        ``Certificate``'s CRD resources) is not available. There are several ways
+        to resolve this issue. Pick one of the following options:
+
+        .. tabs::
+
+            .. tab:: Install CRDs first
+
+                Install cert-manager CRDs before Cilium and cert-manager (see `cert-manager's documentation about installing CRDs with kubectl <https://cert-manager.io/docs/installation/helm/#option-1-installing-crds-with-kubectl>`__):
+
+                .. code-block:: shell-session
+
+                    $ kubectl create -f cert-manager.crds.yaml
+
+                Then install cert-manager, configure an issuer and install Cilium.
+
+            .. tab:: Upgrade Cilium
+
+                Install Cilium with Cluster Mesh disabled:
+
+                .. code-block:: shell-session
+
+                    $ helm install cilium cilium/cilium \
+                        --set clustermesh.useAPIServer=false \
+                        --set clustermesh.config.enabled=false \
+                        ...
+
+                Then install cert-manager, configure an issuer, and enable Cluster Mesh.
+
+            .. tab:: Disable webhook
+
+                Disable cert-manager validation (assuming Cilium is installed in
+                the ``kube-system`` namespace):
+
+                .. code-block:: shell-session
+
+                    $ kubectl label namespace kube-system cert-manager.io/disable-validation=true
+
+                Then install Cilium, cert-manager, and configure an issuer.
+
+            .. tab:: Host network webhook
+
+                Configure cert-manager to expose its webhook within the host
+                network namespace:
+
+                .. code-block:: shell-session
+
+                    $ helm install cert-manager jetstack/cert-manager \
+                        --set webhook.hostNetwork=true \
+                        --set 'webhook.tolerations[0].operator=Exists'
+
+                Then configure an issuer and install Cilium.
+
+    .. group-tab:: Helm
+
+        When using Helm certificates are not automatically renewed. If you
+        encounter issues with expired certificates, you can manually renew them
+        by running ``helm upgrade`` to renew the certificates.
+
+    .. group-tab:: User Provided Certificates
+
+        If you encounter issues with the certificates, you can check the
+        certificates and keys by decoding them:
+
+        .. code-block:: shell-session
+
+            $ kubectl -n kube-system get secret clustermesh-apiserver-server-cert -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -text -noout
+            $ kubectl -n kube-system get secret clustermesh-apiserver-server-cert -o jsonpath='{.data.tls\.key}' | base64 -d | openssl pkey -text -noout
+            $ kubectl -n kube-system get secret clustermesh-apiserver-server-cert -o jsonpath='{.data.ca\.crt}' | base64 -d | openssl x509 -text -noout
+
+        The same commands can be used for the other secrets as well.
+
+    .. group-tab:: Custom Per-Pod Certificates
+
+        **Pod stuck in init / CrashLoopBackOff:**
+
+        The certificate agent init container must write all expected certificate
+        and configuration files before the main container starts. Check its logs
+        and the pod's events:
+
+        .. code-block:: shell-session
+
+            $ kubectl -n kube-system logs <pod> -c <cert-agent>
+            $ kubectl -n kube-system describe pod <pod>
+
+        **Secrets still being generated:**
+
+        If the chart still generates TLS Secrets, verify that
+        ``clustermesh.apiserver.tls.auto.enabled`` is set to ``false``. Automatic
+        generation is controlled by this value, not by
+        ``clustermesh.apiserver.tls.disableDefaultVolumes``.

@@ -113,8 +113,7 @@ func (reporter *JUnitReporter) extractTestOwnerPrefix(testName string) string {
 		firstPart := parts[0]
 		// Check if it looks like a test class name (ends with "Test")
 		if strings.HasSuffix(firstPart, "Test") ||
-			strings.HasSuffix(firstPart, "DatapathConfig") ||
-			strings.HasPrefix(firstPart, "RuntimeAgent") {
+			strings.HasSuffix(firstPart, "DatapathConfig") {
 			return firstPart
 		}
 	}
@@ -309,30 +308,16 @@ func (reporter *JUnitReporter) mapTestToCODEOWNER(prefix string) string {
 		return "test/k8s/chaos.go"
 	case "K8sAgentFQDNTest":
 		return "test/k8s/fqdn.go"
-	case "RuntimeAgentFQDNPolicies":
-		return "test/runtime/fqdn.go"
 	case "K8sAgentHubbleTest":
 		return "test/k8s/hubble.go"
 	case "K8sAgentPolicyTest":
 		return "test/k8s/net_policies.go"
 	case "K8sAgentPerNodeConfigTest":
 		return "test/k8s/config.go"
-	case "K8sPolicyTestExtended":
-		return "test/k8s/net_policies.go"
-	case "RuntimeAgentPolicies":
-		return "test/runtime/net_policies.go"
-	case "K8sDatapathBandwidthTest":
-		return "test/k8s/bandwidth.go"
-	case "K8sDatapathConfig":
-		return "test/k8s/datapath_configuration.go"
-	case "RuntimeDatapathMonitorTest":
-		return "test/runtime/monitor.go"
 	case "K8sDatapathLRPTests":
 		return "test/k8s/lrp.go"
 	case "K8sDatapathServicesTest":
 		return "test/k8s/services.go"
-	case "K8sKafkaPolicyTest":
-		return "test/k8s/kafka_policies.go"
 	case "K8sSpecificMACAddressTests":
 		return "test/k8s/pod_mac_address.go"
 	}

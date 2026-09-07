@@ -88,17 +88,8 @@ function kube::codegen::deepequal_helpers() {
 
 kube::codegen::gen_client \
     "./pkg/k8s/slim/k8s/api" \
-    --with-watch \
     --output-dir "${TMPDIR}/github.com/cilium/cilium/pkg/k8s/slim/k8s/client" \
     --output-pkg "github.com/cilium/cilium/pkg/k8s/slim/k8s/client" \
-    --plural-exceptions ${PLURAL_EXCEPTIONS} \
-    --boilerplate "${SCRIPT_ROOT}/hack/custom-boilerplate.go.txt"
-
-kube::codegen::gen_client \
-    "./pkg/k8s/slim/k8s/apis" \
-    --with-watch \
-    --output-dir "${TMPDIR}/github.com/cilium/cilium/pkg/k8s/slim/k8s/apiextensions-client" \
-    --output-pkg "github.com/cilium/cilium/pkg/k8s/slim/k8s/apiextensions-client" \
     --plural-exceptions ${PLURAL_EXCEPTIONS} \
     --boilerplate "${SCRIPT_ROOT}/hack/custom-boilerplate.go.txt"
 

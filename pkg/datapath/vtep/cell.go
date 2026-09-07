@@ -6,13 +6,12 @@ package vtep
 import (
 	"fmt"
 	"log/slog"
-	"net"
+	"net/netip"
 
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/hive/job"
 	"github.com/spf13/pflag"
 
-	"github.com/cilium/cilium/pkg/cidr"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/mac"
 	"github.com/cilium/cilium/pkg/maps/vtep"
@@ -65,7 +64,7 @@ func newVTEPManager(params vtepManagerParams) error {
 	// use trigger to enforce first execution immediately when the timer job starts
 	tr := job.NewTrigger()
 	tr.Trigger()
-	params.JobGroup.Add(job.Timer("sync-vtep", mgr.syncVTEP, 1*time.Minute, job.WithTrigger(tr)))
+	params.JobGroup.Add(job.Timer("sync-vtep", mgr.syncVTEP, params.Config.VTEPSyncInterval, job.WithTrigger(tr)))
 
 	return nil
 }
@@ -87,6 +86,10 @@ func (r config) Flags(flags *pflag.FlagSet) {
 func (r config) validatedConfig() (*vtepManagerConfig, error) {
 	config := vtepManagerConfig{}
 
+	if r.VTEPSyncInterval <= 0 {
+		return nil, fmt.Errorf("VTEP sync interval must be positive (got %s)", r.VTEPSyncInterval)
+	}
+
 	if len(r.VTEPEndpoint) < 1 {
 		return nil, fmt.Errorf("If VTEP is enabled, at least one VTEP device must be configured")
 	}
@@ -101,23 +104,22 @@ func (r config) validatedConfig() (*vtepManagerConfig, error) {
 	}
 
 	for _, ep := range r.VTEPEndpoint {
-		endpoint := net.ParseIP(ep)
-		if endpoint == nil {
+		endpoint, err := netip.ParseAddr(ep)
+		if err != nil {
 			return nil, fmt.Errorf("Invalid VTEP IP: %v", ep)
 		}
-		ip4 := endpoint.To4()
-		if ip4 == nil {
-			return nil, fmt.Errorf("Invalid VTEP IPv4 address %v", ip4)
+		if !endpoint.Is4() {
+			return nil, fmt.Errorf("Invalid VTEP IPv4 address %v", endpoint)
 		}
 		config.vtepEndpoints = append(config.vtepEndpoints, endpoint)
 	}
 
 	for _, v := range r.VTEPCIDR {
-		externalCIDR, err := cidr.ParseCIDR(v)
+		externalCIDR, err := netip.ParsePrefix(v)
 		if err != nil {
 			return nil, fmt.Errorf("Invalid VTEP CIDR: %v", v)
 		}
-		config.vtepCIDRs = append(config.vtepCIDRs, externalCIDR)
+		config.vtepCIDRs = append(config.vtepCIDRs, externalCIDR.Masked())
 	}
 
 	for _, m := range r.VTEPMAC {

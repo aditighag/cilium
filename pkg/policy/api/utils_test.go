@@ -6,7 +6,6 @@ package api
 import (
 	"testing"
 
-	"github.com/cilium/proxy/pkg/policy/api/kafka"
 	"github.com/stretchr/testify/require"
 )
 
@@ -21,45 +20,6 @@ func TestHTTPEqual(t *testing.T) {
 
 	rules := L7Rules{
 		HTTP: []PortRuleHTTP{rule1, rule2},
-	}
-
-	require.True(t, rule1.Exists(rules))
-	require.True(t, rule2.Exists(rules))
-	require.False(t, rule3.Exists(rules))
-}
-
-func TestKafkaEqual(t *testing.T) {
-	rule1 := kafka.PortRule{APIVersion: "1", APIKey: "foo", Topic: "topic1"}
-	rule2 := kafka.PortRule{APIVersion: "1", APIKey: "bar", Topic: "topic1"}
-	rule3 := kafka.PortRule{APIVersion: "1", APIKey: "foo", Topic: "topic2"}
-
-	rules := L7Rules{
-		Kafka: []kafka.PortRule{rule1, rule2},
-	}
-
-	require.True(t, rule1.Exists(rules.Kafka))
-	require.True(t, rule2.Exists(rules.Kafka))
-	require.False(t, rule3.Exists(rules.Kafka))
-}
-
-func TestL7Equal(t *testing.T) {
-	rule1 := PortRuleL7{"Path": "/foo$", "Method": "GET"}
-	rule2 := PortRuleL7{"Path": "/bar$", "Method": "GET"}
-	rule3 := PortRuleL7{"Path": "/foo$", "Method": "GET", "extra": ""}
-
-	require.True(t, rule1.Equal(rule1))
-	require.True(t, rule2.Equal(rule2))
-	require.True(t, rule3.Equal(rule3))
-	require.False(t, rule1.Equal(rule2))
-	require.False(t, rule2.Equal(rule1))
-	require.False(t, rule1.Equal(rule3))
-	require.False(t, rule3.Equal(rule1))
-	require.False(t, rule2.Equal(rule3))
-	require.False(t, rule3.Equal(rule2))
-
-	rules := L7Rules{
-		L7Proto: "testing",
-		L7:      []PortRuleL7{rule1, rule2},
 	}
 
 	require.True(t, rule1.Exists(rules))

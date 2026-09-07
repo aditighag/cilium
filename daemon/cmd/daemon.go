@@ -5,35 +5,25 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
-	"github.com/cilium/cilium/daemon/infraendpoints"
-	agentK8s "github.com/cilium/cilium/daemon/k8s"
-	linuxdatapath "github.com/cilium/cilium/pkg/datapath/linux"
 	"github.com/cilium/cilium/pkg/datapath/linux/ipsec"
+	"github.com/cilium/cilium/pkg/datapath/linux/probes"
 	datapathTables "github.com/cilium/cilium/pkg/datapath/tables"
-	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
-	"github.com/cilium/cilium/pkg/k8s"
 	"github.com/cilium/cilium/pkg/logging/logfields"
-	"github.com/cilium/cilium/pkg/node"
-	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
 	policyAPI "github.com/cilium/cilium/pkg/policy/api"
 	policytypes "github.com/cilium/cilium/pkg/policy/types"
 	wgTypes "github.com/cilium/cilium/pkg/wireguard/types"
 )
 
-const (
-	// AutoCIDR indicates that a CIDR should be allocated
-	AutoCIDR = "auto"
-)
-
 func initAndValidateDaemonConfig(params daemonConfigParams) error {
 	// WireGuard and IPSec are mutually exclusive.
 	if params.IPSecConfig.Enabled() && params.WireguardConfig.Enabled() {
-		return fmt.Errorf("WireGuard (--%s) cannot be used with IPsec (--%s)", wgTypes.EnableWireguard, datapath.EnableIPSec)
+		return fmt.Errorf("WireGuard (--%s) cannot be used with IPsec (--%s)", wgTypes.EnableWireguard, option.EnableIPSec)
 	}
 
 	if !params.IPSecConfig.DNSProxyInsecureSkipTransparentModeCheckEnabled() {
@@ -48,6 +38,10 @@ func initAndValidateDaemonConfig(params daemonConfigParams) error {
 		}
 	}
 
+	if params.IPSecConfig.Enabled() && params.DaemonConfig.EnableEncryptionStrictModeIngress {
+		return fmt.Errorf("IPSec doesnt support strict ingress encryption.")
+	}
+
 	if params.DaemonConfig.EnableHostFirewall {
 		if params.IPSecConfig.Enabled() {
 			return fmt.Errorf("IPSec cannot be used with the host firewall.")
@@ -56,31 +50,14 @@ func initAndValidateDaemonConfig(params daemonConfigParams) error {
 
 	if params.DaemonConfig.LocalRouterIPv4 != "" || params.DaemonConfig.LocalRouterIPv6 != "" {
 		if params.IPSecConfig.Enabled() {
-			return fmt.Errorf("Cannot specify %s or %s with %s.", option.LocalRouterIPv4, option.LocalRouterIPv6, datapath.EnableIPSec)
+			return fmt.Errorf("Cannot specify %s or %s with %s.", option.LocalRouterIPv4, option.LocalRouterIPv6, option.EnableIPSec)
 		}
 	}
 
 	if params.IPSecConfig.Enabled() || params.WireguardConfig.Enabled() {
 		if !params.DaemonConfig.EnableCiliumNodeCRD {
-			return fmt.Errorf("CiliumNode CRD cannot be disabled when encryption is enabled with WireGuard (--%s) or IPsec (--%s)", wgTypes.EnableWireguard, datapath.EnableIPSec)
+			return fmt.Errorf("CiliumNode CRD cannot be disabled when encryption is enabled with WireGuard (--%s) or IPsec (--%s)", wgTypes.EnableWireguard, option.EnableIPSec)
 		}
-	}
-
-	// IPAMENI IPSec is configured from Reinitialize() to pull in devices
-	// that may be added or removed at runtime.
-	if params.IPSecConfig.Enabled() &&
-		!params.DaemonConfig.TunnelingEnabled() &&
-		len(params.DaemonConfig.EncryptInterface) == 0 &&
-		// If devices are required, we don't look at the EncryptInterface, as we
-		// don't load bpf_network in loader.reinitializeIPSec. Instead, we load
-		// bpf_host onto physical devices as chosen by configuration.
-		!params.DaemonConfig.AreDevicesRequired(params.KPRConfig, params.WireguardConfig.Enabled(), params.IPSecConfig.Enabled()) &&
-		params.DaemonConfig.IPAM != ipamOption.IPAMENI {
-		link, err := linuxdatapath.NodeDeviceNameWithDefaultRoute(params.Logger)
-		if err != nil {
-			return fmt.Errorf("Ipsec default interface lookup failed, consider \"encrypt-interface\" to manually configure interface. Err: %w", err)
-		}
-		params.DaemonConfig.EncryptInterface = append(params.DaemonConfig.EncryptInterface, link)
 	}
 
 	// Do the partial kube-proxy replacement initialization before creating BPF
@@ -93,13 +70,23 @@ func initAndValidateDaemonConfig(params daemonConfigParams) error {
 		return fmt.Errorf("unable to initialize kube-proxy replacement options: %w", err)
 	}
 
+	// NodePort/BPF masquerade features require iptables rules to be installed
+	// so locally generated traffic is marked appropriately.
+	//
+	// The NodePort code must identify locally generated traffic to avoid
+	// NAT port allocation conflicts.
+	if (params.KPRConfig.KubeProxyReplacement || params.DaemonConfig.EnableBPFMasquerade) && !params.DaemonConfig.InstallIptRules {
+		return fmt.Errorf("kube-proxy replacement (--%s) or BPF masquerade (--%s) requires iptables rules (--%s=\"true\")",
+			option.KubeProxyReplacement, option.EnableBPFMasquerade, option.InstallIptRules)
+	}
+
 	if params.K8sClientConfig.IsEnabled() {
 		// Kubernetes demands that the localhost can always reach local
 		// pods. Therefore unless the AllowLocalhost policy is set to a
 		// specific mode, always allow localhost to reach local
 		// endpoints.
-		if params.DaemonConfig.AllowLocalhost == option.AllowLocalhostAuto {
-			params.DaemonConfig.AllowLocalhost = option.AllowLocalhostAlways
+		if params.DaemonConfig.UnsafeDaemonConfigOption.AllowLocalhost == option.AllowLocalhostAuto {
+			params.DaemonConfig.UnsafeDaemonConfigOption.AllowLocalhost = option.AllowLocalhostAlways
 			params.Logger.Info("k8s mode: Allowing localhost to reach local endpoints")
 		}
 	}
@@ -125,27 +112,28 @@ func initAndValidateDaemonConfig(params daemonConfigParams) error {
 		return fmt.Errorf("BPF masquerade requires (--%s=\"true\" or --%s=\"true\")", option.EnableIPv4Masquerade, option.EnableIPv6Masquerade)
 	}
 
+	// If kernel does not support TBID lookup, we do not support dynamic pod
+	// egress routing.
+	if params.DaemonConfig.EnableFibTableIDAnnotation {
+		if err := probes.HaveFibLookupTbid(); err != nil {
+			if !errors.Is(err, probes.ErrNotSupported) {
+				return fmt.Errorf("unable to determine if kernel supports dynamic pod egress routing: %w", err)
+			}
+			return fmt.Errorf("kernel does not support dynamic pod egress routing (disable with --%s)", option.EnableFibTableIDAnnotation)
+		}
+	}
+
+	// If legacy routing mode was enabled, we do not support dynamic pod egress
+	// routing.
+	if params.DaemonConfig.EnableFibTableIDAnnotation && params.DaemonConfig.UnsafeDaemonConfigOption.EnableHostLegacyRouting {
+		return fmt.Errorf("legacy routing mode does not support dynamic pod egress routing (disable with --%s)", option.EnableFibTableIDAnnotation)
+	}
+
 	return nil
 }
 
 func configureDaemon(ctx context.Context, params daemonParams) error {
-	var err error
-
-	bootstrapStats.restore.Start()
-	// fetch old endpoints before k8s is configured.
-	if err := params.EndpointRestorer.FetchOldEndpoints(ctx, params.DaemonConfig.StateDir); err != nil {
-		params.Logger.Error("Unable to read existing endpoints", logfields.Error, err)
-	}
-	bootstrapStats.restore.End(true)
-
-	// Load cached information from restored endpoints in to FQDN NameManager and DNS proxies
-	bootstrapStats.fqdn.Start()
-	params.DNSNameManager.RestoreCache(params.EndpointRestorer.GetState().possible)
-	params.DNSProxy.BootstrapFQDN(params.EndpointRestorer.GetState().possible)
-	bootstrapStats.fqdn.End(true)
-
 	if params.Clientset.IsEnabled() {
-		bootstrapStats.k8sInit.Start()
 		// Errors are handled inside WaitForCRDsToRegister. It will fatal on a
 		// context deadline or if the context has been cancelled, the context's
 		// error will be returned. Otherwise, it succeeded.
@@ -157,17 +145,16 @@ func configureDaemon(ctx context.Context, params daemonParams) error {
 		}
 
 		if params.DaemonConfig.IPAM == ipamOption.IPAMClusterPool ||
-			params.DaemonConfig.IPAM == ipamOption.IPAMMultiPool {
+			params.DaemonConfig.IPAM == ipamOption.IPAMMultiPool ||
+			params.DaemonConfig.IPAM == ipamOption.IPAMENI {
 			// Create the CiliumNode custom resource. This call will block until
 			// the custom resource has been created
 			params.NodeDiscovery.UpdateCiliumNodeResource()
 		}
 
-		if err := agentK8s.WaitForNodeInformation(ctx, params.Logger, params.Resources.LocalNode, params.Resources.LocalCiliumNode); err != nil {
-			return fmt.Errorf("unable to connect to get node spec from apiserver: %w", err)
+		if err := params.LocalNodeStore.WaitForNodeInformation(ctx); err != nil {
+			return fmt.Errorf("failed to wait for node information: %w", err)
 		}
-
-		bootstrapStats.k8sInit.End(true)
 	}
 
 	// The kube-proxy replacement and host-fw devices detection should happen after
@@ -203,35 +190,23 @@ func configureDaemon(ctx context.Context, params daemonParams) error {
 	// Some of the k8s watchers rely on option flags set above (specifically
 	// EnableBPFMasquerade), so we should only start them once the flag values
 	// are set.
-	bootstrapStats.k8sInit.Start()
 	params.K8sWatcher.InitK8sSubsystem(ctx)
-	bootstrapStats.k8sInit.End(true)
-
-	// Fetch the router (`cilium_host`) IPs in case they were set a priori from
-	// the Kubernetes or CiliumNode resource in the K8s subsystem from call
-	// k8s.WaitForNodeInformation(). These will be used later after starting
-	// IPAM initialization to finish off the `cilium_host` IP restoration.
-	var restoredRouterIPs infraendpoints.RestoredIPs
-	restoredRouterIPs.IPv4FromK8s, restoredRouterIPs.IPv6FromK8s = node.GetInternalIPv4Router(params.Logger), node.GetIPv6Router(params.Logger)
-	// Fetch the router IPs from the filesystem in case they were set a priori
-	restoredRouterIPs.IPv4FromFS, restoredRouterIPs.IPv6FromFS = node.ExtractCiliumHostIPFromFS(params.Logger)
 
 	// Configure and start IPAM without using the configuration yet.
-	configureAndStartIPAM(ctx, params)
+	if err := params.IPAMInitializer.ConfigureAndStartIPAM(ctx); err != nil {
+		return err
+	}
 
-	bootstrapStats.restore.Start()
 	// restore endpoints before any IPs are allocated to avoid eventual IP
 	// conflicts later on, otherwise any IP conflict will result in the
 	// endpoint not being able to be restored.
-	err = params.EndpointRestorer.RestoreOldEndpoints()
-	bootstrapStats.restore.EndError(err)
-	if err != nil {
+	if err := params.EndpointRestorer.RestoreOldEndpoints(); err != nil {
 		return err
 	}
 
 	// We must do this after IPAM because we must wait until the
 	// K8s resources have been synced.
-	if err := params.InfraIPAllocator.AllocateIPs(ctx, restoredRouterIPs); err != nil { // will log errors/fatal internally
+	if err := params.InfraIPAllocator.AllocateIPs(ctx); err != nil {
 		return err
 	}
 
@@ -242,40 +217,11 @@ func configureDaemon(ctx context.Context, params daemonParams) error {
 
 	// Annotation of the k8s node must happen after discovery of the
 	// PodCIDR range and allocation of the health IPs.
-	if params.Clientset.IsEnabled() && params.DaemonConfig.AnnotateK8sNode {
-		bootstrapStats.k8sInit.Start()
-		params.Logger.Info("Annotating k8s node",
-			logfields.V4Prefix, node.GetIPv4AllocRange(params.Logger),
-			logfields.V6Prefix, node.GetIPv6AllocRange(params.Logger),
-			logfields.V4HealthIP, node.GetEndpointHealthIPv4(params.Logger),
-			logfields.V6HealthIP, node.GetEndpointHealthIPv6(params.Logger),
-			logfields.V4IngressIP, node.GetIngressIPv4(params.Logger),
-			logfields.V6IngressIP, node.GetIngressIPv6(params.Logger),
-			logfields.V4CiliumHostIP, node.GetInternalIPv4Router(params.Logger),
-			logfields.V6CiliumHostIP, node.GetIPv6Router(params.Logger),
-		)
-
-		latestLocalNode, err := params.LocalNodeStore.Get(ctx)
-		if err == nil {
-			_, err = k8s.AnnotateNode(
-				params.Logger,
-				params.Clientset,
-				nodeTypes.GetName(),
-				latestLocalNode.Node,
-				params.IPsecAgent.SPI())
-		}
-		if err != nil {
-			params.Logger.Warn("Cannot annotate k8s node with CIDR range", logfields.Error, err)
-		}
-
-		bootstrapStats.k8sInit.End(true)
-	} else if !params.DaemonConfig.AnnotateK8sNode {
-		params.Logger.Debug("Annotate k8s node is disabled.")
-	}
+	params.NodeDiscovery.AnnotateK8sNode(ctx)
 
 	// Trigger refresh and update custom resource in the apiserver with all restored endpoints.
 	// Trigger after nodeDiscovery.StartDiscovery to avoid custom resource update conflict.
-	params.IPAM.RestoreFinished()
+	params.IPAMInitializer.RestoreFinished()
 
 	// This needs to be done after the node addressing has been configured
 	// as the node address is required as suffix.
@@ -297,19 +243,16 @@ func configureDaemon(ctx context.Context, params daemonParams) error {
 		return err
 	}
 
-	if err := params.IPsecAgent.StartBackgroundJobs(params.NodeHandler); err != nil {
+	if err := params.IPsecAgent.StartBackgroundJobs(params.Orchestrator.DatapathInitialized()); err != nil {
 		params.Logger.Error("Unable to start IPsec key watcher", logfields.Error, err)
 	}
 
 	if !params.DaemonConfig.DryMode {
 		params.Logger.Info("Validating configured node address ranges")
-		if err := node.ValidatePostInit(params.Logger); err != nil {
+		if err := params.IPAMInitializer.ValidatePostInit(ctx); err != nil {
 			return fmt.Errorf("postinit failed: %w", err)
 		}
 	}
-
-	bootstrapStats.overall.End(true)
-	bootstrapStats.updateMetrics()
 
 	return nil
 }
@@ -373,10 +316,12 @@ func unloadDNSPolicies(params daemonParams) {
 			"Triggering policy recalculation to remove DNS rules due to option",
 			logfields.Option, option.DNSPolicyUnloadOnShutdown,
 		)
-		params.Policy.BumpRevision()
 		regenerationMetadata := &regeneration.ExternalRegenerationMetadata{
-			Reason:            "unloading DNS rules on graceful shutdown",
+			Reason:            regeneration.ReasonDaemonConfigUpdate,
+			Message:           "unloading DNS rules on graceful shutdown",
 			RegenerationLevel: regeneration.RegenerateWithoutDatapath,
+
+			PolicyRevisionToWaitFor: params.Policy.BumpRevision(),
 		}
 		wg := params.EndpointManager.RegenerateAllEndpoints(regenerationMetadata)
 		wg.Wait()

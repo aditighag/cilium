@@ -51,7 +51,7 @@ func TestComputePolicyDenyEnforcementAndRules(t *testing.T) {
 	fooIngressDenyRule1 := &types.PolicyEntry{
 		Ingress:     true,
 		DefaultDeny: true,
-		Deny:        true,
+		Verdict:     types.Deny,
 		Subject:     types.NewLabelSelectorFromLabels(fooSelectLabel),
 		L3:          types.ToSelectors(api.NewESFromLabels(fooSelectLabel)),
 		Labels: labels.LabelArray{
@@ -62,7 +62,7 @@ func TestComputePolicyDenyEnforcementAndRules(t *testing.T) {
 	fooIngressDenyRule2 := &types.PolicyEntry{
 		Ingress:     true,
 		DefaultDeny: true,
-		Deny:        true,
+		Verdict:     types.Deny,
 		Subject:     types.NewLabelSelectorFromLabels(fooSelectLabel),
 		L3:          types.ToSelectors(api.NewESFromLabels(fooSelectLabel)),
 		Labels: labels.LabelArray{
@@ -73,7 +73,7 @@ func TestComputePolicyDenyEnforcementAndRules(t *testing.T) {
 	fooEgressDenyRule1 := &types.PolicyEntry{
 		Ingress:     false,
 		DefaultDeny: true,
-		Deny:        true,
+		Verdict:     types.Deny,
 		Subject:     types.NewLabelSelectorFromLabels(fooSelectLabel),
 		L3:          types.ToSelectors(api.NewESFromLabels(fooSelectLabel)),
 		Labels: labels.LabelArray{
@@ -84,7 +84,7 @@ func TestComputePolicyDenyEnforcementAndRules(t *testing.T) {
 	fooEgressDenyRule2 := &types.PolicyEntry{
 		Ingress:     false,
 		DefaultDeny: true,
-		Deny:        true,
+		Verdict:     types.Deny,
 		Subject:     types.NewLabelSelectorFromLabels(fooSelectLabel),
 		L3:          types.ToSelectors(api.NewESFromLabels(fooSelectLabel)),
 		Labels: labels.LabelArray{
@@ -96,7 +96,7 @@ func TestComputePolicyDenyEnforcementAndRules(t *testing.T) {
 		&types.PolicyEntry{
 			Ingress:     true,
 			DefaultDeny: true,
-			Deny:        true,
+			Verdict:     types.Deny,
 			Subject:     types.NewLabelSelectorFromLabels(fooSelectLabel),
 			L3:          types.ToSelectors(api.NewESFromLabels(fooSelectLabel)),
 			Labels: labels.LabelArray{
@@ -105,7 +105,7 @@ func TestComputePolicyDenyEnforcementAndRules(t *testing.T) {
 		}, &types.PolicyEntry{
 			Ingress:     false,
 			DefaultDeny: true,
-			Deny:        true,
+			Verdict:     types.Deny,
 			Subject:     types.NewLabelSelectorFromLabels(fooSelectLabel),
 			L3:          types.ToSelectors(api.NewESFromLabels(fooSelectLabel)),
 			Labels: labels.LabelArray{
@@ -273,8 +273,8 @@ func TestDeniesIngress(t *testing.T) {
 	flowCtoB := flowAToB
 	flowCtoB.From = idC
 
-	checkFlow(t, repo, td.identityManager, flowAToB, api.Denied)
-	checkFlow(t, repo, td.identityManager, flowCtoB, api.Allowed)
+	checkFlow(t, repo, td.identityManager, flowAToB, false)
+	checkFlow(t, repo, td.identityManager, flowCtoB, true)
 }
 
 func TestDeniesEgress(t *testing.T) {
@@ -305,9 +305,9 @@ func TestDeniesEgress(t *testing.T) {
 	}
 	repo.mustAdd(rule1)
 
-	checkFlow(t, repo, td.identityManager, flowAToB, api.Denied)
-	checkFlow(t, repo, td.identityManager, flowAToC, api.Allowed)
-	checkFlow(t, repo, td.identityManager, flowAToWorld80, api.Allowed)
+	checkFlow(t, repo, td.identityManager, flowAToB, false)
+	checkFlow(t, repo, td.identityManager, flowAToC, true)
+	checkFlow(t, repo, td.identityManager, flowAToWorld80, true)
 }
 
 func TestWildcardL3RulesIngressDeny(t *testing.T) {
@@ -331,7 +331,7 @@ func TestWildcardL3RulesIngressDeny(t *testing.T) {
 			Protocol: api.ProtoAny,
 			U8Proto:  0x0,
 			PerSelectorPolicies: L7DataMap{
-				td.cachedSelectorBar1: &PerSelectorPolicy{IsDeny: true},
+				td.cachedSelectorBar1: denyPerSelectorPolicy,
 			},
 			Ingress:    true,
 			RuleOrigin: OriginForTest(map[CachedSelector]labels.LabelArrayList{td.cachedSelectorBar1: {labelsL3}}),
@@ -385,7 +385,7 @@ func TestWildcardL4RulesIngressDeny(t *testing.T) {
 			U8Proto:  0x6,
 			Ingress:  true,
 			PerSelectorPolicies: L7DataMap{
-				td.cachedSelectorB: &PerSelectorPolicy{IsDeny: true},
+				td.cachedSelectorB: denyPerSelectorPolicy,
 			},
 			RuleOrigin: OriginForTest(map[CachedSelector]labels.LabelArrayList{td.cachedSelectorB: {labelsL4HTTP}}),
 		},
@@ -395,7 +395,7 @@ func TestWildcardL4RulesIngressDeny(t *testing.T) {
 			U8Proto:  0x6,
 			Ingress:  true,
 			PerSelectorPolicies: L7DataMap{
-				td.cachedSelectorB: &PerSelectorPolicy{IsDeny: true},
+				td.cachedSelectorB: denyPerSelectorPolicy,
 			},
 			RuleOrigin: OriginForTest(map[CachedSelector]labels.LabelArrayList{td.cachedSelectorB: {labelsL4Kafka}}),
 		},
@@ -465,7 +465,7 @@ func TestWildcardL3RulesEgressDeny(t *testing.T) {
 			Protocol: "ANY",
 			U8Proto:  0x0,
 			PerSelectorPolicies: L7DataMap{
-				td.cachedSelectorB: &PerSelectorPolicy{IsDeny: true},
+				td.cachedSelectorB: denyPerSelectorPolicy,
 			},
 			Ingress:    false,
 			RuleOrigin: OriginForTest(map[CachedSelector]labels.LabelArrayList{td.cachedSelectorB: {labelsL4}}),
@@ -475,7 +475,7 @@ func TestWildcardL3RulesEgressDeny(t *testing.T) {
 			Protocol: api.ProtoICMP,
 			U8Proto:  0x1,
 			PerSelectorPolicies: L7DataMap{
-				td.cachedSelectorB: &PerSelectorPolicy{IsDeny: true},
+				td.cachedSelectorB: denyPerSelectorPolicy,
 			},
 			Ingress:    false,
 			RuleOrigin: OriginForTest(map[CachedSelector]labels.LabelArrayList{td.cachedSelectorB: {labelsICMP}}),
@@ -485,7 +485,7 @@ func TestWildcardL3RulesEgressDeny(t *testing.T) {
 			Protocol: api.ProtoICMPv6,
 			U8Proto:  0x3A,
 			PerSelectorPolicies: L7DataMap{
-				td.cachedSelectorB: &PerSelectorPolicy{IsDeny: true},
+				td.cachedSelectorB: denyPerSelectorPolicy,
 			},
 			Ingress:    false,
 			RuleOrigin: OriginForTest(map[CachedSelector]labels.LabelArrayList{td.cachedSelectorB: {labelsICMPv6}}),
@@ -541,7 +541,7 @@ func TestWildcardL4RulesEgressDeny(t *testing.T) {
 			U8Proto:  0x6,
 			Ingress:  false,
 			PerSelectorPolicies: L7DataMap{
-				td.cachedSelectorB: &PerSelectorPolicy{IsDeny: true},
+				td.cachedSelectorB: denyPerSelectorPolicy,
 			},
 			RuleOrigin: OriginForTest(map[CachedSelector]labels.LabelArrayList{td.cachedSelectorB: {labelsL3HTTP}}),
 		},
@@ -551,7 +551,7 @@ func TestWildcardL4RulesEgressDeny(t *testing.T) {
 			U8Proto:  0x11,
 			Ingress:  false,
 			PerSelectorPolicies: L7DataMap{
-				td.cachedSelectorB: &PerSelectorPolicy{IsDeny: true},
+				td.cachedSelectorB: denyPerSelectorPolicy,
 			},
 			RuleOrigin: OriginForTest(map[CachedSelector]labels.LabelArrayList{td.cachedSelectorB: {labelsL3DNS}}),
 		},
@@ -566,7 +566,7 @@ func TestWildcardCIDRRulesEgressDeny(t *testing.T) {
 	labelsL3 := labels.LabelArray{labels.ParseLabel("L3")}
 	labelsHTTP := labels.LabelArray{labels.ParseLabel("http")}
 
-	cachedSelectors, _ := td.sc.AddSelectors(dummySelectorCacheUser, EmptyStringLabels,
+	cachedSelectors, _ := td.sc.AddSelectors(dummySelectorCacheUser,
 		types.ToSelector(api.CIDR("192.0.0.0/3")))
 	defer td.sc.RemoveSelectors(cachedSelectors, dummySelectorCacheUser)
 
@@ -608,7 +608,7 @@ func TestWildcardCIDRRulesEgressDeny(t *testing.T) {
 			U8Proto:  0x6,
 			Ingress:  false,
 			PerSelectorPolicies: L7DataMap{
-				cachedSelectors[0]: &PerSelectorPolicy{IsDeny: true},
+				cachedSelectors[0]: denyPerSelectorPolicy,
 			},
 			RuleOrigin: OriginForTest(map[CachedSelector]labels.LabelArrayList{cachedSelectors[0]: {labelsHTTP}}),
 		},
@@ -618,7 +618,7 @@ func TestWildcardCIDRRulesEgressDeny(t *testing.T) {
 			U8Proto:  0x0,
 			Ingress:  false,
 			PerSelectorPolicies: L7DataMap{
-				cachedSelectors[0]: &PerSelectorPolicy{IsDeny: true},
+				cachedSelectors[0]: denyPerSelectorPolicy,
 			},
 			RuleOrigin: OriginForTest(map[CachedSelector]labels.LabelArrayList{cachedSelectors[0]: {labelsL3}}),
 		},
@@ -648,15 +648,17 @@ func TestWildcardL3RulesIngressDenyFromEntities(t *testing.T) {
 			Protocol: "ANY",
 			U8Proto:  0x0,
 			PerSelectorPolicies: L7DataMap{
-				td.cachedSelectorWorld:   &PerSelectorPolicy{IsDeny: true},
-				td.cachedSelectorWorldV4: &PerSelectorPolicy{IsDeny: true},
-				td.cachedSelectorWorldV6: &PerSelectorPolicy{IsDeny: true},
+				td.cachedSelectorWorld:          denyPerSelectorPolicy,
+				td.cachedSelectorWorldV4:        denyPerSelectorPolicy,
+				td.cachedSelectorWorldV6:        denyPerSelectorPolicy,
+				td.cachedSelectorAggregateWorld: denyPerSelectorPolicy,
 			},
 			Ingress: true,
 			RuleOrigin: OriginForTest(map[CachedSelector]labels.LabelArrayList{
-				td.cachedSelectorWorld:   {labelsL3},
-				td.cachedSelectorWorldV4: {labelsL3},
-				td.cachedSelectorWorldV6: {labelsL3},
+				td.cachedSelectorWorld:          {labelsL3},
+				td.cachedSelectorWorldV4:        {labelsL3},
+				td.cachedSelectorWorldV6:        {labelsL3},
+				td.cachedSelectorAggregateWorld: {labelsL3},
 			}),
 		},
 	})
@@ -688,15 +690,17 @@ func TestWildcardL3RulesEgressDenyToEntities(t *testing.T) {
 			Protocol: "ANY",
 			U8Proto:  0x0,
 			PerSelectorPolicies: L7DataMap{
-				td.cachedSelectorWorld:   &PerSelectorPolicy{IsDeny: true},
-				td.cachedSelectorWorldV4: &PerSelectorPolicy{IsDeny: true},
-				td.cachedSelectorWorldV6: &PerSelectorPolicy{IsDeny: true},
+				td.cachedSelectorWorld:          denyPerSelectorPolicy,
+				td.cachedSelectorWorldV4:        denyPerSelectorPolicy,
+				td.cachedSelectorWorldV6:        denyPerSelectorPolicy,
+				td.cachedSelectorAggregateWorld: denyPerSelectorPolicy,
 			},
 			Ingress: false,
 			RuleOrigin: OriginForTest(map[CachedSelector]labels.LabelArrayList{
-				td.cachedSelectorWorld:   {labelsL3},
-				td.cachedSelectorWorldV4: {labelsL3},
-				td.cachedSelectorWorldV6: {labelsL3},
+				td.cachedSelectorWorld:          {labelsL3},
+				td.cachedSelectorWorldV4:        {labelsL3},
+				td.cachedSelectorWorldV6:        {labelsL3},
+				td.cachedSelectorAggregateWorld: {labelsL3},
 			}),
 		},
 	})
@@ -723,7 +727,7 @@ func TestMinikubeGettingStartedDeny(t *testing.T) {
 	expectedDeny := NewL4PolicyMapWithValues(map[string]*L4Filter{"80/TCP": {
 		Port: 80, Protocol: api.ProtoTCP, U8Proto: 6,
 		PerSelectorPolicies: L7DataMap{
-			td.cachedSelectorB: &PerSelectorPolicy{IsDeny: true},
+			td.cachedSelectorB: denyPerSelectorPolicy,
 		},
 		Ingress:    true,
 		RuleOrigin: OriginForTest(map[CachedSelector]labels.LabelArrayList{td.cachedSelectorB: {nil}}),

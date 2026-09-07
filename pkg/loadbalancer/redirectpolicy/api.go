@@ -9,7 +9,7 @@ import (
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/api/v1/server/restapi/service"
-	daemonk8s "github.com/cilium/cilium/daemon/k8s"
+	k8sTables "github.com/cilium/cilium/pkg/k8s/tables"
 	lb "github.com/cilium/cilium/pkg/loadbalancer"
 )
 
@@ -17,14 +17,14 @@ type getLrpHandler struct {
 	db       *statedb.DB
 	lrps     statedb.Table[*LocalRedirectPolicy]
 	backends statedb.Table[*lb.Backend]
-	pods     statedb.Table[daemonk8s.LocalPod]
+	pods     statedb.Table[k8sTables.LocalPod]
 }
 
 func (h *getLrpHandler) Handle(params service.GetLrpParams) middleware.Responder {
 	return service.NewGetLrpOK().WithPayload(getLRPs(h.db.ReadTxn(), h.lrps, h.backends, h.pods))
 }
 
-func getLRPs(txn statedb.ReadTxn, lrps statedb.Table[*LocalRedirectPolicy], backends statedb.Table[*lb.Backend], pods statedb.Table[daemonk8s.LocalPod]) []*models.LRPSpec {
+func getLRPs(txn statedb.ReadTxn, lrps statedb.Table[*LocalRedirectPolicy], backends statedb.Table[*lb.Backend], pods statedb.Table[k8sTables.LocalPod]) []*models.LRPSpec {
 	list := make([]*models.LRPSpec, 0, lrps.NumObjects(txn))
 	for lrp := range lrps.All(txn) {
 		list = append(list, lrp.getModel(txn, backends, pods))
@@ -32,7 +32,7 @@ func getLRPs(txn statedb.ReadTxn, lrps statedb.Table[*LocalRedirectPolicy], back
 	return list
 }
 
-func (lrp *LocalRedirectPolicy) getModel(txn statedb.ReadTxn, backends statedb.Table[*lb.Backend], pods statedb.Table[daemonk8s.LocalPod]) *models.LRPSpec {
+func (lrp *LocalRedirectPolicy) getModel(txn statedb.ReadTxn, backends statedb.Table[*lb.Backend], pods statedb.Table[k8sTables.LocalPod]) *models.LRPSpec {
 	if lrp == nil {
 		return nil
 	}
@@ -67,7 +67,9 @@ func (lrp *LocalRedirectPolicy) getModel(txn statedb.ReadTxn, backends statedb.T
 
 	// Find all backends for the pseudo-service and build the API models for them.
 	beModels := []*models.LRPBackend{}
-	for be := range backends.List(txn, lb.BackendByServiceName(lrpSvcName)) {
+	bes, _ := lb.ListBackendsByServiceName(txn, backends, lrpSvcName)
+	preferred := lb.PreferredBackendsByAddress(bes)
+	for be := range preferred {
 		ipStr := be.Address.Addr().String()
 
 		// Find the pod that owns this backend IP.
@@ -87,10 +89,8 @@ func (lrp *LocalRedirectPolicy) getModel(txn statedb.ReadTxn, backends statedb.T
 			Port:     be.Address.Port(),
 			Protocol: be.Address.Protocol(),
 		}
-		if params := be.GetInstance(lrpSvcName); params != nil {
-			state, _ := params.State.String()
-			beAddrModel.State = state
-		}
+		state, _ := be.State.String()
+		beAddrModel.State = state
 
 		// Create the LRPBackend model.
 		beModel := &models.LRPBackend{

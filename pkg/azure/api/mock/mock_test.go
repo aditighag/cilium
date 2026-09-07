@@ -11,38 +11,39 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/cilium/cilium/pkg/azure/types"
+	// Register the Azure resource-ID parser so AzureInterface.GetVMID()
+	// resolves, which the AssignPrivateIpAddressesVMSS lookup compares against.
+	_ "github.com/cilium/cilium/pkg/azure/types/azureid"
 	ipamTypes "github.com/cilium/cilium/pkg/ipam/types"
 )
 
 func TestMock(t *testing.T) {
 	cidr := netip.MustParsePrefix("10.0.0.0/16")
 	subnet := &ipamTypes.Subnet{ID: "s-1", CIDR: cidr, AvailableAddresses: 65534}
-	api := NewAPI([]*ipamTypes.Subnet{subnet}, []*ipamTypes.VirtualNetwork{{ID: "v-1"}})
+	api := NewAPI([]*ipamTypes.Subnet{subnet})
 	require.NotNil(t, api)
 
-	instances, err := api.GetInstances(t.Context(), ipamTypes.SubnetMap{})
+	nics, err := api.ListAllNetworkInterfaces(t.Context())
 	require.NoError(t, err)
+	instances := api.ParseInterfacesIntoInstanceMap(nics, ipamTypes.SubnetMap{})
 	require.Equal(t, 0, instances.NumInstances())
 
-	vnets, subnets, err := api.GetVpcsAndSubnets(t.Context())
+	subnets, err := api.GetSubnetsByIDs(t.Context(), []string{"s-1"})
 	require.NoError(t, err)
-	require.Len(t, vnets, 1)
-	require.Equal(t, &ipamTypes.VirtualNetwork{ID: "v-1"}, vnets["v-1"])
 	require.Len(t, subnets, 1)
 	require.Equal(t, subnet, subnets["s-1"])
 
 	ifaceID := "/subscriptions/xxx/resourceGroups/g1/providers/Microsoft.Compute/virtualMachineScaleSets/vmss11/virtualMachines/vm1/networkInterfaces/vmss11"
 	instances = ipamTypes.NewInstanceMap()
 	resource := &types.AzureInterface{Name: "eth0"}
-	resource.SetID(ifaceID)
-	instances.Update("vm1", ipamTypes.InterfaceRevision{
-		Resource: resource.DeepCopy(),
-	})
+	resource.ID = ifaceID
+	instances.Update("vm1", resource.DeepCopy())
 	api.UpdateInstances(instances)
-	instances, err = api.GetInstances(t.Context(), ipamTypes.SubnetMap{})
+	nics, err = api.ListAllNetworkInterfaces(t.Context())
 	require.NoError(t, err)
+	instances = api.ParseInterfacesIntoInstanceMap(nics, ipamTypes.SubnetMap{})
 	require.Equal(t, 1, instances.NumInstances())
-	instances.ForeachInterface("", func(instanceID, interfaceID string, iface ipamTypes.InterfaceRevision) error {
+	instances.ForeachInterface("", func(instanceID, interfaceID string, iface ipamTypes.Interface) error {
 		require.Equal(t, "vm1", instanceID)
 		require.Equal(t, ifaceID, interfaceID)
 		return nil
@@ -50,29 +51,28 @@ func TestMock(t *testing.T) {
 
 	err = api.AssignPrivateIpAddressesVMSS(t.Context(), "vm1", "vmss1", "s-1", "eth0", 2)
 	require.NoError(t, err)
-	instances, err = api.GetInstances(t.Context(), ipamTypes.SubnetMap{})
+	nics, err = api.ListAllNetworkInterfaces(t.Context())
 	require.NoError(t, err)
+	instances = api.ParseInterfacesIntoInstanceMap(nics, ipamTypes.SubnetMap{})
 	require.Equal(t, 1, instances.NumInstances())
-	instances.ForeachInterface("", func(instanceID, interfaceID string, revision ipamTypes.InterfaceRevision) error {
+	instances.ForeachInterface("", func(instanceID, interfaceID string, iface ipamTypes.Interface) error {
 		require.Equal(t, "vm1", instanceID)
 		require.Equal(t, ifaceID, interfaceID)
 
-		iface, ok := revision.Resource.(*types.AzureInterface)
+		azIface, ok := iface.(*types.AzureInterface)
 		require.True(t, ok)
-		require.Len(t, iface.Addresses, 2)
+		require.Len(t, azIface.Addresses, 2)
 		return nil
 	})
 
 	vmIfaceID := "/subscriptions/xxx/resourceGroups/g1/providers/Microsoft.Network/networkInterfaces/vm22-if"
 	vmInstances := ipamTypes.NewInstanceMap()
 	resource = &types.AzureInterface{Name: "eth0"}
-	resource.SetID(vmIfaceID)
-	vmInstances.Update("vm2", ipamTypes.InterfaceRevision{
-		Resource: resource.DeepCopy(),
-	})
+	resource.ID = vmIfaceID
+	vmInstances.Update("vm2", resource.DeepCopy())
 	require.NoError(t, err)
 	require.Equal(t, 1, vmInstances.NumInstances())
-	vmInstances.ForeachInterface("", func(instanceID, interfaceID string, iface ipamTypes.InterfaceRevision) error {
+	vmInstances.ForeachInterface("", func(instanceID, interfaceID string, iface ipamTypes.Interface) error {
 		require.Equal(t, "vm2", instanceID)
 		require.Equal(t, vmIfaceID, interfaceID)
 		return nil
@@ -81,17 +81,17 @@ func TestMock(t *testing.T) {
 }
 
 func TestSetMockError(t *testing.T) {
-	api := NewAPI([]*ipamTypes.Subnet{}, []*ipamTypes.VirtualNetwork{})
+	api := NewAPI([]*ipamTypes.Subnet{})
 	require.NotNil(t, api)
 
 	mockError := errors.New("error")
 
-	api.SetMockError(GetInstances, mockError)
-	_, err := api.GetInstances(t.Context(), ipamTypes.SubnetMap{})
+	api.SetMockError(ListAllNetworkInterfaces, mockError)
+	_, err := api.ListAllNetworkInterfaces(t.Context())
 	require.ErrorIs(t, err, mockError)
 
-	api.SetMockError(GetVpcsAndSubnets, mockError)
-	_, _, err = api.GetVpcsAndSubnets(t.Context())
+	api.SetMockError(GetSubnetsByIDs, mockError)
+	_, err = api.GetSubnetsByIDs(t.Context(), nil)
 	require.ErrorIs(t, err, mockError)
 
 	api.SetMockError(AssignPrivateIpAddressesVMSS, mockError)
@@ -102,10 +102,10 @@ func TestSetMockError(t *testing.T) {
 func TestSetLimiter(t *testing.T) {
 	cidr := netip.MustParsePrefix("10.0.0.0/16")
 	subnet := &ipamTypes.Subnet{ID: "s-1", CIDR: cidr, AvailableAddresses: 100}
-	api := NewAPI([]*ipamTypes.Subnet{subnet}, []*ipamTypes.VirtualNetwork{{ID: "v-1"}})
+	api := NewAPI([]*ipamTypes.Subnet{subnet})
 	require.NotNil(t, api)
 
 	api.SetLimiter(10.0, 2)
-	_, err := api.GetInstances(t.Context(), ipamTypes.SubnetMap{})
+	_, err := api.ListAllNetworkInterfaces(t.Context())
 	require.NoError(t, err)
 }

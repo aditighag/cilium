@@ -585,7 +585,6 @@ or ``.matchExpressions``.
 
 .. code-block:: yaml
 
-    ---
     apiVersion: cilium.io/v2
     kind: CiliumPodIPPool
     metadata:
@@ -593,7 +592,8 @@ or ``.matchExpressions``.
       labels:
         pool: blue
 
-    ---
+.. code-block:: yaml
+
     apiVersion: cilium.io/v2
     kind: CiliumBGPAdvertisement
     metadata:
@@ -740,7 +740,7 @@ See :ref:`External Access To ClusterIP Services <external_access_to_clusterip_se
 for how to enable it.
 
 If you only wish to advertise the ``.spec.clusterIP`` and ``.spec.clusterIPs`` of a Service,
-you can specify the ``virtualRouters[*].serviceAdvertisements`` field as ``ClusterIP``.
+you can specify the ``advertisements[*].service.addresses`` field as ``ClusterIP``.
 
 .. code-block:: yaml
 
@@ -916,7 +916,7 @@ Labels were then configured using:
 .. code-block:: shell-session
 
     kubectl label service hello-world vpc1=true
-    kubectl label service hello-world vpc1=true
+    kubectl label service hello-world vpc2=true
 
 The resulting BGP advertisement set both communities ``1111:1111:1111`` and ``2222:2222:2222``.
 All possible combinations of communities (``Standard``, ``Large``, ``WellKnown``) are 

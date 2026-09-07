@@ -6,9 +6,17 @@ package translation
 import (
 	"testing"
 
+	"k8s.io/apimachinery/pkg/types"
+
 	envoy_config_cluster_v3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	envoy_config_core_v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	envoy_config_tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	envoy_upstreams_http_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/cilium/cilium/operator/pkg/model"
+	syncnames "github.com/cilium/cilium/pkg/secretsync/names"
 )
 
 func Test_withClusterLbPolicy(t *testing.T) {
@@ -68,8 +76,95 @@ func Test_withConnectionTimeout(t *testing.T) {
 }
 
 func Test_httpCluster(t *testing.T) {
+	c := &cecTranslator{Config: Config{ClusterConfig: ClusterConfig{
+		IdleTimeoutSeconds:       60,
+		MaxRequestsPerConnection: 1,
+	}}}
+	res, err := c.httpCluster("dummy-name", "dummy-name", false, "", nil)
+	require.NoError(t, err)
+
+	cluster := &envoy_config_cluster_v3.Cluster{}
+	err = proto.Unmarshal(res.Value, cluster)
+
+	require.NoError(t, err)
+	require.Equal(t, "dummy-name", cluster.Name)
+	require.Equal(t, &envoy_config_cluster_v3.Cluster_Type{
+		Type: envoy_config_cluster_v3.Cluster_EDS,
+	}, cluster.ClusterDiscoveryType)
+
+	protocolOptions := &envoy_upstreams_http_v3.HttpProtocolOptions{}
+	require.NoError(t, cluster.TypedExtensionProtocolOptions[httpProtocolOptionsType].UnmarshalTo(protocolOptions))
+	require.Equal(t, int64(60), protocolOptions.CommonHttpProtocolOptions.IdleTimeout.Seconds)
+	require.Equal(t, uint32(1), protocolOptions.CommonHttpProtocolOptions.MaxRequestsPerConnection.Value)
+}
+
+func Test_httpClusterWithTLSOriginationAllowsTLS13(t *testing.T) {
 	c := &cecTranslator{}
-	res, err := c.httpCluster("dummy-name", "dummy-name", false, "")
+	res, err := c.httpCluster("dummy-name", "dummy-name", false, "", &model.BackendTLSOrigination{
+		SNI: "backend.example.com",
+		CACertRef: &model.FullyQualifiedResource{
+			Name:      "ca-cert",
+			Namespace: "default",
+		},
+	})
+	require.NoError(t, err)
+
+	cluster := &envoy_config_cluster_v3.Cluster{}
+	err = proto.Unmarshal(res.Value, cluster)
+	require.NoError(t, err)
+	require.Equal(t, "envoy.transport_sockets.tls", cluster.TransportSocket.Name)
+
+	typedConfig := cluster.TransportSocket.ConfigType.(*envoy_config_core_v3.TransportSocket_TypedConfig)
+	tlsContext := &envoy_config_tls.UpstreamTlsContext{}
+	err = proto.Unmarshal(typedConfig.TypedConfig.Value, tlsContext)
+	require.NoError(t, err)
+	require.NotNil(t, tlsContext.CommonTlsContext.TlsParams)
+	require.Equal(t, envoy_config_tls.TlsParameters_TLSv1_3, tlsContext.CommonTlsContext.TlsParams.TlsMaximumProtocolVersion)
+}
+
+func Test_withTLSOrigination(t *testing.T) {
+	tls := &model.BackendTLSOrigination{
+		SNI: "my-backend.svc.cluster.local",
+		CACertRef: &model.FullyQualifiedResource{
+			Name:      "my-ca-configmap",
+			Namespace: "my-namespace",
+		},
+	}
+
+	t.Run("uses configured secrets namespace in SDS name", func(t *testing.T) {
+		fn := withTLSOrigination("my-secrets-ns", tls)
+		cluster := fn(&envoy_config_cluster_v3.Cluster{})
+		require.NotNil(t, cluster.TransportSocket)
+
+		upstreamTLS := &envoy_config_tls.UpstreamTlsContext{}
+		err := proto.Unmarshal(cluster.TransportSocket.GetTypedConfig().GetValue(), upstreamTLS)
+		require.NoError(t, err)
+
+		combined := upstreamTLS.CommonTlsContext.GetCombinedValidationContext()
+		require.NotNil(t, combined)
+		sdsName := combined.ValidationContextSdsSecretConfig.GetName()
+		require.Equal(t, syncnames.SyncedConfigMapSDSSecretName("my-secrets-ns", types.NamespacedName{Namespace: "my-namespace", Name: "my-ca-configmap"}), sdsName)
+	})
+
+	t.Run("default secrets namespace produces correct SDS name", func(t *testing.T) {
+		fn := withTLSOrigination("cilium-secrets", tls)
+		cluster := fn(&envoy_config_cluster_v3.Cluster{})
+		require.NotNil(t, cluster.TransportSocket)
+
+		upstreamTLS := &envoy_config_tls.UpstreamTlsContext{}
+		err := proto.Unmarshal(cluster.TransportSocket.GetTypedConfig().GetValue(), upstreamTLS)
+		require.NoError(t, err)
+
+		combined := upstreamTLS.CommonTlsContext.GetCombinedValidationContext()
+		require.NotNil(t, combined)
+		sdsName := combined.ValidationContextSdsSecretConfig.GetName()
+		require.Equal(t, syncnames.SyncedConfigMapSDSSecretName("cilium-secrets", types.NamespacedName{Namespace: "my-namespace", Name: "my-ca-configmap"}), sdsName)
+	})
+}
+
+func Test_tcpCluster(t *testing.T) {
+	c := &cecTranslator{}
+	res, err := c.httpCluster("dummy-name", "dummy-name", false, "", nil)
 	require.NoError(t, err)
 
 	cluster := &envoy_config_cluster_v3.Cluster{}
@@ -82,17 +177,120 @@ func Test_httpCluster(t *testing.T) {
 	}, cluster.ClusterDiscoveryType)
 }
 
-func Test_tcpCluster(t *testing.T) {
+func extAuthBackend(ns, name string, port uint32, tls *model.BackendTLSOrigination) model.Backend {
+	return model.Backend{
+		Namespace: ns,
+		Name:      name,
+		Port:      &model.BackendPort{Port: port},
+		TLS:       tls,
+	}
+}
+
+func extAuthModel(protocol model.ExternalAuthProtocol, be model.Backend) *model.Model {
+	return &model.Model{
+		HTTP: []model.HTTPListener{
+			{
+				Routes: []model.HTTPRoute{
+					{
+						ExternalAuth: &model.HTTPExternalAuthFilter{
+							Protocol: protocol,
+							Backend:  be,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func Test_desiredEnvoyCluster_grpcExtAuthWithTLS(t *testing.T) {
+	tls := &model.BackendTLSOrigination{
+		SNI:       "authz.example.com",
+		CACertRef: &model.FullyQualifiedResource{Name: "ca-cert", Namespace: "default"},
+	}
+	be := extAuthBackend("authns", "authsvc", 9001, tls)
+	m := extAuthModel(model.ExternalAuthProtocolGRPC, be)
+
 	c := &cecTranslator{}
-	res, err := c.httpCluster("dummy-name", "dummy-name", false, "")
+	clusters, err := c.desiredEnvoyCluster(m)
 	require.NoError(t, err)
+	require.Len(t, clusters, 1)
 
 	cluster := &envoy_config_cluster_v3.Cluster{}
-	err = proto.Unmarshal(res.Value, cluster)
+	require.NoError(t, proto.Unmarshal(clusters[0].Value, cluster))
 
+	require.Equal(t, "grpc:authns:authsvc:9001", cluster.Name)
+	require.NotNil(t, cluster.TransportSocket, "expected TLS transport socket on gRPC ext_authz cluster")
+	require.Equal(t, "envoy.transport_sockets.tls", cluster.TransportSocket.Name)
+
+	typedConfig := cluster.TransportSocket.ConfigType.(*envoy_config_core_v3.TransportSocket_TypedConfig)
+	tlsCtx := &envoy_config_tls.UpstreamTlsContext{}
+	require.NoError(t, proto.Unmarshal(typedConfig.TypedConfig.Value, tlsCtx))
+	require.Equal(t, "authz.example.com", tlsCtx.Sni)
+}
+
+func Test_desiredEnvoyCluster_httpExtAuthWithTLS(t *testing.T) {
+	tls := &model.BackendTLSOrigination{
+		SNI:       "authz.example.com",
+		CACertRef: &model.FullyQualifiedResource{Name: "ca-cert", Namespace: "default"},
+	}
+	be := extAuthBackend("authns", "authsvc", 9001, tls)
+	m := extAuthModel(model.ExternalAuthProtocolHTTP, be)
+
+	c := &cecTranslator{}
+	clusters, err := c.desiredEnvoyCluster(m)
 	require.NoError(t, err)
-	require.Equal(t, "dummy-name", cluster.Name)
-	require.Equal(t, &envoy_config_cluster_v3.Cluster_Type{
-		Type: envoy_config_cluster_v3.Cluster_EDS,
-	}, cluster.ClusterDiscoveryType)
+	require.Len(t, clusters, 1)
+
+	cluster := &envoy_config_cluster_v3.Cluster{}
+	require.NoError(t, proto.Unmarshal(clusters[0].Value, cluster))
+
+	require.Equal(t, "http:authns:authsvc:9001", cluster.Name)
+	require.NotNil(t, cluster.TransportSocket, "expected TLS transport socket on HTTP ext_authz cluster")
+	require.Equal(t, "envoy.transport_sockets.tls", cluster.TransportSocket.Name)
+
+	typedConfig := cluster.TransportSocket.ConfigType.(*envoy_config_core_v3.TransportSocket_TypedConfig)
+	tlsCtx := &envoy_config_tls.UpstreamTlsContext{}
+	require.NoError(t, proto.Unmarshal(typedConfig.TypedConfig.Value, tlsCtx))
+	require.Equal(t, "authz.example.com", tlsCtx.Sni)
+}
+
+func Test_getGRPCExtAuthBackends(t *testing.T) {
+	grpcBe := extAuthBackend("ns", "grpc-svc", 8080, nil)
+	httpBe := extAuthBackend("ns", "http-svc", 8081, nil)
+	m := &model.Model{
+		HTTP: []model.HTTPListener{
+			{
+				Routes: []model.HTTPRoute{
+					{ExternalAuth: &model.HTTPExternalAuthFilter{Protocol: model.ExternalAuthProtocolGRPC, Backend: grpcBe}},
+					{ExternalAuth: &model.HTTPExternalAuthFilter{Protocol: model.ExternalAuthProtocolHTTP, Backend: httpBe}},
+					{ExternalAuth: &model.HTTPExternalAuthFilter{Protocol: model.ExternalAuthProtocolGRPC, Backend: grpcBe}},
+				},
+			},
+		},
+	}
+
+	backends := getGRPCExtAuthBackends(m)
+	require.Len(t, backends, 1)
+	require.Equal(t, "grpc-svc", backends[0].Name)
+}
+
+func Test_getHTTPExtAuthBackends(t *testing.T) {
+	grpcBe := extAuthBackend("ns", "grpc-svc", 8080, nil)
+	httpBe := extAuthBackend("ns", "http-svc", 8081, nil)
+	m := &model.Model{
+		HTTP: []model.HTTPListener{
+			{
+				Routes: []model.HTTPRoute{
+					{ExternalAuth: &model.HTTPExternalAuthFilter{Protocol: model.ExternalAuthProtocolGRPC, Backend: grpcBe}},
+					{ExternalAuth: &model.HTTPExternalAuthFilter{Protocol: model.ExternalAuthProtocolHTTP, Backend: httpBe}},
+					{ExternalAuth: &model.HTTPExternalAuthFilter{Protocol: model.ExternalAuthProtocolHTTP, Backend: httpBe}},
+				},
+			},
+		},
+	}
+
+	backends := getHTTPExtAuthBackends(m)
+	require.Len(t, backends, 1)
+	require.Equal(t, "http-svc", backends[0].Name)
 }

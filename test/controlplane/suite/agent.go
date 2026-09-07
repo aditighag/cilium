@@ -20,7 +20,6 @@ import (
 	fakecni "github.com/cilium/cilium/daemon/cmd/cni/fake"
 	"github.com/cilium/cilium/daemon/cmd/legacy"
 	fakeDatapath "github.com/cilium/cilium/pkg/datapath/fake"
-	fakeTypes "github.com/cilium/cilium/pkg/datapath/fake/types"
 	"github.com/cilium/cilium/pkg/datapath/linux/route/reconciler"
 	"github.com/cilium/cilium/pkg/datapath/neighbor"
 	"github.com/cilium/cilium/pkg/datapath/prefilter"
@@ -35,8 +34,10 @@ import (
 	"github.com/cilium/cilium/pkg/loadbalancer"
 	"github.com/cilium/cilium/pkg/maps/ctmap"
 	"github.com/cilium/cilium/pkg/maps/policymap"
+	"github.com/cilium/cilium/pkg/maps/subnet"
 	"github.com/cilium/cilium/pkg/metrics"
 	monitorAgent "github.com/cilium/cilium/pkg/monitor/agent"
+	fakenode "github.com/cilium/cilium/pkg/node/fake"
 	"github.com/cilium/cilium/pkg/option"
 )
 
@@ -44,7 +45,7 @@ type agentHandle struct {
 	t         *testing.T
 	db        *statedb.DB
 	nodeAddrs statedb.Table[datapathTables.NodeAddress]
-	fnh       *fakeTypes.FakeNodeHandler
+	fnh       *fakenode.Handler
 
 	hive *hive.Hive
 	log  *slog.Logger
@@ -79,20 +80,23 @@ func (h *agentHandle) setupCiliumAgentHive(clientset k8sClient.Clientset, extraC
 			func() policymap.Factory { return nil },
 			func() *server.Server { return nil },
 			func() *loadbalancer.TestConfig { return &loadbalancer.TestConfig{} },
+			func() statedb.RWTable[subnet.SubnetTableEntry] {
+				return nil
+			},
 			k8sSynced.RejectedCRDSyncPromise,
 		),
 		kvstore.Cell(kvstore.DisabledBackendName),
 		fakeDatapath.Cell,
 		neighbor.ForwardableIPCell,
 		reconciler.TableCell,
-		cell.Provide(neighbor.NewCommonTestConfig(true, false)),
+		cell.Provide(neighbor.NewCommonTestConfig(true, false, 100)),
 		prefilter.Cell,
 		monitorAgent.Cell,
 		metrics.Cell,
 		store.Cell,
 		dial.ServiceResolverCell,
 		cmd.ControlPlane,
-		cell.Invoke(func(_ legacy.DaemonInitialization, nh *fakeTypes.FakeNodeHandler) {
+		cell.Invoke(func(_ legacy.DaemonInitialization, nh *fakenode.Handler) {
 			// with dry-run enabled it's enough to depend on DaemonInitialization
 			h.fnh = nh
 		}),

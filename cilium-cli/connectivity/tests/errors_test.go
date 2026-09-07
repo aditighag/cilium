@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/blang/semver/v4"
 	"github.com/stretchr/testify/assert"
@@ -31,12 +32,13 @@ time=2025-04-08T14:27:09Z level=error msg="bar" serviceID=2 source=/go/src/githu
 `
 
 	for _, tt := range []struct {
-		levels         []string
-		version        semver.Version
-		wantLen        int
-		wantLogsCount  map[string]int
-		wantExampleLog map[string]set.Set[string]
-		wantFilePath   string
+		levels          []string
+		version         semver.Version
+		extraExceptions []string
+		wantLen         int
+		wantLogsCount   map[string]int
+		wantExampleLog  map[string]set.Set[string]
+		wantFilePath    string
 	}{
 		{
 			levels:  defaults.LogCheckLevels,
@@ -92,8 +94,20 @@ time=2025-04-08T14:27:09Z level=error msg="bar" serviceID=2 source=/go/src/githu
 			// in case of no source file information.
 			wantFilePath: "cilium-cli/connectivity/tests/errors.go",
 		},
+		{
+			levels:          defaults.LogCheckLevels,
+			version:         semver.MustParse("1.17.0"),
+			extraExceptions: []string{"bar", "baz"},
+			wantLen:         2,
+			wantLogsCount: map[string]int{
+				`[error][envoy_bug] envoy bug failure: !Thread::MainThread::isMainOrTestThread()`: 1,
+				`[critical][backtrace] Caught Aborted, suspect faulting address 0xd`:              1,
+			},
+			wantFilePath: "cilium-cli/connectivity/tests/errors.go",
+		},
 	} {
-		s := NoErrorsInLogs(tt.version, tt.levels, "one.one.one.one", "k8s.io").(*noErrorsInLogs)
+		var zt time.Time
+		s := NoErrorsInLogs(tt.version, tt.levels, tt.extraExceptions, "one.one.one.one", "k8s.io", zt).(*noErrorsInLogs)
 		fails, example := s.findUniqueFailures([]byte(errs))
 		assert.Len(t, fails, tt.wantLen)
 		for wantMsg, wantCount := range tt.wantLogsCount {
@@ -107,6 +121,130 @@ time=2025-04-08T14:27:09Z level=error msg="bar" serviceID=2 source=/go/src/githu
 			}
 			assert.Equal(t, tt.wantFilePath, s.FilePath())
 		}
+	}
+}
+
+func TestGoBGPv4FailedToSendMatcher(t *testing.T) {
+	const src = "/go/src/github.com/cilium/cilium/vendor/github.com/osrg/gobgp/v4/pkg/server/fsm.go"
+
+	for _, tt := range []struct {
+		name      string
+		log       string
+		wantMatch bool
+	}{
+		{
+			name:      "ignored: failed to send due to closed network connection",
+			log:       `time=2026-05-25T23:16:20Z level=warn source=` + src + `:1739 msg="failed to send" component=gobgp-server State=BGP_FSM_ESTABLISHED Data="write tcp 192.168.10.7:47615->192.168.10.8:11179: use of closed network connection"`,
+			wantMatch: true,
+		},
+		{
+			name:      "ignored: failed to send due to broken pipe",
+			log:       `time=2026-05-26T07:33:03Z level=warn source=` + src + `:1739 msg="failed to send" component=gobgp-server State=BGP_FSM_ESTABLISHED Data="write tcp4 192.168.10.8:11179->192.168.10.6:45369: write: broken pipe"`,
+			wantMatch: true,
+		},
+		{
+			name:      "reported: failed to send due to another error",
+			log:       `time=2026-05-26T07:33:03Z level=warn source=` + src + `:1739 msg="failed to send" component=gobgp-server State=BGP_FSM_ESTABLISHED Data="write tcp 192.168.10.7:47615->192.168.10.8:11179: i/o timeout"`,
+			wantMatch: false,
+		},
+		{
+			name:      "reported: failed to send keepalive (distinct msg) even on broken pipe",
+			log:       `time=2026-05-26T07:33:03Z level=warn source=` + src + `:997 msg="failed to send keepalive on outgoing connection" component=gobgp-server Error="write tcp 192.168.10.7:47615->192.168.10.8:11179: write: broken pipe"`,
+			wantMatch: false,
+		},
+		{
+			name:      "reported: failed to send on broken pipe from another subsystem",
+			log:       `time=2026-05-26T07:33:03Z level=warn source=/go/src/github.com/cilium/cilium/pkg/hubble/relay/relay.go:42 msg="failed to send" subsys=hubble error="broken pipe"`,
+			wantMatch: false,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.wantMatch, gobgpFailedToSend.IsMatch(tt.log))
+		})
+	}
+}
+
+func TestLeaderElectionLeaseLockErrorMatcher(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		log       string
+		wantMatch bool
+	}{
+		{
+			name:      "ignored: client-go leader election lease retrieval failure",
+			log:       `time=2026-07-10T15:06:16Z level=error source=/go/src/github.com/cilium/cilium/vendor/k8s.io/client-go/tools/leaderelection/leaderelection.go:461 msg="Error retrieving lease lock" subsys=klog error="Client.Timeout exceeded while awaiting headers"`,
+			wantMatch: true,
+		},
+		{
+			name:      "reported: same message from another package",
+			log:       `time=2026-07-10T15:06:16Z level=error source=/go/src/github.com/cilium/cilium/operator/pkg/leader/leader.go:42 msg="Error retrieving lease lock" subsys=klog`,
+			wantMatch: false,
+		},
+		{
+			name:      "reported: another client-go leader election error",
+			log:       `time=2026-07-10T15:06:16Z level=error source=/go/src/github.com/cilium/cilium/vendor/k8s.io/client-go/tools/leaderelection/leaderelection.go:461 msg="Failed to renew lease" subsys=klog`,
+			wantMatch: false,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.wantMatch, vendoredLeaderElectionLeaseLockError.IsMatch(tt.log))
+		})
+	}
+}
+
+func TestInstanceOutOfInterfacesThreshold(t *testing.T) {
+	line := func(node string) string {
+		return `time=2026-07-15T20:46:30Z level=warning msg="Instance is out of interfaces" subsys=ipam-allocator-aws name=` + node + ` instanceID=i-0abc`
+	}
+
+	for _, tt := range []struct {
+		name       string
+		lines      []string
+		wantFailed bool
+	}{
+		{
+			name:       "one node at capacity is tolerated",
+			lines:      []string{line("ip-1.compute.internal")},
+			wantFailed: false,
+		},
+		{
+			name: "one node logging repeatedly is still tolerated",
+			lines: []string{
+				line("ip-1.compute.internal"),
+				line("ip-1.compute.internal"),
+				line("ip-1.compute.internal"),
+			},
+			wantFailed: false,
+		},
+		{
+			name: "two distinct nodes at capacity is a failure",
+			lines: []string{
+				line("ip-1.compute.internal"),
+				line("ip-2.compute.internal"),
+			},
+			wantFailed: true,
+		},
+		{
+			name: "many distinct nodes at capacity is a failure",
+			lines: []string{
+				line("ip-1.compute.internal"),
+				line("ip-2.compute.internal"),
+				line("ip-3.compute.internal"),
+			},
+			wantFailed: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var zt time.Time
+			s := NoErrorsInLogs(semver.MustParse("1.19.0"), defaults.LogCheckLevels, nil, "one.one.one.one", "k8s.io", zt).(*noErrorsInLogs)
+			logs := strings.Join(tt.lines, "\n") + "\n"
+			fails, _ := s.findUniqueFailures([]byte(logs))
+			if tt.wantFailed {
+				assert.Contains(t, fails, "Instance is out of interfaces")
+			} else {
+				assert.NotContains(t, fails, "Instance is out of interfaces")
+			}
+		})
 	}
 }
 

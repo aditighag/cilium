@@ -1,54 +1,78 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Cilium
 
-package types
+package types_test
 
 import (
+	"encoding/json"
+	"net/netip"
+	"reflect"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/cilium/cilium/pkg/ipam/types"
+	"github.com/cilium/cilium/pkg/azure/types"
+	// Register the Azure resource-ID parser used by TestExtractIDs.
+	_ "github.com/cilium/cilium/pkg/azure/types/azureid"
+	iputil "github.com/cilium/cilium/pkg/ip"
+	"github.com/cilium/cilium/pkg/mac"
 )
 
-func TestForeachAddresses(t *testing.T) {
-	m := types.NewInstanceMap()
-	m.Update("i-1", types.InterfaceRevision{
-		Resource: &AzureInterface{ID: "1", Addresses: []AzureAddress{
-			{IP: "1.1.1.1"},
-			{IP: "2.2.2.2"},
+// State that does not serialize forces a /status write on every IPAM sync.
+func TestAzureStatusHasNoUnserializedState(t *testing.T) {
+	status := reflect.TypeFor[types.AzureStatus]()
+
+	queue := []reflect.Type{status}
+	for len(queue) > 0 {
+		ty := queue[0]
+		queue = queue[1:]
+
+		for ty.Kind() == reflect.Pointer || ty.Kind() == reflect.Slice || ty.Kind() == reflect.Array || ty.Kind() == reflect.Map {
+			ty = ty.Elem()
+		}
+		// iputil's wrappers serialize through MarshalText, so the unexported
+		// state they keep is legitimate.
+		if ty.Kind() != reflect.Struct || ty.PkgPath() != status.PkgPath() {
+			continue
+		}
+		for field := range ty.Fields() {
+			require.True(t, field.IsExported(), "%s.%s is unexported", ty.Name(), field.Name)
+			require.NotEqual(t, "-", field.Tag.Get("json"), "%s.%s is excluded from JSON", ty.Name(), field.Name)
+			queue = append(queue, field.Type)
+		}
+	}
+}
+
+// A round trip must not perturb the interface, or the write-skip gate breaks.
+func TestAzureInterfaceJSONRoundTrip(t *testing.T) {
+	base := &types.AzureInterface{
+		ID:            "/subscriptions/xxx/resourceGroups/rg1/providers/Microsoft.Compute/virtualMachineScaleSets/vmss1/virtualMachines/0/networkInterfaces/vmss1",
+		IP:            iputil.AddrFrom(netip.MustParseAddr("10.0.0.1")),
+		Name:          "eth0",
+		MAC:           mac.MustParseMAC("aa:bb:cc:dd:ee:ff"),
+		State:         "succeeded",
+		SecurityGroup: "sg1",
+		Addresses: []types.AzureAddress{
+			{IP: iputil.AddrFrom(netip.MustParseAddr("10.0.0.2")), State: "succeeded"},
+			{IP: iputil.AddrFrom(netip.MustParseAddr("10.0.0.3")), State: "succeeded"},
 		},
-		}})
-	m.Update("i-2", types.InterfaceRevision{
-		Resource: &AzureInterface{ID: "1", Addresses: []AzureAddress{
-			{IP: "3.3.3.3"},
-			{IP: "4.4.4.4"},
-		},
-		}})
+		Subnet:  types.AzureSubnet{ID: "s-1", CIDR: iputil.PrefixFrom(netip.MustParsePrefix("10.0.0.0/24"))},
+		Gateway: iputil.AddrFrom(netip.MustParseAddr("10.0.0.1")),
+	}
 
-	// Iterate over all instances
-	addresses := 0
-	m.ForeachAddress("", func(instanceID, interfaceID, ip, poolID string, address types.Address) error {
-		addresses++
-		return nil
-	})
-	require.Equal(t, 4, addresses)
+	marshalled, err := json.Marshal(base)
+	require.NoError(t, err)
+	var roundTripped types.AzureInterface
+	require.NoError(t, json.Unmarshal(marshalled, &roundTripped))
 
-	// Iterate over "i-1"
-	addresses = 0
-	m.ForeachAddress("i-1", func(instanceID, interfaceID, ip, poolID string, address types.Address) error {
-		addresses++
-		return nil
-	})
-	require.Equal(t, 2, addresses)
+	require.Equal(t, *base, roundTripped)
+	require.True(t, base.DeepEqual(&roundTripped))
 
-	// Iterate over all interfaces
-	interfaces := 0
-	m.ForeachInterface("", func(instanceID, interfaceID string, interfaceObj types.InterfaceRevision) error {
-		interfaces++
-		return nil
-	})
-	require.Equal(t, 2, interfaces)
+	// Reordering must be visible to DeepEqual, or sorting the addresses in
+	// PopulateStatusFields would be pointless.
+	reordered := roundTripped.DeepCopy()
+	reordered.Addresses[0], reordered.Addresses[1] = reordered.Addresses[1], reordered.Addresses[0]
+	require.False(t, base.DeepEqual(reordered))
 }
 
 func TestExtractIDs(t *testing.T) {
@@ -73,12 +97,18 @@ func TestExtractIDs(t *testing.T) {
 			expectedVMID:     "",
 			expectedVMSSName: "",
 		},
+		{
+			name:       "Unparseable resource ID",
+			resourceID: "intf-1",
+		},
+		{
+			name: "Empty resource ID",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			intf := AzureInterface{}
-			intf.SetID(tt.resourceID)
+			intf := types.AzureInterface{ID: tt.resourceID}
 
 			require.Equal(t, tt.expectedRG, intf.GetResourceGroup())
 			require.Equal(t, tt.expectedVMID, intf.GetVMID())

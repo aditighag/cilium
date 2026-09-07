@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/require"
@@ -320,4 +321,130 @@ func TestConcurrentControllerUpdate(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, mngr.RemoveControllerAndWait("test"))
 	require.Equal(t, result.Load(), events[len(events)-1].result)
+}
+
+func TestControllerUpdateDuringJitter(t *testing.T) {
+	var afterCalls atomic.Int32
+	timeAfterCh := make(chan time.Time)
+
+	// Mock timeAfter to never fire, and track how many times the controller
+	// enters the jitter sleep block.
+	oldTimeAfter := timeAfter
+	defer func() { timeAfter = oldTimeAfter }()
+	timeAfter = func(d time.Duration) <-chan time.Time {
+		afterCalls.Add(1)
+		return timeAfterCh
+	}
+
+	mngr := NewManager()
+
+	var runs atomic.Int32
+	doFunc := func(ctx context.Context) error {
+		runs.Add(1)
+		return nil
+	}
+
+	// 1. Start controller with a jitter > 0.
+	mngr.UpdateController("test-jitter", ControllerParams{
+		DoFunc: doFunc,
+		Jitter: 1 * time.Hour,
+	})
+
+	// Wait until the controller has entered the jitter sleep (afterCalls == 1)
+	require.NoError(t, testutils.WaitUntil(func() bool {
+		return afterCalls.Load() == 1
+	}, 5*time.Second))
+	require.Equal(t, int32(0), runs.Load())
+
+	// 2. Update it with Jitter = 0. It should run immediately.
+	mngr.UpdateController("test-jitter", ControllerParams{
+		DoFunc: doFunc,
+		Jitter: 0,
+	})
+
+	require.NoError(t, testutils.WaitUntil(func() bool {
+		return runs.Load() == 1
+	}, 5*time.Second))
+
+	runs.Store(0)
+
+	// 3. Update it with Jitter > 0 again. It should go back to sleep.
+	mngr.UpdateController("test-jitter", ControllerParams{
+		DoFunc: doFunc,
+		Jitter: 1 * time.Hour,
+	})
+
+	// Wait until it enters the second jitter sleep.
+	require.NoError(t, testutils.WaitUntil(func() bool {
+		return afterCalls.Load() == 2
+	}, 5*time.Second))
+	require.Equal(t, int32(0), runs.Load())
+
+	// 4. Update it with Jitter > 0 again. This should restart the jitter sleep.
+	mngr.UpdateController("test-jitter", ControllerParams{
+		DoFunc: doFunc,
+		Jitter: 1 * time.Hour,
+	})
+
+	// Wait until it enters the third jitter sleep.
+	require.NoError(t, testutils.WaitUntil(func() bool {
+		return afterCalls.Load() == 3
+	}, 5*time.Second))
+	require.Equal(t, int32(0), runs.Load())
+
+	// Cleanup
+	require.NoError(t, mngr.RemoveControllerAndWait("test-jitter"))
+}
+
+func TestTriggerControllerContext(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var (
+			mgr  = NewManager()
+			cnt  [2]uint
+			stop = make(chan struct{})
+
+			do = func(idx int) ControllerFunc {
+				return func(ctx context.Context) error {
+					cnt[idx]++
+					select {
+					case <-ctx.Done():
+					case <-stop:
+					}
+					return nil
+				}
+			}
+		)
+
+		mgr.CreateController("with-cancel", ControllerParams{
+			DoFunc:               do(0),
+			CancelDoFuncOnUpdate: true,
+		})
+
+		mgr.CreateController("without-cancel", ControllerParams{
+			DoFunc: do(1),
+		})
+
+		t.Cleanup(func() {
+			require.NoError(t, mgr.RemoveControllerAndWait("with-cancel"), "mgr.RemoveControllerAndWait")
+			require.NoError(t, mgr.RemoveControllerAndWait("without-cancel"), "mgr.RemoveControllerAndWait")
+		})
+
+		synctest.Wait()
+		require.EqualValues(t, 1, cnt[0], "Both controllers should have been triggered once")
+		require.EqualValues(t, 1, cnt[1], "Both controllers should have been triggered once")
+
+		mgr.TriggerController("with-cancel")
+		mgr.TriggerController("without-cancel")
+
+		synctest.Wait()
+		require.EqualValues(t, 2, cnt[0], "The controller with CancelDoFuncOnUpdate should have been triggered twice")
+		require.EqualValues(t, 1, cnt[1], "The controller without CancelDoFuncOnUpdate should not have been retriggered")
+
+		close(stop)
+		stop = nil
+
+		synctest.Wait()
+		require.EqualValues(t, 2, cnt[0], "The controller with CancelDoFuncOnUpdate should not have been automatically retriggered")
+		require.EqualValues(t, 2, cnt[1], "The controller without CancelDoFuncOnUpdate should have been retriggered by the queued trigger")
+	})
 }

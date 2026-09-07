@@ -10,7 +10,42 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestParsePrefixes(t *testing.T) {
+	valid, err := ParsePrefixes([]string{
+		"10.0.0.0/8",
+		"10.0.0.1",
+		"2001:db8::/32",
+		"2001:db8::1",
+		"10.1.2.3/8", // not masked
+		"10.0.0.0/33",
+		"10.0.0/8",
+		"not-an-ip",
+	})
+
+	// Every entry that parses is returned, even though others did not.
+	assert.Equal(t, []netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/8"),
+		netip.MustParsePrefix("10.0.0.1/32"),
+		netip.MustParsePrefix("2001:db8::/32"),
+		netip.MustParsePrefix("2001:db8::1/128"),
+		netip.MustParsePrefix("10.0.0.0/8"), // got masked
+	}, valid)
+
+	// The joined error names every rejected entry, and describes the parse the
+	// input asked for: the prefix parse for an entry carrying a '/', the
+	// address parse for one without.
+	require.Error(t, err)
+	assert.ErrorContains(t, err, `netip.ParsePrefix("10.0.0.0/33"): prefix length out of range`)
+	assert.ErrorContains(t, err, `netip.ParsePrefix("10.0.0/8"): ParseAddr("10.0.0"): IPv4 address too short`)
+	assert.ErrorContains(t, err, `ParseAddr("not-an-ip"): unable to parse IP`)
+
+	valid, err = ParsePrefixes(nil)
+	assert.NoError(t, err)
+	assert.Empty(t, valid)
+}
 
 func TestIPToNetPrefix(t *testing.T) {
 	v4, _, err := net.ParseCIDR("1.1.1.1/32")
@@ -53,6 +88,62 @@ func TestPrefixesContains(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(fmt.Sprintf("contains(%v, %s)", tt.prefixes, tt.addr), func(t *testing.T) {
 			assert.Equal(t, tt.ret, PrefixesContains(tt.prefixes, tt.addr))
+		})
+	}
+}
+
+func TestLaminarCIDRsOverlap(t *testing.T) {
+	tests := []struct {
+		name string
+		c1   string
+		c2   string
+		want bool
+	}{
+		{
+			name: "c1 is a subnet of c2",
+			c1:   "192.168.64.0/19",
+			c2:   "192.168.0.0/16",
+			want: true,
+		},
+		{
+			name: "c1 is a supernet of c2",
+			c1:   "10.0.0.0/8",
+			c2:   "10.0.0.0/16",
+			want: true,
+		},
+		{
+			name: "c1 equals c2",
+			c1:   "10.0.0.0/16",
+			c2:   "10.0.0.0/16",
+			want: true,
+		},
+		{
+			name: "disjoint and far apart",
+			c1:   "10.0.0.0/8",
+			c2:   "192.168.0.0/16",
+			want: false,
+		},
+		{
+			name: "same-size adjacent siblings",
+			c1:   "192.168.0.0/17",
+			c2:   "192.168.128.0/17",
+			want: false,
+		},
+		{
+			name: "same-size and non-adjacent",
+			c1:   "192.168.0.0/19",
+			c2:   "192.168.96.0/19",
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c1 := netip.MustParsePrefix(tt.c1).Masked()
+			c2 := netip.MustParsePrefix(tt.c2).Masked()
+			// The check must be symmetric.
+			assert.Equal(t, tt.want, LaminarCIDRsOverlap(c1, c2))
+			assert.Equal(t, tt.want, LaminarCIDRsOverlap(c2, c1))
 		})
 	}
 }

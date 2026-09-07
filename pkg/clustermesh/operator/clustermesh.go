@@ -19,6 +19,7 @@ import (
 	mcsapitypes "github.com/cilium/cilium/pkg/clustermesh/mcsapi/types"
 	"github.com/cilium/cilium/pkg/clustermesh/observer"
 	serviceStore "github.com/cilium/cilium/pkg/clustermesh/store"
+	"github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/clustermesh/wait"
 	"github.com/cilium/cilium/pkg/dial"
 	"github.com/cilium/cilium/pkg/kvstore/store"
@@ -30,31 +31,26 @@ type clusterMesh struct {
 	// common implements the common logic to connect to remote clusters.
 	common common.ClusterMesh
 
-	cfg       ClusterMeshConfig
-	cfgMCSAPI mcsapitypes.MCSAPIConfig
-	logger    *slog.Logger
-	metrics   Metrics
+	cfg           ClusterMeshConfig
+	serviceModeV2 types.ServiceModeV2
+	cfgMCSAPI     mcsapitypes.MCSAPIConfig
+	logger        *slog.Logger
+	metrics       Metrics
 
 	// globalServices is a list of all global services. The datastructure
 	// is protected by its own mutex inside the structure.
 	globalServices *common.GlobalServiceCache
-
-	// globalServiceExports is a list of all global service exports. The datastructure
-	// is protected by its own mutex inside the structure.
-	globalServiceExports *GlobalServiceExportCache
 
 	// ObserverFactories is the list of factories to instantiate additional observers.
 	observerFactories []observer.Factory
 
 	storeFactory store.Factory
 
-	started                         atomic.Bool
-	clusterAddHooks                 []func(string)
-	clusterDeleteHooks              []func(string)
-	clusterServiceUpdateHooks       []func(*serviceStore.ClusterService)
-	clusterServiceDeleteHooks       []func(*serviceStore.ClusterService)
-	clusterServiceExportUpdateHooks []func(*mcsapitypes.MCSAPIServiceSpec)
-	clusterServiceExportDeleteHooks []func(*mcsapitypes.MCSAPIServiceSpec)
+	started                   atomic.Bool
+	clusterAddHooks           []func(string)
+	clusterDeleteHooks        []func(string)
+	clusterServiceUpdateHooks []func(*serviceStore.ClusterService)
+	clusterServiceDeleteHooks []func(*serviceStore.ClusterService)
 
 	syncTimeoutConfig  wait.TimeoutConfig
 	syncTimeoutLogOnce sync.Once
@@ -75,18 +71,9 @@ type ClusterMesh interface {
 	// RegisterClusterServiceDeleteHook register a hook when a service in the mesh is deleted.
 	// This should NOT be called after the Start hook.
 	RegisterClusterServiceDeleteHook(clusterServiceDeleteHook func(*serviceStore.ClusterService))
-	// RegisterClusterServiceExportUpdateHook register a hook when a service export in the mesh is updated.
-	// This should NOT be called after the Start hook.
-	RegisterClusterServiceExportUpdateHook(clusterServiceExportUpdateHook func(*mcsapitypes.MCSAPIServiceSpec))
-	// RegisterClusterServiceExportDeleteHook register a hook when a service export in the mesh is deleted.
-	// This should NOT be called after the Start hook.
-	RegisterClusterServiceExportDeleteHook(clusterServiceExportDeleteHook func(*mcsapitypes.MCSAPIServiceSpec))
 
 	ServicesSynced(ctx context.Context) error
 	GlobalServices() *common.GlobalServiceCache
-
-	ServiceExportsSynced(ctx context.Context) error
-	GlobalServiceExports() *GlobalServiceExportCache
 
 	ObserverSynced(ctx context.Context, name observer.Name) error
 }
@@ -103,20 +90,21 @@ func newClusterMesh(lc cell.Lifecycle, params clusterMeshParams) (*clusterMesh, 
 	params.Logger.Info("Operator ClusterMesh component enabled")
 
 	cm := clusterMesh{
-		cfg:                  params.Cfg,
-		cfgMCSAPI:            params.CfgMCSAPI,
-		logger:               params.Logger,
-		metrics:              params.Metrics,
-		globalServices:       common.NewGlobalServiceCache(params.Logger),
-		globalServiceExports: NewGlobalServiceExportCache(),
-		observerFactories:    params.ObserverFactories,
-		storeFactory:         params.StoreFactory,
-		syncTimeoutConfig:    params.TimeoutConfig,
+		cfg:               params.Cfg,
+		serviceModeV2:     params.ServiceModeV2,
+		cfgMCSAPI:         params.CfgMCSAPI,
+		logger:            params.Logger,
+		metrics:           params.Metrics,
+		globalServices:    common.NewGlobalServiceCache(params.Logger),
+		observerFactories: params.ObserverFactories,
+		storeFactory:      params.StoreFactory,
+		syncTimeoutConfig: params.TimeoutConfig,
 	}
 	cm.common = common.NewClusterMesh(common.Configuration{
 		Logger:              params.Logger,
 		Config:              params.Config,
 		ClusterInfo:         params.ClusterInfo,
+		ClusterIDsManager:   params.ClusterIDsManager,
 		RemoteClientFactory: params.RemoteClientFactory,
 		NewRemoteCluster:    cm.newRemoteCluster,
 		Resolvers: func() (out []dial.Resolver) {
@@ -169,38 +157,18 @@ func (cm *clusterMesh) RegisterClusterServiceDeleteHook(clusterServiceDeleteHook
 	cm.clusterServiceDeleteHooks = append(cm.clusterServiceDeleteHooks, clusterServiceDeleteHook)
 }
 
-// RegisterClusterServiceExportUpdateHook register a hook when a service export in the mesh is updated.
-// This should NOT be called after the Start hook.
-func (cm *clusterMesh) RegisterClusterServiceExportUpdateHook(clusterServiceExportUpdateHook func(*mcsapitypes.MCSAPIServiceSpec)) {
-	if cm.started.Load() {
-		panic(fmt.Errorf("can't call RegisterClusterServiceExportUpdateHook after the Start hook"))
-	}
-	cm.clusterServiceExportUpdateHooks = append(cm.clusterServiceExportUpdateHooks, clusterServiceExportUpdateHook)
-}
-
-// RegisterClusterServiceExportDeleteHook register a hook when a service export in the mesh is deleted.
-// This should NOT be called after the Start hook.
-func (cm *clusterMesh) RegisterClusterServiceExportDeleteHook(clusterServiceExportDeleteHook func(*mcsapitypes.MCSAPIServiceSpec)) {
-	if cm.started.Load() {
-		panic(fmt.Errorf("can't call RegisterClusterServiceExportDeleteHook after the Start hook"))
-	}
-	cm.clusterServiceExportDeleteHooks = append(cm.clusterServiceExportDeleteHooks, clusterServiceExportDeleteHook)
-}
-
 func (cm *clusterMesh) GlobalServices() *common.GlobalServiceCache {
 	return cm.globalServices
-}
-
-func (cm *clusterMesh) GlobalServiceExports() *GlobalServiceExportCache {
-	return cm.globalServiceExports
 }
 
 func (cm *clusterMesh) newRemoteCluster(name string, status common.StatusFunc) common.RemoteCluster {
 	rc := &remoteCluster{
 		logger:                        cm.logger.With(logfields.ClusterName, name),
 		name:                          name,
+		clusterID:                     types.ClusterIDUnset,
 		clusterMeshEnableEndpointSync: cm.cfg.ClusterMeshEnableEndpointSync,
 		clusterMeshEnableMCSAPI:       cm.cfgMCSAPI.EnableMCSAPI,
+		clusterMeshServiceModeV2:      cm.serviceModeV2,
 		storeFactory:                  cm.storeFactory,
 		synced:                        newSynced(),
 		status:                        status,
@@ -213,6 +181,7 @@ func (cm *clusterMesh) newRemoteCluster(name string, status common.StatusFunc) c
 		serviceStore.KeyCreator(
 			serviceStore.ClusterNameValidator(name),
 			serviceStore.NamespacedNameValidator(),
+			serviceStore.ClusterIDValidator(&rc.clusterID),
 		),
 		common.NewSharedServicesObserver(
 			rc.logger,
@@ -230,29 +199,6 @@ func (cm *clusterMesh) newRemoteCluster(name string, status common.StatusFunc) c
 		),
 		store.RWSWithOnSyncCallback(func(ctx context.Context) { rc.synced.services.Stop() }),
 		store.RWSWithEntriesMetric(cm.metrics.TotalServices.WithLabelValues(rc.name)),
-	)
-
-	rc.remoteServiceExports = cm.storeFactory.NewWatchStore(
-		name,
-		mcsapitypes.KeyCreator(
-			mcsapitypes.ClusterNameValidator(name),
-			mcsapitypes.NamespacedNameValidator(),
-		),
-		NewServiceExportsObserver(
-			cm.globalServiceExports,
-			func(svcExport *mcsapitypes.MCSAPIServiceSpec) {
-				for _, hook := range cm.clusterServiceExportUpdateHooks {
-					hook(svcExport)
-				}
-			},
-			func(svcExport *mcsapitypes.MCSAPIServiceSpec) {
-				for _, hook := range cm.clusterServiceExportDeleteHooks {
-					hook(svcExport)
-				}
-			},
-		),
-		store.RWSWithOnSyncCallback(func(ctx context.Context) { rc.synced.serviceExports.Stop() }),
-		store.RWSWithEntriesMetric(cm.metrics.TotalServiceExports.WithLabelValues(name)),
 	)
 
 	rc.observers = make(map[observer.Name]observer.Observer, len(cm.observerFactories))
@@ -284,13 +230,6 @@ func (cm *clusterMesh) Stop(cell.HookContext) error {
 // clustermesh-sync-timeout flag elapsed. It returns an error if the given context expired.
 func (cm *clusterMesh) ServicesSynced(ctx context.Context) error {
 	return cm.synced(ctx, func(rc *remoteCluster) wait.Fn { return rc.synced.Services })
-}
-
-// ServiceExportsSynced returns after that either the initial list of service exports has
-// been received from all remote clusters, or the maximum wait period controlled by the
-// clustermesh-sync-timeout flag elapsed. It returns an error if the given context expired.
-func (cm *clusterMesh) ServiceExportsSynced(ctx context.Context) error {
-	return cm.synced(ctx, func(rc *remoteCluster) wait.Fn { return rc.synced.ServiceExports })
 }
 
 // ObserverSynced returns after that either the given named observer has received

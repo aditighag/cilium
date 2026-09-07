@@ -72,6 +72,8 @@ type Options struct {
 	CiliumOperatorLabelSelector string
 	// The labels used to target 'clustermesh-apiserver' pods.
 	ClustermeshApiserverLabelSelector string
+	// The labels used to target the Cluster Mesh certgen pods.
+	ClustermeshCertgenLabelSelector string
 	// The labels used to target Cilium SPIRE server pods.
 	CiliumSPIREServerLabelSelector string
 	// The labels used to target Cilium SPIRE agent pods.
@@ -416,6 +418,13 @@ func (c *Collector) AbsoluteTempPath(f string) string {
 
 func (c *Collector) WithFileSink(filename string, fn func(io.Writer) error) error {
 	path := c.AbsoluteTempPath(filename)
+	// filename can be derived from data collected inside a target pod (for
+	// example the CNI config file names that SubmitCniConflistSubtask reads
+	// from `ls` output), so reject anything that resolves outside the sysdump
+	// directory before opening it.
+	if !strings.HasPrefix(filepath.Clean(path), filepath.Clean(c.sysdumpDir)+string(os.PathSeparator)) {
+		return fmt.Errorf("refusing to write %q outside of the sysdump directory", filename)
+	}
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, fileMode)
 	if err != nil {
 		return err
@@ -653,6 +662,20 @@ func (c *Collector) Run() error {
 			},
 		},
 		{
+			Description: "Collecting Kubernetes nodes disk usage",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				output, err := c.collectNodeDiskUsage(ctx)
+				if err != nil {
+					return fmt.Errorf("failed to collect Kubernetes nodes disk usage: %w", err)
+				}
+				if err := c.WriteString(kubernetesNodeDiskUsageFileName, output); err != nil {
+					return fmt.Errorf("failed to collect Kubernetes nodes disk usage: %w", err)
+				}
+				return nil
+			},
+		},
+		{
 			Description: "Collecting Kubernetes pods memory/cpu usage",
 			Quick:       true,
 			Task: func(ctx context.Context) error {
@@ -876,15 +899,15 @@ func (c *Collector) Run() error {
 			},
 		},
 		{
-			Description: "Collecting Cilium Pod IP Pools",
+			Description: "Collecting Cilium L2 Announcement Policies",
 			Quick:       true,
 			Task: func(ctx context.Context) error {
-				v, err := c.Client.ListCiliumPodIPPools(ctx, metav1.ListOptions{})
+				v, err := c.Client.ListCiliumL2AnnouncementPolicies(ctx, metav1.ListOptions{})
 				if err != nil {
-					return fmt.Errorf("failed to collect Cilium Pod IP pools: %w", err)
+					return fmt.Errorf("failed to collect Cilium L2 announcement policies: %w", err)
 				}
-				if err := c.WriteYAML(ciliumPodIPPoolsFileName, v); err != nil {
-					return fmt.Errorf("failed to collect Cilium Pod IP pools: %w", err)
+				if err := c.WriteYAML(ciliumL2AnnouncementPoliciesFileName, v); err != nil {
+					return fmt.Errorf("failed to collect Cilium L2 announcement policies: %w", err)
 				}
 				return nil
 			},
@@ -1023,16 +1046,20 @@ func (c *Collector) Run() error {
 			Description: "Collecting the Hubble Relay deployment",
 			Quick:       true,
 			Task: func(ctx context.Context) error {
-				v, err := c.Client.GetDeployment(ctx, c.Options.CiliumNamespace, hubbleRelayDeploymentName, metav1.GetOptions{})
+				deployments, err := c.Client.ListDeployment(ctx, c.Options.CiliumNamespace, metav1.ListOptions{
+					LabelSelector: c.Options.HubbleRelayLabelSelector,
+				})
 				if err != nil {
-					if k8sErrors.IsNotFound(err) {
-						c.logWarn("Deployment %q not found in namespace %q - this is expected if Hubble is not enabled", hubbleRelayDeploymentName, c.Options.CiliumNamespace)
-						return nil
-					}
 					return fmt.Errorf("failed to collect the Hubble Relay deployment: %w", err)
 				}
-				if err := c.WriteYAML(hubbleRelayDeploymentFileName, v); err != nil {
-					return fmt.Errorf("failed to collect the Hubble Relay deployment: %w", err)
+				if len(deployments.Items) == 0 {
+					c.logWarn("Deployment with label %q not found in namespace %q - this is expected if Hubble is not enabled", c.Options.HubbleRelayLabelSelector, c.Options.CiliumNamespace)
+					return nil
+				}
+				for i := range deployments.Items {
+					if err := c.WriteYAML(hubbleRelayDeploymentFileName, &deployments.Items[i]); err != nil {
+						return fmt.Errorf("failed to collect the Hubble Relay deployment %q: %w", deployments.Items[i].Name, err)
+					}
 				}
 				return nil
 			},
@@ -1041,16 +1068,20 @@ func (c *Collector) Run() error {
 			Description: "Collecting the Hubble UI deployment",
 			Quick:       true,
 			Task: func(ctx context.Context) error {
-				v, err := c.Client.GetDeployment(ctx, c.Options.CiliumNamespace, hubbleUIDeploymentName, metav1.GetOptions{})
+				deployments, err := c.Client.ListDeployment(ctx, c.Options.CiliumNamespace, metav1.ListOptions{
+					LabelSelector: c.Options.HubbleUILabelSelector,
+				})
 				if err != nil {
-					if k8sErrors.IsNotFound(err) {
-						c.logWarn("Deployment %q not found in namespace %q - this is expected if Hubble UI is not enabled", hubbleUIDeploymentName, c.Options.CiliumNamespace)
-						return nil
-					}
 					return fmt.Errorf("failed to collect the Hubble UI deployment: %w", err)
 				}
-				if err := c.WriteYAML(hubbleUIDeploymentFileName, v); err != nil {
-					return fmt.Errorf("failed to collect the Hubble UI deployment: %w", err)
+				if len(deployments.Items) == 0 {
+					c.logWarn("Deployment with label %q not found in namespace %q - this is expected if Hubble UI is not enabled", c.Options.HubbleUILabelSelector, c.Options.CiliumNamespace)
+					return nil
+				}
+				for i := range deployments.Items {
+					if err := c.WriteYAML(hubbleUIDeploymentFileName, &deployments.Items[i]); err != nil {
+						return fmt.Errorf("failed to collect the Hubble UI deployment %q: %w", deployments.Items[i].Name, err)
+					}
 				}
 				return nil
 			},
@@ -1131,6 +1162,18 @@ func (c *Collector) Run() error {
 		},
 		{
 			CreatesSubtasks: true,
+			Description:     "Collecting the Cilium operator debug information",
+			Quick:           false,
+			Task: func(ctx context.Context) error {
+				err := c.submitCiliumOperatorDbgTasks(c.CiliumOperatorPods)
+				if err != nil {
+					return fmt.Errorf("failed to collect the Cilium operator debug information: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			CreatesSubtasks: true,
 			Description:     "Collecting the clustermesh debug information, metrics and gops stats",
 			Quick:           false,
 			Task: func(ctx context.Context) error {
@@ -1196,6 +1239,56 @@ func (c *Collector) Run() error {
 					return fmt.Errorf("failed to collect the 'clustermesh-apiserver' deployment: %w", err)
 				}
 				return nil
+			},
+		},
+		{
+			Description: "Collecting the Cluster Mesh certgen cronjob",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				v, err := c.Client.GetCronJob(ctx, c.Options.CiliumNamespace, clustermeshCertgenCronJobName, metav1.GetOptions{})
+				if err != nil {
+					if k8sErrors.IsNotFound(err) {
+						c.logWarn("cronjob %q not found in namespace %q - this is expected if Cluster Mesh is not enabled, or certificates are not generated via certgen",
+							clustermeshCertgenCronJobName, c.Options.CiliumNamespace)
+						return nil
+					}
+					return fmt.Errorf("failed to collect the Cluster Mesh certgen cronjob: %w", err)
+				}
+				if err := c.WriteYAML(clustermeshCertgenCronJobFileName, v); err != nil {
+					return fmt.Errorf("failed to collect the Cluster Mesh certgen cronjob: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			Description: "Collecting the Cluster Mesh certgen logs",
+			Quick:       false,
+			Task: func(ctx context.Context) error {
+				p, err := c.Client.ListPods(ctx, c.Options.CiliumNamespace, metav1.ListOptions{
+					LabelSelector: c.Options.ClustermeshCertgenLabelSelector,
+				})
+				if err != nil {
+					return fmt.Errorf("failed to get logs from the Cluster Mesh certgen pods")
+				}
+				if err := c.SubmitLogsTasks(AllPods(p), c.Options.LogsSinceTime, c.Options.LogsLimitBytes); err != nil {
+					return fmt.Errorf("failed to collect logs from Cluster Mesh certgen pods")
+				}
+				return nil
+			},
+		},
+		{
+			Description: "Collecting the Cluster Mesh cert-manager certificates",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				return c.GatherResourceUnstructured(
+					ctx,
+					certificate,
+					clustermeshCertManagerCertsFileName,
+					"clustermesh-apiserver-admin-cert",
+					"clustermesh-apiserver-local-cert",
+					"clustermesh-apiserver-remote-cert",
+					"clustermesh-apiserver-server-cert",
+				)
 			},
 		},
 		{
@@ -1477,7 +1570,7 @@ func (c *Collector) Run() error {
 					return fmt.Errorf("could not find Cilium Agent Pod to run kvstore get, Cilium Pod list was empty")
 				}
 				for _, pod := range c.CiliumPods {
-					if pod.Status.Phase == "Running" {
+					if pod.Status.Phase == corev1.PodRunning {
 						return c.submitKVStoreTasks(ctx, pod.DeepCopy())
 					}
 				}
@@ -1486,7 +1579,7 @@ func (c *Collector) Run() error {
 		},
 	}
 	ciliumTasks = append(ciliumTasks, collectCiliumV2OrV2Alpha1Resource(c, "ciliumloadbalancerippools", "Cilium LoadBalancer IP Pools"))
-
+	ciliumTasks = append(ciliumTasks, collectCiliumV2OrV2Alpha1Resource(c, "ciliumpodippools", "Cilium Pod IP Pools"))
 	if c.Options.HubbleFlowsCount > 0 {
 		ciliumTasks = append(ciliumTasks, Task{
 			CreatesSubtasks: true,
@@ -2047,6 +2140,21 @@ func (c *Collector) getGatewayAPITasks() []Task {
 			},
 		},
 		{
+			Description: "Collecting ListenerSet entries",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				n := corev1.NamespaceAll
+				v, err := c.Client.ListUnstructured(ctx, listenerSet, &n, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect ListenerSet entries: %w", err)
+				}
+				if err := c.WriteYAML(listenerSetsFileName, v); err != nil {
+					return fmt.Errorf("failed to collect ListenerSet entries: %w", err)
+				}
+				return nil
+			},
+		},
+		{
 			Description: "Collecting ReferenceGrant entries",
 			Quick:       true,
 			Task: func(ctx context.Context) error {
@@ -2092,6 +2200,21 @@ func (c *Collector) getGatewayAPITasks() []Task {
 			},
 		},
 		{
+			Description: "Collecting BackendTLSPolicy entries",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				n := corev1.NamespaceAll
+				v, err := c.Client.ListUnstructured(ctx, backendTLSPolicy, &n, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect BackendTLSPolicy entries: %w", err)
+				}
+				if err := c.WriteYAML(backendTLSPoliciesFileName, v); err != nil {
+					return fmt.Errorf("failed to collect BackendTLSPolicy entries: %w", err)
+				}
+				return nil
+			},
+		},
+		{
 			Description: "Collecting GRPCRoute entries",
 			Quick:       true,
 			Task: func(ctx context.Context) error {
@@ -2132,6 +2255,21 @@ func (c *Collector) getGatewayAPITasks() []Task {
 				}
 				if err := c.WriteYAML(udpRoutesFileName, v); err != nil {
 					return fmt.Errorf("failed to collect UDPRoute entries: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			Description: "Collecting CiliumGatewayClassConfig entries",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				n := corev1.NamespaceAll
+				v, err := c.Client.ListUnstructured(ctx, ciliumGatewayClassConfig, &n, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect CiliumGatewayClassConfig entries: %w", err)
+				}
+				if err := c.WriteYAML(ciliumGatewayClassConfigsFileName, v); err != nil {
+					return fmt.Errorf("failed to collect CiliumGatewayClassConfig entries: %w", err)
 				}
 				return nil
 			},
@@ -2305,16 +2443,31 @@ func (c *Collector) SubmitTetragonBugtoolTasks(pods []*corev1.Pod, tetragonAgent
 	return nil
 }
 
-// removeTopDirectory removes the top directory from a relative file path
-// (e.g. "a/b/c" => "b/c"). Don't pass an absolute path. It doesn't do what
-// you think it does.
-func removeTopDirectory(path string) (string, error) {
-	// file separator hardcoded because sysdump always created on Linux OS
-	index := strings.IndexByte(path, '/')
-	if index < 0 {
-		return "", fmt.Errorf("invalid path %q", path)
+// removeTopDirectory removes the top directory from a relative tar file path
+// (e.g. "a/b/c" => "b/c") and returns a local filesystem path.
+// It rejects absolute paths and any path that escapes the extraction root.
+func removeTopDirectory(tarPath string) (string, error) {
+	if tarPath == "" || filepath.IsAbs(tarPath) {
+		return "", fmt.Errorf("invalid path in tar entry %q", tarPath)
 	}
-	return path[index+1:], nil
+
+	cleanPath := path.Clean(tarPath)
+	if cleanPath == "." || cleanPath == ".." || strings.HasPrefix(cleanPath, "../") {
+		return "", fmt.Errorf("invalid path in tar entry %q", tarPath)
+	}
+
+	_, after, found := strings.Cut(cleanPath, string(filepath.Separator))
+	if !found {
+		return "", fmt.Errorf("invalid path in tar entry %q", tarPath)
+	}
+	if after == "" || after == "." || after == ".." || strings.HasPrefix(after, "../") {
+		return "", fmt.Errorf("invalid path in tar entry %q", tarPath)
+	}
+	localPath, err := filepath.Localize(after)
+	if err != nil {
+		return "", fmt.Errorf("invalid path in tar entry %q: %w", tarPath, err)
+	}
+	return localPath, nil
 }
 
 func untar(src string, dst string) error {
@@ -2328,6 +2481,14 @@ func untar(src string, dst string) error {
 		return err
 	}
 	defer gz.Close()
+
+	// Resolve the extraction root to an absolute path so containment checks
+	// below are reliable even if dst is a relative path.
+	dstAbs, err := filepath.Abs(dst)
+	if err != nil {
+		return err
+	}
+
 	tr := tar.NewReader(gz)
 	for {
 		header, err := tr.Next()
@@ -2345,12 +2506,19 @@ func untar(src string, dst string) error {
 		if err != nil {
 			return err
 		}
-		filename := filepath.Join(dst, name)
+		filename := filepath.Join(dstAbs, name)
+		rel, err := filepath.Rel(dstAbs, filename)
+		if err != nil {
+			return err
+		}
+		if !filepath.IsLocal(rel) {
+			return fmt.Errorf("tar entry %q: path escapes extraction directory", header.Name)
+		}
 		directory := filepath.Dir(filename)
 		if err := os.MkdirAll(directory, 0755); err != nil {
 			return err
 		}
-		f, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, os.FileMode(header.Mode))
+		f, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode))
 		if err != nil {
 			return err
 		}
@@ -2600,24 +2768,32 @@ func (c *Collector) SubmitCniConflistSubtask(pods []*corev1.Pod, containerName s
 	return nil
 }
 
-func (c *Collector) getGopsPID(ctx context.Context, pod *corev1.Pod, containerName string) (string, error) {
-	// Run 'gops' on the pod.
-	gopsOutput, err := c.Client.ExecInPod(ctx, pod.Namespace, pod.Name, containerName, []string{
-		gopsCommand,
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to list processes %q (%q) in namespace %q: %w", pod.Name, containerName, pod.Namespace, err)
+func (c *Collector) getGopsPID(ctx context.Context, pod *corev1.Pod, containerName string) (cmd, pid string, err error) {
+	var gopsOutput bytes.Buffer
+
+	// Run 'gops' on the pod. Try both command paths, as the gops binary got
+	// moved in a9274570b9d1b6092bf07f598a310a2680391699.
+	for _, cmd = range []string{"/usr/bin/gops", "/bin/gops"} {
+		gopsOutput, err = c.Client.ExecInPod(ctx, pod.Namespace, pod.Name, containerName, []string{cmd})
+		if err == nil {
+			break
+		}
 	}
+
+	if err != nil {
+		return "", "", fmt.Errorf("failed to list processes %q (%q) in namespace %q: %w", pod.Name, containerName, pod.Namespace, err)
+	}
+
 	agentPID := gopsPID
 	if c.Options.DetectGopsPID {
 		var err error
 		outputStr := gopsOutput.String()
 		agentPID, err = extractGopsPID(outputStr)
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 	}
-	return agentPID, nil
+	return cmd, agentPID, nil
 }
 
 // SubmitGopsSubtasks submits tasks to collect gops statistics from pods.
@@ -2629,7 +2805,7 @@ func (c *Collector) SubmitGopsSubtasks(pods []*corev1.Pod, containerName string)
 
 		for _, g := range gopsStats {
 			if err := c.Pool.Submit(fmt.Sprintf("gops-%s-%s", p.Name, g), func(ctx context.Context) error {
-				agentPID, err := c.getGopsPID(ctx, p, containerName)
+				gopsCommand, agentPID, err := c.getGopsPID(ctx, p, containerName)
 				if err != nil {
 					return err
 				}
@@ -2658,7 +2834,7 @@ func (c *Collector) SubmitProfilingGopsSubtasks(pods []*corev1.Pod, containerNam
 	for _, p := range pods {
 		for g := range gopsProfiling {
 			if err := c.Pool.Submit(fmt.Sprintf("gops-%s-%s", p.Name, g), func(ctx context.Context) error {
-				agentPID, err := c.getGopsPID(ctx, p, containerName)
+				gopsCommand, agentPID, err := c.getGopsPID(ctx, p, containerName)
 				if err != nil {
 					return err
 				}
@@ -2743,7 +2919,7 @@ func (c *Collector) SubmitStreamProfilingGopsSubtasks(pods []*corev1.Pod, contai
 func (c *Collector) SubmitTracingGopsSubtask(pods []*corev1.Pod, containerName string) error {
 	for _, p := range pods {
 		if err := c.Pool.Submit(fmt.Sprintf("gops-%s-%s", p.Name, gopsTrace), func(ctx context.Context) error {
-			agentPID, err := c.getGopsPID(ctx, p, containerName)
+			gopsCommand, agentPID, err := c.getGopsPID(ctx, p, containerName)
 			if err != nil {
 				return err
 			}
@@ -2855,6 +3031,30 @@ func (c *Collector) submitFlavorSpecificTasks(f k8s.Flavor) error {
 			return fmt.Errorf("failed to submit %q task: %w", awsNodeDaemonSetName, err)
 		}
 		return nil
+	case k8s.KindGKE:
+		if err := c.Pool.Submit(gkeConfigMapsName, func(ctx context.Context) error {
+			// Collect additional, GKE specific configmaps.
+			for cm, filename := range map[string]string{
+				gkeHubbleConfigMap:   gkeCiliumHubbleConfigFileName,
+				gkeOverrideConfigMap: gkeCiliumOverrideConfigFileName,
+			} {
+				configMap, err := c.Client.GetConfigMap(ctx, metav1.NamespaceSystem, cm, metav1.GetOptions{})
+				if err != nil {
+					if k8sErrors.IsNotFound(err) {
+						c.logDebug("ConfigMap %q not found in namespace %q, skipping", cm, metav1.NamespaceSystem)
+						continue
+					}
+					return fmt.Errorf("get '%s/%s' configmap: %w", metav1.NamespaceSystem, cm, err)
+				}
+				if err := c.WriteYAML(filename, configMap); err != nil {
+					return fmt.Errorf("write '%s/%s' configmap: %w", metav1.NamespaceSystem, cm, err)
+				}
+			}
+			return nil
+		}); err != nil {
+			return fmt.Errorf("submit %q task: %w", gkeConfigMapsName, err)
+		}
+		return nil
 	default:
 		c.logDebug("No flavor-specific data to collect for %q", f.Kind.String())
 		return nil
@@ -2933,6 +3133,60 @@ func (c *Collector) SubmitMetricsSubtask(pods []*corev1.Pod, containerName, port
 	return nil
 }
 
+func (c *Collector) submitCiliumOperatorDbgTasks(pods []*corev1.Pod) error {
+	tasks := []struct {
+		name string
+		ext  string
+		args []string
+	}{
+		{
+			name: "statedb-dump",
+			ext:  "json",
+			args: []string{"shell", "db/dump"},
+		},
+		{
+			name: "status-clustermesh",
+			ext:  "txt",
+			args: []string{"status", "clustermesh"},
+		},
+		{
+			name: "troubleshoot-kvstore",
+			ext:  "txt",
+			args: []string{"troubleshoot", "kvstore"},
+		},
+		{
+			name: "troubleshoot-clustermesh",
+			ext:  "txt",
+			args: []string{"troubleshoot", "clustermesh"},
+		},
+	}
+
+	for _, pod := range pods {
+		for _, task := range tasks {
+			// The name of the Cilium operator binary depends on the specific
+			// flavor. Let's infer it based on the specified command.
+			var cmd = "cilium-operator-generic"
+			for _, container := range pod.Spec.Containers {
+				if container.Name == defaults.OperatorContainerName {
+					if len(container.Command) > 0 {
+						cmd = container.Command[0]
+					}
+					break
+				}
+			}
+
+			if err := c.submitPodCommandTask(
+				pod, defaults.OperatorContainerName, task.name, task.ext,
+				append([]string{cmd}, task.args...),
+			); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
 func (c *Collector) submitClusterMeshAPIServerDbgTasks(pods []*corev1.Pod) error {
 	tasks := []struct {
 		name      string
@@ -2949,6 +3203,18 @@ func (c *Collector) submitClusterMeshAPIServerDbgTasks(pods []*corev1.Pod) error
 			name:      "troubleshoot",
 			ext:       "txt",
 			cmd:       []string{defaults.ClusterMeshBinaryName, "clustermesh-dbg", "troubleshoot"},
+			container: defaults.ClusterMeshContainerName,
+		},
+		{
+			name:      "statedb-dump",
+			ext:       "json",
+			cmd:       []string{defaults.ClusterMeshBinaryName, "shell", "db/dump"},
+			container: defaults.ClusterMeshContainerName,
+		},
+		{
+			name:      "kvstore-list",
+			ext:       "txt",
+			cmd:       []string{defaults.ClusterMeshBinaryName, "shell", "kvstore/list"},
 			container: defaults.ClusterMeshContainerName,
 		},
 		{
@@ -2975,44 +3241,64 @@ func (c *Collector) submitClusterMeshAPIServerDbgTasks(pods []*corev1.Pod) error
 			cmd:       []string{defaults.ClusterMeshBinaryName, "kvstoremesh-dbg", "troubleshoot", "--include-local"},
 			container: defaults.ClusterMeshKVStoreMeshContainerName,
 		},
+		{
+			name:      "statedb-dump",
+			ext:       "json",
+			cmd:       []string{defaults.ClusterMeshBinaryName, "shell", "db/dump"},
+			container: defaults.ClusterMeshKVStoreMeshContainerName,
+		},
+		{
+			name:      "kvstore-list",
+			ext:       "txt",
+			cmd:       []string{defaults.ClusterMeshBinaryName, "shell", "kvstore/list"},
+			container: defaults.ClusterMeshKVStoreMeshContainerName,
+		},
 	}
 
 	for _, pod := range pods {
 		for _, task := range tasks {
-			if !podIsRunningAndHasContainer(pod, task.container) {
-				continue
-			}
-
-			filename := fmt.Sprintf("%s-%s-%s-<ts>.%s", pod.Name, task.container, task.name, task.ext)
-			if err := c.Pool.Submit(filename, func(ctx context.Context) error {
-				if err := c.WithFileSink(filename, func(out io.Writer) error {
-					var stderr bytes.Buffer
-
-					err := c.Client.ExecInPodWithWriters(ctx, nil, pod.Namespace, pod.Name, task.container, task.cmd, out, &stderr)
-					if err != nil {
-						stderrStr := stderr.String()
-						if strings.Contains(stderrStr, "Usage:") || strings.Contains(stderrStr, "unknown command") {
-							// The default cobra error tends to be misleading when both the
-							// command and the flags are not found, as it reports the missing
-							// flags rather than the missing command. Hence, let's just guess
-							// and output a generic unknown command error.
-							stderrStr = "unknown command - this is expected if not supported by this Cilium version"
-						}
-
-						return fmt.Errorf("%w: %s", err, stderrStr)
-					}
-
-					return nil
-				}); err != nil {
-					return fmt.Errorf("failed to collect clustermesh %s information from %s/%s (%s): %w",
-						task.name, pod.Namespace, pod.Name, task.container, err)
-				}
-
-				return nil
-			}); err != nil {
-				return fmt.Errorf("failed to submit %s task: %w", filename, err)
+			if err := c.submitPodCommandTask(pod, task.container, task.name, task.ext, task.cmd); err != nil {
+				return err
 			}
 		}
+	}
+
+	return nil
+}
+
+func (c *Collector) submitPodCommandTask(pod *corev1.Pod, container, task, ext string, cmd []string) error {
+	if !podIsRunningAndHasContainer(pod, container) {
+		return nil
+	}
+
+	filename := fmt.Sprintf("%s-%s-%s-<ts>.%s", pod.Name, container, task, ext)
+	if err := c.Pool.Submit(filename, func(ctx context.Context) error {
+		if err := c.WithFileSink(filename, func(out io.Writer) error {
+			var stderr bytes.Buffer
+
+			err := c.Client.ExecInPodWithWriters(ctx, nil, pod.Namespace, pod.Name, container, cmd, out, &stderr)
+			if err != nil {
+				stderrStr := stderr.String()
+				if strings.Contains(stderrStr, "Usage:") || strings.Contains(stderrStr, "unknown command") {
+					// The default cobra error tends to be misleading when both the
+					// command and the flags are not found, as it reports the missing
+					// flags rather than the missing command. Hence, let's just guess
+					// and output a generic unknown command error.
+					stderrStr = "unknown command - this is expected if not supported by this Cilium version"
+				}
+
+				return fmt.Errorf("%w: %s", err, stderrStr)
+			}
+
+			return nil
+		}); err != nil {
+			return fmt.Errorf("failed to collect %s information from %s/%s (%s): %w",
+				task, pod.Namespace, pod.Name, container, err)
+		}
+
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to submit %s task: %w", filename, err)
 	}
 
 	return nil
@@ -3243,6 +3529,9 @@ func InitSysdumpFlags(cmd *cobra.Command, options *Options, optionPrefix string,
 	cmd.Flags().StringVar(&options.ClustermeshApiserverLabelSelector,
 		optionPrefix+"clustermesh-apiserver-label-selector", DefaultClustermeshApiserverLabelSelector,
 		"The labels used to target 'clustermesh-apiserver' pods")
+	cmd.Flags().StringVar(&options.ClustermeshCertgenLabelSelector,
+		optionPrefix+"clustermesh-generate-certs-label-selector", DefaultClustermeshCertgenLabelSelector,
+		"The labels used to target the Cluster Mesh generate certs pods")
 	cmd.Flags().StringVar(&options.CiliumNodeInitLabelSelector,
 		optionPrefix+"cilium-node-init-selector", DefaultCiliumNodeInitLabelSelector,
 		"The labels used to target Cilium node init pods")
@@ -3395,6 +3684,101 @@ func (c *Collector) formatNodeMetricsAsTable(rawMetrics string) (string, error) 
 	tw.Flush()
 
 	return sb.String(), nil
+}
+
+// nodeStatsSummary is the subset of kubelet's /stats/summary that describes
+// disk usage, which is what kubelet evicts pods on.
+type nodeStatsSummary struct {
+	Node struct {
+		NodeName string `json:"nodeName"`
+		Fs       struct {
+			AvailableBytes *uint64 `json:"availableBytes"`
+			CapacityBytes  *uint64 `json:"capacityBytes"`
+			UsedBytes      *uint64 `json:"usedBytes"`
+			InodesFree     *uint64 `json:"inodesFree"`
+		} `json:"fs"`
+		Runtime struct {
+			ImageFs struct {
+				AvailableBytes *uint64 `json:"availableBytes"`
+				CapacityBytes  *uint64 `json:"capacityBytes"`
+				UsedBytes      *uint64 `json:"usedBytes"`
+			} `json:"imageFs"`
+		} `json:"runtime"`
+	} `json:"node"`
+}
+
+// collectNodeDiskUsage reports per-node nodefs and imagefs usage, along with
+// the DiskPressure condition. kubelet evicts pods on ephemeral-storage
+// exhaustion, and without this the only trace left in a sysdump is the
+// resulting eviction events, which say nothing about what filled the disk.
+func (c *Collector) collectNodeDiskUsage(ctx context.Context) (string, error) {
+	nodes, err := c.Client.ListNodes(ctx, metav1.ListOptions{})
+	if err != nil {
+		return "", fmt.Errorf("failed to get nodes: %w", err)
+	}
+
+	var sb strings.Builder
+	tw := tabwriter.NewWriter(&sb, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tNODEFS USED\tNODEFS CAPACITY\tNODEFS(%)\tIMAGEFS USED\tIMAGEFS CAPACITY\tINODES FREE\tDISKPRESSURE")
+
+	for _, node := range nodes.Items {
+		diskPressure := "<unknown>"
+		for _, cond := range node.Status.Conditions {
+			if cond.Type == corev1.NodeDiskPressure {
+				diskPressure = string(cond.Status)
+				break
+			}
+		}
+
+		// Kubelet's stats endpoint is not always reachable through the API
+		// server proxy, so a failure here must not lose the rest of the table.
+		raw, err := c.Client.GetRaw(ctx, fmt.Sprintf("/api/v1/nodes/%s/proxy/stats/summary", node.Name))
+		if err != nil {
+			fmt.Fprintf(tw, "%s\t<error: %s>\t\t\t\t\t\t%s\n", node.Name, err, diskPressure)
+			continue
+		}
+
+		fmt.Fprintln(tw, formatNodeDiskUsageRow(node.Name, raw, diskPressure))
+	}
+
+	tw.Flush()
+
+	return sb.String(), nil
+}
+
+// formatNodeDiskUsageRow renders one tab-separated row of the node disk usage
+// table from a kubelet stats summary payload.
+func formatNodeDiskUsageRow(nodeName, rawSummary, diskPressure string) string {
+	var summary nodeStatsSummary
+	if err := json.Unmarshal([]byte(rawSummary), &summary); err != nil {
+		return fmt.Sprintf("%s\t<unparseable: %s>\t\t\t\t\t\t%s", nodeName, err, diskPressure)
+	}
+
+	pct := func(used, capacity *uint64) string {
+		if used == nil || capacity == nil || *capacity == 0 {
+			return "<unknown>"
+		}
+		return fmt.Sprintf("%.0f%%", float64(*used)/float64(*capacity)*100)
+	}
+	mib := func(v *uint64) string {
+		if v == nil {
+			return "<unknown>"
+		}
+		return fmt.Sprintf("%dMi", *v/(1024*1024))
+	}
+	count := func(v *uint64) string {
+		if v == nil {
+			return "<unknown>"
+		}
+		return strconv.FormatUint(*v, 10)
+	}
+
+	fs, imageFs := summary.Node.Fs, summary.Node.Runtime.ImageFs
+	return fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s",
+		nodeName,
+		mib(fs.UsedBytes), mib(fs.CapacityBytes), pct(fs.UsedBytes, fs.CapacityBytes),
+		mib(imageFs.UsedBytes), mib(imageFs.CapacityBytes),
+		count(fs.InodesFree), diskPressure)
 }
 
 // formatPodMetricsAsTable formats the raw pod metrics JSON into a table format like kubectl top pods

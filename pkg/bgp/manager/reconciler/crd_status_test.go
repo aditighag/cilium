@@ -22,6 +22,7 @@ import (
 	k8sTesting "k8s.io/client-go/testing"
 
 	daemon_k8s "github.com/cilium/cilium/daemon/k8s"
+	"github.com/cilium/cilium/pkg/bgp/config"
 	"github.com/cilium/cilium/pkg/bgp/manager/store"
 	"github.com/cilium/cilium/pkg/bgp/manager/tables"
 	"github.com/cilium/cilium/pkg/hive"
@@ -30,7 +31,6 @@ import (
 	cilium_client_v2 "github.com/cilium/cilium/pkg/k8s/client/clientset/versioned/typed/cilium.io/v2"
 	k8sFakeClient "github.com/cilium/cilium/pkg/k8s/client/testutils"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
-	"github.com/cilium/cilium/pkg/option"
 )
 
 const (
@@ -95,12 +95,12 @@ func newCRDStatusFixture(ctx context.Context, req *require.Assertions, l *slog.L
 	}
 
 	f.hive = hive.New(
-		daemon_k8s.LocalNodeCell,
+		daemon_k8s.ResourcesCell,
 		cell.Provide(
-			func() *option.DaemonConfig {
-				return &option.DaemonConfig{
-					EnableBGPControlPlane:             true,
-					EnableBGPControlPlaneStatusReport: true,
+			func() config.BGPConfig {
+				return config.BGPConfig{
+					Enable:             true,
+					EnableStatusReport: true,
 				}
 			},
 			tables.NewBGPReconcileErrorTable,
@@ -129,7 +129,7 @@ func newCRDStatusFixture(ctx context.Context, req *require.Assertions, l *slog.L
 }
 
 func TestCRDConditions(t *testing.T) {
-	var tests = []struct {
+	tests := []struct {
 		name               string
 		statedbData        []*tables.BGPReconcileError
 		initNodeConfig     *v2.CiliumBGPNodeConfig
@@ -171,7 +171,7 @@ func TestCRDConditions(t *testing.T) {
 						{
 							Type:               v2.BGPInstanceConditionReconcileError,
 							Status:             metav1.ConditionTrue,
-							Reason:             "BGPReconcileError",
+							Reason:             "ReconcileFailed",
 							ObservedGeneration: 19,
 							Message: "bgp-instance-0: error 00\n" +
 								"bgp-instance-0: error 01\n" +
@@ -200,7 +200,7 @@ func TestCRDConditions(t *testing.T) {
 						{
 							Type:   v2.BGPInstanceConditionReconcileError,
 							Status: metav1.ConditionTrue,
-							Reason: "BGPReconcileError",
+							Reason: "ReconcileFailed",
 							Message: "bgp-instance-0: error 00\n" +
 								"bgp-instance-0: error 01\n" +
 								"bgp-instance-1: error 10\n",
@@ -217,7 +217,7 @@ func TestCRDConditions(t *testing.T) {
 						{
 							Type:    v2.BGPInstanceConditionReconcileError,
 							Status:  metav1.ConditionTrue,
-							Reason:  "BGPReconcileError",
+							Reason:  "ReconcileFailed",
 							Message: "bgp-instance-0: error 00\n",
 						},
 					},
@@ -237,7 +237,7 @@ func TestCRDConditions(t *testing.T) {
 						{
 							Type:   v2.BGPInstanceConditionReconcileError,
 							Status: metav1.ConditionTrue,
-							Reason: "BGPReconcileError",
+							Reason: "ReconcileFailed",
 							Message: "bgp-instance-0: error 00\n" +
 								"bgp-instance-0: error 01\n" +
 								"bgp-instance-1: error 10\n",
@@ -254,7 +254,7 @@ func TestCRDConditions(t *testing.T) {
 						{
 							Type:    v2.BGPInstanceConditionReconcileError,
 							Status:  metav1.ConditionFalse,
-							Reason:  "BGPReconcileError",
+							Reason:  "ReconcileSucceeded",
 							Message: "",
 						},
 					},
@@ -351,12 +351,12 @@ func TestDisableStatusReport(t *testing.T) {
 
 	var cs k8sClient.Clientset
 	hive := hive.New(
-		daemon_k8s.LocalNodeCell,
+		daemon_k8s.ResourcesCell,
 		cell.Provide(
-			func() *option.DaemonConfig {
-				return &option.DaemonConfig{
-					EnableBGPControlPlane:             true,
-					EnableBGPControlPlaneStatusReport: false,
+			func() config.BGPConfig {
+				return config.BGPConfig{
+					Enable:             true,
+					EnableStatusReport: false,
 				}
 			},
 			k8sFakeClient.NewFakeClientset,

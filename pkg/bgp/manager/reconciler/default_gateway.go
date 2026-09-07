@@ -16,6 +16,7 @@ import (
 	"github.com/cilium/statedb"
 
 	"github.com/cilium/cilium/pkg/bgp/agent/signaler"
+	"github.com/cilium/cilium/pkg/bgp/config"
 	"github.com/cilium/cilium/pkg/bgp/manager/instance"
 	"github.com/cilium/cilium/pkg/bgp/types"
 	"github.com/cilium/cilium/pkg/datapath/tables"
@@ -43,6 +44,7 @@ type DefaultGatewayReconcilerIn struct {
 	cell.In
 
 	Logger      *slog.Logger
+	BGPConfig   config.BGPConfig
 	DB          *statedb.DB
 	JobGroup    job.Group
 	Signaler    *signaler.BGPCPSignaler
@@ -56,6 +58,10 @@ var (
 )
 
 func NewDefaultGatewayReconciler(p DefaultGatewayReconcilerIn) DefaultGatewayReconcilerOut {
+	if !p.BGPConfig.BGPControlPlaneEnabled() {
+		return DefaultGatewayReconcilerOut{}
+	}
+
 	logger := p.Logger.With(types.ReconcilerLogField, "DefaultGateway")
 
 	// Add job observers for route and device change tracking
@@ -162,7 +168,17 @@ func (r *DefaultGatewayReconciler) getDefaultGateway(defaultGateway *v2.DefaultG
 		if !route.Gw.IsValid() || route.Dst != defaultRoute {
 			continue
 		}
-		dev, _, found := r.deviceTable.Get(txn, tables.DeviceIDIndex.Query(route.LinkIndex))
+		// Only the main table holds the node's default gateway. Other tables
+		// routinely hold their own default routes - Cilium itself installs a
+		// "default via <cilium_host>" one, and a local table can hold a metric-0
+		// "default dev lo" - which are not the way off the node and would
+		// outrank the real default route, as they are usually installed with a
+		// lower metric. Non-unicast types (local, blackhole, unreachable,
+		// prohibit) do not forward anything either.
+		if route.Table != tables.RT_TABLE_MAIN || route.Type != tables.RTN_UNICAST {
+			continue
+		}
+		dev, _, found := r.deviceTable.Get(txn, tables.DeviceByIndex(route.LinkIndex))
 		// ignore routes if the link through which it is reachable is not up
 		if !found || dev.OperStatus != "up" {
 			continue

@@ -46,7 +46,7 @@ Members:
 func TestManager(t *testing.T) {
 	defer testutils.GoleakVerifyNone(t)
 
-	var mgr Manager
+	var mgr *manager
 
 	ipsets := make(map[string]AddrSet) // mocked kernel IP sets
 	var mu lock.Mutex                  // protect the ipsets map
@@ -138,7 +138,7 @@ func TestManager(t *testing.T) {
 			}
 		}),
 
-		cell.Invoke(func(m Manager) {
+		cell.Invoke(func(m *manager) {
 			mgr = m
 		}),
 	)
@@ -318,7 +318,7 @@ func TestManagerNodeIpsetNotNeeded(t *testing.T) {
 			}
 		}),
 		// force manager instantiation
-		cell.Invoke(func(_ Manager) {}),
+		cell.Invoke(func(_ *manager) {}),
 	)
 
 	time.MaxInternalTimerDelay = time.Millisecond
@@ -378,7 +378,7 @@ func TestOpsPruneEnabled(t *testing.T) {
 	fakeLogger := slog.New(slog.DiscardHandler)
 
 	db := statedb.New()
-	table, _ := statedb.NewTable(db, "ipsets", tables.IPSetEntryIndex)
+	table, _ := tables.NewIPSetTable(db)
 
 	txn := db.WriteTxn(table)
 	table.Insert(txn, &tables.IPSetEntry{
@@ -487,7 +487,7 @@ func TestOpsRetry(t *testing.T) {
 	txn.Commit()
 
 	for {
-		queryObj, _, watch, found := table.GetWatch(db.ReadTxn(), tables.IPSetEntryIndex.QueryFromObject(obj))
+		queryObj, _, watch, found := table.GetWatch(db.ReadTxn(), tables.IPSetEntryByKey(tables.IPSetEntryKey{Name: obj.Name, Addr: obj.Addr}))
 		require.True(t, found)
 
 		if queryObj.Status.Kind == reconciler.StatusKindDone {
@@ -585,7 +585,7 @@ func (e *mockExec) exec(ctx context.Context, name string, stdin string, arg ...s
 func BenchmarkManager(b *testing.B) {
 
 	var (
-		mgr         Manager
+		mgr         *manager
 		initializer Initializer
 		addCount    atomic.Int32
 		deleteCount atomic.Int32
@@ -632,7 +632,7 @@ func BenchmarkManager(b *testing.B) {
 			}
 		}),
 
-		cell.Invoke(func(m Manager) {
+		cell.Invoke(func(m *manager) {
 			// Add an initializer to stop the pruning
 			initializer = m.NewInitializer()
 			mgr = m

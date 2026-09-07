@@ -4,6 +4,11 @@
 package features
 
 import (
+	"fmt"
+	"reflect"
+
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/cilium/cilium/operator/option"
 	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/metrics/metric"
@@ -25,8 +30,9 @@ const (
 )
 
 // NewMetrics returns all feature metrics. If 'withDefaults' is set, then
-// all metrics will have defined all of their possible values.
-func NewMetrics(withDefaults bool) Metrics {
+// all metrics will have defined all of their possible values.  If 'withEnvVersion'
+// is set, then we include things like version information from the host.
+func NewMetrics(withDefaults bool, withEnvVersion bool) Metrics {
 	return Metrics{
 		ACLBGatewayAPIEnabled: metric.NewGauge(metric.GaugeOpts{
 			Namespace: metrics.Namespace,
@@ -68,6 +74,7 @@ func NewMetrics(withDefaults bool) Metrics {
 			Subsystem: subsystemCP,
 			Help:      "Kubernetes version detected by the operator",
 			Name:      "kubernetes_version",
+			Disabled:  !withEnvVersion,
 		}, metric.Labels{
 			{
 				Name: "version",
@@ -78,6 +85,7 @@ func NewMetrics(withDefaults bool) Metrics {
 
 type featureMetrics interface {
 	update(params enabledFeatures, config *option.OperatorConfig)
+	toGatherer() (prometheus.Gatherer, error)
 }
 
 func (m Metrics) update(params enabledFeatures, config *option.OperatorConfig) {
@@ -96,7 +104,27 @@ func (m Metrics) update(params enabledFeatures, config *option.OperatorConfig) {
 	if params.IsNodeIPAMEnabled() {
 		m.ACLBNodeIPAMEnabled.Set(1)
 	}
-	if k8sVersionStr := params.K8sVersion(); k8sVersionStr != "" {
-		m.CPKubernetesVersion.WithLabelValues(k8sVersionStr).Set(1)
+	if m.CPKubernetesVersion.IsEnabled() {
+		if k8sVersionStr := params.K8sVersion(); k8sVersionStr != "" {
+			m.CPKubernetesVersion.WithLabelValues(k8sVersionStr).Set(1)
+		}
 	}
+}
+
+func (m Metrics) toGatherer() (prometheus.Gatherer, error) {
+	rv := reflect.ValueOf(m)
+	reg := prometheus.NewPedanticRegistry()
+	for _, f := range rv.Fields() {
+		if !f.CanInterface() {
+			continue
+		}
+		c, ok := reflect.TypeAssert[prometheus.Collector](f)
+		if !ok {
+			continue
+		}
+		if err := reg.Register(c); err != nil {
+			return nil, fmt.Errorf("registering metric: %w", err)
+		}
+	}
+	return reg, nil
 }

@@ -9,8 +9,13 @@ import (
 	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/require"
 
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
+	ciliumio "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
+	ciliumLabels "github.com/cilium/cilium/pkg/labels"
+	ciliumTypes "github.com/cilium/cilium/pkg/types"
+	"github.com/cilium/cilium/pkg/u8proto"
 )
 
 func TestGetPodMetadata(t *testing.T) {
@@ -37,7 +42,7 @@ func TestGetPodMetadata(t *testing.T) {
 
 	expectedLabels := map[string]string{
 		"app":                          "test",
-		"io.cilium.k8s.policy.cluster": "",
+		"io.cilium.k8s.policy.cluster": "default",
 		"io.kubernetes.pod.namespace":  "default",
 		"io.cilium.k8s.namespace.labels.kubernetes.io/metadata.name": "default",
 		"io.cilium.k8s.namespace.labels.namespace-level-key":         "namespace-level-value",
@@ -46,7 +51,7 @@ func TestGetPodMetadata(t *testing.T) {
 	t.Run("normal scenario", func(t *testing.T) {
 		pod := pod.DeepCopy()
 
-		_, labels := GetPodMetadata(hivetest.Logger(t), ns, pod)
+		_, labels := GetPodMetadata(hivetest.Logger(t), cmtypes.DefaultClusterInfo, ns, pod)
 		require.Equal(t, expectedLabels, labels)
 	})
 
@@ -55,7 +60,7 @@ func TestGetPodMetadata(t *testing.T) {
 			pod := pod.DeepCopy()
 			pod.Labels["io.cilium.k8s.namespace.labels.namespace-level-key"] = "override-namespace-level-value"
 
-			_, labels := GetPodMetadata(hivetest.Logger(t), ns, pod)
+			_, labels := GetPodMetadata(hivetest.Logger(t), cmtypes.DefaultClusterInfo, ns, pod)
 			require.Equal(t, expectedLabels, labels)
 		})
 
@@ -63,8 +68,65 @@ func TestGetPodMetadata(t *testing.T) {
 			pod := pod.DeepCopy()
 			pod.Labels["io.cilium.k8s.namespace.labels.another-namespace-key"] = "another-namespace-level-value"
 
-			_, labels := GetPodMetadata(hivetest.Logger(t), ns, pod)
+			_, labels := GetPodMetadata(hivetest.Logger(t), cmtypes.DefaultClusterInfo, ns, pod)
 			require.Equal(t, expectedLabels, labels)
 		})
 	})
+
+	t.Run("named ports metadata", func(t *testing.T) {
+		pod := pod.DeepCopy()
+		pod.Labels[ciliumio.NamedPortsIdentityLabelName] = "spoofed"
+		pod.Labels[ciliumio.NamedPortsIdentityLabelNameForIndex(1)] = "spoofed"
+		pod.Spec.Containers = []slim_corev1.Container{{
+			Ports: []slim_corev1.ContainerPort{
+				{Name: "https", ContainerPort: 443, Protocol: slim_corev1.ProtocolTCP},
+				{Name: "dns", ContainerPort: 53, Protocol: slim_corev1.ProtocolUDP},
+				{Name: "http", ContainerPort: 80, Protocol: slim_corev1.ProtocolTCP},
+				{Name: "", ContainerPort: 8080, Protocol: slim_corev1.ProtocolTCP},
+			},
+		}}
+
+		namedPorts, labels := GetPodMetadata(hivetest.Logger(t), cmtypes.DefaultClusterInfo, ns, pod)
+		require.Equal(t, ciliumTypes.NamedPortMap{
+			"dns":   {Port: 53, Proto: u8proto.UDP},
+			"http":  {Port: 80, Proto: u8proto.TCP},
+			"https": {Port: 443, Proto: u8proto.TCP},
+		}, namedPorts)
+		require.Equal(t, expectedLabels, labels)
+	})
+}
+
+func TestNamedPortsIdentityLabels(t *testing.T) {
+	labelArray := NamedPortsIdentityLabels(ciliumTypes.NamedPortMap{
+		"https": {Port: 443, Proto: u8proto.TCP},
+		"dns":   {Port: 53, Proto: u8proto.UDP},
+		"http":  {Port: 80, Proto: u8proto.TCP},
+	})
+	require.Equal(t, ciliumLabels.LabelArray{ciliumLabels.NewLabel(
+		ciliumio.NamedPortsIdentityLabelName,
+		"dns.UDP.53_http.TCP.80_https.TCP.443",
+		ciliumLabels.LabelSourceGenerated,
+	)}, labelArray)
+
+	labelArray = NamedPortsIdentityLabels(ciliumTypes.NamedPortMap{
+		"port-a": {Port: 8000, Proto: u8proto.TCP},
+		"port-b": {Port: 8001, Proto: u8proto.TCP},
+		"port-c": {Port: 8002, Proto: u8proto.TCP},
+		"port-d": {Port: 8003, Proto: u8proto.TCP},
+		"port-e": {Port: 8004, Proto: u8proto.TCP},
+	})
+	require.Equal(t, ciliumLabels.LabelArray{
+		ciliumLabels.NewLabel(
+			ciliumio.NamedPortsIdentityLabelName,
+			"port-a.TCP.8000_port-b.TCP.8001_port-c.TCP.8002_port-d.TCP.8003",
+			ciliumLabels.LabelSourceGenerated,
+		),
+		ciliumLabels.NewLabel(
+			ciliumio.NamedPortsIdentityLabelNameForIndex(1),
+			"port-e.TCP.8004",
+			ciliumLabels.LabelSourceGenerated,
+		),
+	}, labelArray)
+
+	require.Empty(t, NamedPortsIdentityLabels(nil))
 }

@@ -1,5 +1,6 @@
 name: Bug Report
 description: Report a bug encountered while operating Cilium
+type: Bug
 labels: ["kind/community-report", "kind/bug", "needs/triage"]
 body:
   - type: markdown
@@ -24,11 +25,11 @@ body:
         **NOTE: If your version is NOT listed then please upgrade before opening the GH issue. Thank you**
       options:
         # renovate: datasource=github-tags depName=cilium/cilium
-        - 'equal or higher than v1.18.5 and lower than v1.19.0'
+        - 'equal or higher than v1.20.1 and lower than v1.21.0'
         # renovate: datasource=github-tags depName=cilium/cilium
-        - 'equal or higher than v1.17.11 and lower than v1.18.0'
+        - 'equal or higher than v1.19.7 and lower than v1.20.0'
         # renovate: datasource=github-tags depName=cilium/cilium
-        - 'equal or higher than v1.16.18 and lower than v1.17.0'
+        - 'equal or higher than v1.18.13 and lower than v1.19.0'
     validations:
       required: true
   - type: textarea

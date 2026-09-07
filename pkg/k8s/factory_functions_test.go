@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 	core_v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sTypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/cilium/cilium/api/v1/models"
@@ -128,138 +129,6 @@ func Test_EqualV2CNP(t *testing.T) {
 							},
 						},
 						Spec: &api.Rule{},
-					},
-				},
-			},
-			want: true,
-		},
-	}
-	for _, tt := range tests {
-		got := tt.args.o1.DeepEqual(tt.args.o2)
-		require.Equal(t, tt.want, got, "Test Name: %s", tt.name)
-	}
-}
-
-func Test_EqualV1Endpoints(t *testing.T) {
-	type args struct {
-		o1 *slim_corev1.Endpoints
-		o2 *slim_corev1.Endpoints
-	}
-	tests := []struct {
-		name string
-		args args
-		want bool
-	}{
-		{
-			name: "EPs with the same name",
-			args: args{
-				o1: &slim_corev1.Endpoints{
-					ObjectMeta: slim_metav1.ObjectMeta{
-						Name: "rule1",
-					},
-				},
-				o2: &slim_corev1.Endpoints{
-					ObjectMeta: slim_metav1.ObjectMeta{
-						Name: "rule1",
-					},
-				},
-			},
-			want: true,
-		},
-		{
-			name: "EPs with the different spec",
-			args: args{
-				o1: &slim_corev1.Endpoints{
-					ObjectMeta: slim_metav1.ObjectMeta{
-						Name: "rule1",
-					},
-					Subsets: []slim_corev1.EndpointSubset{
-						{
-							Addresses: []slim_corev1.EndpointAddress{
-								{
-									IP: "172.0.0.1",
-								},
-							},
-						},
-					},
-				},
-				o2: &slim_corev1.Endpoints{
-					ObjectMeta: slim_metav1.ObjectMeta{
-						Name: "rule1",
-					},
-				},
-			},
-			want: false,
-		},
-		{
-			name: "EPs with the same spec",
-			args: args{
-				o1: &slim_corev1.Endpoints{
-					ObjectMeta: slim_metav1.ObjectMeta{
-						Name: "rule1",
-					},
-					Subsets: []slim_corev1.EndpointSubset{
-						{
-							Addresses: []slim_corev1.EndpointAddress{
-								{
-									IP: "172.0.0.1",
-								},
-							},
-						},
-					},
-				},
-				o2: &slim_corev1.Endpoints{
-					ObjectMeta: slim_metav1.ObjectMeta{
-						Name: "rule1",
-					},
-					Subsets: []slim_corev1.EndpointSubset{
-						{
-							Addresses: []slim_corev1.EndpointAddress{
-								{
-									IP: "172.0.0.1",
-								},
-							},
-						},
-					},
-				},
-			},
-			want: true,
-		},
-		{
-			name: "EPs with the same spec (multiple IPs)",
-			args: args{
-				o1: &slim_corev1.Endpoints{
-					ObjectMeta: slim_metav1.ObjectMeta{
-						Name: "rule1",
-					},
-					Subsets: []slim_corev1.EndpointSubset{
-						{
-							Addresses: []slim_corev1.EndpointAddress{
-								{
-									IP: "172.0.0.1",
-								},
-								{
-									IP: "172.0.0.2",
-								},
-							},
-						},
-					},
-				},
-				o2: &slim_corev1.Endpoints{
-					ObjectMeta: slim_metav1.ObjectMeta{
-						Name: "rule1",
-					},
-					Subsets: []slim_corev1.EndpointSubset{
-						{
-							Addresses: []slim_corev1.EndpointAddress{
-								{
-									IP: "172.0.0.1",
-								},
-								{
-									IP: "172.0.0.2",
-								},
-							},
-						},
 					},
 				},
 			},
@@ -1126,11 +995,7 @@ func Test_TransformToCiliumEndpoint(t *testing.T) {
 							ID:          0,
 							Controllers: nil,
 							ExternalIdentifiers: &models.EndpointIdentifiers{
-								ContainerID:   "3290f4bc32129cb3e2f81074557ad9690240ea8fcce84bcc51a9921034875878",
-								ContainerName: "foo",
-								K8sNamespace:  "foo",
-								K8sPodName:    "bar",
-								PodName:       "foo/bar",
+								CniAttachmentID: "3290f4bc32129cb3e2f81074557ad9690240ea8fcce84bcc51a9921034875878",
 							},
 							Health: &models.EndpointHealth{
 								Bpf:           "good",
@@ -1283,6 +1148,12 @@ func Test_ConvertCEPToCoreCEP(t *testing.T) {
 	cep := &v2.CiliumEndpoint{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-endpoint",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					Kind: "Pod",
+					UID:  "test-pod-uid-1234",
+				},
+			},
 		},
 		Status: v2.EndpointStatus{
 			Identity: &v2.EndpointIdentity{
@@ -1315,6 +1186,7 @@ func Test_ConvertCEPToCoreCEP(t *testing.T) {
 
 	require.Equal(t, "test-endpoint", coreCEP.Name)
 	require.Equal(t, int64(1234), coreCEP.IdentityID)
+	require.Equal(t, "test-pod-uid-1234", coreCEP.PodUID)
 	require.Equal(t, "test-service-account", coreCEP.ServiceAccount)
 	require.Equal(t, v2.EncryptionSpec{Key: 42}, coreCEP.Encryption)
 	require.NotNil(t, coreCEP.Networking)
@@ -1323,10 +1195,29 @@ func Test_ConvertCEPToCoreCEP(t *testing.T) {
 	require.Equal(t, "http", coreCEP.NamedPorts[0].Name)
 }
 
+func Test_ConvertCEPToCoreCEP_NoPodOwner(t *testing.T) {
+	cep := &v2.CiliumEndpoint{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-endpoint",
+		},
+		Status: v2.EndpointStatus{
+			Identity: &v2.EndpointIdentity{
+				ID: 1234,
+			},
+		},
+	}
+
+	coreCEP := ConvertCEPToCoreCEP(cep)
+
+	require.Equal(t, "test-endpoint", coreCEP.Name)
+	require.Empty(t, coreCEP.PodUID, "PodUID should be empty when there is no Pod owner reference")
+}
+
 func Test_ConvertCoreCiliumEndpointToTypesCiliumEndpoint(t *testing.T) {
 	coreCEP := &cilium_v2a1.CoreCiliumEndpoint{
 		Name:       "test-endpoint",
 		IdentityID: 5678,
+		PodUID:     "test-pod-uid-5678",
 		Networking: &v2.EndpointNetworking{
 			Addressing: []*v2.AddressPair{
 				{
@@ -1360,6 +1251,22 @@ func Test_ConvertCoreCiliumEndpointToTypesCiliumEndpoint(t *testing.T) {
 	require.Equal(t, "192.168.1.2", typesCEP.Networking.NodeIP)
 	require.Len(t, typesCEP.NamedPorts, 1)
 	require.Equal(t, "grpc", typesCEP.NamedPorts[0].Name)
+	// Verify OwnerReferences reconstructed from PodUID
+	require.Len(t, typesCEP.OwnerReferences, 1)
+	require.Equal(t, "Pod", typesCEP.OwnerReferences[0].Kind)
+	require.Equal(t, k8sTypes.UID("test-pod-uid-5678"), typesCEP.OwnerReferences[0].UID)
+}
+
+func Test_ConvertCoreCiliumEndpointToTypesCiliumEndpoint_NoPodUID(t *testing.T) {
+	coreCEP := &cilium_v2a1.CoreCiliumEndpoint{
+		Name:       "test-endpoint",
+		IdentityID: 5678,
+	}
+
+	typesCEP := ConvertCoreCiliumEndpointToTypesCiliumEndpoint(coreCEP, "test-namespace")
+
+	require.Equal(t, "test-endpoint", typesCEP.Name)
+	require.Nil(t, typesCEP.OwnerReferences)
 }
 
 func Test_AnnotationsEqual(t *testing.T) {

@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
-	"path"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -102,6 +101,14 @@ func (rc *remoteCluster) Run(ctx context.Context, backend kvstore.BackendOperati
 	mgr.Run(ctx)
 }
 
+// OnClusterIDChange is intentionnally a no-op since draining the local entries
+// would not be simple (having a grace period like the drain but also not
+// blocking the initial connection too much). Also kvstoremesh is supposed to
+// reflect the remote cluster entries locally and draining entries earlier
+// might not be clearly better since it would mean that state would differ
+// until actually removed from the remote cluster.
+func (rc *remoteCluster) OnClusterIDChange(context.Context, uint32) {}
+
 func (rc *remoteCluster) Stop() {
 	rc.cancel()
 	rc.synced.Stop()
@@ -165,7 +172,7 @@ func (rc *remoteCluster) Remove(ctx context.Context) {
 // removing the rest of the cached data. Indeed, there's no point in retrieving
 // incomplete data, and it is expected that agents will be disconnecting as well.
 func (rc *remoteCluster) drain(ctx context.Context, withGracePeriod bool) (err error) {
-	var cfgkey = path.Join(kvstore.ClusterConfigPrefix, rc.name)
+	var cfgkey = kvstore.JoinKey(kvstore.ClusterConfigPrefix, rc.name)
 	if err = rc.localBackend.Delete(ctx, cfgkey); err != nil {
 		return fmt.Errorf("deleting key %q: %w", cfgkey, err)
 	}
@@ -190,7 +197,7 @@ func (rc *remoteCluster) drain(ctx context.Context, withGracePeriod bool) (err e
 		}
 	}
 
-	var synpfx = path.Join(kvstore.SyncedPrefix, rc.name) + "/"
+	var synpfx = kvstore.JoinKey(kvstore.SyncedPrefix, rc.name) + "/"
 	if err = rc.localBackend.DeletePrefix(ctx, synpfx); err != nil {
 		return fmt.Errorf("deleting prefix %q: %w", synpfx, err)
 	}
@@ -236,17 +243,21 @@ func (rc *remoteCluster) Status() *models.RemoteCluster {
 
 	status.NumNodes = int64(get(reflector.Nodes).Entries)
 	status.NumSharedServices = int64(get(reflector.Services).Entries)
+	status.NumEndpointSlices = int64(get(reflector.EndpointSlices).Entries)
 	status.NumServiceExports = int64(get(reflector.ServiceExports).Entries)
 	status.NumIdentities = int64(get(reflector.Identities).Entries)
 	status.NumEndpoints = int64(get(reflector.Endpoints).Entries)
 
 	status.Synced = &models.RemoteClusterSynced{
 		Nodes:      get(reflector.Nodes).Synced,
-		Services:   get(reflector.Services).Synced,
+		Services:   !get(reflector.Services).Enabled || get(reflector.Services).Synced,
 		Identities: get(reflector.Identities).Synced,
 		Endpoints:  get(reflector.Endpoints).Synced,
 	}
 
+	if get(reflector.EndpointSlices).Enabled {
+		status.Synced.EndpointSlices = new(get(reflector.EndpointSlices).Synced)
+	}
 	if get(reflector.ServiceExports).Enabled {
 		status.Synced.ServiceExports = ptr.To(get(reflector.ServiceExports).Synced)
 	}

@@ -5,7 +5,6 @@ package k8s
 
 import (
 	"context"
-	"errors"
 	"maps"
 	"net/netip"
 	"slices"
@@ -16,7 +15,9 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	k8sConst "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
+	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/resource"
+	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
 	"github.com/cilium/cilium/pkg/k8s/types"
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/loadbalancer"
@@ -102,10 +103,7 @@ func serviceEventStream(db *statedb.DB, services statedb.Table[*loadbalancer.Ser
 
 				backendsIter, watchBackends := backendChanges.Next(txn)
 				for ev := range backendsIter {
-					be := ev.Object
-					for inst := range be.Instances.All() {
-						changed.Insert(inst.ServiceName)
-					}
+					changed.Insert(ev.Object.ServiceName)
 				}
 
 				// For each changed service look it up along with the associated backends and
@@ -126,7 +124,9 @@ func serviceEventStream(db *statedb.DB, services statedb.Table[*loadbalancer.Ser
 						newEvent.name = svc.Name
 						newEvent.labels = svc.Labels
 						newEvent.selector = svc.Selector
-						for _, rev := range backends.List(txn, loadbalancer.BackendByServiceName(name)) {
+						bes, _ := loadbalancer.ListBackendsByServiceName(txn, backends, name)
+						preferred := loadbalancer.PreferredBackendsByAddress(bes)
+						for _, rev := range preferred {
 							newEvent.backendRevisions = append(newEvent.backendRevisions, rev)
 						}
 						if prevFound {
@@ -165,23 +165,14 @@ func serviceEventStream(db *statedb.DB, services statedb.Table[*loadbalancer.Ser
 // onServiceEvent processes a ServiceNotification and (if necessary)
 // recalculates all policies affected by this change.
 func (p *policyWatcher) onServiceEvent(event serviceEvent) {
-	err := p.updateToServicesPolicies(event)
-	if err != nil {
-		p.log.Warn(
-			"Failed to recalculate CiliumNetworkPolicy rules after service event",
-			logfields.Error, err,
-			logfields.Event, event,
-		)
-	}
+	p.updateToServicesPolicies(event)
 }
 
 // updateToServicesPolicies is to be invoked when a service has changed (i.e. it was
 // added, removed, its endpoints have changed, or its labels have changed).
 // This function then checks if any of the known CNP/CCNPs are affected by this
 // change, and recomputes them by calling resolveCiliumNetworkPolicyRefs.
-func (p *policyWatcher) updateToServicesPolicies(ev serviceEvent) error {
-	var errs []error
-
+func (p *policyWatcher) updateToServicesPolicies(ev serviceEvent) {
 	// candidatePolicyKeys contains the set of policy names we need to process
 	// for this service update. By default, we consider all policies with
 	// a ToServices selector as candidates.
@@ -222,13 +213,13 @@ func (p *policyWatcher) updateToServicesPolicies(ev serviceEvent) error {
 				logfields.ServiceID, ev.name,
 			)
 		}
-		initialRecvTime := time.Now()
 
+		initialRecvTime := time.Now()
 		resourceID := resourceIDForCiliumNetworkPolicy(key, cnp)
 
-		errs = append(errs, p.resolveCiliumNetworkPolicyRefs(cnp, key, initialRecvTime, resourceID, nil))
+		// CNP retrieved from cnpCache is already validated.
+		p.upsertCiliumNetworkPolicyV2(cnp, key, initialRecvTime, resourceID, nil)
 	}
-	return errors.Join(errs...)
 }
 
 // resolveToServices translates all ToServices rules found in the provided CNP
@@ -252,6 +243,21 @@ func (p *policyWatcher) resolveToServices(key resource.Key, cnp *types.SlimCNP) 
 			p.markCNPForService(key, svc.Name)
 		} else {
 			p.clearCNPForService(key, svc.Name)
+		}
+	}
+}
+
+// ResolveToServices translates all ToServices rules found in the provided
+// CNP to CIDR rules. Mutates the supplied CNP. Used by other policy consumers.
+func ResolveToServices(txn statedb.ReadTxn, services statedb.Table[*loadbalancer.Service], backends statedb.Table[*loadbalancer.Backend], cnp *v2.CiliumNetworkPolicy) {
+	for svc := range services.All(txn) {
+		svcEndpoints := newServiceEndpoints(svc, txn, backends)
+
+		// This extracts the selected service endpoints from the rule
+		// and translates it to a ToCIDRSet/ToEndpoints
+		svcEndpoints.processRule(cnp.Spec)
+		for _, spec := range cnp.Specs {
+			svcEndpoints.processRule(spec)
 		}
 	}
 }
@@ -347,7 +353,9 @@ type serviceDetailer interface {
 }
 
 // serviceSelectorMatches returns true if the ToServices k8sServiceSelector
-// matches the labels of the provided service svc
+// matches the labels of the provided service svc.
+//
+// NOTE: This method assumes that the selector is validated beforehand.
 func serviceSelectorMatches(sel *api.K8sServiceSelectorNamespace, svc serviceDetailer) bool {
 	if !(sel.Namespace == svc.getNamespace() || sel.Namespace == "") {
 		return false
@@ -359,22 +367,13 @@ func serviceSelectorMatches(sel *api.K8sServiceSelectorNamespace, svc serviceDet
 
 type labelsMatcher labels.Labels
 
-// Get implements labels.LabelMatcher; label source is ignored
-func (l labelsMatcher) GetLabel(label *labels.Label) (value string) {
-	v := l[label.Key]
-	return v.Value
-}
-
-// Has implements labels.LabelMatcher.
-func (l labelsMatcher) HasLabel(label *labels.Label) (exists bool) {
-	_, ok := l[label.Key]
-	return ok
-}
-
 // Lookup implements labels.LabelMatcher
 func (l labelsMatcher) LookupLabel(label *labels.Label) (value string, exists bool) {
 	v, ok := l[label.Key]
-	return v.Value, ok
+	if ok && (label.IsAnySource() || v.Source == label.Source) {
+		return v.Value, true
+	}
+	return "", false
 }
 
 var _ labels.LabelMatcher = labelsMatcher{}
@@ -404,7 +403,9 @@ func newServiceEndpoints(svc *loadbalancer.Service, txn statedb.ReadTxn, backend
 		svc: svc,
 		backendPrefixes: sync.OnceValue(func() backendPrefixes {
 			prefixes := backendPrefixes{}
-			for be := range backends.List(txn, loadbalancer.BackendByServiceName(svc.Name)) {
+			bes, _ := loadbalancer.ListBackendsByServiceName(txn, backends, svc.Name)
+			preferred := loadbalancer.PreferredBackendsByAddress(bes)
+			for be := range preferred {
 				addr := be.Address.Addr()
 				prefixes = append(prefixes, api.CIDR(netip.PrefixFrom(addr, addr.BitLen()).String()))
 			}
@@ -423,14 +424,19 @@ func appendEndpoints(toCIDRSet *api.CIDRRuleSlice, endpoints []api.CIDR) {
 	}
 }
 
-// appendSelector appends the service selector as a generated EndpointSelector
-func appendSelector(toEndpoints *[]api.EndpointSelector, svcSelector map[string]string, namespace string) {
+func newEndpointSelectorForServiceSelector(namespace string, svcSelector map[string]string) api.EndpointSelector {
 	selector := maps.Clone(svcSelector)
-	selector[labels.LabelSourceK8sKeyPrefix+k8sConst.PodNamespaceLabel] = namespace
-	endpointSelector := api.NewESFromMatchRequirements(selector, nil)
+	selector[k8sConst.PodNamespaceLabel] = namespace
+
+	endpointSelector := api.NewESFromK8sLabelSelector(labels.LabelSourceK8sKeyPrefix, &slim_metav1.LabelSelector{MatchLabels: selector})
 	endpointSelector.Generated = true
 
-	*toEndpoints = append(*toEndpoints, endpointSelector)
+	return endpointSelector
+}
+
+// appendSelector appends the service selector as a generated EndpointSelector
+func appendSelector(toEndpoints *[]api.EndpointSelector, svcSelector map[string]string, namespace string) {
+	*toEndpoints = append(*toEndpoints, newEndpointSelectorForServiceSelector(namespace, svcSelector))
 }
 
 // processRule parses the ToServices selectors in the provided rule and translates it to:

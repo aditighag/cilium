@@ -1,10 +1,19 @@
 {
   "name": "Cilium",
-  "image": "quay.io/cilium/cilium-builder:604b057f8acd732f9d42e6b3d37a3f829b1f6351@sha256:4aca1e0bc9f585122fdb776a8ebd8969be0e84a22411c2b7a4fb3bf0d7d5d86c",
+  "image": "quay.io/cilium/cilium-builder:c7532ca9f45c2905520d5bc92882238e75f6b28b@sha256:e66434016cb094cf680271a40e6aba9072ce88b85885df85c2ecd0028102b688",
   "workspaceFolder": "/go/src/github.com/cilium/cilium",
   "workspaceMount": "source=${localWorkspaceFolder},target=/go/src/github.com/cilium/cilium,type=bind",
+  // This container is based on the cilium-builder image, so contrib/scripts/builder.sh can run commands
+  // in place instead of spawning another builder nested container.
+  "containerEnv": {
+    "IN_CILIUM_BUILDER_CONTAINER": "1"
+  },
   "features": {
-    "ghcr.io/devcontainers/features/docker-in-docker": {}
+    // Ubuntu 26.04 (resolute) has no moby-* packages, so install Docker CE
+    // instead: the feature hard-fails with moby enabled on that distribution.
+    "ghcr.io/devcontainers/features/docker-in-docker": {
+      "moby": false
+    }
   },
   "mounts": [
     // To enable kernel modules for devcontainer

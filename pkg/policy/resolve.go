@@ -14,20 +14,20 @@ import (
 
 	cilium "github.com/cilium/proxy/go/cilium/api"
 
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
+	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/logging/logfields"
-	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy/api"
+	"github.com/cilium/cilium/pkg/policy/types"
+	"github.com/cilium/cilium/pkg/time"
+	pkgTypes "github.com/cilium/cilium/pkg/types"
 	"github.com/cilium/cilium/pkg/u8proto"
 )
 
 // PolicyContext is an interface policy resolution functions use to access the Repository.
 // This way testing code can run without mocking a full Repository.
 type PolicyContext interface {
-	// AllowLocalhost returns true if policy should allow ingress from local host.
-	// Always returns false for egress.
-	AllowLocalhost() bool
-
 	// return the namespace in which the policy rule is being resolved
 	GetNamespace() string
 
@@ -48,10 +48,10 @@ type PolicyContext interface {
 	GetEnvoyHTTPRules(l7Rules *api.L7Rules) (*cilium.HttpNetworkPolicyRules, bool)
 
 	// SetPriority sets the priority level for the first rule being processed.
-	SetPriority(level uint32)
+	SetPriority(tier types.Tier, priority types.Priority)
 
 	// Priority returns the priority level for the current rule.
-	Priority() uint32
+	Priority() (tier types.Tier, priority types.Priority)
 
 	// DefaultDenyIngress returns true if default deny is enabled for ingress
 	DefaultDenyIngress() bool
@@ -71,8 +71,11 @@ type policyContext struct {
 	repo *Repository
 	ns   string
 
-	// level is the precedence level for the rule being processed.
-	level uint32
+	// Policy tier, 0 is the default and highest tier.
+	tier types.Tier
+
+	// priority level for the rule being processed, 0 is the highest priority.
+	priority types.Priority
 
 	defaultDenyIngress bool
 	defaultDenyEgress  bool
@@ -84,10 +87,6 @@ type policyContext struct {
 }
 
 var _ PolicyContext = &policyContext{}
-
-func (p *policyContext) AllowLocalhost() bool {
-	return option.Config.AlwaysAllowLocalhost()
-}
 
 // GetNamespace() returns the namespace for the policy rule being resolved
 func (p *policyContext) GetNamespace() string {
@@ -111,14 +110,15 @@ func (p *policyContext) GetEnvoyHTTPRules(l7Rules *api.L7Rules) (*cilium.HttpNet
 	return p.repo.GetEnvoyHTTPRules(l7Rules, p.ns)
 }
 
-// SetPriority sets the precedence level for the first rule being processed.
-func (p *policyContext) SetPriority(level uint32) {
-	p.level = level
+// SetPriority sets the tier and priority for the first rule being processed.
+func (p *policyContext) SetPriority(tier types.Tier, priority types.Priority) {
+	p.tier = tier
+	p.priority = priority
 }
 
-// Priority returns the precedence level for the current rule.
-func (p *policyContext) Priority() uint32 {
-	return p.level
+// Priority returns the tier and priority for the current rule.
+func (p *policyContext) Priority() (types.Tier, types.Priority) {
+	return p.tier, p.priority
 }
 
 // DefaultDenyIngress returns true if default deny is enabled for ingress
@@ -151,6 +151,8 @@ func (p *policyContext) PolicyTrace(format string, a ...any) {
 	p.logger.Info(fmt.Sprintf(format, a...))
 }
 
+var FallbackRedirectID = "fallback"
+
 // SelectorPolicy represents a selectorPolicy, previously resolved from
 // the policy repository and ready to be distilled against a set of identities
 // to compute datapath-level policy configuration.
@@ -162,18 +164,43 @@ type SelectorPolicy interface {
 	// DistillPolicy returns the policy in terms of connectivity to peer
 	// Identities.
 	DistillPolicy(logger *slog.Logger, owner PolicyOwner, redirects map[string]uint16) *EndpointPolicy
+
+	// GetSelectorSnapshot returns a selector snapshot if available and valid
+	GetSelectorSnapshot() SelectorSnapshot
+
+	// GetEgressNamedPorts iterates named ports for the given identities
+	GetEgressNamedPorts(name string, proto u8proto.U8proto, idents iter.Seq[identity.NumericIdentity]) pkgTypes.NidPortSeq
+
+	// GetAuthTypes returns the AuthTypes required by the policy for traffic to
+	// remoteID, or nil if none.
+	GetAuthTypes(remoteID identity.NumericIdentity) types.AuthTypes
+
+	AddHold() bool
+	ReleaseHold()
+	Detach()
+	Supersede()
+	GetRevision() uint64
+}
+
+type NamedPortsGetter interface {
+	GetNamedPorts() (npm pkgTypes.NamedPortMultiMap)
 }
 
 // selectorPolicy is a structure which contains the resolved policy for a
 // particular Identity across all layers (L3, L4, and L7), with the policy
 // still determined in terms of EndpointSelectors.
 type selectorPolicy struct {
+	clusterInfo cmtypes.ClusterInfo
+
 	// Revision is the revision of the policy repository used to generate
 	// this selectorPolicy.
 	Revision uint64
 
 	// SelectorCache managing selectors in L4Policy
 	SelectorCache *SelectorCache
+
+	// Getter for egress named ports
+	namedPortsGetter NamedPortsGetter
 
 	// L4Policy contains the computed L4 and L7 policy.
 	L4Policy L4Policy
@@ -185,6 +212,44 @@ type selectorPolicy struct {
 	// EgressPolicyEnabled specifies whether this policy contains any policy
 	// at egress.
 	EgressPolicyEnabled bool
+}
+
+func (p *selectorPolicy) GetSelectorSnapshot() SelectorSnapshot {
+	return p.SelectorCache.GetSelectorSnapshot()
+}
+
+func (p *selectorPolicy) GetEgressNamedPorts(name string, proto u8proto.U8proto, idents iter.Seq[identity.NumericIdentity]) pkgTypes.NidPortSeq {
+	if p.namedPortsGetter == nil {
+		return pkgTypes.EmptyNidPortSeq
+	}
+	return p.namedPortsGetter.GetNamedPorts().GetNamedPorts(name, proto, idents)
+}
+
+// GetAuthTypes returns the AuthTypes required by the policy for traffic to
+// remoteID, or nil if none. The selectorPolicy is treated as immutable after
+// creation, so no locking is required.
+func (p *selectorPolicy) GetAuthTypes(remoteID identity.NumericIdentity) types.AuthTypes {
+	var resTypes types.AuthTypes
+	for cs, authTypes := range p.L4Policy.authMap {
+		missing := false
+		for authType := range authTypes {
+			if _, exists := resTypes[authType]; !exists {
+				missing = true
+				break
+			}
+		}
+		// Only check if 'cs' selects 'remoteID' if one of the authTypes is still missing
+		// from the result.
+		if missing && cs.Selects(remoteID) {
+			if resTypes == nil {
+				resTypes = make(types.AuthTypes, 1)
+			}
+			for authType := range authTypes {
+				resTypes[authType] = struct{}{}
+			}
+		}
+	}
+	return resTypes
 }
 
 func (p *selectorPolicy) Attach(ctx PolicyContext) {
@@ -239,6 +304,11 @@ func (p *EndpointPolicy) LookupRedirectPort(ingress bool, protocol string, port 
 	if proxyPort, exists := p.Redirects[proxyID]; exists {
 		return proxyPort, nil
 	}
+	// When simulating policy, we don't want to actually configure proxy. So, use the special
+	// fallback proxy ID
+	if proxyPort, exists := p.Redirects[FallbackRedirectID]; len(p.Redirects) == 1 && exists {
+		return proxyPort, nil
+	}
 	return 0, fmt.Errorf("Proxy port for redirect %q not found", proxyID)
 }
 
@@ -264,20 +334,42 @@ func (p *EndpointPolicy) CopyMapStateFrom(m MapStateMap) {
 // PolicyOwner is anything which consumes a EndpointPolicy.
 type PolicyOwner interface {
 	GetID() uint64
-	GetNamedPort(ingress bool, name string, proto u8proto.U8proto) uint16
+	GetIngressNamedPort(name string, proto u8proto.U8proto) uint16
 	PolicyDebug(msg string, attrs ...any)
 	IsHost() bool
-	MapStateSize() int
+	PreviousMapState() *MapState
 	RegenerateIfAlive(regenMetadata *regeneration.ExternalRegenerationMetadata) <-chan bool
 }
 
 // newSelectorPolicy returns an empty selectorPolicy stub.
-func newSelectorPolicy(selectorCache *SelectorCache) *selectorPolicy {
+func newSelectorPolicy(selectorCache *SelectorCache, clusterInfo cmtypes.ClusterInfo) *selectorPolicy {
 	return &selectorPolicy{
+		clusterInfo:   clusterInfo,
 		Revision:      0,
 		SelectorCache: selectorCache,
 		L4Policy:      NewL4Policy(0),
 	}
+}
+
+func (p *selectorPolicy) AddHold() bool {
+	if p == nil {
+		return false
+	}
+	return p.L4Policy.addHold()
+}
+
+func (p *selectorPolicy) ReleaseHold() {
+	if p == nil {
+		return
+	}
+	p.L4Policy.releaseHold(p.SelectorCache)
+}
+
+func (p *selectorPolicy) Supersede() {
+	if p == nil {
+		return
+	}
+	p.L4Policy.supersede(p.SelectorCache, 0)
 }
 
 // insertUser adds a user to the L4Policy so that incremental
@@ -289,17 +381,14 @@ func (p *selectorPolicy) insertUser(user *EndpointPolicy) {
 // removeUser removes a user from the L4Policy so the EndpointPolicy
 // can be freed when not needed any more
 func (p *selectorPolicy) removeUser(user *EndpointPolicy) {
-	p.L4Policy.removeUser(user)
+	p.L4Policy.removeUser(user, p.SelectorCache)
 }
 
-// detach releases resources held by a selectorPolicy to enable
-// successful eventual GC.  Note that the selectorPolicy itself if not
-// modified in any way, so that it can be used concurrently.
-// The endpointID argument is only necessary if isDelete is false.
-// It ensures that detach does not call a regeneration trigger on
-// the same endpoint that initiated a selector policy update.
-func (p *selectorPolicy) detach(isDelete bool, endpointID uint64) {
-	p.L4Policy.detach(p.SelectorCache, isDelete, endpointID)
+func (p *selectorPolicy) Detach() {
+	if p == nil {
+		return
+	}
+	p.L4Policy.detach(p.SelectorCache)
 }
 
 // DistillPolicy filters down the specified selectorPolicy (which acts
@@ -327,10 +416,11 @@ func (p *selectorPolicy) DistillPolicy(logger *slog.Logger, policyOwner PolicyOw
 	//   ConsumeMapChanges().
 	p.SelectorCache.WithRLock(func(sc *SelectorCache) {
 		selectors := sc.GetSelectorSnapshot()
+		features := p.L4Policy.Ingress.features | p.L4Policy.Egress.features
 		calculatedPolicy = &EndpointPolicy{
 			SelectorPolicy: p,
 			selectors:      selectors,
-			policyMapState: newMapState(logger, policyOwner.MapStateSize()),
+			policyMapState: newMapState(logger, policyOwner.PreviousMapState(), features, p.clusterInfo),
 			policyMapChanges: MapChanges{
 				logger:   logger,
 				firstRev: selectors.Revision,
@@ -354,16 +444,18 @@ func (p *selectorPolicy) DistillPolicy(logger *slog.Logger, policyOwner PolicyOw
 	p.L4Policy.Ingress.toMapState(logger, calculatedPolicy)
 	p.L4Policy.Egress.toMapState(logger, calculatedPolicy)
 
-	if !policyOwner.IsHost() {
-		calculatedPolicy.policyMapState.determineAllowLocalhostIngress()
-	}
-
 	return calculatedPolicy
 }
 
-var (
-	ErrStaleSelectors = errors.New("stale selector snapshot")
-)
+func (p *selectorPolicy) IsDetached() (bool, time.Time) {
+	ptr := p.L4Policy.detachedTime.Load()
+	if ptr == nil {
+		return false, time.Time{}
+	}
+	return true, *ptr
+}
+
+var ErrStaleSelectors = errors.New("stale selector snapshot")
 
 // Ready releases memory held for the selector snapshot.
 // This should be called when the policy has been realized.
@@ -399,6 +491,13 @@ func (p *EndpointPolicy) Detach(logger *slog.Logger) {
 
 func (p *EndpointPolicy) Len() int {
 	return p.policyMapState.Len()
+}
+
+type MapState = mapState
+
+// GetMapState returns a pointer to the current mapstate.
+func (p *EndpointPolicy) GetMapState() *MapState {
+	return &p.policyMapState
 }
 
 func (p *EndpointPolicy) Get(key Key) (MapStateEntry, bool) {
@@ -503,21 +602,27 @@ func (p *EndpointPolicy) MissingMap(realized MapStateMap) iter.Seq2[Key, MapStat
 }
 
 func (p *EndpointPolicy) RevertChanges(changes ChangeState) {
-	// SelectorCache used as Identities interface which only has GetPrefix() that needs no lock
 	p.policyMapState.revertChanges(changes)
 }
 
-// toMapState transforms the L4DirectionPolicy into
+// toMapState transforms an attached L4DirectionPolicy into
 // the datapath-friendly format inside EndpointPolicy.PolicyMapState.
 // Called with selectorcache locked for reading.
 // Called without holding the Repository lock.
 // PolicyOwner (aka Endpoint) is also unlocked during this call,
 // but the Endpoint's build mutex is held.
 func (l4policy L4DirectionPolicy) toMapState(logger *slog.Logger, p *EndpointPolicy) {
-	l4policy.PortRules.ForEach(func(l4 *L4Filter) bool {
-		l4.toMapState(logger, p, l4policy.features, ChangeState{})
-		return true
-	})
+	for tier := range l4policy.PortRules {
+		basePriority := l4policy.tierBasePriority[tier]
+		nextTierPriority := types.LowestPriority
+		if len(l4policy.tierBasePriority) > int(tier)+1 {
+			nextTierPriority = l4policy.tierBasePriority[tier+1]
+		}
+		l4policy.PortRules[tier].ForEach(func(l4 *L4Filter) bool {
+			l4.toMapState(logger, basePriority, nextTierPriority, p, l4policy.features, ChangeState{})
+			return true
+		})
+	}
 }
 
 type PerSelectorPolicyTuple struct {
@@ -534,16 +639,31 @@ func (p *selectorPolicy) RedirectFilters() iter.Seq2[*L4Filter, PerSelectorPolic
 	}
 }
 
+func (p *selectorPolicy) GetRevision() uint64 {
+	if p == nil {
+		return 0
+	}
+	return p.Revision
+}
+
 func (l4policy L4DirectionPolicy) forEachRedirectFilter(yield func(*L4Filter, PerSelectorPolicyTuple) bool) bool {
 	ok := true
-	l4policy.PortRules.ForEach(func(l4 *L4Filter) bool {
-		for cs, ps := range l4.PerSelectorPolicies {
-			if ps != nil && ps.IsRedirect() {
-				ok = yield(l4, PerSelectorPolicyTuple{ps, cs})
+	for i := range l4policy.PortRules {
+		l4policy.PortRules[i].ForEach(func(l4 *L4Filter) bool {
+			for cs, ps := range l4.PerSelectorPolicies {
+				if ps != nil && ps.IsRedirect() {
+					if !yield(l4, PerSelectorPolicyTuple{ps, cs}) {
+						ok = false
+						return false
+					}
+				}
 			}
+			return true
+		})
+		if !ok {
+			break
 		}
-		return ok
-	})
+	}
 	return ok
 }
 
@@ -553,6 +673,16 @@ func (l4policy L4DirectionPolicy) forEachRedirectFilter(yield func(*L4Filter, Pe
 func (p *EndpointPolicy) ConsumeMapChanges() (closer func(), changes ChangeState) {
 	features := p.SelectorPolicy.L4Policy.Ingress.features | p.SelectorPolicy.L4Policy.Egress.features
 	selectors, changes := p.policyMapChanges.consumeMapChanges(p, features)
+
+	// Even if there were no incremental map changes, follow-on processing may
+	// still need a usable selector snapshot. Reopen one on demand if the
+	// current snapshot is already stale.
+	// This block can be removed when UpdateNetworkPolicy no longer requires a selector
+	// snapshot.
+	if !selectors.IsValid() && !p.selectors.IsValid() {
+		// this will get stored to p.selectors below
+		selectors = p.SelectorPolicy.GetSelectorSnapshot()
+	}
 
 	// Update current selector snapshot and provide a closer function to close the new snapshot
 	// if (and only if) the old one was already closed.
@@ -583,9 +713,26 @@ func (p *EndpointPolicy) ConsumeMapChanges() (closer func(), changes ChangeState
 }
 
 // NewEndpointPolicy returns an empty EndpointPolicy stub.
+// The returned stub is not modified.
+// PolicyOwner is left as nil
 func NewEndpointPolicy(logger *slog.Logger, repo PolicyRepository) *EndpointPolicy {
 	return &EndpointPolicy{
-		SelectorPolicy: newSelectorPolicy(repo.GetSelectorCache()),
-		policyMapState: emptyMapState(logger),
+		SelectorPolicy: newSelectorPolicy(repo.GetSelectorCache(), repo.GetClusterInfo()),
+		policyMapState: newMapState(logger, nil, 0, repo.GetClusterInfo()),
 	}
+}
+
+// NewEndpointPolicyForTest creates a minimal EndpointPolicy for unit tests.
+func NewEndpointPolicyForTest(snapshot SelectorSnapshot) *EndpointPolicy {
+	return &EndpointPolicy{
+		SelectorPolicy: &selectorPolicy{
+			L4Policy: NewL4Policy(0),
+		},
+		selectors: snapshot,
+	}
+}
+
+// IsValid returns true if the policy is a result of a policy computation, false for the empty stub.
+func (p *EndpointPolicy) IsValid() bool {
+	return p.PolicyOwner != nil
 }

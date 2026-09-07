@@ -4,7 +4,6 @@
 package loader
 
 import (
-	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -12,17 +11,15 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/vishvananda/netlink"
-	"golang.org/x/sys/unix"
 
+	"github.com/cilium/cilium/pkg/datapath/linux/bigtcp"
+	"github.com/cilium/cilium/pkg/datapath/linux/device"
 	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
-	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/mac"
-	mtuconst "github.com/cilium/cilium/pkg/mtu"
-	"github.com/cilium/cilium/pkg/option"
 )
 
 const qdiscClsact = "clsact"
@@ -35,38 +32,6 @@ func directionToParent(dir string) uint32 {
 		return netlink.HANDLE_MIN_EGRESS
 	}
 	return 0
-}
-
-// enableForwarding puts the given link into the up state and enables IP forwarding.
-func enableForwarding(logger *slog.Logger, sysctl sysctl.Sysctl, link netlink.Link) error {
-	ifName := link.Attrs().Name
-
-	if err := netlink.LinkSetUp(link); err != nil {
-		logger.Warn("Could not set up the link",
-			logfields.Error, err,
-			logfields.Device, ifName,
-		)
-		return fmt.Errorf("failed to set link up: %w", err)
-	}
-
-	sysSettings := make([]tables.Sysctl, 0, 5)
-	if option.Config.EnableIPv6 {
-		sysSettings = append(sysSettings, tables.Sysctl{
-			Name: []string{"net", "ipv6", "conf", ifName, "forwarding"}, Val: "1", IgnoreErr: false})
-	}
-	if option.Config.EnableIPv4 {
-		sysSettings = append(sysSettings, []tables.Sysctl{
-			{Name: []string{"net", "ipv4", "conf", ifName, "forwarding"}, Val: "1", IgnoreErr: false},
-			{Name: []string{"net", "ipv4", "conf", ifName, "rp_filter"}, Val: "0", IgnoreErr: false},
-			{Name: []string{"net", "ipv4", "conf", ifName, "accept_local"}, Val: "1", IgnoreErr: false},
-			{Name: []string{"net", "ipv4", "conf", ifName, "send_redirects"}, Val: "0", IgnoreErr: false},
-		}...)
-	}
-	if err := sysctl.ApplySettings(sysSettings); err != nil {
-		return fmt.Errorf("failed to apply sysctl settings for %s: %w", ifName, err)
-	}
-
-	return nil
 }
 
 func setupVethPair(logger *slog.Logger, sysctl sysctl.Sysctl, name, peerName string) error {
@@ -84,11 +49,11 @@ func setupVethPair(logger *slog.Logger, sysctl sysctl.Sysctl, name, peerName str
 		veth := &netlink.Veth{
 			LinkAttrs: netlink.LinkAttrs{
 				Name:         name,
-				HardwareAddr: net.HardwareAddr(hostMac),
+				HardwareAddr: hostMac.HardwareAddr(),
 				TxQLen:       1000,
 			},
 			PeerName:         peerName,
-			PeerHardwareAddr: net.HardwareAddr(peerMac),
+			PeerHardwareAddr: peerMac.HardwareAddr(),
 		}
 		if err := netlink.LinkAdd(veth); err != nil {
 			return fmt.Errorf("failed to add veth pair: %w", err)
@@ -99,14 +64,26 @@ func setupVethPair(logger *slog.Logger, sysctl sysctl.Sysctl, name, peerName str
 	if err != nil {
 		return fmt.Errorf("failed to get link by name %s: %w", name, err)
 	}
-	if err := enableForwarding(logger, sysctl, veth); err != nil {
-		return fmt.Errorf("failed to enable forwarding on veth: %w", err)
-	}
 	peer, err := safenetlink.LinkByName(peerName)
 	if err != nil {
 		return fmt.Errorf("failed to get link by name %s: %w", peerName, err)
 	}
-	if err := enableForwarding(logger, sysctl, peer); err != nil {
+
+	// Turn ARP off before bringing the links up. The kernel skips duplicate
+	// address detection on NOARP devices, so the kernel-generated IPv6
+	// link-local is added as permanent instead of spending up to a second in
+	// the tentative state, invisible to netlink subscribers.
+	if err := netlink.LinkSetARPOff(veth); err != nil {
+		return fmt.Errorf("failed to set ARP off for %s: %w", name, err)
+	}
+	if err := netlink.LinkSetARPOff(peer); err != nil {
+		return fmt.Errorf("failed to set ARP off for %s: %w", peerName, err)
+	}
+
+	if err := device.EnableForwarding(logger, sysctl, veth); err != nil {
+		return fmt.Errorf("failed to enable forwarding on veth: %w", err)
+	}
+	if err := device.EnableForwarding(logger, sysctl, peer); err != nil {
 		return fmt.Errorf("failed to enable forwarding on peer: %w", err)
 	}
 
@@ -129,13 +106,6 @@ func setupBaseDevice(logger *slog.Logger, sysctl sysctl.Sysctl, mtu int) (netlin
 	linkNet, err := safenetlink.LinkByName(defaults.SecondHostDevice)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to get link for %s: %w", defaults.SecondHostDevice, err)
-	}
-
-	if err := netlink.LinkSetARPOff(linkHost); err != nil {
-		return nil, nil, fmt.Errorf("failed to set ARP off for %s: %w", linkHost.Attrs().Name, err)
-	}
-	if err := netlink.LinkSetARPOff(linkNet); err != nil {
-		return nil, nil, fmt.Errorf("failed to set ARP off for %s: %w", linkNet.Attrs().Name, err)
 	}
 
 	if err := netlink.LinkSetMTU(linkHost, mtu); err != nil {
@@ -179,13 +149,16 @@ func addHostDeviceAddr(hostDev netlink.Link, ipv4, ipv6 net.IP) error {
 
 // setupTunnelDevice ensures the cilium_{mode} device is created and
 // unused leftover devices are cleaned up in case mode changes.
-func setupTunnelDevice(logger *slog.Logger, sysctl sysctl.Sysctl, mode tunnel.EncapProtocol, port, srcPortLow, srcPortHigh uint16, mtu int) error {
+func setupTunnelDevice(logger *slog.Logger, sysctl sysctl.Sysctl, mode tunnel.EncapProtocol, port, srcPortLow, srcPortHigh uint16, mtu int, bigtcp bigtcp.Config) error {
 	switch mode {
 	case tunnel.Geneve:
 		if err := setupGeneveDevice(logger, sysctl, port, srcPortLow, srcPortHigh, mtu); err != nil {
 			return fmt.Errorf("setting up geneve device: %w", err)
 		}
-		if err := removeDevice(defaults.VxlanDevice); err != nil {
+		if err := setupTunnelGSOGRO(logger, defaults.GeneveDevice, bigtcp); err != nil {
+			return fmt.Errorf("setting up GSO/GRO on GENEVE netdev: %w", err)
+		}
+		if err := device.RemoveDevice(defaults.VxlanDevice); err != nil {
 			return fmt.Errorf("removing %s: %w", defaults.VxlanDevice, err)
 		}
 
@@ -193,15 +166,18 @@ func setupTunnelDevice(logger *slog.Logger, sysctl sysctl.Sysctl, mode tunnel.En
 		if err := setupVxlanDevice(logger, sysctl, port, srcPortLow, srcPortHigh, mtu); err != nil {
 			return fmt.Errorf("setting up vxlan device: %w", err)
 		}
-		if err := removeDevice(defaults.GeneveDevice); err != nil {
+		if err := setupTunnelGSOGRO(logger, defaults.VxlanDevice, bigtcp); err != nil {
+			return fmt.Errorf("setting up GSO/GRO on VXLAN netdev: %w", err)
+		}
+		if err := device.RemoveDevice(defaults.GeneveDevice); err != nil {
 			return fmt.Errorf("removing %s: %w", defaults.GeneveDevice, err)
 		}
 
 	default:
-		if err := removeDevice(defaults.VxlanDevice); err != nil {
+		if err := device.RemoveDevice(defaults.VxlanDevice); err != nil {
 			return fmt.Errorf("removing %s: %w", defaults.VxlanDevice, err)
 		}
-		if err := removeDevice(defaults.GeneveDevice); err != nil {
+		if err := device.RemoveDevice(defaults.GeneveDevice); err != nil {
 			return fmt.Errorf("removing %s: %w", defaults.GeneveDevice, err)
 		}
 	}
@@ -229,7 +205,7 @@ func setupGeneveDevice(logger *slog.Logger, sysctl sysctl.Sysctl, dport, srcPort
 		LinkAttrs: netlink.LinkAttrs{
 			Name:         defaults.GeneveDevice,
 			MTU:          mtu,
-			HardwareAddr: net.HardwareAddr(mac),
+			HardwareAddr: mac.HardwareAddr(),
 		},
 		FlowBased: true,
 		Dport:     dport,
@@ -237,7 +213,7 @@ func setupGeneveDevice(logger *slog.Logger, sysctl sysctl.Sysctl, dport, srcPort
 		PortHigh:  int(srcPortHigh),
 	}
 
-	l, err := ensureDevice(logger, sysctl, dev)
+	l, err := device.EnsureDevice(logger, sysctl, dev)
 	if err != nil {
 		return fmt.Errorf("creating geneve device: %w", err)
 	}
@@ -249,7 +225,7 @@ func setupGeneveDevice(logger *slog.Logger, sysctl sysctl.Sysctl, dport, srcPort
 		if err := netlink.LinkDel(l); err != nil {
 			return fmt.Errorf("deleting outdated geneve device: %w", err)
 		}
-		if _, err := ensureDevice(logger, sysctl, dev); err != nil {
+		if _, err := device.EnsureDevice(logger, sysctl, dev); err != nil {
 			return fmt.Errorf("recreating geneve device %s: %w", defaults.GeneveDevice, err)
 		}
 	}
@@ -281,7 +257,7 @@ func setupVxlanDevice(logger *slog.Logger, sysctl sysctl.Sysctl, port, srcPortLo
 		LinkAttrs: netlink.LinkAttrs{
 			Name:         defaults.VxlanDevice,
 			MTU:          mtu,
-			HardwareAddr: net.HardwareAddr(mac),
+			HardwareAddr: mac.HardwareAddr(),
 		},
 		FlowBased: true,
 		Port:      int(port),
@@ -305,7 +281,7 @@ func setupVxlanDevice(logger *slog.Logger, sysctl sysctl.Sysctl, port, srcPortLo
 		}
 	}
 
-	l, err := ensureDevice(logger, sysctl, dev)
+	l, err := device.EnsureDevice(logger, sysctl, dev)
 	if err != nil {
 		return fmt.Errorf("creating vxlan device %s: %w", dev.Attrs().Name, err)
 	}
@@ -322,154 +298,39 @@ func setupVxlanDevice(logger *slog.Logger, sysctl sysctl.Sysctl, port, srcPortLo
 	return nil
 }
 
-// setupIPIPDevices ensures the specified v4 and/or v6 devices are created and
-// configured with their respective sysctls.
-//
-// Calling this function may result in tunl0 (v4) or ip6tnl0 (v6) fallback
-// interfaces being created as a result of loading the ipip and ip6_tunnel
-// kernel modules by creating cilium_ tunnel interfaces. These are catch-all
-// interfaces for the ipip decapsulation stack. By default, these interfaces
-// will be created in new network namespaces, but Cilium disables this behaviour
-// by setting net.core.fb_tunnels_only_for_init_net = 2.
-//
-// In versions of Cilium prior to 1.15, the behaviour was as follows:
-//   - Repurpose the default tunl0 by setting it into collect_md mode and renaming
-//     it to cilium_ipip4. Use the interface for production traffic.
-//   - The same cannot be done for ip6tunl0, as collect_md cannot be enabled on
-//     this interface. Leave it unused.
-//   - Rename sit0 to cilium_sit, if present. This was potentially a mistake,
-//     as the sit module is not involved with ip6tnl interfaces.
-//
-// As of Cilium 1.15, if present, tunl0 is renamed to cilium_tunl and ip6tnl0 is
-// renamed to cilium_ip6tnl. This is to communicate to the user that Cilium has
-// taken control of the encapsulation stack on the node, as it currently doesn't
-// explicitly support sharing it with other tools/CNIs. Fallback devices are left
-// unused for production traffic. Only devices that were explicitly created are
-// used. As of Cilium 1.18, cilium_tunl and cilium_ip6tnl are not created anymore.
-func setupIPIPDevices(logger *slog.Logger, sysctl sysctl.Sysctl, ipv4, ipv6 bool, mtu int) error {
-	// FlowBased sets IFLA_IPTUN_COLLECT_METADATA, the equivalent of 'ip link add
-	// ... type ipip/ip6tnl external'. This is needed so bpf programs can use
-	// bpf_skb_[gs]et_tunnel_key() on packets flowing through tunnels.
-	if ipv4 {
-		dev := &netlink.Iptun{
-			LinkAttrs: netlink.LinkAttrs{
-				Name: defaults.IPIPv4Device,
-				MTU:  mtu - mtuconst.IPIPv4Overhead,
-			},
-			FlowBased: true,
-		}
-
-		if _, err := ensureDevice(logger, sysctl, dev); err != nil {
-			return fmt.Errorf("creating %s: %w", defaults.IPIPv4Device, err)
-		}
-
-		// Rename fallback device created by potential kernel module load after
-		// creating tunnel interface.
-		if err := renameDevice("tunl0", "cilium_tunl"); err != nil {
-			return fmt.Errorf("renaming fallback device %s: %w", "tunl0", err)
-		}
-	} else {
-		if err := removeDevice(defaults.IPIPv4Device); err != nil {
-			return fmt.Errorf("removing %s: %w", defaults.IPIPv4Device, err)
-		}
-	}
-
-	if ipv6 {
-		dev := &netlink.Ip6tnl{
-			LinkAttrs: netlink.LinkAttrs{
-				Name: defaults.IPIPv6Device,
-				MTU:  mtu - mtuconst.IPIPv6Overhead,
-			},
-			FlowBased: true,
-		}
-
-		if _, err := ensureDevice(logger, sysctl, dev); err != nil {
-			return fmt.Errorf("creating %s: %w", defaults.IPIPv6Device, err)
-		}
-
-		// Rename fallback device created by potential kernel module load after
-		// creating tunnel interface.
-		if err := renameDevice("ip6tnl0", "cilium_ip6tnl"); err != nil {
-			return fmt.Errorf("renaming fallback device %s: %w", "tunl0", err)
-		}
-	} else {
-		if err := removeDevice(defaults.IPIPv6Device); err != nil {
-			return fmt.Errorf("removing %s: %w", defaults.IPIPv6Device, err)
-		}
-	}
-
-	return nil
-}
-
-// ensureDevice ensures a device with the given attrs is present on the system.
-// If a device with the given name already exists, device creation is skipped and
-// the existing device will be used as-is for the subsequent configuration steps.
-// The device is never recreated.
-//
-// The device's state is set to 'up', L3 forwarding sysctls are applied, and MTU
-// is set.
-func ensureDevice(logger *slog.Logger, sysctl sysctl.Sysctl, attrs netlink.Link) (netlink.Link, error) {
-	name := attrs.Attrs().Name
-
-	// Reuse existing tunnel interface created by previous runs.
-	l, err := safenetlink.LinkByName(name)
-	if err != nil {
-		if err := netlink.LinkAdd(attrs); err != nil {
-			if errors.Is(err, unix.ENOTSUP) {
-				err = fmt.Errorf("%w, maybe kernel module for %s is not available?", err, attrs.Type())
-			}
-			return nil, fmt.Errorf("creating device %s: %w", name, err)
-		}
-
-		// Fetch the link we've just created.
-		l, err = safenetlink.LinkByName(name)
+func setupTunnelGSOGRO(logger *slog.Logger, device string, bc bigtcp.Config) error {
+	// IPv6 goes first, because {gso,gro}_ipv4_max_size gets auto-adjusted
+	// if the new size of {gso,gro}_max_size isn't greater than 64KB for
+	// backwards compatibility.
+	if bc.GetGROIPv6MaxSize() != 0 && bc.GetGSOIPv6MaxSize() != 0 {
+		logger.Info("Setting IPv6",
+			logfields.Device, device,
+			logfields.GsoMaxSize, bc.GetGSOIPv6MaxSize(),
+			logfields.GroMaxSize, bc.GetGROIPv6MaxSize(),
+		)
+		err := bigtcp.SetGROGSOIPv6MaxSize(logger, device, bc.GetGROIPv6MaxSize(), bc.GetGSOIPv6MaxSize())
 		if err != nil {
-			return nil, fmt.Errorf("retrieving created device %s: %w", name, err)
+			logger.Warn("Could not modify IPv6 gro_max_size and gso_max_size",
+				logfields.Device, device,
+				logfields.Error, err)
+			return err
 		}
 	}
-
-	if err := enableForwarding(logger, sysctl, l); err != nil {
-		return nil, fmt.Errorf("setting up device %s: %w", name, err)
-	}
-
-	// Update MTU on the link if necessary.
-	wantMTU, gotMTU := attrs.Attrs().MTU, l.Attrs().MTU
-	if wantMTU != 0 && wantMTU != gotMTU {
-		if err := netlink.LinkSetMTU(l, wantMTU); err != nil {
-			return nil, fmt.Errorf("setting MTU on %s: %w", name, err)
+	if bc.GetGROIPv4MaxSize() != 0 && bc.GetGSOIPv4MaxSize() != 0 {
+		logger.Info("Setting IPv4",
+			logfields.Device, device,
+			logfields.GsoMaxSize, bc.GetGSOIPv4MaxSize(),
+			logfields.GroMaxSize, bc.GetGROIPv4MaxSize(),
+		)
+		err := bigtcp.SetGROGSOIPv4MaxSize(logger, device, bc.GetGROIPv4MaxSize(), bc.GetGSOIPv4MaxSize())
+		if err != nil {
+			logger.Warn("Could not modify IPv4 gro_ipv4_max_size and gso_ipv4_max_size",
+				logfields.Device, device,
+				logfields.Error, err,
+			)
+			return err
 		}
 	}
-
-	return l, nil
-}
-
-// removeDevice removes the device with the given name. Returns error if the
-// device exists but was unable to be removed.
-func removeDevice(name string) error {
-	link, err := safenetlink.LinkByName(name)
-	if err != nil {
-		return nil
-	}
-
-	if err := netlink.LinkDel(link); err != nil {
-		return fmt.Errorf("removing device %s: %w", name, err)
-	}
-
-	return nil
-}
-
-// renameDevice renames a network device from and to a given value. Returns nil
-// if the device does not exist.
-func renameDevice(from, to string) error {
-	link, err := safenetlink.LinkByName(from)
-	if err != nil {
-		return nil
-	}
-
-	if err := netlink.LinkSetName(link, to); err != nil {
-		return fmt.Errorf("renaming device %s to %s: %w", from, to, err)
-	}
-
 	return nil
 }
 

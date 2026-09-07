@@ -5,12 +5,12 @@ package endpoint
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/netip"
 	"os"
 	"runtime"
@@ -20,7 +20,6 @@ import (
 
 	"github.com/cilium/hive/cell"
 	"github.com/vishvananda/netlink"
-	"go4.org/netipx"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	k8sTypes "k8s.io/apimachinery/pkg/types"
 
@@ -28,12 +27,15 @@ import (
 	"github.com/cilium/cilium/pkg/annotation"
 	"github.com/cilium/cilium/pkg/completion"
 	"github.com/cilium/cilium/pkg/controller"
+	"github.com/cilium/cilium/pkg/datapath/iptables"
 	"github.com/cilium/cilium/pkg/datapath/linux/bandwidth"
+	ipsec "github.com/cilium/cilium/pkg/datapath/linux/ipsec/types"
 	linuxrouting "github.com/cilium/cilium/pkg/datapath/linux/routing"
 	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
-	datapath "github.com/cilium/cilium/pkg/datapath/types"
+	loader "github.com/cilium/cilium/pkg/datapath/loader/types"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
+	endpoint "github.com/cilium/cilium/pkg/endpoint/types"
 	"github.com/cilium/cilium/pkg/eventqueue"
 	"github.com/cilium/cilium/pkg/fqdn"
 	"github.com/cilium/cilium/pkg/fqdn/restore"
@@ -58,6 +60,7 @@ import (
 	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
+	"github.com/cilium/cilium/pkg/policy/compute"
 	"github.com/cilium/cilium/pkg/proxy/accesslog"
 	"github.com/cilium/cilium/pkg/time"
 	"github.com/cilium/cilium/pkg/trigger"
@@ -70,39 +73,6 @@ const (
 
 	resolveIdentity = "resolve-identity"
 	resolveLabels   = "resolve-labels"
-)
-
-const (
-	// PropertyFakeEndpoint marks the endpoint as being "fake". By "fake" it
-	// means that it doesn't have any datapath bpf programs regenerated.
-	PropertyFakeEndpoint = "property-fake-endpoint"
-
-	// PropertyAtHostNS is used for endpoints that are reached via the host networking
-	// namespace, but have their own IP(s) from the node's pod CIDR range
-	PropertyAtHostNS = "property-at-host-network-namespace"
-
-	// PropertyWithouteBPFDatapath marks the endpoint that doesn't contain a
-	// eBPF datapath program.
-	PropertyWithouteBPFDatapath = "property-without-bpf-endpoint"
-
-	// PropertySkipBPFPolicy will mark the endpoint to skip ebpf
-	// policy regeneration.
-	PropertySkipBPFPolicy = "property-skip-bpf-policy"
-
-	// PropertySkipBPFRegeneration will mark the endpoint to skip ebpf
-	// regeneration.
-	PropertySkipBPFRegeneration = "property-skip-bpf-regeneration"
-
-	// PropertyCEPOwner will be able to store the CEP owner for this endpoint.
-	PropertyCEPOwner = "property-cep-owner"
-
-	// PropertyCEPName contains the CEP name for this endpoint.
-	PropertyCEPName = "property-cep-name"
-
-	// PropertySkipMasqueradeV4 will mark the endpoint to skip IPv4 masquerade.
-	PropertySkipMasqueradeV4 = "property-skip-masquerade-v4"
-	// PropertySkipMasqueradeV6 will mark the endpoint to skip IPv6 masquerade.
-	PropertySkipMasqueradeV6 = "property-skip-masquerade-v6"
 )
 
 var (
@@ -155,23 +125,24 @@ var _ notifications.RegenNotificationInfo = (*Endpoint)(nil)
 // purposes is the serializableEndpoint type in this package.
 type Endpoint struct {
 	dnsRulesAPI      DNSRulesAPI
-	loader           datapath.Loader
-	orchestrator     datapath.Orchestrator
-	compilationLock  datapath.CompilationLock
-	bandwidthManager datapath.BandwidthManager
-	ipTablesManager  datapath.IptablesManager
+	loader           loader.Loader
+	orchestrator     endpoint.Orchestrator
+	compilationLock  loader.CompilationLock
+	bandwidthManager bandwidth.Manager
+	ipTablesManager  iptables.Manager
 	identityManager  identitymanager.IDManager
 	monitorAgent     monitoragent.Agent
-	wgConfig         wgTypes.WireguardConfig
-	ipsecConfig      datapath.IPsecConfig
+	wgConfig         wgTypes.Config
+	ipsecConfig      ipsec.Config
 	lxcMap           lxcmap.Map
+	localNodeStore   node.NodeGetter
 
 	epBuildQueue EndpointBuildQueue
 
-	policyRepo policy.PolicyRepository
+	policyRepo    policy.PolicyRepository
+	policyFetcher compute.PolicyRecomputer
 
-	// namedPortsGetter can get the ipcache.IPCache object.
-	namedPortsGetter namedPortsGetter
+	ipcache IPCache
 
 	// kvstoreSyncher updates the kvstore (e.g., etcd) with up-to-date
 	// information about endpoints. Initialized by manager.expose.
@@ -189,27 +160,9 @@ type Endpoint struct {
 	// mutex protects write operations to this endpoint structure
 	mutex lock.RWMutex
 
-	// containerName is the name given to the endpoint by the container runtime.
-	// It is not mutable once set, but is not set on the initial endpoint creation
-	// when using the docker plugin. CNI-based clusters (read: all clusters) set
-	// this on endpoint creation.
-	containerName atomic.Pointer[string]
-
-	// containerID is the container ID that docker has assigned to the endpoint.
-	// It is not mutable once set, but is not set on the initial endpoint creation
-	// when using the docker plugin. CNI-based clusters (read: all clusters) set
-	// this on endpoint creation.
+	// containerID is the container ID that the container runtime has assigned to
+	// the endpoint. It is not mutable once set.
 	containerID atomic.Pointer[string]
-
-	// dockerNetworkID is the network ID of the libnetwork network if the
-	// endpoint is a docker managed container which uses libnetwork
-	// Constant after endpoint creation / restoration.
-	dockerNetworkID string
-
-	// dockerEndpointID is the Docker network endpoint ID if managed by
-	// libnetwork.
-	// immutable.
-	dockerEndpointID string
 
 	// ifName is the name of the host facing interface (veth pair) which
 	// connects into the endpoint
@@ -230,10 +183,10 @@ type Endpoint struct {
 	// with the source endpoints IP should egress when that traffic is not masqueraded.
 	parentIfIndex int
 
-	// disableLegacyIdentifiers disables lookup using legacy endpoint identifiers
-	// (container name, container id, pod name) for this endpoint.
+	// isSecondaryInterface reports whether this endpoint represents a seondary interface in
+	// case of more than once interface per pod.
 	// Immutable after Endpoint creation.
-	disableLegacyIdentifiers bool
+	isSecondaryInterface bool
 
 	// labels is the endpoint's label configuration
 	labels labels.OpLabels
@@ -287,7 +240,7 @@ type Endpoint struct {
 
 	// policyMap is the policy related state of the datapath including
 	// reference to all policy related BPF
-	policyMap *policymap.PolicyMap
+	policyMap policymap.PolicyMap
 
 	// PolicyMapPressureUpdater updates the policymap pressure metric.
 	PolicyMapPressureUpdater policyMapPressureUpdater
@@ -299,16 +252,9 @@ type Endpoint struct {
 	status *EndpointStatus
 
 	// DNSRules is the collection of current endpoint-specific DNS proxy
-	// rules that conform to using restore.PortProto V1 (that is, they do
-	// **not** take protocol into account). These can be restored during
-	// Cilium restart.
-	// TODO: This can be removed when 1.16 is deprecated.
-	DNSRules restore.DNSRules
-
-	// DNSRulesV2 is the collection of current endpoint-specific DNS proxy
 	// rules that conform to using restore.PortProto V2 (that is, they take
 	// protocol into account). These can be restored during Cilium restart.
-	DNSRulesV2 restore.DNSRules
+	DNSRules restore.DNSRules
 
 	// DNSHistory is the collection of still-valid DNS responses intercepted for
 	// this endpoint.
@@ -382,10 +328,12 @@ type Endpoint struct {
 	// You must hold Endpoint.proxyStatisticsMutex to read or write it.
 	proxyStatistics map[string]*models.ProxyStatistics
 
-	// nextPolicyRevision is the policy revision that the endpoint has
-	// updated to and that will become effective with the next regenerate.
-	// Must hold the endpoint mutex *and* buildMutex to write, and either to read.
-	nextPolicyRevision uint64
+	// desiredPolicyRevision is the revision of the policy in e.desiredPolicy.
+	// It can be less than policyRevision when UpdatePolicy bumps policyRevision
+	// without recomputing desired policy.
+	//
+	// To write, both ep.mutex and ep.buildMutex must be held.
+	desiredPolicyRevision uint64
 
 	// forcePolicyCompute full endpoint policy recomputation
 	// Set when endpoint options have been changed. Cleared right before releasing the
@@ -402,13 +350,13 @@ type Endpoint struct {
 	// loggerAttrs are attributes.
 	policyLoggerAttrs lock.Map[string, any]
 
-	// logger is a logrus object with fields set to report an endpoints information.
+	// logger is a logging wrapper with endpoint information pre-cached.
 	// This must only be accessed with atomic.LoadPointer/StorePointer.
 	// 'mutex' must be Lock()ed to synchronize stores. No lock needs to be held
 	// when loading this pointer.
 	logger atomic.Pointer[slog.Logger]
 
-	// logger is a logrus object with fields set to report an endpoints information.
+	// loggerNoSubsys is a logging wrapper with endpoint information pre-cached.
 	// This must only be accessed with atomic.LoadPointer/StorePointer.
 	// 'mutex' must be Lock()ed to synchronize stores. No lock needs to be held
 	// when loading this pointer.
@@ -419,7 +367,7 @@ type Endpoint struct {
 	// Points to a shared policy debug log file.
 	policyDebugLog io.Writer
 
-	// policyLogger is a logrus object with fields set to report an endpoints information.
+	// policyLogger is a logging wrapper with endpoint information pre-cached.
 	// This must only be accessed with atomic LoadPointer/StorePointer.
 	// 'mutex' must be Lock()ed to synchronize stores. No lock needs to be held
 	// when loading this pointer.
@@ -452,6 +400,11 @@ type Endpoint struct {
 	// skipped regeneration levels.
 	skippedRegenerationLevel regeneration.DatapathRegenerationLevel
 
+	// skippedPolicyRevision is the highest PolicyRevisionToWaitFor deferred to an already
+	// queued or upcoming regeneration. The regeneration is bumped to wait for this revision
+	// so it doesn't complete at an older one.
+	skippedPolicyRevision uint64
+
 	// DatapathConfiguration is the endpoint's datapath configuration as
 	// passed in via the plugin that created the endpoint, e.g. the CNI
 	// plugin which performed the plumbing will enable certain datapath
@@ -468,6 +421,7 @@ type Endpoint struct {
 	isHost    bool
 
 	noTrackPort uint16
+	rtInfo      uint32
 
 	// mutable! must hold the endpoint lock to read
 	ciliumEndpointUID k8sTypes.UID
@@ -475,9 +429,8 @@ type Endpoint struct {
 	// properties is used to store some internal properties about this Endpoint.
 	properties map[string]any
 
-	// Root scope for all of this endpoints reporters.
-	reporterScope       cell.Health
-	closeHealthReporter func()
+	// reporterScope is the health scope used by GetReporter.
+	reporterScope atomic.Pointer[cell.Health]
 
 	// NetNsCookie is the network namespace cookie of the Endpoint.
 	NetNsCookie uint64
@@ -499,11 +452,11 @@ func (e *Endpoint) GetPolicyNames() []string {
 }
 
 func (e *Endpoint) GetReporter(name string) cell.Health {
-	if e.reporterScope == nil {
-		_, h := cell.NewSimpleHealth()
-		return h.NewScope(name)
+	if s := e.reporterScope.Load(); s != nil {
+		return (*s).NewScope(name)
 	}
-	return e.reporterScope.NewScope(name)
+	_, h := cell.NewSimpleHealth()
+	return h.NewScope(name)
 }
 
 func (e *Endpoint) InitEndpointHealth(parent cell.Health) {
@@ -512,8 +465,7 @@ func (e *Endpoint) InitEndpointHealth(parent cell.Health) {
 	}
 	s := parent.NewScope(fmt.Sprintf("cilium-endpoint-%d (%s)", e.ID, e.GetK8sNamespaceAndPodName()))
 	if s != nil {
-		e.closeHealthReporter = s.Close
-		e.reporterScope = s
+		e.reporterScope.Store(&s)
 	}
 }
 
@@ -521,8 +473,8 @@ func (e *Endpoint) Close() {
 	e.mutex.Lock()
 	defer e.mutex.Unlock()
 
-	if e.closeHealthReporter != nil {
-		e.closeHealthReporter()
+	if s := e.reporterScope.Swap(nil); s != nil {
+		(*s).Close()
 	}
 
 	if e.PolicyMapPressureUpdater != nil {
@@ -530,8 +482,9 @@ func (e *Endpoint) Close() {
 	}
 }
 
-type namedPortsGetter interface {
-	GetNamedPorts() (npm types.NamedPortMultiMap)
+// IPCache defines the subset of ipcache.IPCache methods used by the endpoint.
+type IPCache interface {
+	GetMetadataLabels(ip netip.Addr) labels.Labels
 }
 
 type DNSRulesAPI interface {
@@ -574,7 +527,7 @@ func (e *Endpoint) LXCMac() mac.MAC {
 }
 
 func (e *Endpoint) IsAtHostNS() bool {
-	return e.isProperty(PropertyAtHostNS)
+	return e.IsProperty(endpoint.PropertyAtHostNS)
 }
 
 func (e *Endpoint) IsHost() bool {
@@ -582,11 +535,11 @@ func (e *Endpoint) IsHost() bool {
 }
 
 func (e *Endpoint) SkipMasqueradeV4() bool {
-	return e.isProperty(PropertySkipMasqueradeV4)
+	return e.IsProperty(endpoint.PropertySkipMasqueradeV4)
 }
 
 func (e *Endpoint) SkipMasqueradeV6() bool {
-	return e.isProperty(PropertySkipMasqueradeV6)
+	return e.IsProperty(endpoint.PropertySkipMasqueradeV6)
 }
 
 // SetIsHost is a convenient method to create host endpoints for testing.
@@ -629,23 +582,30 @@ func (e *Endpoint) waitForProxyCompletions(proxyWaitGroup *completion.WaitGroup)
 	return nil
 }
 
-func createEndpoint(logger *slog.Logger, dnsRulesAPI DNSRulesAPI, epBuildQueue EndpointBuildQueue, loader datapath.Loader, orchestrator datapath.Orchestrator, compilationLock datapath.CompilationLock, bandwidthManager datapath.BandwidthManager, ipTablesManager datapath.IptablesManager, identityManager identitymanager.IDManager, monitorAgent monitoragent.Agent, policyMapFactory policymap.Factory, policyRepo policy.PolicyRepository, namedPortsGetter namedPortsGetter, proxy EndpointProxy, allocator cache.IdentityAllocator, ctMapGC ctmap.GCRunner, kvstoreSyncher *ipcache.IPIdentitySynchronizer, ID uint16, ifName string, wgCfg wgTypes.WireguardConfig, ipsecCfg datapath.IPsecConfig, policyDebugLog io.Writer, lxcMap lxcmap.Map) *Endpoint {
+func createEndpoint(
+	p EndpointParams,
+	dnsRulesAPI DNSRulesAPI,
+	proxy EndpointProxy,
+	ID uint16,
+	ifName string, policyDebugLog io.Writer) *Endpoint {
 	ep := &Endpoint{
 		dnsRulesAPI:        dnsRulesAPI,
-		epBuildQueue:       epBuildQueue,
-		loader:             loader,
-		orchestrator:       orchestrator,
-		compilationLock:    compilationLock,
-		bandwidthManager:   bandwidthManager,
-		ipTablesManager:    ipTablesManager,
-		identityManager:    identityManager,
-		monitorAgent:       monitorAgent,
-		wgConfig:           wgCfg,
-		ipsecConfig:        ipsecCfg,
-		lxcMap:             lxcMap,
-		policyMapFactory:   policyMapFactory,
-		policyRepo:         policyRepo,
-		namedPortsGetter:   namedPortsGetter,
+		epBuildQueue:       p.EPBuildQueue,
+		loader:             p.Loader,
+		orchestrator:       p.Orchestrator,
+		compilationLock:    p.CompilationLock,
+		bandwidthManager:   p.BandwidthManager,
+		ipTablesManager:    p.IPTablesManager,
+		identityManager:    p.IdentityManager,
+		monitorAgent:       p.MonitorAgent,
+		wgConfig:           p.WgConfig,
+		ipsecConfig:        p.IPSecConfig,
+		lxcMap:             p.LxcMap,
+		localNodeStore:     p.LocalNodeStore,
+		policyMapFactory:   p.PolicyMapFactory,
+		policyRepo:         p.PolicyRepo,
+		policyFetcher:      p.PolicyFetcher,
+		ipcache:            p.IPCache,
 		ID:                 ID,
 		createdAt:          time.Now(),
 		proxy:              proxy,
@@ -653,21 +613,20 @@ func createEndpoint(logger *slog.Logger, dnsRulesAPI DNSRulesAPI, epBuildQueue E
 		labels:             labels.NewOpLabels(),
 		Options:            option.NewIntOptions(&EndpointMutableOptionLibrary),
 		DNSRules:           nil,
-		DNSRulesV2:         nil,
 		DNSHistory:         fqdn.NewDNSCacheWithLimit(option.Config.ToFQDNsMinTTL, option.Config.ToFQDNsMaxIPsPerHost),
-		DNSZombies:         fqdn.NewDNSZombieMappings(logger, option.Config.ToFQDNsMaxDeferredConnectionDeletes, option.Config.ToFQDNsMaxIPsPerHost),
+		DNSZombies:         fqdn.NewDNSZombieMappings(p.Logger, option.Config.ToFQDNsMaxDeferredConnectionDeletes, option.Config.ToFQDNsMaxIPsPerHost),
 		state:              "",
 		status:             NewEndpointStatus(),
 		hasBPFProgram:      make(chan struct{}),
-		desiredPolicy:      policy.NewEndpointPolicy(logger, policyRepo),
+		desiredPolicy:      policy.NewEndpointPolicy(p.Logger, p.PolicyRepo),
 		controllers:        controller.NewManager(),
 		regenFailedChan:    make(chan struct{}, 1),
-		allocator:          allocator,
+		allocator:          p.Allocator,
 		logLimiter:         logging.NewLimiter(10*time.Second, 3), // 1 log / 10 secs, burst of 3
 		noTrackPort:        0,
 		properties:         map[string]any{},
-		ctMapGC:            ctMapGC,
-		kvstoreSyncher:     kvstoreSyncher,
+		ctMapGC:            p.CTMapGC,
+		kvstoreSyncher:     p.KVStoreSynchronizer,
 		policyDebugLog:     policyDebugLog,
 		forcePolicyCompute: true,
 	}
@@ -711,8 +670,10 @@ func (e *Endpoint) initDNSHistoryTrigger() {
 }
 
 // CreateIngressEndpoint creates the endpoint corresponding to Cilium Ingress.
-func CreateIngressEndpoint(logger *slog.Logger, dnsRulesAPI DNSRulesAPI, epBuildQueue EndpointBuildQueue, loader datapath.Loader, orchestrator datapath.Orchestrator, compilationLock datapath.CompilationLock, bandwidthManager datapath.BandwidthManager, ipTablesManager datapath.IptablesManager, identityManager identitymanager.IDManager, monitorAgent monitoragent.Agent, policyMapFactory policymap.Factory, policyRepo policy.PolicyRepository, namedPortsGetter namedPortsGetter, proxy EndpointProxy, allocator cache.IdentityAllocator, ctMapGC ctmap.GCRunner, kvstoreSyncher *ipcache.IPIdentitySynchronizer, wgCfg wgTypes.WireguardConfig, ipsecCfg datapath.IPsecConfig, policyDebugLog io.Writer, lxcMap lxcmap.Map) (*Endpoint, error) {
-	ep := createEndpoint(logger, dnsRulesAPI, epBuildQueue, loader, orchestrator, compilationLock, bandwidthManager, ipTablesManager, identityManager, monitorAgent, policyMapFactory, policyRepo, namedPortsGetter, proxy, allocator, ctMapGC, kvstoreSyncher, 0, "", wgCfg, ipsecCfg, policyDebugLog, lxcMap)
+func CreateIngressEndpoint(p EndpointParams,
+	dnsRulesAPI DNSRulesAPI, proxy EndpointProxy,
+	policyDebugLog io.Writer, ipv4, ipv6 netip.Addr) (*Endpoint, error) {
+	ep := createEndpoint(p, dnsRulesAPI, proxy, uint16(0), "", policyDebugLog)
 	ep.DatapathConfiguration = NewDatapathConfiguration()
 
 	ep.isIngress = true
@@ -723,18 +684,16 @@ func CreateIngressEndpoint(logger *slog.Logger, dnsRulesAPI DNSRulesAPI, epBuild
 
 	// Ingress endpoint is reachable via the host networking namespace
 	// Host delivery flag is set in lxcmap
-	ep.properties[PropertyAtHostNS] = true
+	ep.properties[endpoint.PropertyAtHostNS] = true
 
 	// Ingress endpoint has no bpf policy maps
-	ep.properties[PropertySkipBPFPolicy] = true
+	ep.properties[endpoint.PropertySkipBPFPolicy] = true
 
 	// Ingress endpoint has no bpf programs
-	ep.properties[PropertyWithouteBPFDatapath] = true
+	ep.properties[endpoint.PropertyWithouteBPFDatapath] = true
 
-	// node.GetIngressIPv4 has been parsed with net.ParseIP() and may be in IPv4 mapped IPv6
-	// address format. Use netipx.FromStdIP() to make sure we get a plain IPv4 address.
-	ep.IPv4, _ = netipx.FromStdIP(node.GetIngressIPv4(logger))
-	ep.IPv6, _ = netip.AddrFromSlice(node.GetIngressIPv6(logger))
+	ep.IPv4 = ipv4
+	ep.IPv6 = ipv6
 
 	ep.setState(StateWaitingForIdentity, "Ingress Endpoint creation")
 
@@ -742,16 +701,23 @@ func CreateIngressEndpoint(logger *slog.Logger, dnsRulesAPI DNSRulesAPI, epBuild
 }
 
 // CreateHostEndpoint creates the endpoint corresponding to the host.
-func CreateHostEndpoint(logger *slog.Logger, dnsRulesAPI DNSRulesAPI, epBuildQueue EndpointBuildQueue, loader datapath.Loader, orchestrator datapath.Orchestrator, compilationLock datapath.CompilationLock, bandwidthManager datapath.BandwidthManager, ipTablesManager datapath.IptablesManager, identityManager identitymanager.IDManager, monitorAgent monitoragent.Agent, policyMapFactory policymap.Factory, policyRepo policy.PolicyRepository, namedPortsGetter namedPortsGetter, proxy EndpointProxy, allocator cache.IdentityAllocator, ctMapGC ctmap.GCRunner, kvstoreSyncher *ipcache.IPIdentitySynchronizer, wgCfg wgTypes.WireguardConfig, ipsecCfg datapath.IPsecConfig, policyDebugLog io.Writer, lxcMap lxcmap.Map) (*Endpoint, error) {
+func CreateHostEndpoint(p EndpointParams,
+	dnsRulesAPI DNSRulesAPI, proxy EndpointProxy,
+	policyDebugLog io.Writer) (*Endpoint, error) {
 	iface, err := safenetlink.LinkByName(defaults.HostDevice)
 	if err != nil {
 		return nil, err
 	}
 
-	ep := createEndpoint(logger, dnsRulesAPI, epBuildQueue, loader, orchestrator, compilationLock, bandwidthManager, ipTablesManager, identityManager, monitorAgent, policyMapFactory, policyRepo, namedPortsGetter, proxy, allocator, ctMapGC, kvstoreSyncher, 0, defaults.HostDevice, wgCfg, ipsecCfg, policyDebugLog, lxcMap)
+	hostMAC, err := mac.FromHardwareAddr(iface.Attrs().HardwareAddr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid MAC address for %s: %w", defaults.HostDevice, err)
+	}
+
+	ep := createEndpoint(p, dnsRulesAPI, proxy, 0, defaults.HostDevice, policyDebugLog)
 	ep.isHost = true
-	ep.mac = mac.MAC(iface.Attrs().HardwareAddr)
-	ep.nodeMAC = mac.MAC(iface.Attrs().HardwareAddr)
+	ep.mac = hostMAC
+	ep.nodeMAC = hostMAC
 	ep.ifIndex = iface.Attrs().Index
 	ep.DatapathConfiguration = NewDatapathConfiguration()
 
@@ -937,15 +903,6 @@ func (e *Endpoint) SetDefaultOpts(opts *option.IntOptions) {
 	e.UpdateLogger(nil)
 }
 
-// base64 returns the endpoint in a base64 format.
-func (e *Endpoint) base64() (string, error) {
-	jsonBytes, err := e.MarshalJSON()
-	if err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(jsonBytes), nil
-}
-
 // FilterEPDir returns a list of directories' names that possible belong to an endpoint.
 func FilterEPDir(dirFiles []os.DirEntry) []string {
 	eptsID := []string{}
@@ -964,27 +921,33 @@ func FilterEPDir(dirFiles []os.DirEntry) []string {
 //
 // Note that the parse'd endpoint's identity is only partially restored. The
 // caller must call `SetIdentity()` to make the returned endpoint's identity useful.
-func ParseEndpoint(logger *slog.Logger, dnsRulesAPI DNSRulesAPI, epBuildQueue EndpointBuildQueue, loader datapath.Loader, orchestrator datapath.Orchestrator, compilationLock datapath.CompilationLock, bandwidthManager datapath.BandwidthManager, ipTablesManager datapath.IptablesManager, identityManager identitymanager.IDManager, monitorAgent monitoragent.Agent, policyMapFactory policymap.Factory, policyRepo policy.PolicyRepository, namedPortsGetter namedPortsGetter, proxy EndpointProxy, allocator cache.IdentityAllocator, ctMapGC ctmap.GCRunner, kvstoreSyncher *ipcache.IPIdentitySynchronizer, epJSON []byte, wgCfg wgTypes.WireguardConfig, ipsecCfg datapath.IPsecConfig, lxcMap lxcmap.Map) (*Endpoint, error) {
+func ParseEndpoint(p EndpointParams,
+	dnsRulesAPI DNSRulesAPI,
+	proxy EndpointProxy, epJSON []byte,
+	policyDebugLog io.Writer) (*Endpoint, error) {
 	ep := Endpoint{
 		dnsRulesAPI:      dnsRulesAPI,
-		epBuildQueue:     epBuildQueue,
-		loader:           loader,
-		orchestrator:     orchestrator,
-		compilationLock:  compilationLock,
-		bandwidthManager: bandwidthManager,
-		ipTablesManager:  ipTablesManager,
-		identityManager:  identityManager,
-		monitorAgent:     monitorAgent,
-		wgConfig:         wgCfg,
-		ipsecConfig:      ipsecCfg,
-		lxcMap:           lxcMap,
-		policyMapFactory: policyMapFactory,
-		namedPortsGetter: namedPortsGetter,
-		policyRepo:       policyRepo,
+		epBuildQueue:     p.EPBuildQueue,
+		loader:           p.Loader,
+		orchestrator:     p.Orchestrator,
+		compilationLock:  p.CompilationLock,
+		bandwidthManager: p.BandwidthManager,
+		ipTablesManager:  p.IPTablesManager,
+		identityManager:  p.IdentityManager,
+		monitorAgent:     p.MonitorAgent,
+		wgConfig:         p.WgConfig,
+		ipsecConfig:      p.IPSecConfig,
+		lxcMap:           p.LxcMap,
+		localNodeStore:   p.LocalNodeStore,
+		policyMapFactory: p.PolicyMapFactory,
+		policyRepo:       p.PolicyRepo,
+		policyFetcher:    p.PolicyFetcher,
+		ipcache:          p.IPCache,
 		proxy:            proxy,
-		allocator:        allocator,
-		ctMapGC:          ctMapGC,
-		kvstoreSyncher:   kvstoreSyncher,
+		allocator:        p.Allocator,
+		ctMapGC:          p.CTMapGC,
+		kvstoreSyncher:   p.KVStoreSynchronizer,
+		policyDebugLog:   policyDebugLog,
 	}
 
 	if err := ep.UnmarshalJSON(epJSON); err != nil {
@@ -997,7 +960,7 @@ func ParseEndpoint(logger *slog.Logger, dnsRulesAPI DNSRulesAPI, epBuildQueue En
 
 	// Initialize fields to values which are non-nil that are not serialized.
 	ep.hasBPFProgram = make(chan struct{})
-	ep.desiredPolicy = policy.NewEndpointPolicy(logger, policyRepo)
+	ep.desiredPolicy = policy.NewEndpointPolicy(p.Logger, p.PolicyRepo)
 	ep.realizedPolicy = ep.desiredPolicy
 	ep.forcePolicyCompute = true
 	ep.controllers = controller.NewManager()
@@ -1146,7 +1109,8 @@ func (e *Endpoint) Update(cfg *models.EndpointConfigurationSpec) error {
 	// Note: This "retry" behaviour is better suited to a controller, and can be
 	// moved there once we have an endpoint regeneration controller.
 	regenCtx := &regeneration.ExternalRegenerationMetadata{
-		Reason:            "endpoint was updated via API",
+		Reason:            regeneration.ReasonEndpointUpdate,
+		Message:           "endpoint was updated via API",
 		RegenerationLevel: regeneration.RegenerateWithoutDatapath,
 	}
 
@@ -1240,8 +1204,8 @@ func (e *Endpoint) replaceInformationLabels(sourceFilter string, l labels.Labels
 
 // replaceIdentityLabels replaces the identity labels of the endpoint for the
 // given 'sourceFilter', if 'sourceFilter' is 'LabelSourceAny' then all labels
-// are replaced.
-// If a net changed occurred, the identityRevision is bumped and returned,
+// are replaced (including any LabelSourceGenerated labels).
+// If a net change occurred, the identityRevision is bumped and returned,
 // otherwise 0 is returned.
 // Passing a nil set of labels will not perform any action and will return the
 // current endpoint's identityRevision.
@@ -1261,10 +1225,45 @@ func (e *Endpoint) replaceIdentityLabels(sourceFilter string, l labels.Labels) i
 	return rev
 }
 
+// replaceNonGeneratedIdentityLabels replaces the identity labels of the endpoint
+// for the given 'sourceFilter', if 'sourceFilter' is 'LabelSourceAny' then all
+// labels except LabelSourceGenerated labels are replaced.
+// If a net changed occurred, the identityRevision is bumped and returned,
+// otherwise 0 is returned.
+// Passing a nil set of labels will not perform any action and will return the
+// current endpoint's identityRevision.
+// Must be called with e.mutex.Lock().
+func (e *Endpoint) replaceNonGeneratedIdentityLabels(sourceFilter string, l labels.Labels) int {
+	// only add generated labels if sourceFilter is Any or Generated,
+	// as otherwise the generated labels are already left as-is.
+	if sourceFilter == labels.LabelSourceAny || sourceFilter == labels.LabelSourceGenerated {
+		cloned := false
+		for _, v := range e.labels.OrchestrationIdentity {
+			if v.Source == labels.LabelSourceGenerated {
+				if !cloned {
+					l = labels.NewFrom(l)
+					cloned = true
+				}
+				l[v.Key] = v
+			}
+		}
+	}
+	return e.replaceIdentityLabels(sourceFilter, l)
+}
+
 // DeleteConfig is the endpoint deletion configuration
 type DeleteConfig struct {
 	NoIPRelease       bool
 	NoIdentityRelease bool
+
+	// EndpointOwnsIP reports whether the given IP is still owned by the
+	// endpoint being deleted. It guards the per-endpoint routing rule
+	// teardown against a stale delete: in ENI/Azure IPAM mode the rules are
+	// keyed solely by IP address, so a late teardown for an IP that has since
+	// been reused by another endpoint would otherwise strip the live owner's
+	// rules, silently breaking its egress. When nil, the check is skipped and
+	// rules are always deleted.
+	EndpointOwnsIP func(ip netip.Addr) bool
 }
 
 // leaveLocked removes the endpoint's directory from the system. Must be called
@@ -1300,6 +1299,11 @@ func (e *Endpoint) leaveLocked(conf DeleteConfig) []error {
 		}
 	}
 
+	// Endpoint's network policy must be released even if the identity is not released.
+	// Remove network policy before (possibly) releasing identity so proxy cleanup
+	// can still observe the endpoint exactly as it was published.
+	e.removeNetworkPolicy()
+
 	if !conf.NoIdentityRelease && e.SecurityIdentity != nil {
 		if e.identitySet {
 			// Restored endpoint may be created with a reserved identity of 5
@@ -1316,7 +1320,6 @@ func (e *Endpoint) leaveLocked(conf DeleteConfig) []error {
 				errs = append(errs, fmt.Errorf("unable to release identity: %w", err))
 			}
 		}
-		e.removeNetworkPolicy()
 		e.SecurityIdentity = nil
 	}
 
@@ -1324,13 +1327,12 @@ func (e *Endpoint) leaveLocked(conf DeleteConfig) []error {
 	e.controllers.RemoveAll()
 	e.cleanPolicySignals()
 
-	if !e.isProperty(PropertyFakeEndpoint) {
-		e.scrubIPsInConntrackTableLocked()
-	}
+	e.scrubIPsInConntrackTableLocked()
 
 	e.setState(StateDisconnected, "Endpoint removed")
 
 	endpointPolicyStatus.Remove(e.ID)
+	e.status.Clear()
 	e.getLogger().Info("Removed endpoint")
 
 	return errs
@@ -1344,12 +1346,16 @@ func (e *Endpoint) GetK8sNamespace() string {
 	return ns
 }
 
-// GetK8sUID returns the UID of the pod if the endpoint represents a Kubernetes
-// pod.
-func (e *Endpoint) GetK8sUID() string {
-	// const after creation
-	uid := e.K8sUID
-	return uid
+// GetK8sPodUID returns the UID of the Pod represented by the endpoint.
+func (e *Endpoint) GetK8sPodUID() string {
+	// K8sUID is immutable and identifies the Pod generation supplied by CNI.
+	if e.K8sUID != "" {
+		return e.K8sUID
+	}
+	if pod := e.GetPod(); pod != nil {
+		return string(pod.UID)
+	}
+	return ""
 }
 
 // SetPod sets the pod related to this endpoint.
@@ -1392,7 +1398,10 @@ type CEPOwnerInterface interface {
 // GetCEPOwner retrieves the cep owner related to this endpoint which will be,
 // by default, the pod associated with this endpoint.
 func (e *Endpoint) GetCEPOwner() CEPOwnerInterface {
-	if cepOwnerInt, ok := e.properties[PropertyCEPOwner]; ok {
+	e.mutex.RWMutex.RLock()
+	cepOwnerInt, ok := e.properties[endpoint.PropertyCEPOwner]
+	e.mutex.RWMutex.RUnlock()
+	if ok {
 		cepOwner, ok := cepOwnerInt.(CEPOwnerInterface)
 		if ok {
 			return cepOwner
@@ -1402,28 +1411,20 @@ func (e *Endpoint) GetCEPOwner() CEPOwnerInterface {
 	return e.GetPod()
 }
 
-// SetK8sMetadata sets the k8s container ports specified by kubernetes.
+// SetK8sMetadata sets the k8s named ports specified by kubernetes.
 // Note that once put in place, the new k8sPorts is never changed,
 // so that the map can be used concurrently without keeping locks.
 // Can't really error out as that might break backwards compatibility.
-func (e *Endpoint) SetK8sMetadata(containerPorts []slim_corev1.ContainerPort) {
-	k8sPorts := make(types.NamedPortMap, len(containerPorts))
-	for _, cp := range containerPorts {
-		if cp.Name == "" {
-			continue // silently skip unnamed ports
-		}
-		err := k8sPorts.AddPort(cp.Name, int(cp.ContainerPort), string(cp.Protocol))
-		if err != nil {
-			e.getLogger().Warn("Adding named port failed", logfields.Error, err)
-			continue
-		}
-	}
+func (e *Endpoint) SetK8sMetadata(namedPorts types.NamedPortMap) {
+	k8sPorts := maps.Clone(namedPorts)
+	// Store a non-nil pointer even when namedPorts is nil. The pointer tracks
+	// whether K8s metadata has been set; a nil map means the pod has no named ports.
 	e.k8sPorts.Store(&k8sPorts)
 }
 
 // GetK8sPorts returns the k8sPorts, which must not be modified by the caller
 func (e *Endpoint) GetK8sPorts() (k8sPorts types.NamedPortMap) {
-	if p := e.k8sPorts.Load(); p != nil {
+	if p := e.k8sPorts.Load(); p != nil && *p != nil {
 		k8sPorts = *p
 	}
 	return k8sPorts
@@ -1431,6 +1432,8 @@ func (e *Endpoint) GetK8sPorts() (k8sPorts types.NamedPortMap) {
 
 // HaveK8sMetadata returns true once hasK8sMetadata was set
 func (e *Endpoint) HaveK8sMetadata() (metadataSet bool) {
+	// Only the pointer matters here. A non-nil pointer to a nil map means K8s
+	// metadata was set for a pod with no named ports.
 	p := e.k8sPorts.Load()
 	return p != nil
 }
@@ -1473,11 +1476,12 @@ func (e *Endpoint) SetMac(mac mac.MAC) {
 	e.mac = mac
 }
 
-// GetDisableLegacyIdentifiers returns the endpoint's disableLegacyIdentifiers.
-func (e *Endpoint) GetDisableLegacyIdentifiers() bool {
+// IsSecondaryInterface reports whether this endpoint represents a seondary interface in
+// case of more than once interface per pod.
+func (e *Endpoint) IsSecondaryInterface() bool {
 	e.unconditionalRLock()
 	defer e.runlock()
-	return e.disableLegacyIdentifiers
+	return e.isSecondaryInterface
 }
 
 func (e *Endpoint) setState(toState State, reason string) bool {
@@ -1771,6 +1775,73 @@ func (e *Endpoint) APICanModifyConfig(n models.ConfigurationMap) error {
 	return nil
 }
 
+// ApplySourceIPVerificationFromAnnotation applies source IP verification setting
+// from pod annotation to this endpoint. Returns true if the option value was actually
+// changed (requiring datapath regeneration), false otherwise.
+//
+// This method handles locking internally for thread safety.
+//
+// Security model:
+// The namespace annotation (DelegateSourceIPVerification) acts as a permission
+// gate. Only when the namespace grants permission can pod annotations take effect.
+//
+// Logic:
+//  1. If namespace DelegateSourceIPVerification is not truthy: ignore pod
+//     annotation, use global default
+//  2. If namespace allows:
+//     - Pod annotation is "true"/"1"/"TRUE" etc: disable SIP verification
+//     - Pod annotation is "false"/"0"/"FALSE" etc: enable SIP verification
+//     - Pod annotation not exists or invalid: use global default
+//
+// Uses strconv.ParseBool for robust boolean parsing (accepts: 1, t, T, TRUE, true, True,
+// 0, f, F, FALSE, false, False). Whitespace is trimmed before parsing.
+func (e *Endpoint) ApplySourceIPVerificationFromAnnotation(podAnnotations, nsAnnotations map[string]string) bool {
+	// Start with global default setting
+	globalSetting := option.Config.Opts.GetValue(option.SourceIPVerification)
+	finalSetting := globalSetting
+
+	// Check namespace permission gate first
+	nsAllowed := false
+	if nsValue, ok := nsAnnotations[annotation.DelegateSourceIPVerification]; ok {
+		trimmedNsValue := strings.TrimSpace(nsValue)
+		if b, err := strconv.ParseBool(trimmedNsValue); err == nil && b {
+			nsAllowed = true
+		}
+	}
+
+	// Only process pod annotation if namespace allows
+	if nsAllowed {
+		if value, ok := podAnnotations[annotation.DisableSourceIPVerification]; ok {
+			trimmedValue := strings.TrimSpace(value)
+			if b, err := strconv.ParseBool(trimmedValue); err == nil {
+				if b {
+					finalSetting = option.OptionDisabled // Annotation truthy: disable SIP verification
+				} else {
+					finalSetting = option.OptionEnabled // Annotation falsy: enable SIP verification
+				}
+			} else if trimmedValue != "" {
+				e.getLogger().Warn(
+					"Invalid DisableSourceIPVerification annotation value, resetting to global default",
+					logfields.Value, value)
+			}
+		}
+	} else if _, ok := podAnnotations[annotation.DisableSourceIPVerification]; ok {
+		// Pod has the annotation but namespace doesn't grant permission - log at Debug level
+		// to avoid noise in high-frequency reconciliation paths
+		e.getLogger().Debug(
+			"Pod DisableSourceIPVerification annotation ignored: namespace does not have DelegateSourceIPVerification=true")
+	}
+
+	e.unconditionalLock()
+	defer e.unlock()
+
+	if currentSetting := e.Options.GetValue(option.SourceIPVerification); currentSetting != finalSetting {
+		e.Options.SetValidated(option.SourceIPVerification, finalSetting)
+		return true
+	}
+	return false
+}
+
 // metadataResolver will resolve the endpoint's metadata from a metadata
 // resolver.
 //
@@ -1782,8 +1853,9 @@ func (e *Endpoint) APICanModifyConfig(n models.ConfigurationMap) error {
 //     operation will be done in the background and 'regenTriggered'
 //     will always be 'false'.
 //
-//   - bwm - the bandwidth manager used to update the bandwidth policy for this
-//     endpoint.
+//   - baseLabels - optional set of labels to use as a base. Labels resolved
+//     from Kubernetes are merged into these. If empty, only the k8s-sourced
+//     labels are applied.
 //
 //   - resolveMetadata - the metadata resolver that will be used to retrieve this
 //     endpoint's metadata.
@@ -1803,7 +1875,7 @@ func (e *Endpoint) metadataResolver(ctx context.Context,
 
 	ns, podName := e.GetK8sNamespace(), e.GetK8sPodName()
 
-	pod, k8sMetadata, err := resolveMetadata(ns, podName, e.K8sUID)
+	pod, k8sMetadata, err := resolveMetadata(ns, podName, e.K8sUID, !restoredEndpoint)
 	if err != nil {
 		if restoredEndpoint && k8sErrors.IsNotFound(err) {
 			e.Logger(resolveLabels).Info(
@@ -1838,7 +1910,7 @@ func (e *Endpoint) metadataResolver(ctx context.Context,
 	controllerBaseLabels.MergeLabels(k8sMetadata.IdentityLabels)
 
 	e.SetPod(pod)
-	e.SetK8sMetadata(k8sMetadata.ContainerPorts)
+	e.SetK8sMetadata(k8sMetadata.NamedPorts)
 	e.UpdateNoTrackRules(func() string {
 		value, _ := annotation.Get(pod, annotation.NoTrack, annotation.NoTrackAlias)
 		return value
@@ -1848,6 +1920,25 @@ func (e *Endpoint) metadataResolver(ctx context.Context,
 		pod.Annotations[bandwidth.IngressBandwidth],
 		pod.Annotations[bandwidth.Priority],
 	)
+	if tid, ok := pod.Annotations[annotation.FIBTableID]; option.Config.EnableFibTableIDAnnotation && ok {
+		if tidInt, err := strconv.ParseUint(tid, 10, 32); err == nil {
+			e.SetRTInfo(uint32(tidInt), endpoint.RTInfoFIB)
+		}
+	} else {
+		// if either endpoint is no longer annotated, or EnableFibTableIDAnnotation was
+		// disabled, remove pod from FIB table if bound.
+		if _, enc := e.GetRTInfo(); enc == endpoint.RTInfoFIB {
+			e.ClearRTInfo()
+		}
+	}
+
+	// Handle DisableSourceIPVerification annotation.
+	// This must happen before UpdateLabels so we can track if SIP setting changed
+	// and ensure datapath regeneration is triggered if labels don't change.
+	sipChanged := e.ApplySourceIPVerificationFromAnnotation(pod.Annotations, k8sMetadata.NamespaceAnnotations)
+	if sipChanged {
+		e.Logger(resolveLabels).Info("Source IP verification setting changed from pod annotation")
+	}
 
 	// If 'baseLabels' are not set then 'controllerBaseLabels' only contains
 	// labels from k8s. Thus, we should only replace the labels that have their
@@ -1859,20 +1950,36 @@ func (e *Endpoint) metadataResolver(ctx context.Context,
 	}
 	regenTriggered = e.UpdateLabels(ctx, source, controllerBaseLabels, k8sMetadata.InfoLabels, blocking)
 
+	// If SIP setting changed but UpdateLabels did not trigger regeneration (e.g., during
+	// endpoint restore or when identity labels are unchanged), we must explicitly trigger
+	// a datapath regeneration to apply the new SIP setting to the BPF datapath.
+	if sipChanged && !regenTriggered {
+		e.Logger(resolveLabels).Info("Triggering datapath regeneration for source IP verification change")
+		regenMetadata := &regeneration.ExternalRegenerationMetadata{
+			Reason:            "source IP verification annotation applied",
+			RegenerationLevel: regeneration.RegenerateWithDatapath,
+		}
+		if regen, _ := e.SetRegenerateStateIfAlive(regenMetadata); regen {
+			e.Regenerate(regenMetadata)
+			regenTriggered = true
+		}
+	}
+
 	return regenTriggered, nil
 }
 
 // K8sMetadata is a collection of Kubernetes-related metadata that are fetched
 // from Kubernetes.
 type K8sMetadata struct {
-	ContainerPorts []slim_corev1.ContainerPort
-	IdentityLabels labels.Labels
-	InfoLabels     labels.Labels
+	NamedPorts           types.NamedPortMap
+	IdentityLabels       labels.Labels
+	InfoLabels           labels.Labels
+	NamespaceAnnotations map[string]string
 }
 
 // MetadataResolverCB provides an implementation for resolving the endpoint
 // metadata for an endpoint such as the associated labels and annotations.
-type MetadataResolverCB func(ns, podName, uid string) (pod *slim_corev1.Pod, k8sMetadata *K8sMetadata, err error)
+type MetadataResolverCB func(ns, podName, uid string, newPod bool) (pod *slim_corev1.Pod, k8sMetadata *K8sMetadata, err error)
 
 // RunMetadataResolver starts a controller associated with the received
 // endpoint which will periodically attempt to resolve the metadata for the
@@ -1978,9 +2085,7 @@ func (e *Endpoint) ModifyIdentityLabels(source string, addLabels, delLabels labe
 
 	// If the client made a request to modify labels, even if there was
 	// no new labels added or deleted then we can safely remove the init
-	// label. This is a workaround to allow the cilium-docker plugin
-	// to remove endpoints in 'init' state if the containers were not
-	// started with any label.
+	// label.
 	if len(addLabels) == 0 && len(delLabels) == 0 && e.IsInit() {
 		idLabls := e.labels.IdentityLabels()
 		delete(idLabls, labels.IDNameInit)
@@ -2075,12 +2180,13 @@ func (e *Endpoint) InitWithNodeLabels(ctx context.Context, nodeLabels map[string
 // run first synchronously if 'blocking' is true, and then in the background.
 //
 // Returns 'true' if endpoint regeneration was triggered.
+// identityLabels must be non-nil; infoLabels may be nil.
 func (e *Endpoint) UpdateLabels(ctx context.Context, sourceFilter string, identityLabels, infoLabels labels.Labels, blocking bool) (regenTriggered bool) {
 	e.getLogger().Debug(
 		"Refreshing labels of endpoint",
 		logfields.SourceFilter, sourceFilter,
-		logfields.IdentityLabels, identityLabels,
-		logfields.InfoLabels, infoLabels,
+		logfields.IdentityLabels, map[string]labels.Label(identityLabels),
+		logfields.InfoLabels, map[string]labels.Label(infoLabels),
 	)
 
 	if err := e.lockAlive(); err != nil {
@@ -2090,7 +2196,8 @@ func (e *Endpoint) UpdateLabels(ctx context.Context, sourceFilter string, identi
 
 	e.replaceInformationLabels(sourceFilter, infoLabels)
 	// replace identity labels and update the identity if labels have changed
-	rev := e.replaceIdentityLabels(sourceFilter, identityLabels)
+	// UpdateLabels keeps all generated source labels.
+	rev := e.replaceNonGeneratedIdentityLabels(sourceFilter, identityLabels)
 
 	// If the endpoint is in an 'init' state we need to remove this label
 	// regardless of the "sourceFilter". Otherwise, we face risk of leaving the
@@ -2139,7 +2246,7 @@ func (e *Endpoint) UpdateLabelsFrom(oldLbls, newLbls map[string]string, source s
 
 	e.getLogger().Debug(
 		"Updated endpoint with new labels",
-		logfields.Labels, newIdtyLabels,
+		logfields.Labels, map[string]labels.Label(newIdtyLabels),
 	)
 	return nil
 }
@@ -2148,6 +2255,18 @@ func (e *Endpoint) identityResolutionIsObsolete(myChangeRev int) bool {
 	// Check if the endpoint has since received a new identity revision, if
 	// so, abort as a new resolution routine will have been started.
 	return myChangeRev != e.identityRevision
+}
+
+// ForceUpdateCIDRLabels triggers a re-evaluation of the endpoint's CIDR labels
+// and runs the identity resolver to update its security identity if needed.
+func (e *Endpoint) ForceUpdateCIDRLabels(ctx context.Context) {
+	if err := e.lockAlive(); err != nil {
+		return
+	}
+	e.identityRevision++
+	e.unlock()
+
+	e.runIdentityResolver(ctx, false, 0)
 }
 
 // runIdentityResolver resolves the numeric identity for the set of labels that
@@ -2209,12 +2328,57 @@ func (e *Endpoint) runIdentityResolver(ctx context.Context, blocking bool, updat
 	return regenTriggered
 }
 
+// computeCIDRLabelsRLocked should be called with a lock held on the Endpoint.
+func (e *Endpoint) computeCIDRLabelsRLocked() labels.Labels {
+	newCIDRLabels := labels.Labels{}
+	if !option.Config.PolicyCIDRMatchesPods() || e.ipcache == nil {
+		return newCIDRLabels
+	}
+
+	for _, ip := range []netip.Addr{e.IPv4, e.IPv6} {
+		if !ip.IsValid() {
+			continue
+		}
+		hasCIDR := false
+		// Filter labels retrieved from the IPCache. We only match and propagate
+		// CIDR and CIDRGroup labels (source=cidr or source=cidrgroup). Other metadata
+		// labels (such as reserved:world or FQDN labels) are ignored.
+		for _, lbl := range e.ipcache.GetMetadataLabels(ip) {
+			if lbl.Source == labels.LabelSourceCIDR || lbl.Source == labels.LabelSourceCIDRGroup {
+				newCIDRLabels[lbl.GetExtendedKey()] = lbl
+				if lbl.Source == labels.LabelSourceCIDR {
+					hasCIDR = true
+				}
+			}
+		}
+		if !hasCIDR {
+			var wildcard string
+			if ip.Is4() {
+				wildcard = "cidr:0.0.0.0/0"
+			} else {
+				wildcard = "cidr:::/0"
+			}
+			lbl := labels.ParseLabel(wildcard)
+			newCIDRLabels[lbl.GetExtendedKey()] = lbl
+		}
+	}
+
+	return newCIDRLabels
+}
+
 func (e *Endpoint) identityLabelsChanged(ctx context.Context) (regenTriggered bool, err error) {
 	// e.setState() called below, can't take a read lock.
 	if err := e.lockAlive(); err != nil {
 		return false, err
 	}
 	newLabels := e.labels.IdentityLabels()
+
+	if !newLabels.IsReserved() {
+		newLabels.RemoveFromSource(labels.LabelSourceCIDR)
+		newLabels.RemoveFromSource(labels.LabelSourceCIDRGroup)
+		maps.Copy(newLabels, e.computeCIDRLabelsRLocked())
+	}
+
 	myChangeRev := e.identityRevision
 	scopedLog := e.getLogger().With(
 		logfields.IdentityLabels, newLabels,
@@ -2229,11 +2393,21 @@ func (e *Endpoint) identityLabelsChanged(ctx context.Context) (regenTriggered bo
 
 	if e.SecurityIdentity != nil && e.SecurityIdentity.Labels.Equals(newLabels) {
 		// Sets endpoint state to ready if was waiting for identity
+		var deferredRegen *regeneration.ExternalRegenerationMetadata
 		if e.getState() == StateWaitingForIdentity {
 			e.setState(StateReady, "Set identity for this endpoint")
+			// Regenerations requested while the endpoint was parked in
+			// waiting-for-identity were only buffered. No new identity is
+			// assigned here, so no regeneration is queued for us, flush the
+			// buffer instead of waiting for the periodic regeneration.
+			deferredRegen = e.consumeDeferredRegenerationLocked()
 		}
 		e.unlock()
 		scopedLog.Debug("Endpoint labels unchanged, skipping resolution of identity")
+		if deferredRegen != nil {
+			e.RegenerateIfAlive(deferredRegen)
+			return true, nil
+		}
 		return false, nil
 	}
 
@@ -2250,7 +2424,7 @@ func (e *Endpoint) identityLabelsChanged(ctx context.Context) (regenTriggered bo
 	// identity is new, then this will start updating the policy for other
 	// co-located endpoints without having to wait for that RTT.
 	//
-	// This must happen before triggering regeration, as this ID must be
+	// This must happen before triggering regeneration, as this ID must be
 	// plumbed in to the SelectorCache in order for policy to correctly apply
 	// to this endpoint. Fortunately AllocateIdentity() will synchronously
 	// update the SelectorCache, so there are no problems here.
@@ -2327,7 +2501,7 @@ func (e *Endpoint) identityLabelsChanged(ctx context.Context) (regenTriggered bo
 
 	scopedLog.Debug(
 		"Assigned new identity to endpoint",
-		logfields.IdentityNew, allocatedIdentity.StringID(),
+		logfields.IdentityNew, allocatedIdentity,
 	)
 
 	identityToRelease := e.SetIdentity(allocatedIdentity)
@@ -2343,9 +2517,14 @@ func (e *Endpoint) identityLabelsChanged(ctx context.Context) (regenTriggered bo
 		}
 	}
 
+	// Unconditionally force policy recomputation after a new identity has been
+	// assigned.
+	e.forcePolicyComputation()
+
 	readyToRegenerate := false
 	regenMetadata := &regeneration.ExternalRegenerationMetadata{
-		Reason:            "updated security labels",
+		Reason:            regeneration.ReasonLabelsUpdate,
+		Message:           "updated security labels",
 		RegenerationLevel: regeneration.RegenerateWithDatapath,
 	}
 
@@ -2360,10 +2539,6 @@ func (e *Endpoint) identityLabelsChanged(ctx context.Context) (regenTriggered bo
 	if e.ID != 0 {
 		readyToRegenerate = e.setRegenerateStateLocked(regenMetadata)
 	}
-
-	// Unconditionally force policy recomputation after a new identity has been
-	// assigned.
-	e.forcePolicyComputation()
 
 	// Trigger the sync-to-k8s-ciliumendpoint controller to sync the new
 	// endpoint's identity.
@@ -2401,9 +2576,11 @@ func (e *Endpoint) setPolicyRevision(rev uint64) {
 
 	now := time.Now()
 	e.policyRevision = rev
-	e.UpdateLogger(map[string]any{
-		logfields.DatapathPolicyRevision: e.policyRevision,
-	})
+	if e.Options != nil && e.Options.IsEnabled(option.Debug) {
+		e.UpdateLogger(map[string]any{
+			logfields.DatapathPolicyRevision: e.policyRevision,
+		})
+	}
 	for ps := range e.policyRevisionSignals {
 		select {
 		case <-ps.ctx.Done():
@@ -2488,6 +2665,14 @@ func (e *Endpoint) IsDisconnecting() bool {
 	return e.state == StateDisconnected || e.state == StateDisconnecting
 }
 
+// IsAlive returns true if endpoint is not disconnecting/disconnected.
+func (e *Endpoint) IsAlive() bool {
+	e.mutex.RLock()
+	defer e.mutex.RUnlock()
+
+	return !e.IsDisconnecting()
+}
+
 func (e *Endpoint) syncEndpointHeaderFile(reasons []string) {
 	e.buildMutex.Lock()
 	defer e.buildMutex.Unlock()
@@ -2567,16 +2752,30 @@ func (e *Endpoint) Delete(conf DeleteConfig) []error {
 		// This is a best-effort attempt to cleanup. We expect there to be one
 		// ingress rule and multiple egress rules. If we find more rules than
 		// expected, we delete all rules referring to a per-ENI routing table ID.
-		if e.IPv4.IsValid() {
-			if err := linuxrouting.Delete(e.getLogger(), e.IPv4); err != nil {
+		//
+		// The routing rules are keyed solely by IP address, so a stale teardown
+		// for an IP that has since been reused by another endpoint would strip
+		// the live owner's rules. Guard against that by only deleting the rules
+		// if this endpoint still owns the IP.
+		deleteRoutingRules := func(ip netip.Addr) {
+			if conf.EndpointOwnsIP != nil && !conf.EndpointOwnsIP(ip) {
+				e.getLogger().Info(
+					"Skipping deletion of endpoint routing rules: IP is no longer owned by this endpoint",
+					logfields.IPAddr, ip,
+				)
+				return
+			}
+			if err := linuxrouting.Delete(e.getLogger(), ip); err != nil {
 				errs = append(errs, fmt.Errorf("unable to delete endpoint routing rules: %w", err))
 			}
 		}
 
+		if e.IPv4.IsValid() {
+			deleteRoutingRules(e.IPv4)
+		}
+
 		if e.IPv6.IsValid() {
-			if err := linuxrouting.Delete(e.getLogger(), e.IPv6); err != nil {
-				errs = append(errs, fmt.Errorf("unable to delete endpoint routing rules: %w", err))
-			}
+			deleteRoutingRules(e.IPv6)
 		}
 	}
 
@@ -2594,7 +2793,7 @@ func (e *Endpoint) Delete(conf DeleteConfig) []error {
 	}
 
 	// If dry mode is enabled, no changes to system state are made.
-	if !e.isProperty(PropertyFakeEndpoint) {
+	if !e.isPropertyLocked(endpoint.PropertyFakeEndpoint) {
 		// Set the Endpoint's interface down to prevent it from passing any traffic
 		// after its tc filters are removed.
 		if err := e.setDown(); err != nil {
@@ -2605,7 +2804,7 @@ func (e *Endpoint) Delete(conf DeleteConfig) []error {
 		e.orchestrator.Unload(e.createEpInfoCache(""))
 
 		// Delete the endpoint's entries from the global cilium_(egress)call_policy
-		// maps and remove per-endpoint cilium_calls_ and cilium_policy_v2_ map pins.
+		// maps and remove per-endpoint cilium_calls_ and cilium_policy_ map pins.
 		if err := e.deleteMaps(); err != nil {
 			errs = append(errs, err...)
 		}
@@ -2627,6 +2826,13 @@ func (e *Endpoint) setDown() error {
 	}
 	if err != nil {
 		return fmt.Errorf("setting interface %s down: %w", e.HostInterface(), err)
+	}
+	if link.Attrs().Index != e.GetIfIndex() {
+		// Interface with an index different from the one we were expecting.
+		// This can occur if the endpoint was deleted and recreated while the
+		// old endpoint's setDown() was executing. In this case, we should not
+		// set the new interface down.
+		return nil
 	}
 
 	return netlink.LinkSetDown(link)
@@ -2705,20 +2911,51 @@ func (e *Endpoint) GetCreatedAt() time.Time {
 	return e.createdAt
 }
 
+func (e *Endpoint) SetRTInfo(info uint32, t endpoint.RTInfoEncoding) {
+	e.mutex.RWMutex.Lock()
+	defer e.mutex.RWMutex.Unlock()
+
+	e.rtInfo = info
+	e.setPropertyValueLocked(endpoint.PropertyRTInfo, string(t))
+
+}
+
+func (e *Endpoint) GetRTInfo() (uint32, endpoint.RTInfoEncoding) {
+	e.mutex.RWMutex.RLock()
+	defer e.mutex.RWMutex.RUnlock()
+	enc, _ := e.getPropertyValueLocked(endpoint.PropertyRTInfo).(string)
+	return e.rtInfo, endpoint.RTInfoEncoding(enc)
+}
+
+func (e *Endpoint) ClearRTInfo() {
+	e.mutex.RWMutex.Lock()
+	defer e.mutex.RWMutex.Unlock()
+	e.rtInfo = 0
+	delete(e.properties, endpoint.PropertyRTInfo)
+}
+
+func (e *Endpoint) getPropertyValueLocked(key string) any {
+	return e.properties[key]
+}
+
 // GetPropertyValue returns the endpoint property value for this key.
 func (e *Endpoint) GetPropertyValue(key string) any {
 	e.mutex.RWMutex.RLock()
 	defer e.mutex.RWMutex.RUnlock()
-	return e.properties[key]
+	return e.getPropertyValueLocked(key)
+}
+
+func (e *Endpoint) setPropertyValueLocked(key string, value any) any {
+	old := e.properties[key]
+	e.properties[key] = value
+	return old
 }
 
 // SetPropertyValue sets the endpoint property value for this key.
 func (e *Endpoint) SetPropertyValue(key string, value any) any {
 	e.mutex.RWMutex.Lock()
 	defer e.mutex.RWMutex.Unlock()
-	old := e.properties[key]
-	e.properties[key] = value
-	return old
+	return e.setPropertyValueLocked(key, value)
 }
 
 // IsProperty checks if the value of the properties map is set, it's a boolean
@@ -2726,12 +2963,12 @@ func (e *Endpoint) SetPropertyValue(key string, value any) any {
 func (e *Endpoint) IsProperty(propertyKey string) bool {
 	e.mutex.RWMutex.RLock()
 	defer e.mutex.RWMutex.RUnlock()
-	return e.isProperty(propertyKey)
+	return e.isPropertyLocked(propertyKey)
 }
 
 // isProperty checks if the value of the properties map is set, it's a boolean
-// and its value is 'true'.
-func (e *Endpoint) isProperty(propertyKey string) bool {
+// and its value is 'true'. Must be called with the endpoint being (read)-locked.
+func (e *Endpoint) isPropertyLocked(propertyKey string) bool {
 	if v, ok := e.properties[propertyKey]; ok {
 		isSet, ok := v.(bool)
 		return ok && isSet
@@ -2745,4 +2982,69 @@ func (e *Endpoint) GetContainerNetnsPath() string {
 
 func (e *Endpoint) SetContainerNetnsPath(path string) {
 	e.containerNetnsPath = path
+}
+
+// CopyFromTemplate creates a copy of the calling Endpoint object and returns
+// it. This is used to create Endpoint objects without going through the New*()
+// code path which is useful in tests.
+func (e *Endpoint) CopyFromTemplate() *Endpoint {
+	if e == nil {
+		return nil
+	}
+
+	clone := &Endpoint{
+		DNSHistory:   e.DNSHistory,
+		DNSZombies:   e.DNSZombies,
+		ID:           e.ID,
+		IPv4:         e.IPv4,
+		IPv6:         e.IPv6,
+		K8sNamespace: e.K8sNamespace,
+		K8sPodName:   e.K8sPodName,
+
+		aliveCancel:        e.aliveCancel,
+		aliveCtx:           e.aliveCtx,
+		allocator:          e.allocator,
+		compilationLock:    e.compilationLock,
+		controllers:        e.controllers,
+		createdAt:          e.createdAt,
+		ctMapGC:            e.ctMapGC,
+		dnsRulesAPI:        e.dnsRulesAPI,
+		epBuildQueue:       e.epBuildQueue,
+		forcePolicyCompute: e.forcePolicyCompute,
+		hasBPFProgram:      e.hasBPFProgram,
+		identityManager:    e.identityManager,
+		ifIndex:            e.ifIndex,
+		ifName:             e.ifName,
+		kvstoreSyncher:     e.kvstoreSyncher,
+		loader:             e.loader,
+		lxcMap:             e.lxcMap,
+		monitorAgent:       e.monitorAgent,
+		nodeMAC:            e.nodeMAC,
+		orchestrator:       e.orchestrator,
+		policyFetcher:      e.policyFetcher,
+		policyMapFactory:   e.policyMapFactory,
+		policyRepo:         e.policyRepo,
+		proxy:              e.proxy,
+		state:              e.state,
+	}
+	clone.containerID.Store(e.containerID.Load())
+	clone.logger.Store(e.logger.Load())
+
+	clone.mutex = lock.RWMutex{}
+	clone.Options = option.NewIntOptions(&EndpointMutableOptionLibrary)
+	clone.labels = labels.NewOpLabels()
+	clone.status = NewEndpointStatus()
+	if e.controllers == nil {
+		clone.controllers = controller.NewManager()
+	}
+	clone.desiredPolicy = policy.NewEndpointPolicy(e.logger.Load(), e.policyRepo)
+	clone.realizedPolicy = clone.desiredPolicy
+	clone.initialEnvoyPolicyComputed = make(chan struct{})
+
+	clone.properties = maps.Clone(e.properties)
+	if clone.properties == nil {
+		clone.properties = map[string]any{}
+	}
+
+	return clone
 }

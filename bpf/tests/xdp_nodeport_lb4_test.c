@@ -33,6 +33,9 @@ ASSIGN_CONFIG(bool, enable_no_service_endpoints_routable, true)
 #define BACKEND_IP 0x0F00020A /* 10.2.0.15 */
 #define BACKEND_PORT 8080
 
+/* Set port ranges to have deterministic source port selection */
+#include "nodeport_defaults.h"
+
 static long (*bpf_xdp_adjust_tail)(struct xdp_md *xdp_md, int delta) = (void *)65;
 
 static __always_inline int build_packet(struct __ctx_buff *ctx)
@@ -104,7 +107,7 @@ static __always_inline int build_packet(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("xdp", "xdp_lb4_forward_to_other_node")
+SETUP(PROG_TYPE, "xdp_lb4_forward_to_other_node")
 int test1_setup(struct __ctx_buff *ctx)
 {
 	int ret;
@@ -120,7 +123,7 @@ int test1_setup(struct __ctx_buff *ctx)
 	return xdp_receive_packet(ctx);
 }
 
-CHECK("xdp", "xdp_lb4_forward_to_other_node")
+CHECK(PROG_TYPE, "xdp_lb4_forward_to_other_node")
 int test1_check(__maybe_unused const struct __ctx_buff *ctx)
 {
 	test_init();
@@ -172,7 +175,7 @@ int test1_check(__maybe_unused const struct __ctx_buff *ctx)
 		test_fatal("dst port != backend port");
 
 	if (l4->check != bpf_htons(0xc9ee))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_ntohs(0xc9ee));
 
 	char msg[20] = "Should not change!!";
 
@@ -187,7 +190,7 @@ int test1_check(__maybe_unused const struct __ctx_buff *ctx)
 	test_finish();
 }
 
-SETUP("xdp", "xdp_lb4_drop_no_backend")
+SETUP(PROG_TYPE, "xdp_lb4_drop_no_backend")
 int test2_setup(struct __ctx_buff *ctx)
 {
 	int ret;
@@ -201,7 +204,7 @@ int test2_setup(struct __ctx_buff *ctx)
 	return xdp_receive_packet(ctx);
 }
 
-CHECK("xdp", "xdp_lb4_drop_no_backend")
+CHECK(PROG_TYPE, "xdp_lb4_drop_no_backend")
 int test2_check(__maybe_unused const struct __ctx_buff *ctx)
 {
 	void *data_end = (void *)(long)ctx->data_end;

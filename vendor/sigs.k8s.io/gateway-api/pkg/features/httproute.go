@@ -103,6 +103,23 @@ const (
 
 	// This option indicates support for the cors filter in the HTTPRouteFilter (extended conformance)
 	SupportHTTPRouteCORS FeatureName = "HTTPRouteCORS"
+	// This option indicates support for HTTPRoute additional redirect status code 303 (extended conformance)
+	SupportHTTPRoute303RedirectStatusCode FeatureName = "HTTPRoute303RedirectStatusCode"
+
+	// This option indicates support for HTTPRoute additional redirect status code 303 (extended conformance)
+	SupportHTTPRoute307RedirectStatusCode FeatureName = "HTTPRoute307RedirectStatusCode"
+
+	// This option indicates support for HTTPRoute additional redirect status code 303 (extended conformance)
+	SupportHTTPRoute308RedirectStatusCode FeatureName = "HTTPRoute308RedirectStatusCode"
+
+	// This option indicates support for HTTPRoute retry (extended conformance)
+	SupportHTTPRouteRetry FeatureName = "HTTPRouteRetry"
+
+	// This option indicates support for HTTPRoute retry on backend timeout (extended conformance)
+	SupportHTTPRouteRetryBackendTimeout FeatureName = "HTTPRouteRetryBackendTimeout"
+
+	// This option indicates support for HTTPRoute retry on connection error (extended conformance)
+	SupportHTTPRouteRetryConnectionError FeatureName = "HTTPRouteRetryConnectionError"
 )
 
 var (
@@ -204,6 +221,36 @@ var (
 	// HTTPRouteCORS contains metadata for the SupportHTTPRouteCORS feature.
 	HTTPRouteCORS = Feature{
 		Name:    SupportHTTPRouteCORS,
+		Channel: FeatureChannelStandard,
+	}
+	// HTTPRoute303RedirectStatusCodeFeature contains metadata for the HTTPRoute303RedirectStatusCode feature.
+	HTTPRoute303RedirectStatusCodeFeature = Feature{
+		Name:    SupportHTTPRoute303RedirectStatusCode,
+		Channel: FeatureChannelStandard,
+	}
+	// HTTPRoute307RedirectStatusCodeFeature contains metadata for the HTTPRoute307RedirectStatusCode feature.
+	HTTPRoute307RedirectStatusCodeFeature = Feature{
+		Name:    SupportHTTPRoute307RedirectStatusCode,
+		Channel: FeatureChannelStandard,
+	}
+	// HTTPRoute308RedirectStatusCodeFeature contains metadata for the HTTPRoute308RedirectStatusCode feature.
+	HTTPRoute308RedirectStatusCodeFeature = Feature{
+		Name:    SupportHTTPRoute308RedirectStatusCode,
+		Channel: FeatureChannelStandard,
+	}
+	// HTTPRouteRetryFeature contains metadata for the HTTPRouteRetry feature.
+	HTTPRouteRetryFeature = Feature{
+		Name:    SupportHTTPRouteRetry,
+		Channel: FeatureChannelExperimental,
+	}
+	// HTTPRouteRetryBackendTimeoutFeature contains metadata for the HTTPRouteRetryBackendTimeout feature.
+	HTTPRouteRetryBackendTimeoutFeature = Feature{
+		Name:    SupportHTTPRouteRetryBackendTimeout,
+		Channel: FeatureChannelExperimental,
+	}
+	// HTTPRouteRetryConnectionErrorFeature contains metadata for the HTTPRouteRetryConnectionError feature.
+	HTTPRouteRetryConnectionErrorFeature = Feature{
+		Name:    SupportHTTPRouteRetryConnectionError,
 		Channel: FeatureChannelExperimental,
 	}
 )
@@ -232,4 +279,10 @@ var HTTPRouteExtendedFeatures = sets.New(
 	HTTPRouteBackendProtocolWebSocketFeature,
 	HTTPRouteNamedRouteRule,
 	HTTPRouteCORS,
+	HTTPRoute303RedirectStatusCodeFeature,
+	HTTPRoute307RedirectStatusCodeFeature,
+	HTTPRoute308RedirectStatusCodeFeature,
+	HTTPRouteRetryFeature,
+	HTTPRouteRetryBackendTimeoutFeature,
+	HTTPRouteRetryConnectionErrorFeature,
 )

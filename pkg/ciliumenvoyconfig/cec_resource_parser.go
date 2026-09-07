@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net"
 	"strconv"
 
 	"github.com/cilium/hive/cell"
@@ -18,6 +17,7 @@ import (
 	envoy_config_endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	envoy_config_listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	envoy_config_route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	extauthzv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
 	envoy_config_healthcheck "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/health_check/v3"
 	envoy_config_http "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	envoy_config_tcp "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
@@ -33,6 +33,9 @@ import (
 	"github.com/cilium/cilium/pkg/bpf"
 	"github.com/cilium/cilium/pkg/envoy"
 	envoyCfg "github.com/cilium/cilium/pkg/envoy/config"
+	util "github.com/cilium/cilium/pkg/envoy/util"
+	"github.com/cilium/cilium/pkg/envoy/xds"
+	iputil "github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/k8s"
 	cilium_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -60,13 +63,22 @@ type CECResourceParser struct {
 	logger        *slog.Logger
 	portAllocator PortAllocator
 
-	ingressIPv4 net.IP
-	ingressIPv6 net.IP
+	ingressIPv4 iputil.Addr
+	ingressIPv6 iputil.Addr
 
 	defaultMaxConcurrentRetries uint32
 	defaultMaxConnections       uint32
 	defaultMaxRequests          uint32
+	defaultMaxPendingRequests   uint32
 	httpLingerConfig            int
+	accessLogPath               string
+
+	// enableBPFTProxy indicates whether BPF TProxy is enabled. When set,
+	// SO_REUSEPORT is disabled on (non-internal) listeners as it is not
+	// compatible with BPF TPROXY.
+	enableBPFTProxy bool
+
+	xdsMode envoyCfg.XDSMode
 }
 
 type parserParams struct {
@@ -79,18 +91,31 @@ type parserParams struct {
 	DB            *statedb.DB
 	Nodes         statedb.Table[*node.LocalNode]
 
-	CecConfig   CECConfig
-	EnvoyConfig envoyCfg.ProxyConfig
+	DaemonConfig *option.DaemonConfig
+	CecConfig    CECConfig
+	EnvoyConfig  envoyCfg.ProxyConfig
 }
 
 func newCECResourceParser(params parserParams) *CECResourceParser {
+	// Normalize xdsMode if left empty
+	xdsMode := params.EnvoyConfig.EnvoyXDSMode
+	if xdsMode == "" {
+		xdsMode = envoyCfg.DefaultXDSMode
+	}
+
 	parser := &CECResourceParser{
 		logger:                      params.Logger,
 		portAllocator:               params.PortAllocator,
 		defaultMaxConcurrentRetries: params.EnvoyConfig.ProxyMaxConcurrentRetries,
 		defaultMaxConnections:       params.EnvoyConfig.ProxyClusterMaxConnections,
 		defaultMaxRequests:          params.EnvoyConfig.ProxyClusterMaxRequests,
+		defaultMaxPendingRequests:   params.EnvoyConfig.ProxyClusterMaxPendingRequests,
 		httpLingerConfig:            params.EnvoyConfig.EnvoyHTTPUpstreamLingerTimeout,
+		enableBPFTProxy:             params.DaemonConfig.EnableBPFTProxy,
+		xdsMode:                     xdsMode,
+	}
+	if params.EnvoyConfig.EnvoyAccessLogEnabled {
+		parser.accessLogPath = util.GetAccessLogSocketPath(util.GetSocketDir(option.Config.RunDir))
 	}
 
 	// Retrieve Ingress IPs from local Node.
@@ -118,12 +143,14 @@ func newCECResourceParser(params parserParams) *CECResourceParser {
 }
 
 type PortAllocator interface {
+	RestoreComplete() <-chan struct{}
 	AllocateCRDProxyPort(name string) (uint16, error)
+	ReallocateCRDProxyPort(name string) (uint16, error)
 	AckProxyPortWithReference(ctx context.Context, name string) error
 	ReleaseProxyPort(name string) error
 }
 
-// ParseResources parses all supported Envoy resource types from CiliumEnvoyConfig CRD to the internal type `envoy.Resources`.
+// ParseResources parses all supported Envoy resource types from CiliumEnvoyConfig CRD to the internal type `xds.Resources`.
 //
 // - Qualify names by prepending the namespace and name of the origin CEC to the Envoy resource names.
 // - Validate resources
@@ -139,7 +166,7 @@ type PortAllocator interface {
 //   - `useOriginalSourceAddr` is passed to the Envoy Cilium BPF Metadata listener filter on all Listeners.
 //   - `newResources` is passed as `true` when parsing resources that are being added or are the new version of the resources being updated,
 //     and as `false` if the resources are being removed or are the old version of the resources being updated. Only 'new' resources are validated.
-func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, xdsResources []cilium_v2.XDSResource, isL7LB bool, injectCiliumEnvoyFilters bool, useOriginalSourceAddr bool, newResources bool) (envoy.Resources, error) {
+func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, xdsResources []cilium_v2.XDSResource, isL7LB bool, injectCiliumEnvoyFilters bool, useOriginalSourceAddr bool, newResources bool) (xds.Resources, error) {
 	// only validate new resources - old ones are already applied
 	validate := newResources
 
@@ -147,7 +174,7 @@ func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, 
 	// and downstream filters were injected.
 	injectCiliumUpstreamFilters := false
 
-	resources := envoy.Resources{}
+	resources := xds.NewResources()
 	for _, res := range xdsResources {
 		// Skip empty TypeURLs, which are left behind when Unmarshalling resource JSON fails
 		if res.TypeUrl == "" {
@@ -155,24 +182,26 @@ func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, 
 		}
 		message, err := res.UnmarshalNew()
 		if err != nil {
-			return envoy.Resources{}, err
+			return xds.Resources{}, err
 		}
 		typeURL := res.GetTypeUrl()
 		switch typeURL {
 		case envoy.ListenerTypeURL:
 			listener, ok := message.(*envoy_config_listener.Listener)
 			if !ok {
-				return envoy.Resources{}, fmt.Errorf("invalid type for Listener: %T", message)
+				return xds.Resources{}, fmt.Errorf("invalid type for Listener: %T", message)
 			}
 			// Check that a listener name is provided
 			if listener.Name == "" {
-				return envoy.Resources{}, fmt.Errorf("unspecified Listener name")
+				return xds.Resources{}, fmt.Errorf("unspecified Listener name")
 			}
 
-			if option.Config.EnableBPFTProxy {
+			if r.enableBPFTProxy && listener.GetInternalListener() == nil {
 				// Envoy since 1.20.0 uses SO_REUSEPORT on listeners by default.
 				// BPF TPROXY is currently not compatible with SO_REUSEPORT, so
 				// disable it.  Note that this may degrade Envoy performance.
+				// Skip internal listeners as they don't bind to sockets and
+				// don't support the EnableReusePort field (validation would fail).
 				listener.EnableReusePort = &wrapperspb.BoolValue{Value: false}
 			}
 
@@ -189,7 +218,7 @@ func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, 
 
 			// Fill in SDS & RDS config source if unset
 			for _, fc := range listener.FilterChains {
-				fillInTransportSocketXDS(cecNamespace, cecName, fc.TransportSocket)
+				fillInTransportSocketXDS(cecNamespace, cecName, fc.TransportSocket, r.xdsMode)
 				foundCiliumNetworkFilter := false
 				for i, filter := range fc.Filters {
 					if filter.Name == ciliumNetworkFilterName {
@@ -217,7 +246,7 @@ func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, 
 								rds.RouteConfigName, updated = api.ResourceQualifiedName(cecNamespace, cecName, rds.RouteConfigName, api.ForceNamespace)
 							}
 							if rds.ConfigSource == nil {
-								rds.ConfigSource = envoy.CiliumXDSConfigSource
+								rds.ConfigSource = envoy.CiliumConfigSource(r.xdsMode)
 								updated = true
 							}
 						}
@@ -227,7 +256,7 @@ func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, 
 							}
 						}
 						if injectCiliumDownstreamFilters {
-							l7FilterUpdated := injectCiliumL7Filter(hcmConfig)
+							l7FilterUpdated := injectCiliumL7Filter(r.accessLogPath, hcmConfig)
 							updated = updated || l7FilterUpdated
 						}
 
@@ -277,16 +306,16 @@ func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, 
 			// Check for duplicate after the name has been qualified
 			for i := range resources.Listeners {
 				if listener.Name == resources.Listeners[i].Name {
-					return envoy.Resources{}, fmt.Errorf("duplicate Listener name %q", listener.Name)
+					return xds.Resources{}, fmt.Errorf("duplicate Listener name %q", listener.Name)
 				}
 			}
 
 			if validate {
 				if err := listener.Validate(); err != nil {
-					return envoy.Resources{}, fmt.Errorf("failed to validate Listener (%w): %s", err, listener.String())
+					return xds.Resources{}, fmt.Errorf("failed to validate Listener (%w): %s", err, listener.String())
 				}
 			}
-			resources.Listeners = append(resources.Listeners, listener)
+			resources.Listeners[listener.Name] = listener
 
 			r.logger.Debug("ParseResources: Parsed listener",
 				logfields.Name, name,
@@ -295,11 +324,11 @@ func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, 
 		case envoy.RouteTypeURL:
 			route, ok := message.(*envoy_config_route.RouteConfiguration)
 			if !ok {
-				return envoy.Resources{}, fmt.Errorf("invalid type for Route: %T", message)
+				return xds.Resources{}, fmt.Errorf("invalid type for Route: %T", message)
 			}
 			// Check that a Route name is provided
 			if route.Name == "" {
-				return envoy.Resources{}, fmt.Errorf("unspecified RouteConfiguration name")
+				return xds.Resources{}, fmt.Errorf("unspecified RouteConfiguration name")
 			}
 
 			qualifyRouteConfigurationResourceNames(cecNamespace, cecName, route)
@@ -310,16 +339,16 @@ func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, 
 			// Check for duplicate after the name has been qualified
 			for i := range resources.Routes {
 				if route.Name == resources.Routes[i].Name {
-					return envoy.Resources{}, fmt.Errorf("duplicate Route name %q", route.Name)
+					return xds.Resources{}, fmt.Errorf("duplicate Route name %q", route.Name)
 				}
 			}
 
 			if validate {
 				if err := route.Validate(); err != nil {
-					return envoy.Resources{}, fmt.Errorf("failed to validate RouteConfiguration (%w): %s", err, route.String())
+					return xds.Resources{}, fmt.Errorf("failed to validate RouteConfiguration (%w): %s", err, route.String())
 				}
 			}
-			resources.Routes = append(resources.Routes, route)
+			resources.Routes[route.Name] = route
 
 			r.logger.Debug("ParseResources: Parsed route",
 				logfields.Name, name,
@@ -328,24 +357,28 @@ func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, 
 		case envoy.ClusterTypeURL:
 			cluster, ok := message.(*envoy_config_cluster.Cluster)
 			if !ok {
-				return envoy.Resources{}, fmt.Errorf("invalid type for Route: %T", message)
+				return xds.Resources{}, fmt.Errorf("invalid type for Route: %T", message)
 			}
 			// Check that a Cluster name is provided
 			if cluster.Name == "" {
-				return envoy.Resources{}, fmt.Errorf("unspecified Cluster name")
+				return xds.Resources{}, fmt.Errorf("unspecified Cluster name")
 			}
 
-			fillInTransportSocketXDS(cecNamespace, cecName, cluster.TransportSocket)
+			fillInTransportSocketXDS(cecNamespace, cecName, cluster.TransportSocket, r.xdsMode)
 
-			fillInCircuitBreakers(cluster, r.defaultMaxConcurrentRetries, r.defaultMaxConnections, r.defaultMaxRequests)
+			fillInCircuitBreakers(cluster, r.defaultMaxConcurrentRetries, r.defaultMaxConnections, r.defaultMaxRequests, r.defaultMaxPendingRequests)
 
 			// Fill in EDS config source if unset
 			if enum := cluster.GetType(); enum == envoy_config_cluster.Cluster_EDS {
 				if cluster.EdsClusterConfig == nil {
 					cluster.EdsClusterConfig = &envoy_config_cluster.Cluster_EdsClusterConfig{}
 				}
-				if cluster.EdsClusterConfig.EdsConfig == nil {
-					cluster.EdsClusterConfig.EdsConfig = envoy.CiliumXDSConfigSource
+				if cluster.EdsClusterConfig.EdsConfig == nil || r.xdsMode.IsADS() {
+					// In ADS mode all inline xDS references must use the aggregated
+					// stream. Gateway-generated CEC clusters may already carry a split
+					// xDS source, so normalize only ADS mode and preserve the existing
+					// behavior for legacy split xDS mode.
+					cluster.EdsClusterConfig.EdsConfig = envoy.CiliumConfigSource(r.xdsMode)
 				}
 			}
 
@@ -359,16 +392,16 @@ func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, 
 			// Check for duplicate after the name has been qualified
 			for i := range resources.Clusters {
 				if cluster.Name == resources.Clusters[i].Name {
-					return envoy.Resources{}, fmt.Errorf("duplicate Cluster name %q", cluster.Name)
+					return xds.Resources{}, fmt.Errorf("duplicate Cluster name %q", cluster.Name)
 				}
 			}
 
 			if validate {
 				if err := cluster.Validate(); err != nil {
-					return envoy.Resources{}, fmt.Errorf("failed to validate Cluster %q (%w): %s", cluster.Name, err, cluster.String())
+					return xds.Resources{}, fmt.Errorf("failed to validate Cluster %q (%w): %s", cluster.Name, err, cluster.String())
 				}
 			}
-			resources.Clusters = append(resources.Clusters, cluster)
+			resources.Clusters[cluster.Name] = cluster
 
 			r.logger.Debug("ParseResources: Parsed cluster",
 				logfields.Name, name,
@@ -377,11 +410,11 @@ func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, 
 		case envoy.EndpointTypeURL:
 			endpoints, ok := message.(*envoy_config_endpoint.ClusterLoadAssignment)
 			if !ok {
-				return envoy.Resources{}, fmt.Errorf("invalid type for Route: %T", message)
+				return xds.Resources{}, fmt.Errorf("invalid type for Route: %T", message)
 			}
 			// Check that a Cluster name is provided
 			if endpoints.ClusterName == "" {
-				return envoy.Resources{}, fmt.Errorf("unspecified ClusterLoadAssignment cluster_name")
+				return xds.Resources{}, fmt.Errorf("unspecified ClusterLoadAssignment cluster_name")
 			}
 
 			name := endpoints.ClusterName
@@ -390,16 +423,16 @@ func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, 
 			// Check for duplicate after the name has been qualified
 			for i := range resources.Endpoints {
 				if endpoints.ClusterName == resources.Endpoints[i].ClusterName {
-					return envoy.Resources{}, fmt.Errorf("duplicate cluster_name %q", endpoints.ClusterName)
+					return xds.Resources{}, fmt.Errorf("duplicate cluster_name %q", endpoints.ClusterName)
 				}
 			}
 
 			if validate {
 				if err := endpoints.Validate(); err != nil {
-					return envoy.Resources{}, fmt.Errorf("failed to validate ClusterLoadAssignment for cluster %q (%w): %s", endpoints.ClusterName, err, endpoints.String())
+					return xds.Resources{}, fmt.Errorf("failed to validate ClusterLoadAssignment for cluster %q (%w): %s", endpoints.ClusterName, err, endpoints.String())
 				}
 			}
-			resources.Endpoints = append(resources.Endpoints, endpoints)
+			resources.Endpoints[endpoints.ClusterName] = endpoints
 
 			r.logger.Debug("ParseResources: Parsed endpoints for cluster",
 				logfields.Name, name,
@@ -408,11 +441,11 @@ func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, 
 		case envoy.SecretTypeURL:
 			secret, ok := message.(*envoy_config_tls.Secret)
 			if !ok {
-				return envoy.Resources{}, fmt.Errorf("invalid type for Secret: %T", message)
+				return xds.Resources{}, fmt.Errorf("invalid type for Secret: %T", message)
 			}
 			// Check that a Secret name is provided
 			if secret.Name == "" {
-				return envoy.Resources{}, fmt.Errorf("unspecified Secret name")
+				return xds.Resources{}, fmt.Errorf("unspecified Secret name")
 			}
 
 			name := secret.Name
@@ -421,23 +454,23 @@ func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, 
 			// Check for duplicate after the name has been qualified
 			for i := range resources.Secrets {
 				if secret.Name == resources.Secrets[i].Name {
-					return envoy.Resources{}, fmt.Errorf("duplicate Secret name %q", secret.Name)
+					return xds.Resources{}, fmt.Errorf("duplicate Secret name %q", secret.Name)
 				}
 			}
 
 			if validate {
 				if err := secret.Validate(); err != nil {
-					return envoy.Resources{}, fmt.Errorf("failed to validate Secret for cluster %q: %w", secret.Name, err)
+					return xds.Resources{}, fmt.Errorf("failed to validate Secret for cluster %q: %w", secret.Name, err)
 				}
 			}
-			resources.Secrets = append(resources.Secrets, secret)
+			resources.Secrets[secret.Name] = secret
 
 			r.logger.Debug("ParseResources: Parsed secret",
 				logfields.Name, name,
 				logfields.Secret, secret)
 
 		default:
-			return envoy.Resources{}, fmt.Errorf("unsupported type: %s", typeURL)
+			return xds.Resources{}, fmt.Errorf("unsupported type: %s", typeURL)
 		}
 	}
 
@@ -452,7 +485,7 @@ func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, 
 				listenerName := listener.Name
 				port, err := r.portAllocator.AllocateCRDProxyPort(listenerName)
 				if err != nil || port == 0 {
-					return envoy.Resources{}, fmt.Errorf("listener port allocation for %q failed: %w", listenerName, err)
+					return xds.Resources{}, fmt.Errorf("listener port allocation for %q failed: %w", listenerName, err)
 				}
 				if resources.PortAllocationCallbacks == nil {
 					resources.PortAllocationCallbacks = make(map[string]func(context.Context) error)
@@ -500,7 +533,10 @@ func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, 
 
 		if validate {
 			if err := listener.Validate(); err != nil {
-				return envoy.Resources{}, fmt.Errorf("failed to validate Listener %q (%w): %s", listener.Name, err, listener.String())
+				return xds.Resources{}, fmt.Errorf("failed to validate Listener %q (%w): %s", listener.Name, err, listener.String())
+			}
+			if listenerHasDuplicateFilterChainMatch(listener) {
+				return xds.Resources{}, fmt.Errorf("Listener %q contains filter chains with duplicate matching rules", listener.Name)
 			}
 		}
 	}
@@ -509,13 +545,13 @@ func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, 
 	for _, cluster := range resources.Clusters {
 		if cluster.LoadAssignment != nil {
 			if err := validateEDSEndpoints(cecNamespace, cecName, cluster.LoadAssignment, resources.Listeners); err != nil {
-				return envoy.Resources{}, fmt.Errorf("ParseResources: Cluster refers to missing internal listener %q (%w): %s", cluster.Name, err, cluster.String())
+				return xds.Resources{}, fmt.Errorf("ParseResources: Cluster refers to missing internal listener %q (%w): %s", cluster.Name, err, cluster.String())
 			}
 		}
 	}
 	for _, endpoints := range resources.Endpoints {
 		if err := validateEDSEndpoints(cecNamespace, cecName, endpoints, resources.Listeners); err != nil {
-			return envoy.Resources{}, fmt.Errorf("ParseResources: Endpoint refers to missing internal listener %q (%w): %s", endpoints.ClusterName, err, endpoints.String())
+			return xds.Resources{}, fmt.Errorf("ParseResources: Endpoint refers to missing internal listener %q (%w): %s", endpoints.ClusterName, err, endpoints.String())
 		}
 	}
 
@@ -530,7 +566,7 @@ func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, 
 			a := cluster.TypedExtensionProtocolOptions[httpProtocolOptionsType]
 			if a != nil {
 				if err := a.UnmarshalTo(opts); err != nil {
-					return envoy.Resources{}, fmt.Errorf("failed to unmarshal HttpProtocolOptions: %w", err)
+					return xds.Resources{}, fmt.Errorf("failed to unmarshal HttpProtocolOptions: %w", err)
 				}
 			}
 
@@ -541,22 +577,22 @@ func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, 
 			if ts != nil {
 				tc := ts.GetTypedConfig()
 				if tc == nil {
-					return envoy.Resources{}, fmt.Errorf("Transport socket has no type: %s", ts.String())
+					return xds.Resources{}, fmt.Errorf("Transport socket has no type: %s", ts.String())
 				}
 				switch tc.GetTypeUrl() {
 				case upstreamTlsContextTypeURL, quicUpstreamTransportTypeURL:
 					supportsALPN = true
 				}
 			}
-			injected, err := injectCiliumUpstreamL7Filter(opts, supportsALPN)
+			injected, err := injectCiliumUpstreamL7Filter(r.accessLogPath, opts, supportsALPN)
 			if err != nil {
-				return envoy.Resources{}, fmt.Errorf("failed to inject upstream filters for cluster %q: %w", cluster.Name, err)
+				return xds.Resources{}, fmt.Errorf("failed to inject upstream filters for cluster %q: %w", cluster.Name, err)
 			}
 			if injected {
 				cluster.TypedExtensionProtocolOptions[httpProtocolOptionsType] = toAny(opts)
 				if validate {
 					if err := cluster.Validate(); err != nil {
-						return envoy.Resources{}, fmt.Errorf("failed to validate Cluster %q after injecting Cilium upstream filters (%s): %w", cluster.Name, cluster.String(), err)
+						return xds.Resources{}, fmt.Errorf("failed to validate Cluster %q after injecting Cilium upstream filters (%s): %w", cluster.Name, cluster.String(), err)
 					}
 				}
 			}
@@ -564,6 +600,23 @@ func (r *CECResourceParser) ParseResources(cecNamespace string, cecName string, 
 	}
 
 	return resources, nil
+}
+
+// listenerHasDuplicateFilterChainMatch reports whether the listener contains
+// filter chains with identical matching rules. Rejection here is order
+// sensitive, so some configs pass here and Envoy will later reject them.
+func listenerHasDuplicateFilterChainMatch(listener *envoy_config_listener.Listener) bool {
+	seenMatches := make([]*envoy_config_listener.FilterChainMatch, 0, len(listener.GetFilterChains()))
+	for _, filterChain := range listener.GetFilterChains() {
+		match := filterChain.GetFilterChainMatch()
+		for _, seenMatch := range seenMatches {
+			if proto.Equal(match, seenMatch) {
+				return true
+			}
+		}
+		seenMatches = append(seenMatches, match)
+	}
+	return false
 }
 
 // 'l7lb' triggers the upstream mark to embed source pod EndpointID instead of source security ID
@@ -575,6 +628,10 @@ func (r *CECResourceParser) getBPFMetadataListenerFilter(useOriginalSourceAddr b
 		IsL7Lb:                   l7lb,
 		ProxyId:                  uint32(proxyPort),
 		IpcacheName:              ipcache.Name,
+	}
+
+	if r.xdsMode != envoyCfg.EnvoyXDSModeSplit {
+		conf.CiliumConfigSource = envoy.CiliumConfigSource(r.xdsMode)
 	}
 
 	if isHTTPListener && r.httpLingerConfig >= 0 {
@@ -596,12 +653,12 @@ func (r *CECResourceParser) getBPFMetadataListenerFilter(useOriginalSourceAddr b
 	// One solution to this dilemma would be to never configure these addresses if
 	// useOriginalSourceAddr is true and let such traffic fail.
 	if l7lb {
-		if r.ingressIPv4 != nil {
+		if r.ingressIPv4.IsValid() {
 			conf.Ipv4SourceAddress = r.ingressIPv4.String()
 			// Enforce ingress policy for Ingress
 			conf.EnforcePolicyOnL7Lb = true
 		}
-		if r.ingressIPv6 != nil {
+		if r.ingressIPv6.IsValid() {
 			conf.Ipv6SourceAddress = r.ingressIPv6.String()
 			// Enforce ingress policy for Ingress
 			conf.EnforcePolicyOnL7Lb = true
@@ -649,7 +706,7 @@ func qualifyEDSEndpoints(namespace, name string, eds *envoy_config_endpoint.Clus
 
 // validateAddress checks that the referred to internal listener is specified, if it is in the same CRD
 func validateAddress(namespace, name string, address *envoy_config_core.Address,
-	listeners []*envoy_config_listener.Listener,
+	listeners map[string]*envoy_config_listener.Listener,
 ) error {
 	internalAddress := address.GetEnvoyInternalAddress()
 	if internalAddress != nil {
@@ -659,9 +716,9 @@ func validateAddress(namespace, name string, address *envoy_config_core.Address,
 			if internalNamespace == namespace && internalName == name {
 				found := false
 				// Check that the listener exists and is an internal listener
-				for i := range listeners {
-					if x.ServerListenerName == listeners[i].Name &&
-						listeners[i].GetInternalListener() != nil {
+				for _, listener := range listeners {
+					if x.ServerListenerName == listener.Name &&
+						listener.GetInternalListener() != nil {
 						found = true
 						break
 					}
@@ -677,7 +734,7 @@ func validateAddress(namespace, name string, address *envoy_config_core.Address,
 
 // validateEDSEndpoints checks internal listener references, if any
 func validateEDSEndpoints(namespace, name string, eds *envoy_config_endpoint.ClusterLoadAssignment,
-	listeners []*envoy_config_listener.Listener,
+	listeners map[string]*envoy_config_listener.Listener,
 ) error {
 	for _, cla := range eds.Endpoints {
 		for _, lbe := range cla.LbEndpoints {
@@ -760,7 +817,7 @@ func qualifyRouteConfigurationResourceNames(namespace, name string, routeConfig 
 }
 
 // injectCiliumL7Filter injects the Cilium HTTP filter just before the HTTP Router filter
-func injectCiliumL7Filter(hcmConfig *envoy_config_http.HttpConnectionManager) bool {
+func injectCiliumL7Filter(accessLogPath string, hcmConfig *envoy_config_http.HttpConnectionManager) bool {
 	foundCiliumL7Filter := false
 
 	for j, httpFilter := range hcmConfig.HttpFilters {
@@ -770,7 +827,7 @@ func injectCiliumL7Filter(hcmConfig *envoy_config_http.HttpConnectionManager) bo
 		case envoyRouterFilterName:
 			if !foundCiliumL7Filter {
 				hcmConfig.HttpFilters = append(hcmConfig.HttpFilters[:j+1], hcmConfig.HttpFilters[j:]...)
-				hcmConfig.HttpFilters[j] = envoy.GetCiliumHttpFilter()
+				hcmConfig.HttpFilters[j] = envoy.GetCiliumHttpFilter(accessLogPath)
 				return true
 			}
 		}
@@ -808,6 +865,28 @@ func qualifyHttpFilters(cecNamespace string, cecName string, hcmConfig *envoy_co
 					httpFilterConfig.ClusterMinHealthyPercentages = clusters
 					h.TypedConfig = toAny(httpFilterConfig)
 				}
+			case *extauthzv3.ExtAuthz:
+				var nameUpdated bool
+				switch svc := httpFilterConfig.Services.(type) {
+				case *extauthzv3.ExtAuthz_GrpcService:
+					if eg := svc.GrpcService.GetEnvoyGrpc(); eg != nil {
+						eg.ClusterName, nameUpdated = api.ResourceQualifiedName(cecNamespace, cecName, eg.ClusterName)
+						if nameUpdated {
+							updated = true
+							h.TypedConfig = toAny(httpFilterConfig)
+						}
+					}
+				case *extauthzv3.ExtAuthz_HttpService:
+					if uri := svc.HttpService.GetServerUri(); uri != nil {
+						if cluster, ok := uri.HttpUpstreamType.(*envoy_config_core.HttpUri_Cluster); ok {
+							cluster.Cluster, nameUpdated = api.ResourceQualifiedName(cecNamespace, cecName, cluster.Cluster)
+							if nameUpdated {
+								updated = true
+								h.TypedConfig = toAny(httpFilterConfig)
+							}
+						}
+					}
+				}
 			}
 		}
 	}
@@ -816,7 +895,7 @@ func qualifyHttpFilters(cecNamespace string, cecName string, hcmConfig *envoy_co
 }
 
 // injectCiliumUpstreamL7Filter injects the Cilium HTTP filter just before the Upstream Codec filter
-func injectCiliumUpstreamL7Filter(opts *envoy_config_upstream.HttpProtocolOptions, supportsALPN bool) (bool, error) {
+func injectCiliumUpstreamL7Filter(accessLogPath string, opts *envoy_config_upstream.HttpProtocolOptions, supportsALPN bool) (bool, error) {
 	filters := opts.GetHttpFilters()
 	if filters == nil {
 		filters = make([]*envoy_config_http.HttpFilter, 0, 2)
@@ -848,9 +927,9 @@ func injectCiliumUpstreamL7Filter(opts *envoy_config_upstream.HttpProtocolOption
 		j := codecFilterIndex
 		if j >= 0 {
 			filters = append(filters[:j+1], filters[j:]...)
-			filters[j] = envoy.GetCiliumHttpFilter()
+			filters[j] = envoy.GetCiliumHttpFilter(accessLogPath)
 		} else {
-			filters = append(filters, envoy.GetCiliumHttpFilter())
+			filters = append(filters, envoy.GetCiliumHttpFilter(accessLogPath))
 		}
 		changed = true
 	}
@@ -890,11 +969,11 @@ func injectCiliumUpstreamL7Filter(opts *envoy_config_upstream.HttpProtocolOption
 	return changed, nil
 }
 
-func qualifySdsSecretConfig(sc *envoy_config_tls.SdsSecretConfig, cecNamespace string, cecName string) bool {
+func qualifySdsSecretConfig(sc *envoy_config_tls.SdsSecretConfig, cecNamespace string, cecName string, xdsMode envoyCfg.XDSMode) bool {
 	updated := false
 
 	if sc.SdsConfig == nil {
-		sc.SdsConfig = envoy.CiliumXDSConfigSource
+		sc.SdsConfig = envoy.CiliumConfigSource(xdsMode)
 		updated = true
 	}
 	var nameUpdated bool
@@ -906,19 +985,19 @@ func qualifySdsSecretConfig(sc *envoy_config_tls.SdsSecretConfig, cecNamespace s
 	return updated
 }
 
-func fillInTlsContextXDS(cecNamespace string, cecName string, tls *envoy_config_tls.CommonTlsContext) bool {
+func fillInTlsContextXDS(cecNamespace string, cecName string, tls *envoy_config_tls.CommonTlsContext, xdsMode envoyCfg.XDSMode) bool {
 	updated := false
 
 	if tls != nil {
 		for _, sc := range tls.TlsCertificateSdsSecretConfigs {
-			updated = qualifySdsSecretConfig(sc, cecNamespace, cecName) || updated
+			updated = qualifySdsSecretConfig(sc, cecNamespace, cecName, xdsMode) || updated
 		}
 		if sc := tls.GetValidationContextSdsSecretConfig(); sc != nil {
-			updated = qualifySdsSecretConfig(sc, cecNamespace, cecName) || updated
+			updated = qualifySdsSecretConfig(sc, cecNamespace, cecName, xdsMode) || updated
 		}
 		if cvc := tls.GetCombinedValidationContext(); cvc != nil {
 			if sc := cvc.GetValidationContextSdsSecretConfig(); sc != nil {
-				updated = qualifySdsSecretConfig(sc, cecNamespace, cecName) || updated
+				updated = qualifySdsSecretConfig(sc, cecNamespace, cecName, xdsMode) || updated
 			}
 		}
 	}
@@ -926,7 +1005,7 @@ func fillInTlsContextXDS(cecNamespace string, cecName string, tls *envoy_config_
 	return updated
 }
 
-func fillInTransportSocketXDS(cecNamespace string, cecName string, ts *envoy_config_core.TransportSocket) {
+func fillInTransportSocketXDS(cecNamespace string, cecName string, ts *envoy_config_core.TransportSocket, xdsMode envoyCfg.XDSMode) {
 	if ts != nil {
 		if tc := ts.GetTypedConfig(); tc != nil {
 			any, err := tc.UnmarshalNew()
@@ -937,17 +1016,17 @@ func fillInTransportSocketXDS(cecNamespace string, cecName string, ts *envoy_con
 			switch tls := any.(type) {
 			case *envoy_config_tls.DownstreamTlsContext:
 
-				wasUpdated := fillInTlsContextXDS(cecNamespace, cecName, tls.CommonTlsContext)
+				wasUpdated := fillInTlsContextXDS(cecNamespace, cecName, tls.CommonTlsContext, xdsMode)
 
 				if tls.GetSessionTicketKeysSdsSecretConfig() != nil {
-					wasUpdated = qualifySdsSecretConfig(tls.GetSessionTicketKeysSdsSecretConfig(), cecNamespace, cecName) || wasUpdated
+					wasUpdated = qualifySdsSecretConfig(tls.GetSessionTicketKeysSdsSecretConfig(), cecNamespace, cecName, xdsMode) || wasUpdated
 				}
 
 				if wasUpdated {
 					updated = toAny(tls)
 				}
 			case *envoy_config_tls.UpstreamTlsContext:
-				if fillInTlsContextXDS(cecNamespace, cecName, tls.CommonTlsContext) {
+				if fillInTlsContextXDS(cecNamespace, cecName, tls.CommonTlsContext, xdsMode) {
 					updated = toAny(tls)
 				}
 			}
@@ -960,13 +1039,14 @@ func fillInTransportSocketXDS(cecNamespace string, cecName string, ts *envoy_con
 	}
 }
 
-func fillInCircuitBreakers(cluster *envoy_config_cluster.Cluster, defaultConcurrentRetries uint32, defaultMaxConnections uint32, defaultRequests uint32) {
+func fillInCircuitBreakers(cluster *envoy_config_cluster.Cluster, defaultConcurrentRetries, defaultMaxConnections, defaultRequests, defaultPendingRequests uint32) {
 	if cluster.CircuitBreakers == nil {
 		cluster.CircuitBreakers = &envoy_config_cluster.CircuitBreakers{
 			Thresholds: []*envoy_config_cluster.CircuitBreakers_Thresholds{{
-				MaxRetries:     &wrapperspb.UInt32Value{Value: defaultConcurrentRetries},
-				MaxConnections: &wrapperspb.UInt32Value{Value: defaultMaxConnections},
-				MaxRequests:    &wrapperspb.UInt32Value{Value: defaultRequests},
+				MaxRetries:         &wrapperspb.UInt32Value{Value: defaultConcurrentRetries},
+				MaxConnections:     &wrapperspb.UInt32Value{Value: defaultMaxConnections},
+				MaxRequests:        &wrapperspb.UInt32Value{Value: defaultRequests},
+				MaxPendingRequests: &wrapperspb.UInt32Value{Value: defaultPendingRequests},
 			}},
 		}
 	}

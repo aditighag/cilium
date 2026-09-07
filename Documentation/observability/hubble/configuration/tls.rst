@@ -46,18 +46,27 @@ restart Hubble server or Hubble Relay.
         their expiration date). The certgen method is easier to implement than
         cert-manager but less flexible.
 
-        ::
+        The following Helm values configure certgen:
 
-            --set hubble.tls.auto.enabled=true               # enable automatic TLS certificate generation
-            --set hubble.tls.auto.method=cronJob             # auto generate certificates using cronJob method
-            --set hubble.tls.auto.certValidityDuration=1095  # certificates validity duration in days (default 3 years)
-            --set hubble.tls.auto.schedule="0 0 1 */4 *"     # schedule for certificates re-generation (crontab syntax)
+        .. code-block:: yaml
+
+            hubble:
+              tls:
+                auto:
+                  # enable automatic TLS certificate generation
+                  enabled: true
+                  # auto generate certificates using cronJob method
+                  method: cronJob
+                  # certificates validity duration in days (default 3 years)
+                  certValidityDuration: 1095
+                  # schedule for certificates re-generation (crontab syntax)
+                  schedule: "0 0 1 */4 *"
 
     .. group-tab:: cert-manager
 
         This method relies on `cert-manager <https://cert-manager.io/>`__ to generate
-        the TLS certificates. cert-manager has becomes the de facto way to manage TLS on
-        Kubernetes, and it has the following advantages compared to the other
+        the TLS certificates. cert-manager is the de facto way to manage TLS certificates
+        on Kubernetes, and it has the following advantages compared to the other
         documented methods:
 
         * Support for multiple issuers (e.g. a custom CA,
@@ -76,27 +85,47 @@ restart Hubble server or Hubble Relay.
            and setup an `issuer <https://cert-manager.io/docs/configuration/>`_.
            Please make sure that your issuer is able to create certificates under the
            ``cilium.io`` domain name.
-        #. Install/upgrade Cilium including the following Helm flags:
+        #. Install or upgrade Cilium with the following Helm values:
 
-        ::
+        .. code-block:: yaml
 
-            --set hubble.tls.auto.enabled=true                                 # enable automatic TLS certificate generation
-            --set hubble.tls.auto.method=certmanager                           # auto generate certificates using cert-manager
-            --set hubble.tls.auto.certValidityDuration=1095                    # certificates validity duration in days (default 3 years)
-            --set hubble.tls.auto.certManagerIssuerRef.group="cert-manager.io" # Reference to cert-manager's issuer
-            --set hubble.tls.auto.certManagerIssuerRef.kind="ClusterIssuer"
-            --set hubble.tls.auto.certManagerIssuerRef.name="ca-issuer"
+            hubble:
+              tls:
+                auto:
+                  # enable automatic TLS certificate generation
+                  enabled: true
+                  # auto generate certificates using cert-manager
+                  method: certmanager
+                  # certificates validity duration in days (default 3 years)
+                  certValidityDuration: 1095
+                  certManagerIssuerRef:
+                    # Reference to cert-manager's issuer
+                    group: cert-manager.io
+                    kind: ClusterIssuer
+                    name: ca-issuer
+
+        During the first Cilium installation, cert-manager's webhook might not
+        yet be available when Cilium creates its ``Certificate`` resources. See
+        :ref:`hubble_enable_tls_troubleshooting` if that occurs.
 
     .. group-tab:: Helm
 
         When using Helm, TLS certificates are (re-)generated every time Helm is used
-        for install or upgrade.
+        to install or upgrade Cilium.
 
-        ::
+        The following Helm values configure Helm certificate generation:
 
-            --set hubble.tls.auto.enabled=true               # enable automatic TLS certificate generation
-            --set hubble.tls.auto.method=helm                # auto generate certificates using helm method
-            --set hubble.tls.auto.certValidityDuration=1095  # certificates validity duration in days (default 3 years)
+        .. code-block:: yaml
+
+            hubble:
+              tls:
+                auto:
+                  # enable automatic TLS certificate generation
+                  enabled: true
+                  # auto generate certificates using helm method
+                  method: helm
+                  # certificates validity duration in days (default 3 years)
+                  certValidityDuration: 1095
 
         The downside of the Helm method is that while certificates are automatically
         generated, they are not automatically renewed.  Consequently, running
@@ -107,16 +136,20 @@ restart Hubble server or Hubble Relay.
 
         In order to provide your own TLS certificates, ``hubble.tls.auto.enabled`` must be
         set to ``false``, secrets containing the certificates must be created in the
-        ``kube-system`` namespace, and the secret names must be provided to Helm.
+        namespace where Cilium is installed, which is typically ``kube-system``,
+        and the secret names must be provided to Helm.
 
-        Provided files must be **base64 encoded** PEM certificates.
+        The **Common Name (CN)** and **Subject Alternative Name (SAN)** of the
+        certificates must be set as follows. ``<cluster-name>`` refers to the
+        cluster name defined by ``cluster.name`` (defaults to ``default``):
 
-        In addition, the **Common Name (CN)** and **Subject Alternative Name (SAN)**
-        of the certificate for Hubble server MUST be set to
-        ``*.{cluster-name}.hubble-grpc.cilium.io`` where ``{cluster-name}`` is the
-        cluster name defined by ``cluster.name`` (defaults to ``default``).
+        - Hubble server: ``*.<cluster-name>.hubble-grpc.cilium.io``
+        - Hubble Relay: ``*.hubble-relay.cilium.io``
+        - Hubble UI: ``*.hubble-ui.cilium.io``
+        - Hubble metrics: ``<cluster-name>.hubble-metrics.cilium.io``
 
-        Once the certificates have been issued, the secrets must be created in the ``kube-system`` namespace.
+        Once the certificates have been issued, create the secrets in the target
+        namespace.
 
         Each secret must contain the following keys:
 
@@ -151,24 +184,101 @@ restart Hubble server or Hubble Relay.
 
           $ kubectl -n kube-system create secret generic hubble-metrics-certs --from-file=hubble-metrics.crt --from-file=hubble-metrics.key --from-file=ca.crt
 
-        After the secrets have been created, the secret names must be provided to Helm and automatic certificate generation must be disabled:
+        After the secrets have been created, provide their names to Helm and
+        disable automatic certificate generation with the following Helm values:
 
-        ::
+        .. code-block:: yaml
 
-            --set hubble.tls.auto.enabled=false                                       # Disable automatic TLS certificate generation
-            --set hubble.tls.server.existingSecret="hubble-server-certs"
-            --set hubble.relay.tls.server.enabled=true                                # Enable TLS on Hubble Relay (optional)
-            --set hubble.relay.tls.server.existingSecret="hubble-relay-server-certs"
-            --set hubble.relay.tls.client.existingSecret="hubble-relay-client-certs"
-            --set hubble.ui.tls.client.existingSecret="hubble-ui-client-certs"
-            --set hubble.metrics.tls.enabled=true                                     # Enable TLS on the Hubble metrics API (optional)
-            --set hubble.metrics.tls.server.existingSecret="hubble-metrics-certs"
+            hubble:
+              tls:
+                auto:
+                  # Disable automatic TLS certificate generation.
+                  enabled: false
+                server:
+                  existingSecret: hubble-server-certs
+              relay:
+                tls:
+                  server:
+                    # Enable TLS on Hubble Relay (optional).
+                    enabled: true
+                    existingSecret: hubble-relay-server-certs
+                  client:
+                    existingSecret: hubble-relay-client-certs
+              ui:
+                tls:
+                  client:
+                    existingSecret: hubble-ui-client-certs
+              metrics:
+                tls:
+                  # Enable TLS on the Hubble metrics API (optional).
+                  enabled: true
+                  server:
+                    existingSecret: hubble-metrics-certs
 
         - ``hubble.relay.tls.server.existingSecret`` and ``hubble.ui.tls.client.existingSecret``
           only need to be provided when ``hubble.relay.tls.server.enabled=true`` (default ``false``).
         - ``hubble.ui.tls.client.existingSecret`` only needs to be provided when ``hubble.ui.enabled`` (default ``false``).
         - ``hubble.metrics.tls.server.existingSecret`` only needs to be provided when ``hubble.metrics.tls.enabled`` (default ``false``).
           For more details on configuring the Hubble metrics API with TLS, see :ref:`hubble_configure_metrics_tls`.
+
+    .. group-tab:: Custom Per-Pod Certificates
+
+        If you want to provide TLS certificates directly to each pod rather
+        than through Kubernetes Secrets (e.g., per-pod certificates issued at
+        runtime by HashiCorp Vault, the cert-manager CSI driver, or SPIFFE),
+        configure a certificate agent and mount its output into the component.
+
+        The external certificate agent is responsible for generating valid
+        certificates. It must generate certificates with the same CN and
+        SAN requirements as user-provided certificates, and write these files:
+
+        - Hubble server: ``server.crt``, ``server.key``, and
+          ``client-ca.crt`` in ``/var/lib/cilium/tls/hubble``
+        - Hubble Relay: ``client.crt``, ``client.key``, and
+          ``hubble-server-ca.crt`` in ``/var/lib/hubble-relay/tls``. If Relay
+          TLS server is enabled, you also need ``server.crt`` and ``server.key``
+          in the same directory
+        - Hubble UI: ``client.crt``, ``client.key``, and
+          ``hubble-relay-ca.crt`` in ``/var/lib/hubble-ui/certs``
+
+        The following Helm values disable the default certificate volumes:
+
+        .. code-block:: yaml
+
+            hubble:
+              tls:
+                disableDefaultVolumes: true
+
+              relay:
+                tls:
+                  disableDefaultVolumes: true
+
+              ui:
+                tls:
+                  disableDefaultVolumes: true
+
+        Configure the certificate agent using the following extension points:
+
+        .. code-block:: yaml
+
+            # Hubble server (on the cilium-agent DaemonSet)
+            extraInitContainers: []
+            extraVolumes: []
+            extraVolumeMounts: []
+
+            hubble:
+              relay:
+                extraInitContainers: []
+                extraVolumes: []
+                extraVolumeMounts: []
+
+              ui:
+                extraInitContainers: []
+                backend:
+                  extraVolumes: []
+                  extraVolumeMounts: []
+
+        Their exact contents are out of scope for this guide.
 
 .. _hubble_enable_tls_troubleshooting:
 
@@ -182,9 +292,7 @@ If you encounter issues after enabling TLS, you can use the following instructio
     .. group-tab:: cert-manager
 
 
-        While installing Cilium or cert-manager you may get the following error:
-
-        ::
+        While installing Cilium or cert-manager you may get the following error::
 
             Error: Internal error occurred: failed calling webhook "webhook.cert-manager.io": Post "https://cert-manager-webhook.cert-manager.svc:443/mutate?timeout=10s": dial tcp x.x.x.x:443: connect: connection refused
 
@@ -238,7 +346,7 @@ If you encounter issues after enabling TLS, you can use the following instructio
 
                     $ helm install cert-manager jetstack/cert-manager \
                             --set webhook.hostNetwork=true \
-                            --set webhook.tolerations='["operator": "Exists"]'
+                            --set 'webhook.tolerations[0].operator=Exists'
 
                 Then configure an issuer and install Cilium.
 
@@ -268,6 +376,45 @@ If you encounter issues after enabling TLS, you can use the following instructio
         of the certificate for Hubble server MUST be set to
         ``*.{cluster-name}.hubble-grpc.cilium.io`` where ``{cluster-name}`` is
         the cluster name defined by ``cluster.name`` (defaults to ``default``).
+
+    .. group-tab:: Custom Per-Pod Certificates
+
+        **Pod stuck in init / CrashLoopBackOff:**
+
+        The certificate agent init container must write all expected cert files
+        before the main container starts. Check its logs and the pod's events:
+
+        .. code-block:: shell-session
+
+            $ kubectl -n kube-system logs <pod> -c <cert-agent>
+            $ kubectl -n kube-system describe pod <pod>
+
+        Verify the file names match what each component expects (see the
+        "Custom Per-Pod Certificates" configuration tab for the full list).
+
+        **TLS handshake failures:**
+
+        If components start but fail to connect over TLS, check the
+        component logs for TLS errors:
+
+        .. code-block:: shell-session
+
+            $ kubectl -n kube-system logs <pod> -c <container>
+
+        Common causes:
+
+        - The certificate CN/SAN does not match the expected pattern
+          (e.g., ``*.{cluster-name}.hubble-grpc.cilium.io`` for Hubble server)
+        - The CA certificate used to sign the server cert does not match
+          the CA file provided to the client
+        - Certificates have expired
+
+        **Secrets still being generated:**
+
+        If the chart is still generating TLS Secrets, verify that
+        ``tls.auto.enabled`` is set to ``false``. The auto-generated
+        Secrets are controlled by this flag, not by
+        ``disableDefaultVolumes``.
 
 
 Validating the Installation

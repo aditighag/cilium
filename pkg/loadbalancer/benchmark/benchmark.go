@@ -23,7 +23,6 @@ import (
 	"github.com/cilium/statedb/reconciler"
 	k8sRuntime "k8s.io/apimachinery/pkg/runtime"
 
-	daemonk8s "github.com/cilium/cilium/daemon/k8s"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/hive"
@@ -32,6 +31,7 @@ import (
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	slim_discovery_v1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/discovery/v1"
+	k8sTables "github.com/cilium/cilium/pkg/k8s/tables"
 	k8sTestUtils "github.com/cilium/cilium/pkg/k8s/testutils"
 	"github.com/cilium/cilium/pkg/loadbalancer"
 	lbmaps "github.com/cilium/cilium/pkg/loadbalancer/maps"
@@ -446,7 +446,7 @@ func checkTables(db *statedb.DB, writer *writer.Writer, svcs []*slim_corev1.Serv
 				if fe.Status.Kind != reconciler.StatusKindDone {
 					err = errors.Join(err, fmt.Errorf("Incorrect status for frontend #%06d, got %v, want %v", i, fe.Status.Kind, "Done"))
 				}
-				backends := slices.Collect(statedb.ToSeq(iter.Seq2[loadbalancer.BackendParams, statedb.Revision](fe.Backends)))
+				backends := slices.Collect(statedb.ToSeq(iter.Seq2[*loadbalancer.Backend, statedb.Revision](fe.Backends)))
 				for wantAddr := range epSlices[i].Backends { // There is only one element in this map.
 					if backends[0].Address.AddrCluster() != wantAddr {
 						err = errors.Join(err, fmt.Errorf("Incorrect backend address for frontend #%06d, got %v, want %v", i, backends[0].Address.AddrCluster(), wantAddr))
@@ -462,9 +462,18 @@ func checkTables(db *statedb.DB, writer *writer.Writer, svcs []*slim_corev1.Serv
 		if backendsNo := writer.Backends().NumObjects(txn); backendsNo != len(epSlices) {
 			err = errors.Join(err, fmt.Errorf("Incorrect number of backends, got %d, want %d", backendsNo, len(epSlices)))
 		} else {
+			expectedBySvc := map[loadbalancer.ServiceName]*k8s.Endpoints{}
+			for _, ep := range epSlices {
+				expectedBySvc[ep.ServiceName] = ep
+			}
 			i := 0
 			for be := range writer.Backends().All(txn) {
-				want := epSlices[i]
+				want, ok := expectedBySvc[be.ServiceName]
+				if !ok {
+					err = errors.Join(err, fmt.Errorf("Unexpected backend service for backend #%06d: %s", i, be.ServiceName.String()))
+					i++
+					continue
+				}
 				for wantAddr, wantBe := range want.Backends { // There is only one element in this map.
 					if be.Address.AddrCluster() != wantAddr {
 						err = errors.Join(err, fmt.Errorf("Incorrect address for backend #%06d, got %v, want %v", i, be.Address.AddrCluster(), wantAddr))
@@ -478,20 +487,14 @@ func checkTables(db *statedb.DB, writer *writer.Writer, svcs []*slim_corev1.Serv
 						}
 					}
 				}
-				if be.Instances.Len() != 1 {
-					err = errors.Join(err, fmt.Errorf("Incorrect instances count for backend #%06d, got %v, want %v", i, be.Instances.Len(), 1))
-				} else {
-					for k, instance := range be.Instances.All() { // There should
-						if k.ServiceName.Name() != svcs[i].Name {
-							err = errors.Join(err, fmt.Errorf("Incorrect service name for backend #%06d, got %v, want %v", i, k.ServiceName.Name(), svcs[i].Name))
-						}
-						if state, tmpErr := instance.State.String(); tmpErr != nil || state != "active" {
-							err = errors.Join(err, fmt.Errorf("Incorrect state for backend #%06d, got %q, want %q", i, state, "active"))
-						}
-						if instance.PortNames[0] != svcs[i].Spec.Ports[0].Name {
-							err = errors.Join(err, fmt.Errorf("Incorrect instance port name for backend #%06d, got %q, want %q", i, instance.PortNames[0], svcs[i].Spec.Ports[0].Name))
-						}
-					}
+				if be.ServiceName.Name() != svcs[i].Name {
+					err = errors.Join(err, fmt.Errorf("Incorrect service name for backend #%06d, got %v, want %v", i, be.ServiceName.Name(), svcs[i].Name))
+				}
+				if state, tmpErr := be.State.String(); tmpErr != nil || state != "active" {
+					err = errors.Join(err, fmt.Errorf("Incorrect state for backend #%06d, got %q, want %q", i, state, "active"))
+				}
+				if len(be.PortNames) == 0 || be.PortNames[0] != svcs[i].Spec.Ports[0].Name {
+					err = errors.Join(err, fmt.Errorf("Incorrect backend port name for backend #%06d, got %q, want %q", i, be.PortNames, svcs[i].Spec.Ports[0].Name))
 				}
 
 				i++
@@ -561,7 +564,7 @@ func testHive(maps lbmaps.LBMaps,
 				reflectors.EventStreamForBenchmark,
 			),
 
-			daemonk8s.PodTableCell,
+			k8sTables.PodTableCell,
 
 			cell.Invoke(func(db_ *statedb.DB, w *writer.Writer, bo_ *lbreconciler.BPFOps) {
 				*db = db_

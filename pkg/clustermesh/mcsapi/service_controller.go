@@ -21,11 +21,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	mcsapicontrollers "sigs.k8s.io/mcs-api/controllers"
-	mcsapiv1alpha1 "sigs.k8s.io/mcs-api/pkg/apis/v1alpha1"
+	mcsapiv1beta1 "sigs.k8s.io/mcs-api/pkg/apis/v1beta1"
 
 	controllerruntime "github.com/cilium/cilium/operator/pkg/controller-runtime"
 	"github.com/cilium/cilium/pkg/annotation"
 	mcsapitypes "github.com/cilium/cilium/pkg/clustermesh/mcsapi/types"
+	cmnamespace "github.com/cilium/cilium/pkg/clustermesh/namespace"
 )
 
 // mcsAPIServiceReconciler is a controller that creates a derived service from
@@ -34,13 +35,15 @@ import (
 // the existing clustermesh features for the MCS API Support.
 type mcsAPIServiceReconciler struct {
 	client.Client
-	Logger *slog.Logger
+	Logger          *slog.Logger
+	NamespaceConfig cmnamespace.Config
 }
 
-func newMCSAPIServiceReconciler(mgr ctrl.Manager, logger *slog.Logger) *mcsAPIServiceReconciler {
+func newMCSAPIServiceReconciler(mgr ctrl.Manager, logger *slog.Logger, namespaceConfig cmnamespace.Config) *mcsAPIServiceReconciler {
 	return &mcsAPIServiceReconciler{
-		Client: mgr.GetClient(),
-		Logger: logger,
+		Client:          mgr.GetClient(),
+		Logger:          logger,
+		NamespaceConfig: namespaceConfig,
 	}
 }
 
@@ -64,7 +67,7 @@ func derivedName(name types.NamespacedName) string {
 	return "derived-" + strings.ToLower(base32.HexEncoding.WithPadding(base32.NoPadding).EncodeToString(hash.Sum(nil)))[:10]
 }
 
-func servicePorts(svcImport *mcsapiv1alpha1.ServiceImport) []corev1.ServicePort {
+func servicePorts(svcImport *mcsapiv1beta1.ServiceImport) []corev1.ServicePort {
 	ports := make([]corev1.ServicePort, 0, len(svcImport.Spec.Ports))
 	for _, port := range svcImport.Spec.Ports {
 		ports = append(ports, corev1.ServicePort{
@@ -120,7 +123,7 @@ func getDesiredIPs(svc *corev1.Service) []string {
 // patchServiceImport patches the ServiceImport with the derived service name and
 // also report back the IPs of the derived service to the ServiceImport.
 func (r *mcsAPIServiceReconciler) patchServiceImport(
-	ctx context.Context, svcImport *mcsapiv1alpha1.ServiceImport,
+	ctx context.Context, svcImport *mcsapiv1beta1.ServiceImport,
 	derivedServiceName string, desiredIPs []string,
 ) error {
 	updated := false
@@ -150,11 +153,11 @@ func (r *mcsAPIServiceReconciler) getBaseDerivedService(
 	ctx context.Context,
 	req ctrl.Request,
 	derivedServiceName string,
-	svcImport *mcsapiv1alpha1.ServiceImport,
+	svcImport *mcsapiv1beta1.ServiceImport,
 ) (*corev1.Service, bool, error) {
 	isHeadless := false
 	if svcImport != nil {
-		isHeadless = svcImport.Spec.Type == mcsapiv1alpha1.Headless
+		isHeadless = svcImport.Spec.Type == mcsapiv1beta1.Headless
 	}
 
 	svcBase := &corev1.Service{
@@ -194,12 +197,22 @@ func (r *mcsAPIServiceReconciler) getBaseDerivedService(
 	return &svc, true, nil
 }
 
-func (r *mcsAPIServiceReconciler) getSvcImport(ctx context.Context, req ctrl.Request) (*mcsapiv1alpha1.ServiceImport, error) {
-	var svcImport mcsapiv1alpha1.ServiceImport
+func (r *mcsAPIServiceReconciler) getSvcImport(ctx context.Context, req ctrl.Request) (*mcsapiv1beta1.ServiceImport, error) {
+	var svcImport mcsapiv1beta1.ServiceImport
 	if err := r.Client.Get(ctx, req.NamespacedName, &svcImport); err != nil {
 		return nil, client.IgnoreNotFound(err)
 	}
 	return &svcImport, nil
+}
+
+func (r *mcsAPIServiceReconciler) getNamespace(ctx context.Context, name string) (*corev1.Namespace, error) {
+	var ns corev1.Namespace
+	key := types.NamespacedName{Name: name}
+
+	if err := r.Client.Get(ctx, key, &ns); err != nil {
+		return nil, client.IgnoreNotFound(err)
+	}
+	return &ns, nil
 }
 
 func (r *mcsAPIServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -215,6 +228,19 @@ func (r *mcsAPIServiceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	svc, svcExists, err := r.getBaseDerivedService(ctx, req, derivedServiceName, svcImport)
 	if err != nil {
 		return controllerruntime.Fail(err)
+	}
+
+	// Fetch namespace directly to avoid stale data from resource store.
+	// No Namespace watch needed since ServiceImport controller updates trigger reconciliation.
+	ns, err := r.getNamespace(ctx, req.Namespace)
+	if err != nil {
+		return controllerruntime.Fail(err)
+	}
+	if !cmnamespace.IsGlobalNamespace(ns, r.NamespaceConfig.GlobalNamespacesByDefault) {
+		if svcExists {
+			return controllerruntime.Fail(r.Client.Delete(ctx, svc))
+		}
+		return controllerruntime.Success()
 	}
 
 	if val, ok := svcImport.Annotations[annotation.SupportedIPFamilies]; val == "" && ok {
@@ -249,10 +275,14 @@ func (r *mcsAPIServiceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if svc.Labels == nil {
 		svc.Labels = map[string]string{}
 	}
-	svc.Labels[mcsapiv1alpha1.LabelServiceName] = req.NamespacedName.Name
+	svc.Labels[mcsapiv1beta1.LabelServiceName] = req.NamespacedName.Name
 
 	if !svcExists {
 		if err := r.Client.Create(ctx, svc); err != nil {
+			if k8sApiErrors.IsForbidden(err) && k8sApiErrors.HasStatusCause(err, corev1.NamespaceTerminatingCause) {
+				r.Logger.InfoContext(ctx, "Aborting reconciliation because namespace is being terminated")
+				return controllerruntime.Success()
+			}
 			return controllerruntime.Fail(err)
 		}
 	} else {
@@ -273,12 +303,12 @@ func (r *mcsAPIServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// the derived service name so we say that we own ServiceImport here
 		// and always derive the name in the Reconcile function anyway.
 		Named("ServiceMCSAPI").
-		For(&mcsapiv1alpha1.ServiceImport{}).
+		For(&mcsapiv1beta1.ServiceImport{}).
 		// Watch for changes to ServiceExport
-		Watches(&mcsapiv1alpha1.ServiceExport{}, &handler.EnqueueRequestForObject{}).
+		Watches(&mcsapiv1beta1.ServiceExport{}, &handler.EnqueueRequestForObject{}).
 		// Watch for changes to Services
 		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
-			svcImportOwner := getOwnerReferenceName(obj.GetOwnerReferences(), mcsapiv1alpha1.GroupVersion.String(), mcsapiv1alpha1.ServiceImportKindName)
+			svcImportOwner := getOwnerReferenceName(obj.GetOwnerReferences(), mcsapiv1beta1.GroupVersion.String(), mcsapiv1beta1.ServiceImportKindName)
 			if svcImportOwner == "" {
 				return []ctrl.Request{{NamespacedName: types.NamespacedName{
 					Name: obj.GetName(), Namespace: obj.GetNamespace(),

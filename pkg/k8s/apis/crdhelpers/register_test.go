@@ -88,7 +88,8 @@ func TestCreateUpdateCRD(t *testing.T) {
 				crd := getV1TestCRD()
 				client := fake.NewSimpleClientset()
 				require.NoError(t, k8sversion.Force(v1Support.Major+"."+v1Support.Minor))
-				return CreateUpdateCRD(hivetest.Logger(t), client, crd, newFakePoller(), NeedsUpdateV1Factory(labelKey, minVersion))
+				_, err := CreateUpdateCRD(t.Context(), hivetest.Logger(t), client, crd, newFakePoller(), NeedsUpdateV1Factory(labelKey, minVersion))
+				return err
 			},
 			wantErr: false,
 		},
@@ -99,7 +100,8 @@ func TestCreateUpdateCRD(t *testing.T) {
 				crd := getV1TestCRD()
 				client := fake.NewSimpleClientset()
 				require.NoError(t, k8sversion.Force(v1beta1Support.Major+"."+v1beta1Support.Minor))
-				return CreateUpdateCRD(hivetest.Logger(t), client, crd, newFakePoller(), NeedsUpdateV1Factory(labelKey, minVersion))
+				_, err := CreateUpdateCRD(t.Context(), hivetest.Logger(t), client, crd, newFakePoller(), NeedsUpdateV1Factory(labelKey, minVersion))
+				return err
 			},
 			wantErr: false,
 		},
@@ -126,7 +128,8 @@ func TestCreateUpdateCRD(t *testing.T) {
 				)
 				require.NoError(t, err)
 
-				return CreateUpdateCRD(hivetest.Logger(t), client, crd, newFakePoller(), NeedsUpdateV1Factory(labelKey, minVersion))
+				_, err = CreateUpdateCRD(t.Context(), hivetest.Logger(t), client, crd, newFakePoller(), NeedsUpdateV1Factory(labelKey, minVersion))
+				return err
 			},
 			wantErr: false,
 		},
@@ -166,7 +169,8 @@ func TestCreateUpdateCRD(t *testing.T) {
 				crd := getV1TestCRD()
 				crd.ObjectMeta.Name = crdToInstall.ObjectMeta.Name
 
-				return CreateUpdateCRD(hivetest.Logger(t), client, crd, newFakePoller(), NeedsUpdateV1Factory(labelKey, minVersion))
+				_, err = CreateUpdateCRD(t.Context(), hivetest.Logger(t), client, crd, newFakePoller(), NeedsUpdateV1Factory(labelKey, minVersion))
+				return err
 			},
 			wantErr: false,
 		},
@@ -278,8 +282,9 @@ func newFakePoller() fakePoller { return fakePoller{} }
 type fakePoller struct{}
 
 func (m fakePoller) Poll(
+	_ context.Context,
 	interval, duration time.Duration,
-	conditionFn func() (bool, error),
+	conditionFn func(context.Context) (bool, error),
 ) error {
 	return nil
 }

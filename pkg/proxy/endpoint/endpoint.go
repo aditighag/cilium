@@ -15,7 +15,7 @@ type EndpointInfoSource interface {
 	GetID() uint64
 	GetIPv4Address() string
 	GetIPv6Address() string
-	GetNamedPort(ingress bool, name string, proto u8proto.U8proto) uint16
+	GetIngressNamedPort(name string, proto u8proto.U8proto) uint16
 }
 
 // EndpointUpdater returns information about an endpoint being proxied and

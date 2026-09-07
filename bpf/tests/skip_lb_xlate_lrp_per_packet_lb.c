@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 /* Copyright Authors of Cilium */
 
-#include <bpf/ctx/unspec.h>
+#include <bpf/ctx/skb.h>
 #include "common.h"
 #include "pktgen.h"
 
@@ -28,7 +28,7 @@ ASSIGN_CONFIG(__u64, endpoint_netns_cookie, NETNS_COOKIE)
 #define V6_SERVICE_IP		v6_pod_one
 #define V6_BACKEND_IP		v6_pod_two
 
-PKTGEN("tc", "v4_local_redirect")
+PKTGEN(PROG_TYPE, "v4_local_redirect")
 int  v4_local_backend_to_service_packetgen(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -51,14 +51,9 @@ int  v4_local_backend_to_service_packetgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("tc", "v4_local_redirect")
+SETUP(PROG_TYPE, "v4_local_redirect")
 int v4_local_backend_to_service_setup(struct __ctx_buff *ctx)
 {
-	lb_v4_add_service_with_flags(V4_SERVICE_IP, SERVICE_PORT, IPPROTO_TCP, 1, 1,
-				     SVC_FLAG_ROUTABLE, SVC_FLAG_LOCALREDIRECT);
-	lb_v4_add_backend(V4_SERVICE_IP, SERVICE_PORT, 1, 124,
-			  V4_BACKEND_IP, BACKEND_PORT, IPPROTO_TCP, 0);
-
 	/* Add the service in cilium_skip_lb4 to skip service translation for request originating from the local backend */
 	struct skip_lb4_key key = {
 		.netns_cookie = NETNS_COOKIE,
@@ -66,6 +61,12 @@ int v4_local_backend_to_service_setup(struct __ctx_buff *ctx)
 		.port = SERVICE_PORT,
 	};
 	__u8 val = 0;
+
+	lb_v4_add_service_with_flags(V4_SERVICE_IP, SERVICE_PORT, IPPROTO_TCP, 1, 1,
+				     SVC_FLAG_ROUTABLE, SVC_FLAG_LOCALREDIRECT);
+	lb_v4_add_backend(V4_SERVICE_IP, SERVICE_PORT, 1, 124,
+			  V4_BACKEND_IP, BACKEND_PORT, IPPROTO_TCP, 0);
+
 	map_update_elem(&cilium_skip_lb4, &key, &val, BPF_ANY);
 
 	/* Add an IPCache entry for the backend pod */
@@ -78,7 +79,7 @@ int v4_local_backend_to_service_setup(struct __ctx_buff *ctx)
 /* Test that sending a packet from a backend pod to its own service does not
  * get sent back to the backend due to local redirect policy
  */
-CHECK("tc", "v4_local_redirect")
+CHECK(PROG_TYPE, "v4_local_redirect")
 int v4_local_backend_to_service_check(__maybe_unused const struct __ctx_buff *ctx)
 {
 	void *data;
@@ -88,6 +89,9 @@ int v4_local_backend_to_service_check(__maybe_unused const struct __ctx_buff *ct
 	struct tcphdr *l4;
 
 	test_init();
+
+	endpoint_v4_del_entry(V4_BACKEND_IP);
+
 	data = (void *)(long)ctx->data;
 	data_end = (void *)(long)ctx->data_end;
 	if (data + sizeof(__u32) > data_end)
@@ -117,7 +121,7 @@ int v4_local_backend_to_service_check(__maybe_unused const struct __ctx_buff *ct
 	test_finish();
 }
 
-PKTGEN("tc", "v6_local_redirect")
+PKTGEN(PROG_TYPE, "v6_local_redirect")
 int  v6_local_backend_to_service_packetgen(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -140,7 +144,7 @@ int  v6_local_backend_to_service_packetgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("tc", "v6_local_redirect")
+SETUP(PROG_TYPE, "v6_local_redirect")
 int v6_local_backend_to_service_setup(struct __ctx_buff *ctx)
 {
 	union v6addr service_ip __align_stack_8 = {};
@@ -171,7 +175,7 @@ int v6_local_backend_to_service_setup(struct __ctx_buff *ctx)
 	return pod_send_packet(ctx);
 }
 
-CHECK("tc", "v6_local_redirect")
+CHECK(PROG_TYPE, "v6_local_redirect")
 int v6_local_backend_to_service_check(__maybe_unused const struct __ctx_buff *ctx)
 {
 	void *data;

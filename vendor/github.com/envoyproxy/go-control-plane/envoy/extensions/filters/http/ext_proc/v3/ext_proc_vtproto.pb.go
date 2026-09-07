@@ -52,6 +52,18 @@ func (m *ExternalProcessor) MarshalToSizedBufferVTStrict(dAtA []byte) (int, erro
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
 	}
+	if m.AllowContentLengthHeader {
+		i--
+		if m.AllowContentLengthHeader {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i--
+		dAtA[i] = 0x1
+		i--
+		dAtA[i] = 0xd0
+	}
 	if m.ProcessingRequestModifier != nil {
 		if vtmsg, ok := interface{}(m.ProcessingRequestModifier).(interface {
 			MarshalToSizedBufferVTStrict([]byte) (int, error)
@@ -502,6 +514,16 @@ func (m *MetadataOptions) MarshalToSizedBufferVTStrict(dAtA []byte) (int, error)
 	if m.unknownFields != nil {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
+	}
+	if m.ClusterMetadataForwardingNamespaces != nil {
+		size, err := m.ClusterMetadataForwardingNamespaces.MarshalToSizedBufferVTStrict(dAtA[:i])
+		if err != nil {
+			return 0, err
+		}
+		i -= size
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(size))
+		i--
+		dAtA[i] = 0x1a
 	}
 	if m.ReceivingNamespaces != nil {
 		size, err := m.ReceivingNamespaces.MarshalToSizedBufferVTStrict(dAtA[:i])
@@ -980,6 +1002,9 @@ func (m *ExternalProcessor) SizeVT() (n int) {
 		}
 		n += 2 + l + protohelpers.SizeOfVarint(uint64(l))
 	}
+	if m.AllowContentLengthHeader {
+		n += 3
+	}
 	n += len(m.unknownFields)
 	return n
 }
@@ -1038,6 +1063,10 @@ func (m *MetadataOptions) SizeVT() (n int) {
 	}
 	if m.ReceivingNamespaces != nil {
 		l = m.ReceivingNamespaces.SizeVT()
+		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
+	}
+	if m.ClusterMetadataForwardingNamespaces != nil {
+		l = m.ClusterMetadataForwardingNamespaces.SizeVT()
 		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
 	}
 	n += len(m.unknownFields)

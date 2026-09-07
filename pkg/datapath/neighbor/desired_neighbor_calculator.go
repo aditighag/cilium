@@ -19,6 +19,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/cilium/cilium/pkg/datapath/tables"
+	"github.com/cilium/cilium/pkg/rate"
 	"github.com/cilium/cilium/pkg/time"
 )
 
@@ -79,7 +80,22 @@ func (c *desiredNeighborCalculator) Run(ctx context.Context, health cell.Health)
 	const resyncInterval = 5 * time.Minute
 	resyncTimer := time.NewTimer(resyncInterval)
 
+	// Limit the rate of reconciliation. Interval was fairly arbitrarily chosen,
+	// it seems a good balance between frequent updates and resource usage.
+	limit := rate.NewLimiter(15*time.Second, c.Config.NeighborCalculatorRatelimit)
+
 	for {
+		// Block until the rate limiter allows us to proceed
+		err := limit.Wait(ctx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				// If the context was canceled, we are shutting down, so stop the loop
+				return nil
+			}
+
+			return err
+		}
+
 		rx := c.DB.ReadTxn()
 
 		// Get inserted or updated forwardable IPs since the last revision processed
@@ -213,10 +229,9 @@ func (c *desiredNeighborCalculator) commitDesiredNeighbors(
 			Status:             reconciler.StatusPending(),
 		}, func(old *DesiredNeighbor, new *DesiredNeighbor) *DesiredNeighbor {
 			// New object, but no modifications
-			return &DesiredNeighbor{
-				DesiredNeighborKey: old.DesiredNeighborKey,
-				Status:             old.Status,
-			}
+			new.DesiredNeighborKey = old.DesiredNeighborKey
+			new.Status = old.Status
+			return new
 		}); err != nil {
 			errs = errors.Join(errs, fmt.Errorf("failed to insert desired neighbor: %w", err))
 		}
@@ -294,7 +309,7 @@ func (c *desiredNeighborCalculator) getNextHopIP(fip netip.Addr, ifindex int) (n
 }
 
 func l2Devices(tbl statedb.Table[*tables.Device], rx statedb.ReadTxn) ([]*tables.Device, <-chan struct{}) {
-	devIter, watch := tbl.ListWatch(rx, tables.DeviceSelectedIndex.Query(true))
+	devIter, watch := tbl.ListWatch(rx, tables.DevicesBySelected(true))
 
 	return slices.Collect(func(yield func(*tables.Device) bool) {
 		for dev := range devIter {

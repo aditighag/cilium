@@ -19,7 +19,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	mcsapiv1alpha1 "sigs.k8s.io/mcs-api/pkg/apis/v1alpha1"
+	mcsapiv1beta1 "sigs.k8s.io/mcs-api/pkg/apis/v1beta1"
 )
 
 func getExpectedDerivedLabels(localEpSliceName string) map[string]string {
@@ -44,15 +44,15 @@ var (
 	}}
 	commonDerivedName = derivedName(types.NamespacedName{Name: "full", Namespace: "default"})
 	commonLabels      = map[string]string{
-		"test-label":                      "copied",
-		mcsapiv1alpha1.LabelServiceName:   "full",
-		discoveryv1.LabelServiceName:      commonDerivedName,
-		mcsapiv1alpha1.LabelSourceCluster: "cluster1",
-		discoveryv1.LabelManagedBy:        endpointSliceLocalMCSAPIControllerName,
+		"test-label":                     "copied",
+		mcsapiv1beta1.LabelServiceName:   "full",
+		discoveryv1.LabelServiceName:     commonDerivedName,
+		mcsapiv1beta1.LabelSourceCluster: "cluster1",
+		discoveryv1.LabelManagedBy:       endpointSliceLocalMCSAPIControllerName,
 	}
 
 	endpointsliceMirrorFixtures = []client.Object{
-		&mcsapiv1alpha1.ServiceExport{
+		&mcsapiv1beta1.ServiceExport{
 			TypeMeta: typeMetaSvcExport,
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "full",
@@ -235,6 +235,18 @@ var (
 			Ports:       commonPorts,
 			AddressType: discoveryv1.AddressTypeIPv4,
 		},
+		&discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "full-duplicate-derived",
+				Namespace: "default",
+				Labels: map[string]string{
+					discoveryv1.LabelServiceName: "full",
+				},
+			},
+			Endpoints:   commonEndpoints,
+			Ports:       commonPorts,
+			AddressType: discoveryv1.AddressTypeIPv4,
+		},
 
 		&corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{
@@ -310,9 +322,9 @@ var (
 				Name:      commonDerivedName + "-update-4",
 				Namespace: "default",
 				Labels: map[string]string{
-					mcsapiv1alpha1.LabelServiceName: "full",
-					discoveryv1.LabelManagedBy:      endpointSliceLocalMCSAPIControllerName,
-					localEndpointSliceLabel:         "full-update-4",
+					mcsapiv1beta1.LabelServiceName: "full",
+					discoveryv1.LabelManagedBy:     endpointSliceLocalMCSAPIControllerName,
+					localEndpointSliceLabel:        "full-update-4",
 				},
 				OwnerReferences: commonOwnerReferences,
 			},
@@ -325,9 +337,9 @@ var (
 				Name:      commonDerivedName + "-update-5",
 				Namespace: "default",
 				Labels: map[string]string{
-					mcsapiv1alpha1.LabelServiceName: "full",
-					discoveryv1.LabelManagedBy:      endpointSliceLocalMCSAPIControllerName,
-					localEndpointSliceLabel:         "full-update-5",
+					mcsapiv1beta1.LabelServiceName: "full",
+					discoveryv1.LabelManagedBy:     endpointSliceLocalMCSAPIControllerName,
+					localEndpointSliceLabel:        "full-update-5",
 				},
 			},
 			Endpoints:   commonEndpoints,
@@ -406,8 +418,30 @@ var (
 			Ports:       commonPorts,
 			AddressType: discoveryv1.AddressTypeIPv4,
 		},
+		&discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            commonDerivedName + "-duplicate-derived",
+				Namespace:       "default",
+				Labels:          getExpectedDerivedLabels("full-duplicate-derived"),
+				OwnerReferences: commonOwnerReferences,
+			},
+			Endpoints:   commonEndpoints,
+			Ports:       commonPorts,
+			AddressType: discoveryv1.AddressTypeIPv4,
+		},
+		&discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            commonDerivedName + "-duplicate-derived-extra",
+				Namespace:       "default",
+				Labels:          getExpectedDerivedLabels("full-duplicate-derived"),
+				OwnerReferences: commonOwnerReferences,
+			},
+			Endpoints:   commonEndpoints,
+			Ports:       commonPorts,
+			AddressType: discoveryv1.AddressTypeIPv4,
+		},
 
-		&mcsapiv1alpha1.ServiceExport{
+		&mcsapiv1beta1.ServiceExport{
 			TypeMeta: typeMetaSvcExport,
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "port-filter",
@@ -468,6 +502,7 @@ func Test_mcsEndpointSliceMirror_Reconcile(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithObjects(endpointsliceMirrorFixtures...).
 		WithScheme(testScheme()).
+		WithIndex(&discoveryv1.EndpointSlice{}, derivedEndpointSliceByLocalNameIndex, derivedEndpointSliceByLocalNameIndexFunc).
 		Build()
 	r := &mcsAPIEndpointSliceMirrorReconciler{
 		Client:      c,
@@ -475,38 +510,26 @@ func Test_mcsEndpointSliceMirror_Reconcile(t *testing.T) {
 		clusterName: "cluster1",
 	}
 
-	for _, tt := range []struct {
-		suffix                string
-		derivedReconciliation bool
-	}{
-		{suffix: "keep"},
-		{suffix: ""},
-		{suffix: "update-1"},
-		{suffix: "update-2"},
-		{suffix: "update-3"},
-		{suffix: "update-4"},
-		{suffix: "update-5"},
-		{
-			suffix:                "not-linked-service-2",
-			derivedReconciliation: true,
-		},
-		{
-			suffix:                "not-linked-service-3",
-			derivedReconciliation: true,
-		},
+	for _, suffix := range []string{
+		"keep",
+		"",
+		"update-1",
+		"update-2",
+		"update-3",
+		"update-4",
+		"update-5",
+		"not-linked-service-2",
+		"not-linked-service-3",
 	} {
-		t.Run(fmt.Sprintf("Check mirrored Endpoint %s", tt.suffix), func(t *testing.T) {
-			fullSuffix := "-" + tt.suffix
-			if tt.suffix == "" {
+		t.Run(fmt.Sprintf("Check mirrored Endpoint %s", suffix), func(t *testing.T) {
+			fullSuffix := "-" + suffix
+			if suffix == "" {
 				fullSuffix = ""
 			}
 
 			key := types.NamespacedName{
 				Name:      "full" + fullSuffix,
 				Namespace: "default",
-			}
-			if tt.derivedReconciliation {
-				key.Name = commonDerivedName + fullSuffix
 			}
 			result, err := r.Reconcile(t.Context(), ctrl.Request{
 				NamespacedName: key,
@@ -515,10 +538,10 @@ func Test_mcsEndpointSliceMirror_Reconcile(t *testing.T) {
 			require.Equal(t, ctrl.Result{}, result, "Result should be empty")
 
 			keyDerived := types.NamespacedName{
-				Name:      commonDerivedName + "-" + tt.suffix,
+				Name:      commonDerivedName + "-" + suffix,
 				Namespace: "default",
 			}
-			if tt.suffix == "" {
+			if suffix == "" {
 				keyDerived.Name = commonDerivedName
 			}
 			epSlice := &discoveryv1.EndpointSlice{}
@@ -554,27 +577,57 @@ func Test_mcsEndpointSliceMirror_Reconcile(t *testing.T) {
 		require.NoError(t, err)
 	})
 
+	t.Run("Check duplicate derived Endpoint cleanup", func(t *testing.T) {
+		key := types.NamespacedName{
+			Name:      "full-duplicate-derived",
+			Namespace: "default",
+		}
+		result, err := r.Reconcile(t.Context(), ctrl.Request{
+			NamespacedName: key,
+		})
+		require.NoError(t, err)
+		require.Equal(t, ctrl.Result{}, result, "Result should be empty")
+
+		keyDerived := types.NamespacedName{
+			Name:      commonDerivedName + "-duplicate-derived",
+			Namespace: "default",
+		}
+		epSlice := &discoveryv1.EndpointSlice{}
+		err = c.Get(t.Context(), keyDerived, epSlice)
+		require.NoError(t, err)
+
+		keyDuplicate := types.NamespacedName{
+			Name:      commonDerivedName + "-duplicate-derived-extra",
+			Namespace: "default",
+		}
+		err = c.Get(t.Context(), keyDuplicate, epSlice)
+		require.True(t, apierrors.IsNotFound(err), "duplicate EndpointSlice should be deleted")
+	})
+
 	for _, tt := range []struct {
-		suffix              string
-		localReconciliation bool
+		suffix           string
+		malformedCleanup bool
 	}{
 		{suffix: "delete"},
 		{suffix: "wrong-family-delete"},
 		{suffix: "wrong-family-ignore"},
+		{suffix: "not-linked-service-1"},
 		{
-			suffix:              "not-linked-service-1",
-			localReconciliation: true,
+			suffix:           "not-linked-service-4",
+			malformedCleanup: true,
 		},
-		{suffix: "not-linked-service-4"},
 	} {
 		t.Run(fmt.Sprintf("Check delete Endpoint %s", tt.suffix), func(t *testing.T) {
 			keyDerived := types.NamespacedName{
 				Name:      commonDerivedName + "-" + tt.suffix,
 				Namespace: "default",
 			}
-			keyReconcile := keyDerived
-			if tt.localReconciliation {
-				keyReconcile.Name = "full-" + tt.suffix
+			keyReconcile := types.NamespacedName{
+				Name:      "full-" + tt.suffix,
+				Namespace: "default",
+			}
+			if tt.malformedCleanup {
+				keyReconcile.Name = malformedDerivedEndpointSliceRequest(keyDerived.Name)
 			}
 			result, err := r.Reconcile(t.Context(), ctrl.Request{
 				NamespacedName: keyReconcile,

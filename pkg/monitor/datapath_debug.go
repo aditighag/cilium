@@ -5,9 +5,10 @@ package monitor
 
 import (
 	"bufio"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"net"
+	"net/netip"
 
 	// NOTE: syscall is deprecated, but it is replaced by golang.org/x/sys
 	//       which reuses syscall.Errno similarly to how we do below.
@@ -216,9 +217,9 @@ func l4CreateInfo(n *DebugMsg) string {
 }
 
 func ip4Str(arg1 uint32) string {
-	ip := make(net.IP, 4)
-	byteorder.Native.PutUint32(ip, arg1)
-	return ip.String()
+	var buf [4]byte
+	binary.NativeEndian.PutUint32(buf[:], arg1)
+	return netip.AddrFrom4(buf).String()
 }
 
 func ip6Str(arg1 uint32) string {
@@ -269,11 +270,11 @@ func (n *DebugMsg) Decode(data []byte) error {
 
 	n.Type = data[0]
 	n.SubType = data[1]
-	n.Source = byteorder.Native.Uint16(data[2:4])
-	n.Hash = byteorder.Native.Uint32(data[4:8])
-	n.Arg1 = byteorder.Native.Uint32(data[8:12])
-	n.Arg2 = byteorder.Native.Uint32(data[12:16])
-	n.Arg3 = byteorder.Native.Uint32(data[16:20])
+	n.Source = binary.NativeEndian.Uint16(data[2:4])
+	n.Hash = binary.NativeEndian.Uint32(data[4:8])
+	n.Arg1 = binary.NativeEndian.Uint32(data[8:12])
+	n.Arg2 = binary.NativeEndian.Uint32(data[12:16])
+	n.Arg3 = binary.NativeEndian.Uint32(data[16:20])
 
 	return nil
 }
@@ -282,7 +283,7 @@ func (n *DebugMsg) Decode(data []byte) error {
 func (n *DebugMsg) Message(linkMonitor getters.LinkGetter) string {
 	switch n.SubType {
 	case DbgGeneric:
-		return fmt.Sprintf("No message, arg1=%d (%#x) arg2=%d (%#x)", n.Arg1, n.Arg1, n.Arg2, n.Arg2)
+		return fmt.Sprintf("No message, arg1=%d (%#x) arg2=%d (%#x) arg3=%d (%#x)", n.Arg1, n.Arg1, n.Arg2, n.Arg2, n.Arg3, n.Arg3)
 	case DbgLocalDelivery:
 		return fmt.Sprintf("Attempting local delivery for container id %d from seclabel %d", n.Arg1, n.Arg2)
 	case DbgEncap:
@@ -317,7 +318,7 @@ func (n *DebugMsg) Message(linkMonitor getters.LinkGetter) string {
 	case DbgIcmp6Request:
 		return fmt.Sprintf("ICMPv6 echo request for router offset=%d", n.Arg1)
 	case DbgIcmp6Ns:
-		return fmt.Sprintf("ICMPv6 neighbour soliciation for address %x:%x", n.Arg1, n.Arg2)
+		return fmt.Sprintf("ICMPv6 neighbour solicitation for address %x:%x", n.Arg1, n.Arg2)
 	case DbgIcmp6TimeExceeded:
 		return "Sending ICMPv6 time exceeded"
 	case DbgDecap:
@@ -488,14 +489,14 @@ func (n *DebugCapture) Decode(data []byte) error {
 
 	n.Type = data[0]
 	n.SubType = data[1]
-	n.Source = byteorder.Native.Uint16(data[2:4])
-	n.Hash = byteorder.Native.Uint32(data[4:8])
-	n.OrigLen = byteorder.Native.Uint32(data[8:12])
-	n.Len = byteorder.Native.Uint16(data[12:14])
+	n.Source = binary.NativeEndian.Uint16(data[2:4])
+	n.Hash = binary.NativeEndian.Uint32(data[4:8])
+	n.OrigLen = binary.NativeEndian.Uint32(data[8:12])
+	n.Len = binary.NativeEndian.Uint16(data[12:14])
 	n.Version = data[14]
 	n.ExtVersion = data[15]
-	n.Arg1 = byteorder.Native.Uint32(data[16:20])
-	n.Arg2 = byteorder.Native.Uint32(data[20:24])
+	n.Arg1 = binary.NativeEndian.Uint32(data[16:20])
+	n.Arg2 = binary.NativeEndian.Uint32(data[20:24])
 
 	return nil
 }

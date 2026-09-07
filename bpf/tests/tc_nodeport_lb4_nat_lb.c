@@ -8,21 +8,17 @@
 /* Enable code paths under test */
 #define ENABLE_IPV4
 #define ENABLE_NODEPORT
-#define ENABLE_HOST_ROUTING
-#define ENABLE_EGRESS_GATEWAY	1
-#define ENABLE_MASQUERADE_IPV4	1
 
 #define CLIENT_IP		v4_ext_one
 #define CLIENT_PORT		__bpf_htons(111)
 #define CLIENT_IP_2		v4_ext_two
-#define CLIENT_NODE_IP		v4_node_two
 
 #define FRONTEND_IP_LOCAL	v4_svc_one
 #define FRONTEND_IP_REMOTE	v4_svc_two
+#define FRONTEND_IP_REMOTE_2	v4_svc_three
 #define FRONTEND_PORT		tcp_svc_one
 
 #define LB_IP			v4_node_one
-#define IPV4_DIRECT_ROUTING	LB_IP
 
 #define BACKEND_IP_LOCAL	v4_pod_one
 #define BACKEND_IP_REMOTE	v4_pod_two
@@ -31,7 +27,6 @@
 #define DEFAULT_IFACE		24
 #define BACKEND_IFACE		25
 #define SVC_EGRESS_IFACE	26
-#define ENCAP_IFINDEX		42
 
 #define BACKEND_EP_ID		127
 
@@ -144,24 +139,30 @@ mock_ctx_redirect(const struct __sk_buff *ctx __maybe_unused,
 		return CTX_ACT_REDIRECT;
 	if (ip4->saddr == FRONTEND_IP_REMOTE && ifindex == DEFAULT_IFACE)
 		return CTX_ACT_REDIRECT;
+	if (ip4->saddr == FRONTEND_IP_REMOTE_2 && ifindex == DEFAULT_IFACE)
+		return CTX_ACT_REDIRECT;
 
 	return CTX_ACT_DROP;
 }
 
 #include "lib/bpf_host.h"
 
-#include "lib/egressgw_policy.h"
 #include "lib/endpoint.h"
 #include "lib/ipcache.h"
 #include "lib/lb.h"
 
+ASSIGN_CONFIG(bool, enable_bpf_host_routing, true)
 ASSIGN_CONFIG(__u32, interface_ifindex, DEFAULT_IFACE)
+ASSIGN_CONFIG(union v4addr, ipv4_direct_routing, { .be32 = LB_IP })
+
+/* Set port ranges to have deterministic source port selection */
+#include "nodeport_defaults.h"
 
 /* Test that a SVC request to a local backend
  * - gets DNATed (but not SNATed)
- * - gets redirected by TC (as ENABLE_HOST_ROUTING is set)
+ * - gets redirected by TC (as BPF Host Routing is enabled)
  */
-PKTGEN("tc", "tc_nodeport_local_backend")
+PKTGEN(PROG_TYPE, "tc_nodeport_local_backend")
 int nodeport_local_backend_pktgen(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -188,7 +189,7 @@ int nodeport_local_backend_pktgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("tc", "tc_nodeport_local_backend")
+SETUP(PROG_TYPE, "tc_nodeport_local_backend")
 int nodeport_local_backend_setup(struct __ctx_buff *ctx)
 {
 	__u16 revnat_id = 1;
@@ -206,7 +207,7 @@ int nodeport_local_backend_setup(struct __ctx_buff *ctx)
 	return netdev_receive_packet(ctx);
 }
 
-CHECK("tc", "tc_nodeport_local_backend")
+CHECK(PROG_TYPE, "tc_nodeport_local_backend")
 int nodeport_local_backend_check(const struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -216,6 +217,8 @@ int nodeport_local_backend_check(const struct __ctx_buff *ctx)
 	struct iphdr *l3;
 
 	test_init();
+
+	endpoint_v4_del_entry(BACKEND_IP_LOCAL);
 
 	data = (void *)(long)ctx_data(ctx);
 	data_end = (void *)(long)ctx->data_end;
@@ -259,14 +262,14 @@ int nodeport_local_backend_check(const struct __ctx_buff *ctx)
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst TCP port hasn't been NATed to backend port");
 
-	if (l4->check != bpf_htons(0xd7d0))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+	if (l4->check != bpf_htons(0x3771))
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_htons(0x3771));
 
 	test_finish();
 }
 
 /* Test that a reply by the local backend gets revDNATed at to-netdev. */
-PKTGEN("tc", "tc_nodeport_local_backend_reply")
+PKTGEN(PROG_TYPE, "tc_nodeport_local_backend_reply")
 int nodeport_local_backend_reply_pktgen(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -293,13 +296,13 @@ int nodeport_local_backend_reply_pktgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("tc", "tc_nodeport_local_backend_reply")
+SETUP(PROG_TYPE, "tc_nodeport_local_backend_reply")
 int nodeport_local_backend_reply_setup(struct __ctx_buff *ctx)
 {
 	return netdev_send_packet(ctx);
 }
 
-CHECK("tc", "tc_nodeport_local_backend_reply")
+CHECK(PROG_TYPE, "tc_nodeport_local_backend_reply")
 int nodeport_local_backend_reply_check(const struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -352,8 +355,8 @@ int nodeport_local_backend_reply_check(const struct __ctx_buff *ctx)
 	if (l4->dest != CLIENT_PORT)
 		test_fatal("dst port has changed");
 
-	if (l4->check != bpf_htons(0x01a9))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+	if (l4->check != bpf_htons(0x6149))
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_htons(0x6149));
 
 	test_finish();
 }
@@ -361,7 +364,7 @@ int nodeport_local_backend_reply_check(const struct __ctx_buff *ctx)
 /* Same scenario as above, but for a different CLIENT_IP_2. Here replies
  * should leave via a non-default interface.
  */
-PKTGEN("tc", "tc_nodeport_local_backend_redirect")
+PKTGEN(PROG_TYPE, "tc_nodeport_local_backend_redirect")
 int nodeport_local_backend_redirect_pktgen(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -388,13 +391,16 @@ int nodeport_local_backend_redirect_pktgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("tc", "tc_nodeport_local_backend_redirect")
+SETUP(PROG_TYPE, "tc_nodeport_local_backend_redirect")
 int nodeport_local_backend_redirect_setup(struct __ctx_buff *ctx)
 {
+	endpoint_v4_add_entry(BACKEND_IP_LOCAL, BACKEND_IFACE, BACKEND_EP_ID, 0, 0, 0,
+			      (__u8 *)local_backend_mac, (__u8 *)node_mac);
+
 	return netdev_receive_packet(ctx);
 }
 
-CHECK("tc", "tc_nodeport_local_backend_redirect")
+CHECK(PROG_TYPE, "tc_nodeport_local_backend_redirect")
 int nodeport_local_backend_redirect_check(const struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -404,6 +410,8 @@ int nodeport_local_backend_redirect_check(const struct __ctx_buff *ctx)
 	struct iphdr *l3;
 
 	test_init();
+
+	endpoint_v4_del_entry(BACKEND_IP_LOCAL);
 
 	data = (void *)(long)ctx_data(ctx);
 	data_end = (void *)(long)ctx->data_end;
@@ -447,8 +455,8 @@ int nodeport_local_backend_redirect_check(const struct __ctx_buff *ctx)
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst TCP port hasn't been NATed to backend port");
 
-	if (l4->check != bpf_htons(0xcccf))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+	if (l4->check != bpf_htons(0x2c70))
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_htons(0x2c70));
 
 	test_finish();
 }
@@ -456,7 +464,7 @@ int nodeport_local_backend_redirect_check(const struct __ctx_buff *ctx)
 /* Test that to-netdev respects the routing needed for CLIENT_IP_2,
  * and redirects the packet to the correct egress interface.
  */
-PKTGEN("tc", "tc_nodeport_local_backend_redirect_reply")
+PKTGEN(PROG_TYPE, "tc_nodeport_local_backend_redirect_reply")
 int nodeport_local_backend_redirect_reply_pktgen(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -483,13 +491,13 @@ int nodeport_local_backend_redirect_reply_pktgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("tc", "tc_nodeport_local_backend_redirect_reply")
+SETUP(PROG_TYPE, "tc_nodeport_local_backend_redirect_reply")
 int nodeport_local_backend_redirect_reply_setup(struct __ctx_buff *ctx)
 {
 	return netdev_send_packet(ctx);
 }
 
-CHECK("tc", "tc_nodeport_local_backend_redirect_reply")
+CHECK(PROG_TYPE, "tc_nodeport_local_backend_redirect_reply")
 int nodeport_local_backend_redirect_reply_check(const struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -542,17 +550,17 @@ int nodeport_local_backend_redirect_reply_check(const struct __ctx_buff *ctx)
 	if (l4->dest != CLIENT_PORT)
 		test_fatal("dst port has changed");
 
-	if (l4->check != bpf_htons(0xcccf))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+	if (l4->check != bpf_htons(0x2c70))
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_htons(0x2c70));
 
 	test_finish();
 }
 
 /* Test that a SVC request (UDP) to a local backend
  * - gets DNATed (but not SNATed)
- * - gets redirected by TC (as ENABLE_HOST_ROUTING is set)
+ * - gets redirected by TC (as BPF Host Routing is enabled)
  */
-PKTGEN("tc", "tc_nodeport_udp_local_backend")
+PKTGEN(PROG_TYPE, "tc_nodeport_udp_local_backend")
 int nodeport_udp_local_backend_pktgen(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -579,10 +587,13 @@ int nodeport_udp_local_backend_pktgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("tc", "tc_nodeport_udp_local_backend")
+SETUP(PROG_TYPE, "tc_nodeport_udp_local_backend")
 int nodeport_udp_local_backend_setup(struct __ctx_buff *ctx)
 {
 	__u16 revnat_id = 2;
+
+	endpoint_v4_add_entry(BACKEND_IP_LOCAL, BACKEND_IFACE, BACKEND_EP_ID, 0, 0, 0,
+			      (__u8 *)local_backend_mac, (__u8 *)node_mac);
 
 	lb_v4_add_service(FRONTEND_IP_LOCAL, FRONTEND_PORT, IPPROTO_UDP, 1, revnat_id);
 	lb_v4_add_backend(FRONTEND_IP_LOCAL, FRONTEND_PORT, 1, 125,
@@ -591,7 +602,7 @@ int nodeport_udp_local_backend_setup(struct __ctx_buff *ctx)
 	return netdev_receive_packet(ctx);
 }
 
-CHECK("tc", "tc_nodeport_udp_local_backend")
+CHECK(PROG_TYPE, "tc_nodeport_udp_local_backend")
 int nodeport_udp_local_backend_check(const struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -601,6 +612,8 @@ int nodeport_udp_local_backend_check(const struct __ctx_buff *ctx)
 	struct iphdr *l3;
 
 	test_init();
+
+	endpoint_v4_del_entry(BACKEND_IP_LOCAL);
 
 	data = (void *)(long)ctx_data(ctx);
 	data_end = (void *)(long)ctx->data_end;
@@ -645,7 +658,7 @@ int nodeport_udp_local_backend_check(const struct __ctx_buff *ctx)
 		test_fatal("dst port hasn't been NATed to backend port");
 
 	if (l4->check != bpf_htons(0x699a))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_htons(0x699a));
 
 	test_finish();
 }
@@ -654,7 +667,7 @@ int nodeport_udp_local_backend_check(const struct __ctx_buff *ctx)
  * - gets DNATed and SNATed,
  * - gets redirected back out by TC
  */
-PKTGEN("tc", "tc_nodeport_nat_fwd")
+PKTGEN(PROG_TYPE, "tc_nodeport_nat_fwd")
 int nodeport_nat_fwd_pktgen(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -681,7 +694,7 @@ int nodeport_nat_fwd_pktgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("tc", "tc_nodeport_nat_fwd")
+SETUP(PROG_TYPE, "tc_nodeport_nat_fwd")
 int nodeport_nat_fwd_setup(struct __ctx_buff *ctx)
 {
 	__u16 revnat_id = 1;
@@ -695,7 +708,7 @@ int nodeport_nat_fwd_setup(struct __ctx_buff *ctx)
 	return netdev_receive_packet(ctx);
 }
 
-CHECK("tc", "tc_nodeport_nat_fwd")
+CHECK(PROG_TYPE, "tc_nodeport_nat_fwd")
 int nodeport_nat_fwd_check(__maybe_unused const struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -752,7 +765,7 @@ static __always_inline int build_reply(struct __ctx_buff *ctx)
 	struct pktgen builder;
 	struct tcphdr *l4;
 	void *data;
-	__u16 nat_source_port = 0;
+	__be16 nat_source_port = 0;
 	__u32 key = 0;
 
 	struct mock_settings *settings = map_lookup_elem(&settings_map, &key);
@@ -819,8 +832,8 @@ static __always_inline int check_reply(const struct __ctx_buff *ctx)
 	if (l4->dest != CLIENT_PORT)
 		test_fatal("dst port hasn't been RevNATed to client port");
 
-	if (l4->check != bpf_htons(0x1a8))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+	if (l4->check != bpf_htons(0x6148))
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_htons(0x6148));
 
 	test_finish();
 }
@@ -828,19 +841,19 @@ static __always_inline int check_reply(const struct __ctx_buff *ctx)
 /* Test that the LB RevDNATs and RevSNATs a reply from the
  * NAT remote backend, and sends it back to the client.
  */
-PKTGEN("tc", "tc_nodeport_nat_fwd_reply")
+PKTGEN(PROG_TYPE, "tc_nodeport_nat_fwd_reply")
 int nodeport_nat_fwd_reply_pktgen(struct __ctx_buff *ctx)
 {
 	return build_reply(ctx);
 }
 
-SETUP("tc", "tc_nodeport_nat_fwd_reply")
+SETUP(PROG_TYPE, "tc_nodeport_nat_fwd_reply")
 int nodeport_nat_fwd_reply_setup(struct __ctx_buff *ctx)
 {
 	return netdev_receive_packet(ctx);
 }
 
-CHECK("tc", "tc_nodeport_nat_fwd_reply")
+CHECK(PROG_TYPE, "tc_nodeport_nat_fwd_reply")
 int nodeport_nat_fwd_reply_check(const struct __ctx_buff *ctx)
 {
 	return check_reply(ctx);
@@ -848,42 +861,15 @@ int nodeport_nat_fwd_reply_check(const struct __ctx_buff *ctx)
 
 /* Test that the LB RevDNATs and RevSNATs a reply from the
  * NAT remote backend, and sends it back to the client.
- * Even when there's a catch-all EGW policy configured.
- */
-PKTGEN("tc", "tc_nodeport_nat_fwd_reply2_egw")
-int nodeport_nat_fwd_reply2_egw_pktgen(struct __ctx_buff *ctx)
-{
-	return build_reply(ctx);
-}
-
-SETUP("tc", "tc_nodeport_nat_fwd_reply2_egw")
-int nodeport_nat_fwd_reply2_egw_setup(struct __ctx_buff *ctx)
-{
-	ipcache_v4_add_entry(CLIENT_IP, 0, 112200, CLIENT_NODE_IP, 0);
-	add_egressgw_policy_entry(CLIENT_IP, v4_all, 0, LB_IP, LB_IP);
-
-	return netdev_receive_packet(ctx);
-}
-
-CHECK("tc", "tc_nodeport_nat_fwd_reply2_egw")
-int nodeport_nat_fwd_reply2_egw_check(const struct __ctx_buff *ctx)
-{
-	del_egressgw_policy_entry(CLIENT_IP, v4_all, 0);
-
-	return check_reply(ctx);
-}
-
-/* Test that the LB RevDNATs and RevSNATs a reply from the
- * NAT remote backend, and sends it back to the client.
  * Even if the FIB lookup fails.
  */
-PKTGEN("tc", "tc_nodeport_nat_fwd_reply_no_fib")
+PKTGEN(PROG_TYPE, "tc_nodeport_nat_fwd_reply_no_fib")
 int nodepoirt_nat_fwd_reply_no_fib_pktgen(struct __ctx_buff *ctx)
 {
 	return build_reply(ctx);
 }
 
-SETUP("tc", "tc_nodeport_nat_fwd_reply_no_fib")
+SETUP(PROG_TYPE, "tc_nodeport_nat_fwd_reply_no_fib")
 int nodeport_nat_fwd_reply_no_fib_setup(struct __ctx_buff *ctx)
 {
 	__u32 key = 0;
@@ -895,7 +881,7 @@ int nodeport_nat_fwd_reply_no_fib_setup(struct __ctx_buff *ctx)
 	return netdev_receive_packet(ctx);
 }
 
-CHECK("tc", "tc_nodeport_nat_fwd_reply_no_fib")
+CHECK(PROG_TYPE, "tc_nodeport_nat_fwd_reply_no_fib")
 int nodeport_nat_fwd_reply_no_fib_check(__maybe_unused const struct __ctx_buff *ctx)
 {
 	return check_reply(ctx);
@@ -911,17 +897,17 @@ int nodeport_nat_fwd_reply_no_fib_check(__maybe_unused const struct __ctx_buff *
  * Test that the LB fails to RevDNAT and RevSNAT a reply from the
  * NAT remote backend when its Rev NAT entry gets deleted
  */
-PKTGEN("tc", "tc_nodeport_nat_fwd_reply_punt")
+PKTGEN(PROG_TYPE, "tc_nodeport_nat_fwd_reply_punt")
 int nodeport_nat_fwd_reply_punt_pktgen(struct __ctx_buff *ctx)
 {
 	return build_reply(ctx);
 }
 
-SETUP("tc", "tc_nodeport_nat_fwd_reply_punt")
+SETUP(PROG_TYPE, "tc_nodeport_nat_fwd_reply_punt")
 int nodeport_nat_fwd_reply_punt_setup(struct __ctx_buff *ctx)
 {
 	/* Delete the Rev NAT */
-	__u16 nat_source_port = 0;
+	__be16 nat_source_port = 0;
 	__u32 key = 0;
 
 	struct mock_settings *settings = map_lookup_elem(&settings_map, &key);
@@ -943,7 +929,7 @@ int nodeport_nat_fwd_reply_punt_setup(struct __ctx_buff *ctx)
 	return netdev_receive_packet(ctx);
 }
 
-CHECK("tc", "tc_nodeport_nat_fwd_reply_punt")
+CHECK(PROG_TYPE, "tc_nodeport_nat_fwd_reply_punt")
 int nodeport_nat_fwd_reply_punt_check(const struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -969,7 +955,7 @@ int nodeport_nat_fwd_reply_punt_check(const struct __ctx_buff *ctx)
  * - gets DNATed and SNATed,
  * - gets redirected back out by TC
  */
-PKTGEN("tc", "tc_nodeport_nat_fwd_restore")
+PKTGEN(PROG_TYPE, "tc_nodeport_nat_fwd_restore")
 int nodeport_nat_fwd_restore_pktgen(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -996,7 +982,7 @@ int nodeport_nat_fwd_restore_pktgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("tc", "tc_nodeport_nat_fwd_restore")
+SETUP(PROG_TYPE, "tc_nodeport_nat_fwd_restore")
 int nodeport_nat_fwd_restore_setup(struct __ctx_buff *ctx)
 {
 	__u16 revnat_id = 3;
@@ -1018,7 +1004,7 @@ int nodeport_nat_fwd_restore_setup(struct __ctx_buff *ctx)
 	return netdev_receive_packet(ctx);
 }
 
-CHECK("tc", "tc_nodeport_nat_fwd_restore")
+CHECK(PROG_TYPE, "tc_nodeport_nat_fwd_restore")
 int nodeport_nat_fwd_restore_check(__maybe_unused const struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -1073,19 +1059,19 @@ int nodeport_nat_fwd_restore_check(__maybe_unused const struct __ctx_buff *ctx)
 /* Test that the restored LB RevDNATs and RevSNATs a reply from the
  * NAT remote backend, and sends it back to the client.
  */
-PKTGEN("tc", "tc_nodeport_nat_fwd_restore_reply")
+PKTGEN(PROG_TYPE, "tc_nodeport_nat_fwd_restore_reply")
 int nodeport_nat_fwd_restore_reply_pktgen(struct __ctx_buff *ctx)
 {
 	return build_reply(ctx);
 }
 
-SETUP("tc", "tc_nodeport_nat_fwd_restore_reply")
+SETUP(PROG_TYPE, "tc_nodeport_nat_fwd_restore_reply")
 int nodeport_nat_fwd_restore_reply_setup(struct __ctx_buff *ctx)
 {
 	return netdev_receive_packet(ctx);
 }
 
-CHECK("tc", "tc_nodeport_nat_fwd_restore_reply")
+CHECK(PROG_TYPE, "tc_nodeport_nat_fwd_restore_reply")
 int nodeport_nat_fwd_restore_reply_check(const struct __ctx_buff *ctx)
 {
 	return check_reply(ctx);
@@ -1099,7 +1085,7 @@ int nodeport_nat_fwd_restore_reply_check(const struct __ctx_buff *ctx)
   *
   * Test that source port is changed when the Original NAT entry is deleted.(ReSNATed)
   */
-PKTGEN("tc", "tc_nodeport_nat_fwd_original_renated")
+PKTGEN(PROG_TYPE, "tc_nodeport_nat_fwd_original_renated")
 int nodeport_nat_fwd_original_renated_pktgen(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -1126,7 +1112,7 @@ int nodeport_nat_fwd_original_renated_pktgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("tc", "tc_nodeport_nat_fwd_original_renated")
+SETUP(PROG_TYPE, "tc_nodeport_nat_fwd_original_renated")
 int nodeport_nat_fwd_original_renated_setup(struct __ctx_buff *ctx)
 {
 	__u16 revnat_id = 4;
@@ -1152,7 +1138,7 @@ int nodeport_nat_fwd_original_renated_setup(struct __ctx_buff *ctx)
 	return netdev_receive_packet(ctx);
 }
 
-CHECK("tc", "tc_nodeport_nat_fwd_original_renated")
+CHECK(PROG_TYPE, "tc_nodeport_nat_fwd_original_renated")
 int nodeport_nat_fwd_original_renated_check(const struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -1160,7 +1146,7 @@ int nodeport_nat_fwd_original_renated_check(const struct __ctx_buff *ctx)
 	struct tcphdr *l4;
 	struct iphdr *l3;
 	__u32 key = 0;
-	__u16 nat_source_port = 0;
+	__be16 nat_source_port = 0;
 
 	test_init();
 
@@ -1215,13 +1201,13 @@ int nodeport_nat_fwd_original_renated_check(const struct __ctx_buff *ctx)
  * NAT remote backend, and sends it back to the client. And expects
  * the Original NAT entry to be restored.
  */
-PKTGEN("tc", "tc_nodeport_nat_fwd_restore_original_entry")
+PKTGEN(PROG_TYPE, "tc_nodeport_nat_fwd_restore_original_entry")
 int nodeport_nat_fwd_restore_original_entry_pktgen(struct __ctx_buff *ctx)
 {
 	return build_reply(ctx);
 }
 
-SETUP("tc", "tc_nodeport_nat_fwd_restore_original_entry")
+SETUP(PROG_TYPE, "tc_nodeport_nat_fwd_restore_original_entry")
 int nodeport_nat_fwd_restore_original_entry_setup(struct __ctx_buff *ctx)
 {
 	struct ipv4_ct_tuple otuple = {};
@@ -1240,7 +1226,7 @@ int nodeport_nat_fwd_restore_original_entry_setup(struct __ctx_buff *ctx)
 	return netdev_receive_packet(ctx);
 }
 
-CHECK("tc", "tc_nodeport_nat_fwd_restore_original_entry")
+CHECK(PROG_TYPE, "tc_nodeport_nat_fwd_restore_original_entry")
 int nodeport_nat_fwd_restore_original_entry_check(struct __ctx_buff *ctx)
 {
 	return check_reply(ctx);
@@ -1251,7 +1237,7 @@ int nodeport_nat_fwd_restore_original_entry_check(struct __ctx_buff *ctx)
  * - gets redirected back out by TC
  * - verifies that the Original NAT entry is restored.
  */
-PKTGEN("tc", "tc_nodeport_nat_fwd_verify_restored_original_entry")
+PKTGEN(PROG_TYPE, "tc_nodeport_nat_fwd_verify_restored_original_entry")
 int nodeport_nat_fwd_verify_restored_original_entry_pktgen(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -1278,7 +1264,7 @@ int nodeport_nat_fwd_verify_restored_original_entry_pktgen(struct __ctx_buff *ct
 	return 0;
 }
 
-SETUP("tc", "tc_nodeport_nat_fwd_verify_restored_original_entry")
+SETUP(PROG_TYPE, "tc_nodeport_nat_fwd_verify_restored_original_entry")
 int nodeport_nat_fwd_verify_restored_original_entry_setup(struct __ctx_buff *ctx)
 {
 	__u16 revnat_id = 5;
@@ -1291,7 +1277,7 @@ int nodeport_nat_fwd_verify_restored_original_entry_setup(struct __ctx_buff *ctx
 	return netdev_receive_packet(ctx);
 }
 
-CHECK("tc", "tc_nodeport_nat_fwd_verify_restored_original_entry")
+CHECK(PROG_TYPE, "tc_nodeport_nat_fwd_verify_restored_original_entry")
 int nodeport_nat_fwd_verify_restored_original_entry_check(struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -1299,7 +1285,7 @@ int nodeport_nat_fwd_verify_restored_original_entry_check(struct __ctx_buff *ctx
 	struct tcphdr *l4;
 	struct iphdr *l3;
 	__u32 key = 0;
-	__u16 nat_source_port = 0;
+	__be16 nat_source_port = 0;
 
 	test_init();
 
@@ -1343,6 +1329,156 @@ int nodeport_nat_fwd_verify_restored_original_entry_check(struct __ctx_buff *ctx
 
 	if (l4->source != nat_source_port)
 		test_fatal("Original NAT entry hasn't been restored");
+
+	test_finish();
+}
+
+/* The following two tests cover GH#10983: two NodePort services sharing the
+ * same backend pod. The same client 5-tuple is reused across both services.
+ * Make sure that the CT entry's rev_nat_index is correctly updated to svc2's
+ * index, so the reply is rev-NATed back to svc2 fronted, not svc1.
+ */
+
+/* Test that a request to svc2 (FRONTEND_IP_REMOTE_2), which shares the same
+ * backend as svc1, is correctly forwarded.
+ */
+PKTGEN(PROG_TYPE, "tc_nodeport_nat_shared_backend_fwd")
+int tc_nodeport_nat_shared_backend_fwd_pktgen(struct __ctx_buff *ctx)
+{
+	struct pktgen builder;
+	struct tcphdr *l4;
+	void *data;
+
+	pktgen__init(&builder, ctx);
+
+	l4 = pktgen__push_ipv4_tcp_packet(&builder,
+					  (__u8 *)client_mac, (__u8 *)lb_mac,
+					  CLIENT_IP, FRONTEND_IP_REMOTE_2,
+					  CLIENT_PORT, FRONTEND_PORT);
+	if (!l4)
+		return TEST_ERROR;
+
+	data = pktgen__push_data(&builder, default_data, sizeof(default_data));
+	if (!data)
+		return TEST_ERROR;
+
+	pktgen__finish(&builder);
+	return 0;
+}
+
+SETUP(PROG_TYPE, "tc_nodeport_nat_shared_backend_fwd")
+int tc_nodeport_nat_shared_backend_fwd_setup(struct __ctx_buff *ctx)
+{
+	__u16 revnat_id = 6;
+
+	lb_v4_add_service(FRONTEND_IP_REMOTE_2, FRONTEND_PORT, IPPROTO_TCP, 1, revnat_id);
+	/* Reuse the same backend_id=124 / BACKEND_IP_REMOTE as svc1. */
+	lb_v4_add_backend(FRONTEND_IP_REMOTE_2, FRONTEND_PORT, 1, 124,
+			  BACKEND_IP_REMOTE, BACKEND_PORT, IPPROTO_TCP, 0);
+
+	ipcache_v4_add_entry(BACKEND_IP_REMOTE, 0, 112233, 0, 0);
+
+	return netdev_receive_packet(ctx);
+}
+
+CHECK(PROG_TYPE, "tc_nodeport_nat_shared_backend_fwd")
+int tc_nodeport_nat_shared_backend_fwd_check(__maybe_unused const struct __ctx_buff *ctx)
+{
+	void *data, *data_end;
+	__u32 *status_code;
+	struct tcphdr *l4;
+	struct iphdr *l3;
+	__u32 key = 0;
+
+	test_init();
+
+	data = (void *)(long)ctx_data(ctx);
+	data_end = (void *)(long)ctx->data_end;
+
+	if (data + sizeof(__u32) > data_end)
+		test_fatal("status code out of bounds");
+
+	status_code = data;
+	assert(*status_code == CTX_ACT_REDIRECT);
+
+	l3 = data + sizeof(__u32) + sizeof(struct ethhdr);
+	if ((void *)l3 + sizeof(struct iphdr) > data_end)
+		test_fatal("l3 out of bounds");
+
+	l4 = (void *)l3 + sizeof(struct iphdr);
+	if ((void *)l4 + sizeof(struct tcphdr) > data_end)
+		test_fatal("l4 out of bounds");
+
+	if (l3->saddr != LB_IP)
+		test_fatal("src IP hasn't been NATed to LB IP");
+
+	if (l3->daddr != BACKEND_IP_REMOTE)
+		test_fatal("dst IP hasn't been NATed to backend IP");
+
+	if (l4->dest != BACKEND_PORT)
+		test_fatal("dst port hasn't been NATed to backend port");
+
+	struct mock_settings *settings = map_lookup_elem(&settings_map, &key);
+
+	if (settings)
+		settings->nat_source_port = l4->source;
+
+	test_finish();
+}
+
+/* Test that the reply from the shared backend is rev-NATed to svc2
+ * (FRONTEND_IP_REMOTE_2), not svc1.
+ */
+PKTGEN(PROG_TYPE, "tc_nodeport_nat_shared_backend_reply")
+int tc_nodeport_nat_shared_backend_reply_pktgen(struct __ctx_buff *ctx)
+{
+	return build_reply(ctx);
+}
+
+SETUP(PROG_TYPE, "tc_nodeport_nat_shared_backend_reply")
+int tc_nodeport_nat_shared_backend_reply_setup(struct __ctx_buff *ctx)
+{
+	return netdev_receive_packet(ctx);
+}
+
+CHECK(PROG_TYPE, "tc_nodeport_nat_shared_backend_reply")
+int tc_nodeport_nat_shared_backend_reply_check(const struct __ctx_buff *ctx)
+{
+	void *data, *data_end;
+	__u32 *status_code;
+	struct tcphdr *l4;
+	struct iphdr *l3;
+
+	test_init();
+
+	data = (void *)(long)ctx_data(ctx);
+	data_end = (void *)(long)ctx->data_end;
+
+	if (data + sizeof(__u32) > data_end)
+		test_fatal("status code out of bounds");
+
+	status_code = data;
+	assert(*status_code == CTX_ACT_REDIRECT);
+
+	l3 = data + sizeof(__u32) + sizeof(struct ethhdr);
+	if ((void *)l3 + sizeof(struct iphdr) > data_end)
+		test_fatal("l3 out of bounds");
+
+	l4 = (void *)l3 + sizeof(struct iphdr);
+	if ((void *)l4 + sizeof(struct tcphdr) > data_end)
+		test_fatal("l4 out of bounds");
+
+	if (l3->saddr != FRONTEND_IP_REMOTE_2)
+		test_fatal("src IP hasn't been RevNATed to svc2 frontend IP");
+
+	if (l3->daddr != CLIENT_IP)
+		test_fatal("dst IP hasn't been RevNATed to client IP");
+
+	if (l4->source != FRONTEND_PORT)
+		test_fatal("src port hasn't been RevNATed to frontend port");
+
+	if (l4->dest != CLIENT_PORT)
+		test_fatal("dst port hasn't been RevNATed to client port");
 
 	test_finish();
 }

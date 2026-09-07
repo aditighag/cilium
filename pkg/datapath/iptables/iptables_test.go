@@ -4,12 +4,19 @@
 package iptables
 
 import (
+	"errors"
 	"fmt"
+	"net"
+	"net/netip"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/vishvananda/netlink"
+
+	"github.com/cilium/cilium/pkg/loadbalancer"
+	wgTypes "github.com/cilium/cilium/pkg/wireguard/types"
 )
 
 type expectation struct {
@@ -24,6 +31,7 @@ type mockIptables struct {
 	ipset        string
 	expectations []expectation
 	index        int
+	mode         string
 }
 
 func (ipt *mockIptables) getProg() string {
@@ -32,6 +40,10 @@ func (ipt *mockIptables) getProg() string {
 
 func (ipt *mockIptables) getIpset() string {
 	return ipt.ipset
+}
+
+func (ipt *mockIptables) getMode() string {
+	return ipt.mode
 }
 
 func (ipt *mockIptables) runProgOutput(args []string) (out string, err error) {
@@ -72,7 +84,7 @@ func (ipt *mockIptables) checkExpectations() error {
 	return nil
 }
 
-var mockManager = &Manager{
+var mockManager = &manager{
 	haveIp6tables:        false,
 	haveSocketMatch:      true,
 	haveBPFSocketAssign:  false,
@@ -627,12 +639,6 @@ func TestRemoveCiliumRulesv4(t *testing.T) {
 			args: "-t mangle -D PREROUTING -m comment --comment cilium-feeder: CILIUM_PRE_mangle -j OLD_CILIUM_PRE_mangle",
 		}, {
 			args: "-t mangle -D POSTROUTING -m comment --comment cilium-feeder: CILIUM_POST_mangle -j OLD_CILIUM_POST_mangle",
-		}, {
-			args: "-t mangle -D OLD_CILIUM_PRE_mangle -m socket --transparent -m comment --comment cilium: any->pod redirect proxied traffic to host proxy -j MARK --set-xmark 0x200/0xffffffff",
-		}, {
-			args: "-t mangle -D OLD_CILIUM_PRE_mangle -p tcp -m mark --mark 0xd5a90200 -m comment --comment cilium: TPROXY to host cilium-dns-egress proxy -j TPROXY --on-port 43477 --on-ip 127.0.0.1 --tproxy-mark 0x200/0xffffffff",
-		}, {
-			args: "-t mangle -D OLD_CILIUM_PRE_mangle -p udp -m mark --mark 0xd5a90200 -m comment --comment cilium: TPROXY to host cilium-dns-egress proxy -j TPROXY --on-port 43477 --on-ip 127.0.0.1 --tproxy-mark 0x200/0xffffffff",
 		},
 	}
 
@@ -676,12 +682,6 @@ func TestRemoveCiliumRulesv6(t *testing.T) {
 			args: "-t mangle -D PREROUTING -m comment --comment cilium-feeder: CILIUM_PRE_mangle -j OLD_CILIUM_PRE_mangle",
 		}, {
 			args: "-t mangle -D POSTROUTING -m comment --comment cilium-feeder: CILIUM_POST_mangle -j OLD_CILIUM_POST_mangle",
-		}, {
-			args: "-t mangle -D OLD_CILIUM_PRE_mangle -m socket --transparent -m comment --comment cilium: any->pod redirect proxied traffic to host proxy -j MARK --set-xmark 0x200/0xffffffff",
-		}, {
-			args: "-t mangle -D OLD_CILIUM_PRE_mangle -p tcp -m mark --mark 0xd5a90200 -m comment --comment cilium: TPROXY to host cilium-dns-egress proxy -j TPROXY --on-port 43477 --on-ip ::1 --tproxy-mark 0x200/0xffffffff",
-		}, {
-			args: "-t mangle -D OLD_CILIUM_PRE_mangle -p udp -m mark --mark 0xd5a90200 -m comment --comment cilium: TPROXY to host cilium-dns-egress proxy -j TPROXY --on-port 43477 --on-ip ::1 --tproxy-mark 0x200/0xffffffff",
 		},
 	}
 
@@ -878,7 +878,7 @@ func testTunnelRulesTunnelingEnabled(t *testing.T, port uint16) {
 	mockIp4tables := &mockIptables{t: t, prog: "iptables"}
 	mockIp6tables := &mockIptables{t: t, prog: "ip6tables"}
 
-	mockManager := &Manager{
+	mockManager := &manager{
 		sharedCfg: SharedConfig{
 			EnableIPv4:       true,
 			EnableIPv6:       true,
@@ -914,7 +914,7 @@ func TestTunnelGeneveRulesTunnelingEnabled(t *testing.T) {
 func TestTunnelRulesTunnelingDisabled(t *testing.T) {
 	mockIp4tables := &mockIptables{t: t, prog: "iptables"}
 	mockIp6tables := &mockIptables{t: t, prog: "ip6tables"}
-	mockManager := &Manager{
+	mockManager := &manager{
 		sharedCfg: SharedConfig{
 			EnableIPv4:       true,
 			EnableIPv6:       true,
@@ -935,7 +935,7 @@ func TestNoTrackHostPorts(t *testing.T) {
 	mockIp4tables := &mockIptables{t: t, prog: "iptables"}
 	mockIp6tables := &mockIptables{t: t, prog: "ip6tables"}
 
-	testMgr := &Manager{
+	testMgr := &manager{
 		haveIp6tables:        false,
 		haveSocketMatch:      true,
 		haveBPFSocketAssign:  false,
@@ -1001,27 +1001,27 @@ func TestNoTrackHostPorts(t *testing.T) {
 		assert.NoError(t, mockIp6tables.checkExpectations())
 	})
 
-	t.Run("test changing the port", func(t *testing.T) {
+	t.Run("test changing the protocol installs before deleting", func(t *testing.T) {
 		mockIp4tables.expectations = []expectation{
 			{args: "-t raw -A CILIUM_PRE_raw -p tcp --match multiport --dports 443 -m comment --comment cilium no-track-host-ports -j CT --notrack"},
 			{args: "-t raw -A CILIUM_OUTPUT_raw -p tcp --match multiport --sports 443 -m comment --comment cilium no-track-host-ports return traffic -j CT --notrack"},
 
-			{args: "-t raw -D CILIUM_PRE_raw -p tcp --match multiport --dports 443,999 -m comment --comment cilium no-track-host-ports -j CT --notrack"},
-			{args: "-t raw -D CILIUM_OUTPUT_raw -p tcp --match multiport --sports 443,999 -m comment --comment cilium no-track-host-ports return traffic -j CT --notrack"},
-
 			{args: "-t raw -A CILIUM_PRE_raw -p udp --match multiport --dports 443 -m comment --comment cilium no-track-host-ports -j CT --notrack"},
 			{args: "-t raw -A CILIUM_OUTPUT_raw -p udp --match multiport --sports 443 -m comment --comment cilium no-track-host-ports return traffic -j CT --notrack"},
+
+			{args: "-t raw -D CILIUM_PRE_raw -p tcp --match multiport --dports 443,999 -m comment --comment cilium no-track-host-ports -j CT --notrack"},
+			{args: "-t raw -D CILIUM_OUTPUT_raw -p tcp --match multiport --sports 443,999 -m comment --comment cilium no-track-host-ports return traffic -j CT --notrack"},
 		}
 
 		mockIp6tables.expectations = []expectation{
 			{args: "-t raw -A CILIUM_PRE_raw -p tcp --match multiport --dports 443 -m comment --comment cilium no-track-host-ports -j CT --notrack"},
 			{args: "-t raw -A CILIUM_OUTPUT_raw -p tcp --match multiport --sports 443 -m comment --comment cilium no-track-host-ports return traffic -j CT --notrack"},
 
-			{args: "-t raw -D CILIUM_PRE_raw -p tcp --match multiport --dports 443,999 -m comment --comment cilium no-track-host-ports -j CT --notrack"},
-			{args: "-t raw -D CILIUM_OUTPUT_raw -p tcp --match multiport --sports 443,999 -m comment --comment cilium no-track-host-ports return traffic -j CT --notrack"},
-
 			{args: "-t raw -A CILIUM_PRE_raw -p udp --match multiport --dports 443 -m comment --comment cilium no-track-host-ports -j CT --notrack"},
 			{args: "-t raw -A CILIUM_OUTPUT_raw -p udp --match multiport --sports 443 -m comment --comment cilium no-track-host-ports return traffic -j CT --notrack"},
+
+			{args: "-t raw -D CILIUM_PRE_raw -p tcp --match multiport --dports 443,999 -m comment --comment cilium no-track-host-ports -j CT --notrack"},
+			{args: "-t raw -D CILIUM_OUTPUT_raw -p tcp --match multiport --sports 443,999 -m comment --comment cilium no-track-host-ports return traffic -j CT --notrack"},
 		}
 
 		assert.NoError(t, testMgr.setNoTrackHostPorts(testState, testPod2, []string{"443/udp"}))
@@ -1104,23 +1104,51 @@ func TestNoTrackHostPorts(t *testing.T) {
 	})
 }
 
+func TestReplaceNoTrackHostPortRulesDoesNotCleanupOnInstallFailure(t *testing.T) {
+	installErr := errors.New("install failed")
+	mockIp4tables := &mockIptables{
+		t:    t,
+		prog: "iptables",
+		expectations: []expectation{
+			{args: "-t raw -A CILIUM_PRE_raw -p udp --match multiport --dports 53 -m comment --comment cilium no-track-host-ports -j CT --notrack"},
+			{
+				args: "-t raw -A CILIUM_OUTPUT_raw -p udp --match multiport --sports 53 -m comment --comment cilium no-track-host-ports return traffic -j CT --notrack",
+				err:  installErr,
+			},
+		},
+	}
+	testMgr := &manager{
+		sharedCfg: SharedConfig{EnableIPv4: true},
+		ip4tables: mockIp4tables,
+	}
+
+	// No delete commands are expected: failed installation must leave the old
+	// TCP rules in place for full reconciliation.
+	err := testMgr.replaceNoTrackHostPortRules(
+		map[loadbalancer.L4Type][]uint16{loadbalancer.TCP: {80}},
+		map[loadbalancer.L4Type][]uint16{loadbalancer.UDP: {53}},
+	)
+	require.ErrorIs(t, err, installErr)
+	require.NoError(t, mockIp4tables.checkExpectations())
+}
+
 func TestEncryptionRules(t *testing.T) {
 	mockIp4tables := &mockIptables{t: t, prog: "iptables"}
 	mockIp6tables := &mockIptables{t: t, prog: "ip6tables"}
 
-	testMgr := &Manager{
+	testMgr := &manager{
 		haveSocketMatch:      true,
 		haveBPFSocketAssign:  false,
 		ipEarlyDemuxDisabled: false,
 		sharedCfg: SharedConfig{
-			EnableIPv4:      true,
-			EnableIPv6:      true,
-			EnableWireguard: true,
+			EnableIPv4:  true,
+			EnableIPv6:  true,
+			EnableIPSec: true,
 		},
 		ip4tables: mockIp4tables,
 		ip6tables: mockIp6tables,
 	}
-	t.Run("test adding iptables rules for wireguard encryption", func(t *testing.T) {
+	t.Run("test adding iptables rules for ipsec encryption", func(t *testing.T) {
 
 		mockIp4tables.expectations = []expectation{
 			{args: "-t filter -A CILIUM_INPUT -m mark --mark 0x00000e00/0x00000f00 -m comment --comment exclude encrypt/decrypt marks from filter CILIUM_INPUT chain -j ACCEPT"},
@@ -1170,4 +1198,137 @@ func TestEncryptionRules(t *testing.T) {
 		assert.NoError(t, mockIp4tables.checkExpectations())
 		assert.NoError(t, mockIp6tables.checkExpectations())
 	})
+
+	t.Run("test adding iptables rules for wireguard encryption", func(t *testing.T) {
+		testMgr.sharedCfg = SharedConfig{
+			EnableIPv4:      true,
+			EnableIPv6:      true,
+			EnableWireguard: true,
+		}
+
+		port := wgTypes.ListenPort
+		expected := "%s -A %s -p udp --dport %d -m comment --comment %s"
+
+		mockIp4tables.expectations = []expectation{
+			{args: fmt.Sprintf(expected, "-t raw", "CILIUM_PRE_raw", port, "cilium: NOTRACK for wireguard traffic -j CT --notrack")},
+			{args: fmt.Sprintf(expected, "-t raw", "CILIUM_OUTPUT_raw", port, "cilium: NOTRACK for wireguard traffic -j CT --notrack")},
+		}
+
+		mockIp6tables.expectations = mockIp4tables.expectations
+
+		assert.NoError(t, testMgr.addCiliumNoTrackEncryptionRules())
+		assert.NoError(t, mockIp4tables.checkExpectations())
+		assert.NoError(t, mockIp6tables.checkExpectations())
+
+		mockIp4tables.expectations = []expectation{
+			{args: fmt.Sprintf(expected, "-t filter", "CILIUM_OUTPUT", port, "cilium: ACCEPT for wireguard traffic -j ACCEPT")},
+			{args: fmt.Sprintf(expected, "-t filter", "CILIUM_INPUT", port, "cilium: ACCEPT for wireguard traffic -j ACCEPT")},
+		}
+
+		mockIp6tables.expectations = mockIp4tables.expectations
+
+		assert.NoError(t, testMgr.addCiliumAcceptEncryptionRules())
+		assert.NoError(t, mockIp4tables.checkExpectations())
+		assert.NoError(t, mockIp6tables.checkExpectations())
+	})
+}
+
+// TestAddNoTrackPodTrafficRules verifies that when InstallNoConntrackIptRules
+// is enabled, addNoTrackPodTrafficRules generates the correct iptables rules
+// to skip conntrack for pod traffic in both CILIUM_PRE_raw and
+// CILIUM_OUTPUT_raw chains. This covers the "Skip conntrack for pod traffic"
+// scenario previously tested by K8sDatapathConfig.
+func TestAddNoTrackPodTrafficRules(t *testing.T) {
+	podsCIDR := "10.0.0.0/16"
+
+	mockIp4 := &mockIptables{
+		t:    t,
+		prog: "iptables",
+		expectations: []expectation{
+			// CILIUM_PRE_raw -s podsCIDR
+			{args: "-t raw -I CILIUM_PRE_raw -s 10.0.0.0/16 -m comment --comment cilium: NOTRACK for pod traffic -j CT --notrack"},
+			// CILIUM_PRE_raw -d podsCIDR
+			{args: "-t raw -I CILIUM_PRE_raw -d 10.0.0.0/16 -m comment --comment cilium: NOTRACK for pod traffic -j CT --notrack"},
+			// CILIUM_OUTPUT_raw -s podsCIDR
+			{args: "-t raw -I CILIUM_OUTPUT_raw -s 10.0.0.0/16 -m comment --comment cilium: NOTRACK for pod traffic -j CT --notrack"},
+			// CILIUM_OUTPUT_raw -d podsCIDR
+			{args: "-t raw -I CILIUM_OUTPUT_raw -d 10.0.0.0/16 -m comment --comment cilium: NOTRACK for pod traffic -j CT --notrack"},
+		},
+	}
+
+	testMgr := &manager{
+		sharedCfg: SharedConfig{
+			InstallNoConntrackIptRules: true,
+			EnableIPv4:                 true,
+		},
+		ip4tables: mockIp4,
+	}
+
+	err := testMgr.addNoTrackPodTrafficRules(mockIp4, podsCIDR)
+	assert.NoError(t, err)
+	assert.NoError(t, mockIp4.checkExpectations())
+}
+
+// TestAllEgressMasqueradeCmdsRandomFully specifically tests the --random-fully
+// flag in masquerade rules, covering the iptables masquerading scenario
+// previously tested by K8sDatapathConfig Encapsulation context.
+func TestAllEgressMasqueradeCmdsRandomFully(t *testing.T) {
+	allocRange := "10.0.0.0/16"
+	snatDstExclusionCIDR := "192.168.0.0/16"
+
+	// Without --random-fully
+	cmdsWithout := allEgressMasqueradeCmds(allocRange, snatDstExclusionCIDR, nil, false)
+	for _, cmd := range cmdsWithout {
+		assert.NotContains(t, cmd, "--random-fully",
+			"Expected no --random-fully when disabled")
+	}
+
+	// With --random-fully
+	cmdsWith := allEgressMasqueradeCmds(allocRange, snatDstExclusionCIDR, nil, true)
+	for _, cmd := range cmdsWith {
+		assert.Contains(t, cmd, "--random-fully",
+			"Expected --random-fully when enabled")
+	}
+
+	// With --random-fully and specific masquerade interfaces
+	cmdsMultiIface := allEgressMasqueradeCmds(allocRange, snatDstExclusionCIDR,
+		[]string{"eth0", "ens5"}, true)
+	assert.Len(t, cmdsMultiIface, 2, "Expected one rule per masquerade interface")
+	for _, cmd := range cmdsMultiIface {
+		assert.Contains(t, cmd, "--random-fully",
+			"Expected --random-fully when enabled with multiple interfaces")
+	}
+}
+
+func TestInstallMasqueradeRouteSourceRules(t *testing.T) {
+	routes := []netlink.Route{
+		{Dst: mustParseCIDR("0.0.0.0/0"), Src: net.ParseIP("198.18.4.4"), LinkIndex: 0, Family: 2},
+		{Dst: mustParseCIDR("10.0.0.0/16"), Src: net.ParseIP("10.0.0.1"), LinkIndex: 5, Family: 2},
+		{Dst: mustParseCIDR("10.0.1.0/24"), Src: net.ParseIP("10.0.1.1"), LinkIndex: 5, Family: 2},
+	}
+
+	mockProg := &mockIptables{t: t, prog: "iptables", expectations: []expectation{
+		{args: "-t nat -A CILIUM_POST_nat -s 11.0.0.0/24 -d 10.0.1.0/24 -o eth0 -m comment --comment cilium snat non-cluster via source route -j SNAT --to-source 10.0.1.1"},
+		{args: "-t nat -A CILIUM_POST_nat -s 11.0.0.0/24 -d 10.0.0.0/16 -o eth0 -m comment --comment cilium snat non-cluster via source route -j SNAT --to-source 10.0.0.1"},
+		{args: "-t nat -A CILIUM_POST_nat -s 11.0.0.0/24 ! -d 11.0.0.0/24 ! -o cilium_+ -m comment --comment cilium snat non-cluster via source route -j SNAT --to-source 198.18.4.4"},
+	}}
+
+	linkByIndex := func(index int) (netlink.Link, error) {
+		return &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "eth0", Index: 5}}, nil
+	}
+
+	mgr := &manager{}
+	err := mgr.installMasqueradeRouteSourceRules(
+		mockProg, routes, linkByIndex,
+		[]string{"eth0"}, netip.MustParsePrefix("11.0.0.0/24"), "11.0.0.0/24",
+	)
+	require.NoError(t, err)
+	require.NoError(t, mockProg.checkExpectations())
+}
+func mustParseCIDR(s string) *net.IPNet {
+	_, n, err := net.ParseCIDR(s)
+	if err != nil {
+		panic(err)
+	}
+	return n
 }

@@ -11,8 +11,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2_types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 
-	cilium_ec2 "github.com/cilium/cilium/pkg/aws/ec2"
+	awsAPI "github.com/cilium/cilium/pkg/aws/api"
 	"github.com/cilium/cilium/pkg/policy/api"
 )
 
@@ -20,24 +21,25 @@ var (
 	policySecurityGroupIDKey = aws.String("group-id")
 	policySecurityGroupName  = aws.String("group-name")
 	policyEC2Labelskey       = "tag"
+
+	policyManagedPrefixListID      = aws.String("prefix-list-id")
+	policyManagedPrefixListName    = aws.String("prefix-list-name")
+	policyManagedPrefixListOwnerID = aws.String("owner-id")
 )
 
-func init() {
-	api.RegisterToGroupsProvider(api.AWSProvider, GetIPsFromGroup)
-}
-
 // GetIPsFromGroup will return the list of the IPs for the given group filter
-func GetIPsFromGroup(ctx context.Context, group *api.Groups) ([]netip.Addr, error) {
-	result := []netip.Addr{}
+func GetIPsFromGroup(ctx context.Context, group *api.Groups) ([]netip.Prefix, error) {
 	if group.AWS == nil {
-		return result, fmt.Errorf("no aws data available")
+		return []netip.Prefix{}, nil
 	}
 
-	cfg, err := cilium_ec2.NewConfig(ctx)
+	cfg, err := awsAPI.NewConfig(ctx)
 	if err != nil {
 		return nil, err
 	}
 	ec2Client := ec2.NewFromConfig(cfg)
+
+	addrs := []netip.Addr{}
 
 	// If the group has a security group filter, add the IPs from the network interfaces
 	if len(group.AWS.SecurityGroupsIds) > 0 || len(group.AWS.SecurityGroupsNames) > 0 {
@@ -45,7 +47,7 @@ func GetIPsFromGroup(ctx context.Context, group *api.Groups) ([]netip.Addr, erro
 		if err != nil {
 			return nil, err
 		}
-		result = append(result, ips...)
+		addrs = append(addrs, ips...)
 	}
 
 	// If the group has a label filter, add the IPs from the instances
@@ -54,10 +56,25 @@ func GetIPsFromGroup(ctx context.Context, group *api.Groups) ([]netip.Addr, erro
 		if err != nil {
 			return nil, err
 		}
-		result = append(result, ips...)
+		addrs = append(addrs, ips...)
 	}
 
-	return result, nil
+	result := make(sets.Set[netip.Prefix], len(addrs))
+
+	for _, addr := range addrs {
+		result.Insert(netip.PrefixFrom(addr, addr.BitLen()))
+	}
+
+	if group.AWS.ManagedPrefixList != nil {
+		ips, err := getManagedPrefixListIpsFromFilter(ctx, group.AWS.ManagedPrefixList, ec2Client)
+		if err != nil {
+			return nil, err
+		}
+
+		result.Insert(ips...)
+	}
+
+	return result.UnsortedList(), nil
 }
 
 // getNetworkInterfaceIpsFromFilter returns the IPs from the network interfaces for
@@ -155,4 +172,70 @@ func extractIPs(reservations []ec2_types.Reservation) []netip.Addr {
 		}
 	}
 	return result
+}
+
+type ec2ManagedPrefixListAPIClient interface {
+	ec2.DescribeManagedPrefixListsAPIClient
+	ec2.GetManagedPrefixListEntriesAPIClient
+}
+
+// getManagedPrefixListIpsFromFilter returns prefixes from any managed prefix
+// lists matching the given filter
+func getManagedPrefixListIpsFromFilter(ctx context.Context, filter *api.AWSManagedPrefixList, ec2Client ec2ManagedPrefixListAPIClient) ([]netip.Prefix, error) {
+	result := []netip.Prefix{}
+	input := &ec2.DescribeManagedPrefixListsInput{}
+
+	if len(filter.IDs) > 0 {
+		input.Filters = append(input.Filters, ec2_types.Filter{
+			Name:   policyManagedPrefixListID,
+			Values: filter.IDs,
+		})
+	}
+
+	if len(filter.Names) > 0 {
+		input.Filters = append(input.Filters, ec2_types.Filter{
+			Name:   policyManagedPrefixListName,
+			Values: filter.Names,
+		})
+	}
+
+	if len(filter.OwnerIDs) > 0 {
+		input.Filters = append(input.Filters, ec2_types.Filter{
+			Name:   policyManagedPrefixListOwnerID,
+			Values: filter.OwnerIDs,
+		})
+	}
+
+	paginator := ec2.NewDescribeManagedPrefixListsPaginator(ec2Client, input)
+	for paginator.HasMorePages() {
+		output, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("cannot retrieve aws managed prefix list information: %w", err)
+		}
+
+		for _, plist := range output.PrefixLists {
+			input := &ec2.GetManagedPrefixListEntriesInput{
+				PrefixListId: plist.PrefixListId,
+			}
+
+			paginator := ec2.NewGetManagedPrefixListEntriesPaginator(ec2Client, input)
+			for paginator.HasMorePages() {
+				output, err := paginator.NextPage(ctx)
+				if err != nil {
+					return nil, fmt.Errorf("cannot retrieve aws managed prefix list entries: %w", err)
+				}
+
+				for _, entry := range output.Entries {
+					addr, err := netip.ParsePrefix(aws.ToString(entry.Cidr))
+					if err != nil {
+						return nil, fmt.Errorf("cannot parse aws managed prefix list entry: %w", err)
+					}
+
+					result = append(result, addr)
+				}
+			}
+		}
+	}
+
+	return result, nil
 }

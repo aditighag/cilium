@@ -57,7 +57,6 @@ context of that pod:
 
    $ kubectl -n kube-system exec cilium-2hq5z -- cilium-dbg status
    KVStore:                Ok   etcd: 1/1 connected: http://demo-etcd-lab--a.etcd.tgraf.test1.lab.corp.isovalent.link:2379 - 3.2.5 (Leader)
-   ContainerRuntime:       Ok   docker daemon: OK
    Kubernetes:             Ok   OK
    Kubernetes APIs:        ["cilium/v2::CiliumNetworkPolicy", "networking.k8s.io/v1::NetworkPolicy", "core/v1::Service", "core/v1::Endpoint", "core/v1::Node", "CustomResourceDefinition"]
    Cilium:                 Ok   OK
@@ -82,7 +81,6 @@ of all nodes in the cluster:
 
    $ ./k8s-cilium-exec.sh cilium-dbg status
    KVStore:                Ok   Etcd: http://127.0.0.1:2379 - (Leader) 3.1.10
-   ContainerRuntime:       Ok
    Kubernetes:             Ok   OK
    Kubernetes APIs:        ["networking.k8s.io/v1beta1::Ingress", "core/v1::Node", "CustomResourceDefinition", "cilium/v2::CiliumNetworkPolicy", "networking.k8s.io/v1::NetworkPolicy", "core/v1::Service", "core/v1::Endpoint"]
    Cilium:                 Ok   OK
@@ -127,7 +125,6 @@ e.g.:
 
    $ cilium-dbg status
    KVStore:                Ok   etcd: 1/1 connected: https://192.168.60.11:2379 - 3.2.7 (Leader)
-   ContainerRuntime:       Ok
    Kubernetes:             Ok   OK
    Kubernetes APIs:        ["core/v1::Endpoint", "networking.k8s.io/v1beta1::Ingress", "core/v1::Node", "CustomResourceDefinition", "cilium/v2::CiliumNetworkPolicy", "networking.k8s.io/v1::NetworkPolicy", "core/v1::Service"]
    Cilium:                 Ok   OK
@@ -539,7 +536,7 @@ Policymap pressure and overflow
 The most important step in debugging policymap pressure is finding out which
 node(s) are impacted.
 
-The ``cilium_bpf_map_pressure{map_name="cilium_policy_v2_*"}`` metric monitors the
+The ``cilium_bpf_map_pressure{map_name="cilium_policy_v3_*"}`` metric monitors the
 endpoint's BPF policymap pressure. This metric exposes the maximum BPF map
 pressure on the node, meaning the policymap experiencing the most pressure on a
 particular node.
@@ -784,17 +781,14 @@ Troubleshooting steps:
 
    When running in :ref:`arch_overlay` mode:
 
-#. Run ``cilium-dbg bpf tunnel list`` and verify that each Cilium node is aware of
-   the other nodes in the cluster.  If not, check the logfile for errors.
-
 #. If nodes are being populated correctly, run ``tcpdump -n -i cilium_vxlan`` on
    each node to verify whether cross node traffic is being forwarded correctly
    between nodes.
 
    If packets are being dropped,
 
-   * verify that the node IP listed in ``cilium-dbg bpf tunnel list`` can reach each
-     other.
+   * verify that the node IP listed in ``cilium-dbg bpf ipcache list`` can reach
+     each other.
    * verify that the firewall on each node allows UDP port 8472.
 
    When running in :ref:`arch_direct_routing` mode:

@@ -21,10 +21,10 @@ cilium connectivity perf [flags]
       --msg-size int                     Size of message to use in UDP test (default 1024)
       --namespace-labels map             Add labels to the connectivity test namespace
       --net-qos                          Test pod network Quality of Service
-      --node-selector-client map         Node selector for the other-node client pod
-      --node-selector-server map         Node selector for the server pod (and client same-node)
+      --node-selector-client string      Node selector (label query) for the other-node client pod (default "cilium.io/no-schedule!=true")
+      --node-selector-server string      Node selector (label query) for the server pod (and client same-node) (default "cilium.io/no-schedule!=true")
       --other-node                       Run tests in which the client and the server are hosted on difference nodes (default true)
-      --performance-image string         Image path to use for performance (default "quay.io/cilium/network-perf:3.19-1764664744-8340907@sha256:8dce3fcab1a4c22f28fc53020079e6686d5548173f337cf07514e9d13213394d")
+      --performance-image string         Image path to use for performance (default "quay.io/cilium/network-perf:3.21-1788350426-c114a5d@sha256:9c317f55137854eda73e9e0833545bb60301f6e368891b6797123915816e3532")
       --pod-net                          Test pod network (default true)
       --pod-to-host                      Test pod-to-host traffic
       --print-image-artifacts            Prints the used image artifacts

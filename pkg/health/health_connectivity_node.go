@@ -4,12 +4,15 @@
 package health
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 
+	"github.com/cilium/cilium/api/v1/client/daemon"
+	"github.com/cilium/cilium/api/v1/health/client/restapi"
 	healthApi "github.com/cilium/cilium/api/v1/health/server"
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/api"
@@ -39,7 +42,7 @@ const (
 )
 
 // launchCiliumNodeHealth starts the cilium-health server and returns a handle to obtain its status
-func (h *ciliumHealthManager) launchCiliumNodeHealth(spec *healthApi.Spec, initialized <-chan struct{}) (*CiliumHealth, error) {
+func (h *ciliumHealthManager) launchCiliumNodeHealth(ctx context.Context, spec *healthApi.Spec, initialized <-chan struct{}) (*CiliumHealth, error) {
 	var (
 		err error
 		ch  = &CiliumHealth{
@@ -56,7 +59,12 @@ func (h *ciliumHealthManager) launchCiliumNodeHealth(spec *healthApi.Spec, initi
 		HealthAPISpec: spec,
 	}
 
-	ch.server, err = server.NewServer(h.logger, config, h.healthConfig.IsActiveHealthCheckingEnabled())
+	ln, err := h.localNodeStore.Get(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get local node: %w", err)
+	}
+
+	ch.server, err = server.NewServer(h.logger, config, h.healthConfig.IsActiveHealthCheckingEnabled(), ln)
 	if err != nil {
 		return nil, fmt.Errorf("failed to instantiate cilium-health server: %w", err)
 	}
@@ -80,7 +88,7 @@ func (ch *CiliumHealth) runServer(initialized <-chan struct{}) {
 		cli, err := ciliumPkg.NewDefaultClient()
 		if err == nil {
 			// Making sure that we can talk with the daemon.
-			if _, err = cli.Daemon.GetHealthz(nil); err == nil {
+			if _, err = cli.Daemon.GetHealthz(daemon.NewGetHealthzParams()); err == nil {
 				break
 			}
 		}
@@ -118,7 +126,7 @@ func (ch *CiliumHealth) runServer(initialized <-chan struct{}) {
 			State: models.StatusStateOk,
 		}
 
-		_, err := ch.client.Restapi.GetHealthz(nil)
+		_, err := ch.client.Restapi.GetHealthz(restapi.NewGetHealthzParams())
 		if err != nil {
 			status.Msg = err.Error()
 			status.State = models.StatusStateWarning

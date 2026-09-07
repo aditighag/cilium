@@ -5,7 +5,6 @@ package common
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -24,18 +23,17 @@ import (
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/metrics"
+	"github.com/cilium/cilium/pkg/node"
 )
 
-var (
-	remoteConnectionControllerGroup = controller.NewGroup("clustermesh-remote-cluster")
-	clusterConfigControllerGroup    = controller.NewGroup("clustermesh-cluster-config")
-)
+var remoteConnectionControllerGroup = controller.NewGroup("clustermesh-remote-cluster")
 
 type RemoteCluster interface {
 	// Run implements the actual business logic once the connection to the remote cluster has been established.
 	// The ready channel shall be closed when the initialization tasks completed, possibly returning an error.
 	Run(ctx context.Context, backend kvstore.BackendOperations, config types.CiliumClusterConfig, ready chan<- error)
 
+	OnClusterIDChange(ctx context.Context, newID uint32)
 	Stop()
 	Remove(ctx context.Context)
 	RevokeCache(ctx context.Context)
@@ -48,13 +46,18 @@ type remoteCluster struct {
 
 	// name is the name of the cluster
 	name string
+	// clusterID is the clusterID advertized by the remote cluster
+	clusterID uint32
+
+	localClusterInfo  types.ClusterInfo
+	clusterIDsManager ClusterIDsManager
 
 	// configPath is the path to the etcd configuration to be used to
 	// connect to the etcd cluster of the remote cluster
 	configPath string
 
 	// clusterSizeDependantInterval allows to calculate intervals based on cluster size.
-	clusterSizeDependantInterval kvstore.ClusterSizeDependantIntervalFunc
+	clusterSizeDependantInterval node.ClusterSizeDependantIntervalFunc
 
 	// resolvers are the set of resolvers used to create the custom dialer.
 	resolvers []dial.Resolver
@@ -139,7 +142,16 @@ func (rc *remoteCluster) restartRemoteConnection() {
 				rc.releaseOldConnection()
 
 				clusterLock := rc.clusterLockFactory()
-				extraOpts := rc.makeExtraOpts(clusterLock)
+
+				ciliumConfig, err := ParseCiliumConfig(rc.configPath)
+				if err != nil {
+					rc.logger.Error("Failed to parse Cilium config from etcd client config",
+						logfields.Error, err,
+					)
+					return err
+				}
+
+				extraOpts := rc.makeExtraOpts(clusterLock, ciliumConfig)
 				backend, errChan := rc.remoteClientFactory(ctx, rc.logger, rc.configPath, extraOpts)
 
 				// Block until either an error is returned or
@@ -147,7 +159,6 @@ func (rc *remoteCluster) restartRemoteConnection() {
 				// connection
 				rc.logger.Debug("Waiting for connection to be established")
 
-				var err error
 				select {
 				case err = <-errChan:
 				case err = <-clusterLock.errors:
@@ -174,19 +185,24 @@ func (rc *remoteCluster) restartRemoteConnection() {
 				rc.mutex.Unlock()
 
 				ctx, cancel := context.WithCancel(ctx)
-				rc.wg.Add(1)
-				go func() {
-					rc.watchdog(ctx, backend, clusterLock)
+				configChanged := make(chan struct{})
+				rc.wg.Go(func() {
+					rc.watchdog(ctx, backend, clusterLock, configChanged)
 					cancel()
-					rc.wg.Done()
-				}()
+				})
 
 				rc.logger.Info(
 					"Connection to remote cluster established",
 					logfields.EtcdClusterID, etcdClusterID,
 				)
 
-				config, err := rc.getClusterConfig(ctx, backend)
+				configUpdates := make(chan types.CiliumClusterConfig)
+				rc.wg.Go(func() {
+					clustercfg.Watch(ctx, rc.name, backend, rc.logger, configUpdates)
+					close(configUpdates)
+				})
+
+				config, err := rc.waitForClusterConfig(ctx, configUpdates)
 				if err != nil {
 					// Return immediately if the context has been canceled, to
 					// avoid emitting a spurious warning in case the failure is
@@ -198,22 +214,23 @@ func (rc *remoteCluster) restartRemoteConnection() {
 					default:
 					}
 
-					if errors.Is(err, clustercfg.ErrNotFound) {
-						rc.logger.Warn("Unable to get remote cluster configuration",
-							logfields.Error, err,
-							logfields.Hint, "If KVStoreMesh is enabled, check whether it is connected to the target cluster."+
-								" Additionally, ensure that the cluster name is correct.",
-						)
-					} else {
-						rc.logger.Warn("Unable to get remote cluster configuration",
-							logfields.Error, err,
-						)
-					}
+					rc.logger.Warn("Unable to get remote cluster configuration",
+						logfields.Error, err,
+						logfields.Hint, "If KVStoreMesh is enabled, check whether it is connected to the target cluster."+
+							" Additionally, ensure that the cluster name is correct.",
+					)
 
 					cancel()
 					return err
 				}
+				if err := rc.onClusterConfigUpdate(ctx, config); err != nil {
+					rc.logger.Warn("Invalid remote cluster configuration", logfields.Error, err)
+					cancel()
+					return err
+				}
 				rc.logger.Info("Found remote cluster configuration")
+
+				rc.wg.Go(func() { rc.watchClusterConfig(configUpdates, configChanged) })
 
 				ready := make(chan error)
 
@@ -226,12 +243,10 @@ func (rc *remoteCluster) restartRemoteConnection() {
 				// to return early from the controller body, so that the statistics
 				// are updated correctly. Instead, blocking until rc.Run terminates
 				// would prevent a previous failure from being cleared out.
-				rc.wg.Add(1)
-				go func() {
+				rc.wg.Go(func() {
 					rc.Run(ctx, backend, config, ready)
 					cancel()
-					rc.wg.Done()
-				}()
+				})
 
 				if err := <-ready; err != nil {
 					select {
@@ -257,7 +272,40 @@ func (rc *remoteCluster) restartRemoteConnection() {
 	)
 }
 
-func (rc *remoteCluster) watchdog(ctx context.Context, backend kvstore.BackendOperations, clusterLock *clusterLock) {
+func (rc *remoteCluster) onClusterConfigUpdate(ctx context.Context, config types.CiliumClusterConfig) error {
+	if err := rc.localClusterInfo.ValidateRemoteConfig(config); err != nil {
+		return err
+	}
+	if config.ID == rc.clusterID {
+		return nil
+	}
+
+	if err := rc.clusterIDsManager.ReserveClusterID(config.ID); err != nil {
+		// release the old ID
+		rc.RemoteCluster.OnClusterIDChange(ctx, types.ClusterIDUnset)
+		rc.clusterIDsManager.ReleaseClusterID(rc.clusterID)
+		rc.clusterID = types.ClusterIDUnset
+		return err
+	}
+
+	rc.RemoteCluster.OnClusterIDChange(ctx, config.ID)
+	rc.clusterIDsManager.ReleaseClusterID(rc.clusterID)
+	rc.clusterID = config.ID
+	return nil
+}
+
+func (rc *remoteCluster) watchdog(
+	ctx context.Context, backend kvstore.BackendOperations,
+	clusterLock *clusterLock, configChanged <-chan struct{},
+) {
+	restart := func() {
+		// Let's manually trigger the controller, instead of directly calling
+		// restartRemoteConnection, to prevent the risk of a race condition if
+		// the watchdog triggers at the same time of the cluster removal, which
+		// would otherwise resurrect an already stopped connection.
+		rc.controllers.TriggerController(rc.remoteConnectionControllerName)
+	}
+
 	handleErr := func(err error) {
 		rc.logger.Warn("Error observed on etcd connection, reconnecting etcd", logfields.Error, err)
 		rc.mutex.Lock()
@@ -268,7 +316,7 @@ func (rc *remoteCluster) watchdog(ctx context.Context, backend kvstore.BackendOp
 		rc.metricReadinessStatus.Set(metrics.BoolToFloat64(rc.isReadyLocked()))
 		rc.mutex.Unlock()
 
-		rc.restartRemoteConnection()
+		restart()
 	}
 
 	select {
@@ -280,17 +328,33 @@ func (rc *remoteCluster) watchdog(ctx context.Context, backend kvstore.BackendOp
 		if ok && err != nil {
 			handleErr(err)
 		}
+	case <-configChanged:
+		rc.logger.Info("Remote cluster configuration changed, reconnecting")
+		// Let's bypass handleErr as it's not an actual error
+		restart()
 	case <-ctx.Done():
 		return
 	}
 }
 
-func (rc *remoteCluster) getClusterConfig(ctx context.Context, backend kvstore.BackendOperations) (types.CiliumClusterConfig, error) {
-	var (
-		clusterConfigRetrievalTimeout = 3 * time.Minute
-		lastError                     = context.Canceled
-		lastErrorLock                 lock.Mutex
-	)
+// watchClusterConfig watches the configuration of the remote cluster and on
+// the first config update signals the changed channel by closing it
+func (rc *remoteCluster) watchClusterConfig(
+	configUpdates <-chan types.CiliumClusterConfig, configChanged chan<- struct{},
+) {
+	_, ok := <-configUpdates
+	// Note that the configUpdates channels already deduplicates config changes
+	if ok {
+		close(configChanged)
+	}
+}
+
+// waitForClusterConfig waits until the first configuration of the remote
+// cluster is retrieved from the configUpdates channel.
+func (rc *remoteCluster) waitForClusterConfig(
+	ctx context.Context, configUpdates <-chan types.CiliumClusterConfig,
+) (types.CiliumClusterConfig, error) {
+	const clusterConfigRetrievalTimeout = 3 * time.Minute
 
 	ctx, cancel := context.WithTimeout(ctx, clusterConfigRetrievalTimeout)
 	defer cancel()
@@ -299,61 +363,49 @@ func (rc *remoteCluster) getClusterConfig(ctx context.Context, backend kvstore.B
 	rc.config = &models.RemoteClusterConfig{Required: true}
 	rc.mutex.Unlock()
 
-	cfgch := make(chan types.CiliumClusterConfig, 1)
-	defer close(cfgch)
-
-	// We retry here rather than simply returning an error and relying on the external
-	// controller backoff period to avoid recreating every time a new connection to the remote
-	// kvstore, which would introduce an unnecessary overhead. Still, we do return in case of
-	// consecutive failures, to ensure that we do not retry forever if something strange happened.
-	ctrlname := rc.remoteConnectionControllerName + "-cluster-config"
-	defer rc.controllers.RemoveControllerAndWait(ctrlname)
-	rc.controllers.UpdateController(ctrlname, controller.ControllerParams{
-		Group: clusterConfigControllerGroup,
-		DoFunc: func(ctx context.Context) error {
-			rc.logger.Debug("Retrieving cluster configuration from remote kvstore")
-			config, err := clustercfg.Get(ctx, rc.name, backend)
-			if err != nil {
-				lastErrorLock.Lock()
-				lastError = err
-				lastErrorLock.Unlock()
-				return err
-			}
-
-			cfgch <- config
-			return nil
-		},
-		Context:          ctx,
-		MaxRetryInterval: 30 * time.Second,
-	})
+	rc.logger.Debug("Retrieving cluster configuration from remote kvstore")
 
 	// Wait until either the configuration is retrieved, or the context expires
 	select {
-	case config := <-cfgch:
+	case config, ok := <-configUpdates:
+		if !ok {
+			break
+		}
+
 		rc.mutex.Lock()
 		rc.config.Retrieved = true
 		rc.config.ClusterID = int64(config.ID)
 		rc.config.Kvstoremesh = config.Capabilities.Cached
 		rc.config.SyncCanaries = config.Capabilities.SyncedCanaries
 		rc.config.ServiceExportsEnabled = config.Capabilities.ServiceExportsEnabled
+		rc.config.EndpointSlicesExportMode = string(config.Capabilities.EndpointSlicesExportMode)
 		rc.mutex.Unlock()
 
 		return config, nil
 	case <-ctx.Done():
-		lastErrorLock.Lock()
-		defer lastErrorLock.Unlock()
-		return types.CiliumClusterConfig{}, fmt.Errorf("failed to retrieve cluster configuration: %w", lastError)
 	}
+
+	return types.CiliumClusterConfig{}, fmt.Errorf("failed to retrieve cluster configuration: %w", ctx.Err())
 }
 
-func (rc *remoteCluster) makeExtraOpts(clusterLock *clusterLock) kvstore.ExtraOptions {
+func (rc *remoteCluster) makeExtraOpts(clusterLock *clusterLock, ciliumConfig CiliumEtcdConfig) kvstore.ExtraOptions {
 	var dialOpts []grpc.DialOption
 
 	dialOpts = append(dialOpts, grpc.WithStreamInterceptor(newStreamInterceptor(clusterLock)), grpc.WithUnaryInterceptor(newUnaryInterceptor(clusterLock)))
 
 	// Allow to resolve service names without depending on the DNS. This prevents the need
 	// for setting the DNSPolicy to ClusterFirstWithHostNet when running in host network.
-	dialOpts = append(dialOpts, grpc.WithContextDialer(dial.NewContextDialer(rc.logger, rc.resolvers...)))
+	dialer := dial.NewContextDialer(rc.logger, rc.resolvers...)
+
+	if len(ciliumConfig.HostAliases) > 0 {
+		dialer = dial.NewStaticContextDialerWithFallback(
+			rc.logger,
+			ConvertHostAliasesToPlainMap(ciliumConfig.HostAliases),
+			dialer,
+		)
+	}
+
+	dialOpts = append(dialOpts, grpc.WithContextDialer(dialer))
 
 	return kvstore.ExtraOptions{
 		NoLockQuorumCheck:            true,
@@ -385,6 +437,7 @@ func (rc *remoteCluster) onStop() {
 func (rc *remoteCluster) onRemove(ctx context.Context) {
 	rc.onStop()
 	rc.Remove(ctx)
+	rc.clusterIDsManager.ReleaseClusterID(rc.clusterID)
 
 	rc.logger.Info("Remote cluster disconnected")
 }
@@ -404,8 +457,7 @@ func (rc *remoteCluster) status() *models.RemoteCluster {
 	rc.mutex.RLock()
 	defer rc.mutex.RUnlock()
 
-	// This can happen when the controller in restartRemoteConnection is waiting
-	// for the first connection to succeed.
+	// This can happen when the first connection has not succeeded yet.
 	var backendStatus = "Waiting for initial connection to be established"
 	if rc.backend != nil {
 		backendStatus = rc.backend.Status().Msg

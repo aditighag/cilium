@@ -15,12 +15,8 @@
 #define DSR_ENCAP_GENEVE	3
 #define DSR_ENCAP_MODE		DSR_ENCAP_GENEVE
 
-#define TUNNEL_PROTOCOL		TUNNEL_PROTOCOL_GENEVE
 #define ENCAP_IFINDEX		42
 #define TUNNEL_MODE
-
-/* Skip ingress policy checks */
-#define USE_BPF_PROG_FOR_INGRESS_POLICY
 
 #define CLIENT_IP		v4_ext_one
 #define CLIENT_PORT		__bpf_htons(111)
@@ -30,7 +26,6 @@
 #define FRONTEND_PORT		tcp_svc_one
 
 #define LB_IP			v4_node_one
-#define IPV4_DIRECT_ROUTING	LB_IP
 #define BACKEND_NODE_IP		v4_node_two
 
 #define DIRECT_ROUTING_IFINDEX	25
@@ -84,11 +79,15 @@ long mock_fib_lookup(__maybe_unused void *ctx, struct bpf_fib_lookup *params,
 #include "lib/ipcache.h"
 #include "lib/lb.h"
 
+ASSIGN_CONFIG(bool, enable_endpoint_routes, true)
+ASSIGN_CONFIG(__u8, tunnel_protocol, TUNNEL_PROTOCOL_GENEVE)
+ASSIGN_CONFIG(union v4addr, ipv4_direct_routing, { .be32 = LB_IP })
+
 /* Test that a SVC request to a local backend
  * - gets DNATed (but not SNATed)
  * - gets passed up from XDP to TC
  */
-PKTGEN("xdp", "nodeport_geneve_dsr_lb_xdp1_local_backend")
+PKTGEN(PROG_TYPE, "nodeport_geneve_dsr_lb_xdp1_local_backend")
 int nodeport_geneve_dsr_lb_xdp1_local_backend_pktgen(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -115,7 +114,7 @@ int nodeport_geneve_dsr_lb_xdp1_local_backend_pktgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("xdp", "nodeport_geneve_dsr_lb_xdp1_local_backend")
+SETUP(PROG_TYPE, "nodeport_geneve_dsr_lb_xdp1_local_backend")
 int nodeport_geneve_dsr_lb_xdp1_local_backend_setup(struct __ctx_buff *ctx)
 {
 	__u16 revnat_id = 1;
@@ -133,7 +132,7 @@ int nodeport_geneve_dsr_lb_xdp1_local_backend_setup(struct __ctx_buff *ctx)
 	return xdp_receive_packet(ctx);
 }
 
-CHECK("xdp", "nodeport_geneve_dsr_lb_xdp1_local_backend")
+CHECK(PROG_TYPE, "nodeport_geneve_dsr_lb_xdp1_local_backend")
 int nodeport_geneve_dsr_lb_xdp1_local_backend_check(const struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -144,6 +143,8 @@ int nodeport_geneve_dsr_lb_xdp1_local_backend_check(const struct __ctx_buff *ctx
 	__u32 *meta;
 
 	test_init();
+
+	endpoint_v4_del_entry(BACKEND_IP_LOCAL);
 
 	data = (void *)(long)ctx_data(ctx);
 	data_end = (void *)(long)ctx->data_end;
@@ -192,8 +193,8 @@ int nodeport_geneve_dsr_lb_xdp1_local_backend_check(const struct __ctx_buff *ctx
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst TCP port hasn't been NATed to backend port");
 
-	if (l4->check != bpf_htons(0xd7d0))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+	if (l4->check != bpf_htons(0x3771))
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_htons(0x3771));
 
 	test_finish();
 }
@@ -203,7 +204,7 @@ int nodeport_geneve_dsr_lb_xdp1_local_backend_check(const struct __ctx_buff *ctx
  * - has tunnel encapsulation header added,
  * - has DSR option inserted
  */
-PKTGEN("xdp", "nodeport_geneve_dsr_lb_xdp2_fwd")
+PKTGEN(PROG_TYPE, "nodeport_geneve_dsr_lb_xdp2_fwd")
 int nodeport_geneve_dsr_lb_xdp2_fwd_pktgen(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -230,7 +231,7 @@ int nodeport_geneve_dsr_lb_xdp2_fwd_pktgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("xdp", "nodeport_geneve_dsr_lb_xdp2_fwd")
+SETUP(PROG_TYPE, "nodeport_geneve_dsr_lb_xdp2_fwd")
 int nodeport_geneve_dsr_lb_xdp2_fwd_setup(struct __ctx_buff *ctx)
 {
 	__u32 backend_id = 125;
@@ -245,7 +246,7 @@ int nodeport_geneve_dsr_lb_xdp2_fwd_setup(struct __ctx_buff *ctx)
 	return xdp_receive_packet(ctx);
 }
 
-CHECK("xdp", "nodeport_geneve_dsr_lb_xdp2_fwd")
+CHECK(PROG_TYPE, "nodeport_geneve_dsr_lb_xdp2_fwd")
 int nodeport_geneve_dsr_lb_xdp_fwd_check(__maybe_unused const struct __ctx_buff *ctx)
 {
 	struct geneve_dsr_opt4 *dsr_opt;
@@ -314,7 +315,7 @@ int nodeport_geneve_dsr_lb_xdp_fwd_check(__maybe_unused const struct __ctx_buff 
 	if (l3->protocol != IPPROTO_UDP)
 		test_fatal("outer IP doesn't have correct L4 protocol");
 
-	if (l3->saddr != IPV4_DIRECT_ROUTING)
+	if (l3->saddr != CONFIG(ipv4_direct_routing).be32)
 		test_fatal("outerSrcIP is not correct");
 
 	if (l3->daddr != BACKEND_NODE_IP)
@@ -323,7 +324,7 @@ int nodeport_geneve_dsr_lb_xdp_fwd_check(__maybe_unused const struct __ctx_buff 
 	if (l3->check != bpf_htons(0x5371))
 		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
 
-	if (udp->dest != bpf_htons(TUNNEL_PORT))
+	if (udp->dest != bpf_htons(CONFIG(tunnel_port)))
 		test_fatal("outerDstPort is not tunnel port");
 
 	__be32 sec_id;
@@ -367,8 +368,8 @@ int nodeport_geneve_dsr_lb_xdp_fwd_check(__maybe_unused const struct __ctx_buff 
 	if (tcp_inner->dest != BACKEND_PORT)
 		test_fatal("innerDstPort hasn't been NATed to backend port");
 
-	if (tcp_inner->check != bpf_htons(0xd7cf))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(tcp_inner->check));
+	if (tcp_inner->check != bpf_htons(0x3770))
+		test_fatal("L4 checksum is invalid: %x != %x", tcp_inner->check, bpf_htons(0x3770));
 
 	test_finish();
 }

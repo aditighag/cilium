@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"maps"
-	"net"
 	"net/netip"
 	"testing"
 
@@ -18,7 +17,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	baseclocktest "k8s.io/utils/clock/testing"
 
-	"github.com/cilium/cilium/pkg/cidr"
 	"github.com/cilium/cilium/pkg/container/set"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/hive"
@@ -159,8 +157,8 @@ func TestReconciliationLoop(t *testing.T) {
 							Type: addressing.NodeCiliumInternalIP,
 						},
 					}
-					n.IPv4AllocCIDR = cidr.MustParseCIDR("5.5.5.0/24")
-					n.IPv6AllocCIDR = cidr.MustParseCIDR("2001:aaaa::/96")
+					n.IPv4AllocCIDR = types.PrefixFrom(netip.MustParsePrefix("5.5.5.0/24"))
+					n.IPv6AllocCIDR = types.PrefixFrom(netip.MustParsePrefix("2001:aaaa::/96"))
 				})
 
 				txn := db.WriteTxn(devices)
@@ -177,9 +175,9 @@ func TestReconciliationLoop(t *testing.T) {
 				installRules: true,
 				devices:      sets.New("test-1"),
 				localNodeInfo: localNodeInfo{
-					internalIPv4:  net.ParseIP("1.1.1.1"),
-					ipv4AllocCIDR: cidr.MustParseCIDR("5.5.5.0/24").String(),
-					ipv6AllocCIDR: cidr.MustParseCIDR("2001:aaaa::/96").String(),
+					internalIPv4:  netip.MustParseAddr("1.1.1.1"),
+					ipv4AllocCIDR: netip.MustParsePrefix("5.5.5.0/24"),
+					ipv6AllocCIDR: netip.MustParsePrefix("2001:aaaa::/96"),
 				},
 			},
 		},
@@ -198,9 +196,9 @@ func TestReconciliationLoop(t *testing.T) {
 				installRules: true,
 				devices:      sets.New("test-1", "test-2"),
 				localNodeInfo: localNodeInfo{
-					internalIPv4:  net.ParseIP("1.1.1.1"),
-					ipv4AllocCIDR: cidr.MustParseCIDR("5.5.5.0/24").String(),
-					ipv6AllocCIDR: cidr.MustParseCIDR("2001:aaaa::/96").String(),
+					internalIPv4:  netip.MustParseAddr("1.1.1.1"),
+					ipv4AllocCIDR: netip.MustParsePrefix("5.5.5.0/24"),
+					ipv6AllocCIDR: netip.MustParsePrefix("2001:aaaa::/96"),
 				},
 			},
 		},
@@ -214,17 +212,17 @@ func TestReconciliationLoop(t *testing.T) {
 							Type: addressing.NodeCiliumInternalIP,
 						},
 					}
-					n.IPv4AllocCIDR = cidr.MustParseCIDR("6.6.6.0/24")
-					n.IPv6AllocCIDR = cidr.MustParseCIDR("3002:bbbb::/96")
+					n.IPv4AllocCIDR = types.PrefixFrom(netip.MustParsePrefix("6.6.6.0/24"))
+					n.IPv6AllocCIDR = types.PrefixFrom(netip.MustParsePrefix("3002:bbbb::/96"))
 				})
 			},
 			expected: desiredState{
 				installRules: true,
 				devices:      sets.New("test-1", "test-2"),
 				localNodeInfo: localNodeInfo{
-					internalIPv4:  net.ParseIP("2.2.2.2"),
-					ipv4AllocCIDR: cidr.MustParseCIDR("6.6.6.0/24").String(),
-					ipv6AllocCIDR: cidr.MustParseCIDR("3002:bbbb::/96").String(),
+					internalIPv4:  netip.MustParseAddr("2.2.2.2"),
+					ipv4AllocCIDR: netip.MustParsePrefix("6.6.6.0/24"),
+					ipv6AllocCIDR: netip.MustParsePrefix("3002:bbbb::/96"),
 				},
 			},
 		},
@@ -243,9 +241,9 @@ func TestReconciliationLoop(t *testing.T) {
 				installRules: true,
 				devices:      sets.New("test-1", "test-2"),
 				localNodeInfo: localNodeInfo{
-					internalIPv4:  net.ParseIP("2.2.2.2"),
-					ipv4AllocCIDR: cidr.MustParseCIDR("6.6.6.0/24").String(),
-					ipv6AllocCIDR: cidr.MustParseCIDR("3002:bbbb::/96").String(),
+					internalIPv4:  netip.MustParseAddr("2.2.2.2"),
+					ipv4AllocCIDR: netip.MustParsePrefix("6.6.6.0/24"),
+					ipv6AllocCIDR: netip.MustParsePrefix("3002:bbbb::/96"),
 				},
 				proxies: map[string]proxyInfo{
 					"proxy-test-1": {
@@ -270,9 +268,9 @@ func TestReconciliationLoop(t *testing.T) {
 				installRules: true,
 				devices:      sets.New("test-1", "test-2"),
 				localNodeInfo: localNodeInfo{
-					internalIPv4:  net.ParseIP("2.2.2.2"),
-					ipv4AllocCIDR: cidr.MustParseCIDR("6.6.6.0/24").String(),
-					ipv6AllocCIDR: cidr.MustParseCIDR("3002:bbbb::/96").String(),
+					internalIPv4:  netip.MustParseAddr("2.2.2.2"),
+					ipv4AllocCIDR: netip.MustParsePrefix("6.6.6.0/24"),
+					ipv6AllocCIDR: netip.MustParsePrefix("3002:bbbb::/96"),
 				},
 				proxies: map[string]proxyInfo{
 					"proxy-test-1": {
@@ -308,9 +306,9 @@ func TestReconciliationLoop(t *testing.T) {
 				installRules: true,
 				devices:      sets.New("test-1", "test-2"),
 				localNodeInfo: localNodeInfo{
-					internalIPv4:  net.ParseIP("2.2.2.2"),
-					ipv4AllocCIDR: cidr.MustParseCIDR("6.6.6.0/24").String(),
-					ipv6AllocCIDR: cidr.MustParseCIDR("3002:bbbb::/96").String(),
+					internalIPv4:  netip.MustParseAddr("2.2.2.2"),
+					ipv4AllocCIDR: netip.MustParsePrefix("6.6.6.0/24"),
+					ipv6AllocCIDR: netip.MustParsePrefix("3002:bbbb::/96"),
 				},
 				proxies: map[string]proxyInfo{
 					"proxy-test-1": {
@@ -343,9 +341,9 @@ func TestReconciliationLoop(t *testing.T) {
 				installRules: true,
 				devices:      sets.New("test-1", "test-2"),
 				localNodeInfo: localNodeInfo{
-					internalIPv4:  net.ParseIP("2.2.2.2"),
-					ipv4AllocCIDR: cidr.MustParseCIDR("6.6.6.0/24").String(),
-					ipv6AllocCIDR: cidr.MustParseCIDR("3002:bbbb::/96").String(),
+					internalIPv4:  netip.MustParseAddr("2.2.2.2"),
+					ipv4AllocCIDR: netip.MustParsePrefix("6.6.6.0/24"),
+					ipv6AllocCIDR: netip.MustParsePrefix("3002:bbbb::/96"),
 				},
 				proxies: map[string]proxyInfo{
 					"proxy-test-1": {
@@ -374,9 +372,9 @@ func TestReconciliationLoop(t *testing.T) {
 				installRules: true,
 				devices:      sets.New("test-1", "test-2"),
 				localNodeInfo: localNodeInfo{
-					internalIPv4:  net.ParseIP("2.2.2.2"),
-					ipv4AllocCIDR: cidr.MustParseCIDR("6.6.6.0/24").String(),
-					ipv6AllocCIDR: cidr.MustParseCIDR("3002:bbbb::/96").String(),
+					internalIPv4:  netip.MustParseAddr("2.2.2.2"),
+					ipv4AllocCIDR: netip.MustParsePrefix("6.6.6.0/24"),
+					ipv6AllocCIDR: netip.MustParsePrefix("3002:bbbb::/96"),
 				},
 				proxies: map[string]proxyInfo{
 					"proxy-test-1": {
@@ -408,9 +406,9 @@ func TestReconciliationLoop(t *testing.T) {
 				installRules: true,
 				devices:      sets.New("test-1", "test-2"),
 				localNodeInfo: localNodeInfo{
-					internalIPv4:  net.ParseIP("2.2.2.2"),
-					ipv4AllocCIDR: cidr.MustParseCIDR("6.6.6.0/24").String(),
-					ipv6AllocCIDR: cidr.MustParseCIDR("3002:bbbb::/96").String(),
+					internalIPv4:  netip.MustParseAddr("2.2.2.2"),
+					ipv4AllocCIDR: netip.MustParsePrefix("6.6.6.0/24"),
+					ipv6AllocCIDR: netip.MustParsePrefix("3002:bbbb::/96"),
 				},
 				proxies: map[string]proxyInfo{
 					"proxy-test-1": {
@@ -442,9 +440,9 @@ func TestReconciliationLoop(t *testing.T) {
 				installRules: true,
 				devices:      sets.New("test-1", "test-2"),
 				localNodeInfo: localNodeInfo{
-					internalIPv4:  net.ParseIP("2.2.2.2"),
-					ipv4AllocCIDR: cidr.MustParseCIDR("6.6.6.0/24").String(),
-					ipv6AllocCIDR: cidr.MustParseCIDR("3002:bbbb::/96").String(),
+					internalIPv4:  netip.MustParseAddr("2.2.2.2"),
+					ipv4AllocCIDR: netip.MustParsePrefix("6.6.6.0/24"),
+					ipv6AllocCIDR: netip.MustParsePrefix("3002:bbbb::/96"),
 				},
 				proxies: map[string]proxyInfo{
 					"proxy-test-1": {
@@ -560,7 +558,7 @@ func assertIptablesState(current, expected desiredState) error {
 		return fmt.Errorf("expected devices names to be %v, found %v",
 			expected.devices.UnsortedList(), current.devices.UnsortedList())
 	}
-	if !current.localNodeInfo.equal(expected.localNodeInfo) {
+	if current.localNodeInfo != expected.localNodeInfo {
 		return fmt.Errorf("expected local node info to be %v, found %v",
 			expected.localNodeInfo, current.localNodeInfo)
 	}
@@ -590,27 +588,15 @@ func assertIptablesState(current, expected desiredState) error {
 }
 
 func (s desiredState) deepCopy() desiredState {
-	ipv4 := make(net.IP, len(s.localNodeInfo.internalIPv4))
-	copy(ipv4, s.localNodeInfo.internalIPv4)
-	ipv6 := make(net.IP, len(s.localNodeInfo.internalIPv6))
-	copy(ipv6, s.localNodeInfo.internalIPv6)
-
 	noTrackHostPorts := make(noTrackHostPortsByPod, len(s.noTrackHostPorts))
 	for k, v := range s.noTrackHostPorts {
 		noTrackHostPorts[k] = v.Clone()
 	}
 
 	return desiredState{
-		installRules: s.installRules,
-		devices:      s.devices.Clone(),
-		localNodeInfo: localNodeInfo{
-			internalIPv4:          ipv4,
-			internalIPv6:          ipv6,
-			ipv4AllocCIDR:         s.localNodeInfo.ipv4AllocCIDR,
-			ipv6AllocCIDR:         s.localNodeInfo.ipv6AllocCIDR,
-			ipv4NativeRoutingCIDR: s.localNodeInfo.ipv4NativeRoutingCIDR,
-			ipv6NativeRoutingCIDR: s.localNodeInfo.ipv6NativeRoutingCIDR,
-		},
+		installRules:     s.installRules,
+		devices:          s.devices.Clone(),
+		localNodeInfo:    s.localNodeInfo,
 		proxies:          maps.Clone(s.proxies),
 		noTrackPods:      s.noTrackPods.Clone(),
 		noTrackHostPorts: noTrackHostPorts,

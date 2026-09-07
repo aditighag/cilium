@@ -36,6 +36,8 @@ repository in the Cilium project:
   These owners are a stand-in for the user community to bring a user
   perspective to the review process. Consider how information is presented,
   consistency of flags and options.
+- `@cilium/committers <https://github.com/orgs/cilium/teams/committers>`__:
+  Cilium contributors with commit access.
 - `@cilium/ci-structure <https://github.com/orgs/cilium/teams/ci-structure>`__:
   Provide guidance around the best use of Cilium project continuous
   integration and testing infrastructure, including GitHub actions, VM
@@ -75,7 +77,7 @@ repository in the Cilium project:
   metrics being added or extended.
 - `@cilium/release-managers <https://github.com/orgs/cilium/teams/release-managers>`__:
   Review files related to releases like AUTHORS and VERSION.
-- `@cilium/security <https://github.com/orgs/cilium/teams/security>`__:
+- `@cilium/security-cilium <https://github.com/orgs/cilium/teams/security-cilium>`__:
   Provide feedback on changes that could have security implications for Cilium,
   and maintain security-related documentation.
 - `@cilium/vendor <https://github.com/orgs/cilium/teams/vendor>`__:
@@ -89,6 +91,8 @@ Repository Owners
 The following code owners are responsible for a range of general feedback for
 contributions to specific repositories:
 
+- `@cilium/cilium-io <https://github.com/orgs/cilium/teams/cilium-io>`__
+  Reviewing code related to the website
 - `@cilium/sig-hubble <https://github.com/orgs/cilium/teams/sig-hubble>`__:
   Review all Cilium and Hubble code related to observing system events,
   exporting those via gRPC protocols outside the node and outside the
@@ -110,6 +114,7 @@ related processes. For the full codeowners for individual repositories, see
 the CODEOWNERS file in the corresponding repository.
 
 - `@cilium/cilium-cli-maintainers <https://github.com/orgs/cilium/teams/cilium-cli-maintainers>`__
+- `@cilium/cilium-io-committers <https://github.com/orgs/cilium/teams/cilium-io-committers>`__
 - `@cilium/cilium-maintainers <https://github.com/orgs/cilium/teams/cilium-maintainers>`__
 - `@cilium/cilium-packer-ci-build-maintainers <https://github.com/orgs/cilium/teams/cilium-packer-ci-build-maintainers>`__
 - `@cilium/ebpf-lib-maintainers <https://github.com/orgs/cilium/teams/ebpf-lib-maintainers>`__
@@ -138,16 +143,13 @@ The following codeowner groups cover more specific knowledge about Cilium
 Agent internals or the way that particular Cilium features interact with
 external software and protocols:
 
-- `@cilium/docker <https://github.com/orgs/cilium/teams/docker>`__:
-  Maintain the deprecated docker-plugin.
 - `@cilium/endpoint <https://github.com/orgs/cilium/teams/endpoint>`__:
   Provide background on how the Cilium Endpoint package fits into the overall
-  agent architecture, relationship with generation of policy / datapath
-  constructs, serialization and restore from disk.
+  cluster architecture, lifecycle of endpoints, relationship with generation
+  of policy / datapath constructs, serialization and restore from disk.
 - `@cilium/envoy <https://github.com/orgs/cilium/teams/envoy>`__:
   Maintain the L7 proxy integration with Envoy. This includes the
-  configurations for Envoy via xDS protocols as well as the extensible
-  proxylib framework for Go-based layer 7 filters.
+  configurations for Envoy via xDS protocols.
 - `@cilium/egress-gateway <https://github.com/orgs/cilium/teams/egress-gateway>`__:
   Maintain the egress gateway control plane and datapath logic.
 - `@cilium/fqdn <https://github.com/orgs/cilium/teams/fqdn>`__:
@@ -228,3 +230,12 @@ external software and protocols:
   Maintain the ztunnel mTLS-proxy integration in Cilium to ensure the ztunnel
   agent receives the necessary information to successfully proxy pod-to-pod
   traffic through mTLS tunnels.
+- `@cilium/network-driver <https://github.com/orgs/cilium/teams/network-driver>`__:
+  Maintain the Cilium Network Driver feature, that allows to request and share
+  networking resources, like SR-IOV devices, among workloads. Responsible for all
+  interactions between the driver and the Kubelet via the Dynamic Resource
+  Allocation (DRA) API as well as between the driver and the Container Runtime
+  via the Node Resource Interface (NRI) API. Ensure the consistency of the
+  dedicated IPAM modes with the Network Driver resources management.
+  This code owner is not related to the low level interactions with the Linux
+  network drivers.

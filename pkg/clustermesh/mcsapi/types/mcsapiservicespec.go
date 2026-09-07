@@ -8,26 +8,43 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"path"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
-	mcsapiv1alpha1 "sigs.k8s.io/mcs-api/pkg/apis/v1alpha1"
+	mcsapiv1beta1 "sigs.k8s.io/mcs-api/pkg/apis/v1beta1"
 
+	"github.com/cilium/cilium/pkg/clustermesh/observer"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/kvstore/store"
 )
+
+const Name observer.Name = "service exports"
 
 var (
 	// ServiceExportStorePrefix is the kvstore prefix of the shared store
 	//
 	// WARNING - STABLE API: Changing the structure or values of this will
 	// break backwards compatibility
-	ServiceExportStorePrefix = path.Join(kvstore.BaseKeyPrefix, "state", "serviceexports", "v1")
+	ServiceExportStorePrefix = kvstore.JoinKey(kvstore.BaseKeyPrefix, "state", "serviceexports", "v1")
 )
+
+// CheckLocalSvcValidForExport checks if the local service is valid for export.
+// The logic here MUST be kept up to date with the logic in CheckLocalSlimSvcValidForExport.
+func CheckLocalSvcValidForExport(localSvc *corev1.Service) (bool, mcsapiv1beta1.ServiceExportConditionReason, string) {
+	if localSvc.Spec.Type == corev1.ServiceTypeExternalName {
+		return false, mcsapiv1beta1.ServiceExportReasonInvalidServiceType, "Service type ExternalName is not supported"
+	}
+	return true, "", ""
+}
+
+// CheckLocalSlimSvcValidForExport checks if the local service is valid for export.
+// The logic here MUST be kept up to date with the logic in CheckLocalSvcValidForExport.
+func CheckLocalSlimSvcValidForExport(localSvc *slim_corev1.Service) bool {
+	return localSvc.Spec.Type != slim_corev1.ServiceTypeExternalName
+}
 
 type MCSAPIServiceSpec struct {
 	// Cluster is the cluster name the service is configured in
@@ -40,21 +57,21 @@ type MCSAPIServiceSpec struct {
 	Namespace string `json:"namespace"`
 
 	// Annotations contains the exported annotations
-	Annotations map[string]string
+	Annotations map[string]string `json:"annotations,omitempty"`
 
 	// Labels contains the exported labels
-	Labels map[string]string
+	Labels map[string]string `json:"labels,omitempty"`
 
 	// ExportCreationTimestamp is the timestamp representing when the
 	// ServiceExport object was created. It is used for conflict resolution.
 	ExportCreationTimestamp metav1.Time `json:"exportCreationTimestamp"`
 
 	// Ports are the list of ports of the Service in MCS API format
-	Ports []mcsapiv1alpha1.ServicePort `json:"ports"`
+	Ports []mcsapiv1beta1.ServicePort `json:"ports"`
 
 	// Type defines the type of this service.
 	// Must be ClusterSetIP or Headless.
-	Type mcsapiv1alpha1.ServiceImportType `json:"type"`
+	Type mcsapiv1beta1.ServiceImportType `json:"type"`
 
 	// Supports "ClientIP" and "None". Used to maintain session affinity.
 	// Enable client IP based session affinity.
@@ -91,7 +108,7 @@ type MCSAPIServiceSpec struct {
 func (s *MCSAPIServiceSpec) GetKeyName() string {
 	// WARNING - STABLE API: Changing the structure of the key may break
 	// backwards compatibility
-	return path.Join(s.Cluster, s.Namespace, s.Name)
+	return kvstore.JoinKey(s.Cluster, s.Namespace, s.Name)
 }
 
 // NamespaceServiceName returns the namespace and service name
@@ -131,7 +148,7 @@ func (s *MCSAPIServiceSpec) validate() error {
 		return errors.New("name is unset")
 	case s.ExportCreationTimestamp.IsZero():
 		return errors.New("exportCreationTimestamp is unset")
-	case s.Type != mcsapiv1alpha1.ClusterSetIP && s.Type != mcsapiv1alpha1.Headless:
+	case s.Type != mcsapiv1beta1.ClusterSetIP && s.Type != mcsapiv1beta1.Headless:
 		return fmt.Errorf("type is unknown: %s", s.Type)
 	case s.SessionAffinity != corev1.ServiceAffinityClientIP && s.SessionAffinity != corev1.ServiceAffinityNone:
 		return fmt.Errorf("session affinity is unknown: %s", s.SessionAffinity)
@@ -211,19 +228,19 @@ func toKubeIPFamilies(ipFamilies []slim_corev1.IPFamily) []corev1.IPFamily {
 	return kubeIPFamilies
 }
 
-func FromCiliumServiceToMCSAPIServiceSpec(clusterName string, svc *slim_corev1.Service, svcExport *mcsapiv1alpha1.ServiceExport) *MCSAPIServiceSpec {
-	ports := make([]mcsapiv1alpha1.ServicePort, 0, len(svc.Spec.Ports))
+func FromCiliumServiceToMCSAPIServiceSpec(clusterName string, svc *slim_corev1.Service, svcExport *mcsapiv1beta1.ServiceExport) *MCSAPIServiceSpec {
+	ports := make([]mcsapiv1beta1.ServicePort, 0, len(svc.Spec.Ports))
 	for _, port := range svc.Spec.Ports {
-		ports = append(ports, mcsapiv1alpha1.ServicePort{
+		ports = append(ports, mcsapiv1beta1.ServicePort{
 			Name:        port.Name,
 			AppProtocol: port.AppProtocol,
 			Protocol:    corev1.Protocol(port.Protocol),
 			Port:        port.Port,
 		})
 	}
-	mcsAPISvcType := mcsapiv1alpha1.ClusterSetIP
+	mcsAPISvcType := mcsapiv1beta1.ClusterSetIP
 	if svc.Spec.ClusterIP == slim_corev1.ClusterIPNone {
-		mcsAPISvcType = mcsapiv1alpha1.Headless
+		mcsAPISvcType = mcsapiv1beta1.Headless
 	}
 	mcsAPISvcSpec := &MCSAPIServiceSpec{
 		Cluster:         clusterName,

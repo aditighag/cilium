@@ -19,6 +19,7 @@ import (
 	"github.com/cilium/cilium/pkg/hubble/parser/options"
 	k8sConst "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
 	"github.com/cilium/cilium/pkg/k8s/utils"
+	ciliumLabels "github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/monitor/api"
 	"github.com/cilium/cilium/pkg/proxy/accesslog"
 	"github.com/cilium/cilium/pkg/source"
@@ -53,7 +54,6 @@ func New(
 			Enabled:            false,
 			RedactHTTPUserInfo: true,
 			RedactHTTPQuery:    false,
-			RedactKafkaAPIKey:  false,
 			RedactHttpHeaders: options.HttpHeadersList{
 				Allow: map[string]struct{}{},
 				Deny:  map[string]struct{}{},
@@ -109,25 +109,25 @@ func (p *Parser) Decode(r *accesslog.LogRecord, decoded *flowpb.Flow) error {
 	sourceIP, _ := netip.ParseAddr(ip.Source)
 	destinationIP, _ := netip.ParseAddr(ip.Destination)
 	var sourceNames, destinationNames []string
-	var sourceNamespace, sourcePod, destinationNamespace, destinationPod string
+	var sourceNamespace, sourcePod, sourcePodUID, destinationNamespace, destinationPod, destinationPodUID string
 	if p.dnsGetter != nil {
 		sourceNames = p.dnsGetter.GetNamesOf(uint32(r.DestinationEndpoint.ID), sourceIP)
 		destinationNames = p.dnsGetter.GetNamesOf(uint32(r.SourceEndpoint.ID), destinationIP)
 	}
 	if p.ipGetter != nil {
 		if meta := p.ipGetter.GetK8sMetadata(sourceIP); meta != nil {
-			sourceNamespace, sourcePod = meta.Namespace, meta.PodName
+			sourceNamespace, sourcePod, sourcePodUID = meta.Namespace, meta.PodName, meta.PodUID
 		}
 		if meta := p.ipGetter.GetK8sMetadata(destinationIP); meta != nil {
-			destinationNamespace, destinationPod = meta.Namespace, meta.PodName
+			destinationNamespace, destinationPod, destinationPodUID = meta.Namespace, meta.PodName, meta.PodUID
 		}
 	}
-	srcEndpoint := decodeEndpoint(r.SourceEndpoint, sourceNamespace, sourcePod)
-	dstEndpoint := decodeEndpoint(r.DestinationEndpoint, destinationNamespace, destinationPod)
+	srcEndpoint := decodeEndpoint(r.SourceEndpoint, sourceNamespace, sourcePod, sourcePodUID)
+	dstEndpoint := decodeEndpoint(r.DestinationEndpoint, destinationNamespace, destinationPod, destinationPodUID)
 
 	if p.endpointGetter != nil {
-		p.updateEndpointWorkloads(sourceIP, srcEndpoint)
-		p.updateEndpointWorkloads(destinationIP, dstEndpoint)
+		p.updateEndpointFromLocal(sourceIP, srcEndpoint)
+		p.updateEndpointFromLocal(destinationIP, dstEndpoint)
 	}
 
 	l4, sourcePort, destinationPort := decodeLayer4(r.TransportProtocol, r.SourceEndpoint, r.DestinationEndpoint)
@@ -223,8 +223,18 @@ func (p *Parser) computeResponseTime(r *accesslog.LogRecord, timestamp time.Time
 	return 0
 }
 
-func (p *Parser) updateEndpointWorkloads(ip netip.Addr, endpoint *flowpb.Endpoint) {
+func (p *Parser) updateEndpointFromLocal(ip netip.Addr, endpoint *flowpb.Endpoint) {
 	if ep, ok := p.endpointGetter.GetEndpointInfo(ip); ok {
+		// Access logs are decoded asynchronously. The IP may now belong to a
+		// replacement endpoint, so only use Pod metadata when the IDs match.
+		if ep.GetID() != uint64(endpoint.GetID()) {
+			return
+		}
+		// Keep the Pod identity tuple tied to the ID-matched endpoint. When the
+		// UID is unknown, empty is safer than retaining metadata resolved by IP.
+		endpoint.Namespace = ep.GetK8sNamespace()
+		endpoint.PodName = ep.GetK8sPodName()
+		endpoint.PodUid = ep.GetK8sPodUID()
 		if pod := ep.GetPod(); pod != nil {
 			workload, workloadTypeMeta, ok := utils.GetWorkloadMetaFromPod(pod)
 			if ok {
@@ -324,16 +334,17 @@ func decodeLayer4(protocol accesslog.TransportProtocol, source, destination acce
 	}
 }
 
-func decodeEndpoint(endpoint accesslog.EndpointInfo, namespace, podName string) *flowpb.Endpoint {
+func decodeEndpoint(endpoint accesslog.EndpointInfo, namespace, podName, podUID string) *flowpb.Endpoint {
 	labels := endpoint.Labels.GetModel()
 	slices.Sort(labels)
 	return &flowpb.Endpoint{
 		ID:          uint32(endpoint.ID),
 		Identity:    uint32(endpoint.Identity),
-		ClusterName: endpoint.Labels.Get(string(source.Kubernetes) + "." + k8sConst.PolicyLabelCluster),
+		ClusterName: endpoint.Labels.Get(string(source.Kubernetes) + ciliumLabels.SourceDelimiter + k8sConst.PolicyLabelCluster),
 		Namespace:   namespace,
 		Labels:      labels,
 		PodName:     podName,
+		PodUid:      podUID,
 	}
 }
 
@@ -358,11 +369,6 @@ func decodeLayer7(r *accesslog.LogRecord, opts *options.Options) *flowpb.Layer7 
 		return &flowpb.Layer7{
 			Type:   flowType,
 			Record: decodeHTTP(r.Type, r.HTTP, opts),
-		}
-	case r.Kafka != nil:
-		return &flowpb.Layer7{
-			Type:   flowType,
-			Record: decodeKafka(r.Type, r.Kafka, opts),
 		}
 	default:
 		return &flowpb.Layer7{
@@ -393,8 +399,6 @@ func (p *Parser) getSummary(logRecord *accesslog.LogRecord, flow *flowpb.Flow) s
 	}
 	if http := logRecord.HTTP; http != nil {
 		return p.httpSummary(logRecord.Type, http, flow)
-	} else if kafka := logRecord.Kafka; kafka != nil {
-		return kafkaSummary(flow)
 	} else if dns := logRecord.DNS; dns != nil {
 		return dnsSummary(logRecord.Type, dns)
 	} else if generic := logRecord.L7; generic != nil {

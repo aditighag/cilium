@@ -28,7 +28,7 @@ on:
 # By specifying the access of one of the scopes, all of those that are not
 # specified are set to 'none'.
 permissions:
-  # To read actions state with catchpoint/workflow-telemetry-action
+  # To read actions state with cilium/workflow-telemetry-action
   actions: read
   # To be able to access the repository with actions/checkout
   contents: read
@@ -73,7 +73,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Set initial commit status
-        uses: myrotvorets/set-commit-status-action@3730c0a348a2ace3c110851bed53331bc6406e9f # v2.0.1
+        uses: cilium/actions/set-commit-status@fe0702f5df0d8e44d48f1baa226c023b73ff6b5e # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -87,6 +87,11 @@ jobs:
         id: merge
         run: |
           ARGS='${{ inputs.extra-args }}'
+          # Empty on schedule events, where jq would emit nothing and thus
+          # silently drop "detect-race".
+          if [ -z "${ARGS}" ]; then
+            ARGS='{}'
+          fi
           echo "extra-args=$(echo "${ARGS}" | jq -c '. + {"detect-race": true}')" >> "$GITHUB_OUTPUT"
 
   conformance-ginkgo-race:

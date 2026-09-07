@@ -7,13 +7,11 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"path"
 	"sync/atomic"
-
-	"k8s.io/utils/ptr"
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/clustermesh/common"
+	"github.com/cilium/cilium/pkg/clustermesh/endpointslice"
 	mcsapitypes "github.com/cilium/cilium/pkg/clustermesh/mcsapi/types"
 	"github.com/cilium/cilium/pkg/clustermesh/observer"
 	serviceStore "github.com/cilium/cilium/pkg/clustermesh/store"
@@ -22,6 +20,7 @@ import (
 	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/kvstore/store"
 	"github.com/cilium/cilium/pkg/lock"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 )
 
 var (
@@ -36,14 +35,15 @@ type remoteCluster struct {
 	logger *slog.Logger
 	// name is the name of the cluster
 	name string
+	// clusterID is the cluster ID advertised by the remote cluster.
+	clusterID uint32
 
 	clusterMeshEnableEndpointSync bool
 	clusterMeshEnableMCSAPI       bool
+	clusterMeshServiceModeV2      types.ServiceModeV2
 
 	// remoteServices is the shared store representing services in remote clusters
 	remoteServices store.WatchStore
-	// remoteServiceExports is the shared store representing service exports in remote clusters
-	remoteServiceExports store.WatchStore
 
 	// observers are observers watching additional prefixes.
 	observers map[observer.Name]observer.Observer
@@ -64,6 +64,8 @@ type remoteCluster struct {
 }
 
 func (rc *remoteCluster) Run(ctx context.Context, backend kvstore.BackendOperations, config types.CiliumClusterConfig, ready chan<- error) {
+	rc.clusterID = config.ID
+
 	var mgr store.WatchStoreManager
 	if config.Capabilities.SyncedCanaries {
 		mgr = rc.storeFactory.NewWatchStoreManager(backend, rc.name)
@@ -77,20 +79,22 @@ func (rc *remoteCluster) Run(ctx context.Context, backend kvstore.BackendOperati
 	}
 
 	if rc.clusterMeshEnableEndpointSync {
-		mgr.Register(adapter(serviceStore.ServiceStorePrefix), func(ctx context.Context) {
-			rc.remoteServices.Watch(ctx, backend, path.Join(adapter(serviceStore.ServiceStorePrefix), rc.name))
-		})
-	}
-
-	if rc.clusterMeshEnableMCSAPI && config.Capabilities.ServiceExportsEnabled != nil {
-		mgr.Register(adapter(mcsapitypes.ServiceExportStorePrefix), func(ctx context.Context) {
-			rc.remoteServiceExports.Watch(ctx, backend, path.Join(adapter(mcsapitypes.ServiceExportStorePrefix), rc.name))
-		})
-	} else {
-		// Drain the remote service exports in case the remote cluster no longer supports them
-		rc.remoteServiceExports.Drain()
-		// Mimic that service exports are synced if not enabled
-		rc.synced.serviceExports.Stop()
+		if rc.clusterMeshServiceModeV2.ShouldWatchLegacyServices() &&
+			config.Capabilities.EndpointSlicesExportMode != types.EndpointSlicesExportModeEndpointSlicesOnly {
+			mgr.Register(adapter(serviceStore.ServiceStorePrefix), func(ctx context.Context) {
+				rc.remoteServices.Watch(ctx, backend, kvstore.JoinKey(adapter(serviceStore.ServiceStorePrefix), rc.name))
+			})
+		} else {
+			if rc.clusterMeshServiceModeV2.ShouldWatchLegacyServices() {
+				rc.logger.Error("Remote cluster does not support legacy service resources while Cilium is configured to watch them. "+
+					"EndpointSliceSync will not take into account any backends from this cluster!",
+					logfields.ClusterName, rc.name)
+			}
+			// Drain any existing services in case the remote cluster no longer supports them
+			rc.remoteServices.Drain()
+			// Mimic that services are synced if not enabled
+			rc.synced.services.Stop()
+		}
 	}
 
 	for _, obs := range rc.observers {
@@ -107,6 +111,24 @@ func (rc *remoteCluster) Run(ctx context.Context, backend kvstore.BackendOperati
 	mgr.Run(ctx)
 }
 
+func (rc *remoteCluster) OnClusterIDChange(ctx context.Context, newID uint32) {
+	if rc.clusterID != types.ClusterIDUnset {
+		rc.logger.Info(
+			"Remote Cluster ID changed: draining all known entries before reconnecting. "+
+				"Expect connectivity disruption towards this cluster",
+			logfields.ClusterID, newID,
+		)
+		// Let's fully drain all previously known entries by calling [Remove] if the
+		// remote cluster changed the cluster ID. Although synthetic deletion events
+		// would be generated in any case upon initial listing (as the entries with
+		// the incorrect ID would not pass validation), that would leave a window of
+		// time in which there would still be stale entries for a Cluster ID that has
+		// already been released, potentially leading to inconsistencies if the same
+		// ID is acquired again in the meanwhile.
+		rc.Remove(ctx)
+	}
+}
+
 func (rc *remoteCluster) Stop() {
 	rc.synced.Stop()
 }
@@ -116,7 +138,6 @@ func (rc *remoteCluster) Stop() {
 // prevents the operator from maintaining state for potentially stale information.
 func (rc *remoteCluster) RevokeCache(ctx context.Context) {
 	rc.remoteServices.Drain()
-	rc.remoteServiceExports.Drain()
 
 	for _, obs := range rc.observers {
 		obs.Revoke()
@@ -131,7 +152,6 @@ func (rc *remoteCluster) Remove(context.Context) {
 	// is removed, and not in case the operator is shutting down, otherwise we
 	// would break existing connections on restart.
 	rc.remoteServices.Drain()
-	rc.remoteServiceExports.Drain()
 
 	for _, obs := range rc.observers {
 		obs.Drain()
@@ -140,17 +160,15 @@ func (rc *remoteCluster) Remove(context.Context) {
 
 type synced struct {
 	wait.SyncedCommon
-	services       *lock.StoppableWaitGroup
-	serviceExports *lock.StoppableWaitGroup
-	observers      map[observer.Name]chan struct{}
+	services  *lock.StoppableWaitGroup
+	observers map[observer.Name]chan struct{}
 }
 
 func newSynced() synced {
 	return synced{
-		SyncedCommon:   wait.NewSyncedCommon(),
-		services:       lock.NewStoppableWaitGroup(),
-		serviceExports: lock.NewStoppableWaitGroup(),
-		observers:      make(map[observer.Name]chan struct{}),
+		SyncedCommon: wait.NewSyncedCommon(),
+		services:     lock.NewStoppableWaitGroup(),
+		observers:    make(map[observer.Name]chan struct{}),
 	}
 }
 
@@ -159,13 +177,6 @@ func newSynced() synced {
 // or the given context is canceled.
 func (s *synced) Services(ctx context.Context) error {
 	return s.Wait(ctx, s.services.WaitChannel())
-}
-
-// ServiceExports returns after that the initial list of service exports has been
-// received from the remote cluster, the remote cluster is disconnected,
-// or the given context is canceled.
-func (s *synced) ServiceExports(ctx context.Context) error {
-	return s.Wait(ctx, s.serviceExports.WaitChannel())
 }
 
 // ObserverSynced returns after that either the given named observer has
@@ -184,25 +195,35 @@ func (s *synced) Observer(ctx context.Context, name observer.Name) error {
 func (rc *remoteCluster) Status() *models.RemoteCluster {
 	status := rc.status()
 
+	get := func(name observer.Name) observer.Status {
+		obs, ok := rc.observers[name]
+		if ok {
+			return obs.Status()
+		}
+		return observer.Status{}
+	}
+
 	status.NumSharedServices = int64(rc.remoteServices.NumEntries())
-	status.NumServiceExports = int64(rc.remoteServiceExports.NumEntries())
+	status.NumServiceExports = int64(get(mcsapitypes.Name).Entries)
+	isServicesWatched := rc.clusterMeshEnableEndpointSync && rc.clusterMeshServiceModeV2.ShouldWatchLegacyServices()
 
 	status.Synced = &models.RemoteClusterSynced{
-		Services: !rc.clusterMeshEnableEndpointSync || rc.remoteServices.Synced(),
+		Services: !isServicesWatched || rc.remoteServices.Synced(),
 		// The operator does not watch nodes, endpoints and identities, hence
 		// let's pretend them to be synchronized by default.
 		Nodes:      true,
 		Endpoints:  true,
 		Identities: true,
 	}
-	if status.Config != nil && status.Config.ServiceExportsEnabled != nil &&
-		rc.clusterMeshEnableMCSAPI {
-		status.Synced.ServiceExports = ptr.To(rc.remoteServiceExports.Synced())
+	if get(endpointslice.Name).Enabled {
+		status.Synced.EndpointSlices = new(get(endpointslice.Name).Synced)
+	}
+	if get(mcsapitypes.Name).Enabled {
+		status.Synced.ServiceExports = new(get(mcsapitypes.Name).Synced)
 	}
 
 	status.Ready = status.Ready &&
 		status.Synced.Nodes && status.Synced.Services &&
-		(status.Synced.ServiceExports == nil || *status.Synced.ServiceExports) &&
 		status.Synced.Identities && status.Synced.Endpoints
 
 	// We mark the status as ready only after being sure that all observers

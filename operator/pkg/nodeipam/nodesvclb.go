@@ -24,13 +24,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	controllerruntime "github.com/cilium/cilium/operator/pkg/controller-runtime"
-	"github.com/cilium/cilium/pkg/annotation"
 	"github.com/cilium/cilium/pkg/logging/logfields"
-)
-
-var (
-	nodeSvcLBClass                 = annotation.Prefix + "/node"
-	nodeSvcLBMatchLabelsAnnotation = annotation.Prefix + ".nodeipam" + "/match-node-labels"
+	"github.com/cilium/cilium/pkg/nodeipamconfig"
 )
 
 type nodeSvcLBReconciler struct {
@@ -164,7 +159,7 @@ func (r nodeSvcLBReconciler) isServiceSupported(svc *corev1.Service) bool {
 	if svc.Spec.LoadBalancerClass == nil {
 		return r.DefaultIPAM
 	}
-	return *svc.Spec.LoadBalancerClass == nodeSvcLBClass
+	return *svc.Spec.LoadBalancerClass == nodeipamconfig.NodeSvcLBClass
 }
 
 // getEndpointSliceNodes returns the set of node names if eTP=Local. If eTP=Cluster
@@ -212,7 +207,7 @@ func (r *nodeSvcLBReconciler) getRelevantNodes(ctx context.Context, svc *corev1.
 		return []corev1.Node{}, err
 	}
 	nodeListOptions := &client.ListOptions{}
-	if val, ok := svc.Annotations[nodeSvcLBMatchLabelsAnnotation]; ok {
+	if val, ok := svc.Annotations[nodeipamconfig.NodeSvcLBMatchLabelsAnnotation]; ok {
 		parsedLabels, err := labels.Parse(val)
 		if err != nil {
 			scopedLog.ErrorContext(
@@ -236,13 +231,11 @@ func (r *nodeSvcLBReconciler) getRelevantNodes(ctx context.Context, svc *corev1.
 		)
 	}
 
+	var excludedNodes []string
 	relevantNodes := []corev1.Node{}
 	for _, node := range nodes.Items {
 		if !shouldIncludeNode(&node) {
-			scopedLog.DebugContext(
-				ctx, "Skipping Node to be deleted or excluded from load balancers",
-				logfields.NodeName, node.Name,
-			)
+			excludedNodes = append(excludedNodes, node.Name)
 			continue
 		}
 		if endpointSliceNames != nil && !endpointSliceNames.Has(node.Name) {
@@ -254,6 +247,13 @@ func (r *nodeSvcLBReconciler) getRelevantNodes(ctx context.Context, svc *corev1.
 		}
 
 		relevantNodes = append(relevantNodes, node)
+	}
+
+	if len(excludedNodes) > 0 {
+		scopedLog.InfoContext(
+			ctx, "Skipping Nodes that are being deleted or are excluded from load balancers",
+			logfields.Nodes, excludedNodes,
+		)
 	}
 
 	if len(nodes.Items) > 0 && len(relevantNodes) == 0 {

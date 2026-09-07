@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"path"
 	"slices"
 	"strings"
 
@@ -28,12 +27,17 @@ import (
 //
 // The ciliumClusterName is used to determine the admin username.
 //
+// The createSharedRemoteUser parameter controls whether the shared "remote" etcd user is created.
+//
 // The context provided as ctx can be used to implement a timeout on operations, and is passed to all etcd client
 // functions.
 //
 // Note that this function is **not idempotent**. It expects a completely blank etcd server with no non-default users,
 // roles, permissions, or keys.
-func ClusterMeshEtcdInit(ctx context.Context, log *slog.Logger, client *clientv3.Client, ciliumClusterName string) error {
+func ClusterMeshEtcdInit(
+	ctx context.Context, log *slog.Logger, client *clientv3.Client,
+	ciliumClusterName string, createSharedRemoteUser bool,
+) error {
 	ic := initClient{
 		log:    log,
 		client: client,
@@ -99,27 +103,29 @@ func ClusterMeshEtcdInit(ctx context.Context, log *slog.Logger, client *clientv3
 		}
 	}
 
-	// Remote user (i.e., remote clusters accessing state information)
-	remoteUsername := username("remote")
-	log.Info(
-		"Configuring remote user",
-		logfields.EtcdUsername, remoteUsername,
-	)
+	// Remote role and optional shared user (i.e., remote clusters accessing state information)
 	remoteRolename := rolename("remote")
-	err = ic.addNoPasswordUser(ctx, remoteUsername)
-	if err != nil {
-		return err
-	}
 	err = ic.addRole(ctx, remoteRolename)
-	if err != nil {
-		return err
-	}
-	err = ic.grantRoleToUser(ctx, remoteRolename, remoteUsername)
 	if err != nil {
 		return err
 	}
 	for _, keyRange := range rangesForRemoteRole(ciliumClusterName) {
 		err = ic.grantPermissionToRole(ctx, readOnly, keyRange, remoteRolename)
+		if err != nil {
+			return err
+		}
+	}
+	if createSharedRemoteUser {
+		remoteUsername := username("remote")
+		log.Info(
+			"Configuring remote user",
+			logfields.EtcdUsername, remoteUsername,
+		)
+		err = ic.addNoPasswordUser(ctx, remoteUsername)
+		if err != nil {
+			return err
+		}
+		err = ic.grantRoleToUser(ctx, remoteRolename, remoteUsername)
 		if err != nil {
 			return err
 		}
@@ -288,7 +294,7 @@ func rangesForRemoteRole(clusterName string) []keyRange {
 	return []keyRange{
 		rangeForPrefix(kvstore.HeartbeatPath, withoutTrailingSlash),
 		rangeForPrefix(kvstore.StatePrefix),
-		rangeForKey(path.Join(kvstore.ClusterConfigPrefix, clusterName)),
-		rangeForPrefix(path.Join(kvstore.SyncedPrefix, clusterName)),
+		rangeForKey(kvstore.JoinKey(kvstore.ClusterConfigPrefix, clusterName)),
+		rangeForPrefix(kvstore.JoinKey(kvstore.SyncedPrefix, clusterName)),
 	}
 }

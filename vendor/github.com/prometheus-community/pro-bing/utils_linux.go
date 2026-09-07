@@ -1,5 +1,17 @@
+// Copyright The Prometheus Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //go:build linux
-// +build linux
 
 package probing
 
@@ -144,13 +156,13 @@ func (c *icmpV6Conn) SetBroadcastFlag() error {
 func (c *icmpv4Conn) InstallICMPIDFilter(id int) error {
 	filter, err := bpf.Assemble([]bpf.Instruction{
 		bpf.LoadMemShift{Off: 0},          // Skip IP header
-		bpf.LoadIndirect{Off: 4, Size: 2}, // Load ICMP echo ident
-		bpf.JumpIf{Cond: bpf.JumpEqual, Val: uint32(id), SkipTrue: 0, SkipFalse: 1},                     // Jump on ICMP Echo Request (ID check)
-		bpf.RetConstant{Val: ^uint32(0)},                                                                // If our ID, accept the packet
-		bpf.LoadIndirect{Off: 0, Size: 1},                                                               // Load ICMP type
+		bpf.LoadIndirect{Off: 0, Size: 1}, // Load ICMP type
 		bpf.JumpIf{Cond: bpf.JumpEqual, Val: uint32(ipv4.ICMPTypeEchoReply), SkipTrue: 1, SkipFalse: 0}, // Check if ICMP Echo Reply
-		bpf.RetConstant{Val: 0xFFFFFFF},                                                                 // Accept packet if it's not Echo Reply
-		bpf.RetConstant{Val: 0},                                                                         // Reject Echo packet with wrong identifier
+		bpf.RetConstant{Val: 0},           // Reject if false
+		bpf.LoadIndirect{Off: 4, Size: 2}, // Load ICMP echo ident
+		bpf.JumpIf{Cond: bpf.JumpEqual, Val: uint32(id), SkipTrue: 0, SkipFalse: 1}, // Check if it matches our identifier
+		bpf.RetConstant{Val: ^uint32(0)},                                            // Accept if true
+		bpf.RetConstant{Val: 0},                                                     // Reject if false
 	})
 	if err != nil {
 		return err
@@ -161,13 +173,13 @@ func (c *icmpv4Conn) InstallICMPIDFilter(id int) error {
 // InstallICMPIDFilter attaches a BPF program to the connection to filter ICMPv6 packets id.
 func (c *icmpV6Conn) InstallICMPIDFilter(id int) error {
 	filter, err := bpf.Assemble([]bpf.Instruction{
-		bpf.LoadAbsolute{Off: 4, Size: 2},                                                               // Load ICMP echo identifier
-		bpf.JumpIf{Cond: bpf.JumpEqual, Val: uint32(id), SkipTrue: 0, SkipFalse: 1},                     // Check if it matches our identifier
-		bpf.RetConstant{Val: ^uint32(0)},                                                                // Accept if true
-		bpf.LoadAbsolute{Off: 0, Size: 1},                                                               // Load ICMP type
+		bpf.LoadAbsolute{Off: 0, Size: 1}, // Load ICMP type
 		bpf.JumpIf{Cond: bpf.JumpEqual, Val: uint32(ipv6.ICMPTypeEchoReply), SkipTrue: 1, SkipFalse: 0}, // Check if it is an ICMP6 echo reply
-		bpf.RetConstant{Val: ^uint32(0)},                                                                // Accept if false
-		bpf.RetConstant{Val: 0},                                                                         // Reject if echo with wrong identifier
+		bpf.RetConstant{Val: 0},           // Reject if false
+		bpf.LoadAbsolute{Off: 4, Size: 2}, // Load ICMP echo identifier
+		bpf.JumpIf{Cond: bpf.JumpEqual, Val: uint32(id), SkipTrue: 0, SkipFalse: 1}, // Check if it matches our identifier
+		bpf.RetConstant{Val: ^uint32(0)},                                            // Accept if true
+		bpf.RetConstant{Val: 0},                                                     // Reject if false
 	})
 	if err != nil {
 		return err

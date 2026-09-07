@@ -11,6 +11,11 @@ on:
         description: 'Image tag to use for the images in the chart.'
         type: string
         required: true
+      extra_values_file_changes:
+        description: 'Additional values_file_changes JSON entries to merge into the default chart overrides.'
+        type: string
+        required: false
+        default: "{}"
 
 # By specifying the access of one of the scopes, all of those that are not
 # specified are set to 'none'.
@@ -36,7 +41,7 @@ jobs:
       chart-version: ${{ steps.get-version.outputs.chart_version }}
     steps:
     - name: Checkout GitHub main
-      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         ref: ${{ github.event.repository.default_branch }}
         persist-credentials: false
@@ -52,11 +57,15 @@ jobs:
           exit 1
         fi
 
-    - name: Checkout Source Code
-      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+    # Warning: since this is a privileged workflow, subsequent workflow job
+    # steps must take care not to execute untrusted code.
+    - name: Checkout Source Code (NOT TRUSTED)
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
         ref: ${{ inputs.checkout_ref }}
+        # Required by checkout v7+ to fetch fork PR code; see the NOT TRUSTED warning above.
+        allow-unsafe-pr-checkout: true
         # required for git describe
         fetch-depth: 0
 
@@ -75,7 +84,7 @@ jobs:
     needs: setup-charts
     steps:
     - name: Checkout GitHub Actions definitions
-      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
         ref: ${{ github.event.repository.default_branch }}
@@ -84,49 +93,67 @@ jobs:
     - name: Set Environment Variables
       uses: ./.github/actions/set-env-variables
 
-    - name: Checkout Feature Branch Code
-      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+    # Warning: since this is a privileged workflow, subsequent workflow job
+    # steps must take care not to execute untrusted code.
+    - name: Checkout Feature Branch Code (NOT TRUSTED)
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
         ref: ${{ inputs.checkout_ref }}
+        # Required by checkout v7+ to fetch fork PR code; see the NOT TRUSTED warning above.
+        allow-unsafe-pr-checkout: true
         sparse-checkout: install/kubernetes/cilium
 
+    - name: Merge chart value overrides
+      id: values
+      shell: bash
+      run: |
+        base_changes=$(cat <<EOF
+        {
+          "image.repository": "${{ env.REGISTRY_DEV }}/${{ env.ORGANIZATION_DEV }}/cilium-ci",
+          "image.tag": "${{ inputs.image_tag }}",
+          "image.digest": "",
+          "image.useDigest": false,
+          "preflight.image.repository": "${{ env.REGISTRY_DEV }}/${{ env.ORGANIZATION_DEV }}/cilium-ci",
+          "preflight.image.tag": "${{ inputs.image_tag }}",
+          "preflight.image.digest": "",
+          "preflight.image.useDigest": false,
+          "operator.image.repository": "${{ env.REGISTRY_DEV }}/${{ env.ORGANIZATION_DEV }}/operator",
+          "operator.image.suffix": "-ci",
+          "operator.image.genericDigest": "",
+          "operator.image.azureDigest": "",
+          "operator.image.awsDigest": "",
+          "operator.image.alibabacloudDigest": "",
+          "operator.image.useDigest": false,
+          "operator.image.tag": "${{ inputs.image_tag }}",
+          "hubble.relay.image.repository": "${{ env.REGISTRY_DEV }}/${{ env.ORGANIZATION_DEV }}/hubble-relay-ci",
+          "hubble.relay.image.tag": "${{ inputs.image_tag }}",
+          "hubble.relay.image.digest": "",
+          "hubble.relay.image.useDigest": false,
+          "clustermesh.apiserver.image.repository": "${{ env.REGISTRY_DEV }}/${{ env.ORGANIZATION_DEV }}/clustermesh-apiserver-ci",
+          "clustermesh.apiserver.image.tag": "${{ inputs.image_tag }}",
+          "clustermesh.apiserver.image.digest": "",
+          "clustermesh.apiserver.image.useDigest": false
+        }
+        EOF
+        )
+
+        merged_changes=$(jq -cn \
+          --argjson base "${base_changes}" \
+          --argjson extra '${{ inputs.extra_values_file_changes }}' \
+          '$base + $extra')
+
+        echo "json=${merged_changes}" >> "${GITHUB_OUTPUT}"
+
     - name: Push charts
-      uses: cilium/reusable-workflows/.github/actions/push-helm-chart@6ae27958f2f37545bf48e44106b73df05b1f6d12 # v0.1.0
+      uses: cilium/reusable-workflows/.github/actions/push-helm-chart@ad5dbc4e2c7f7322efc87b0e20553d44e9de536e # v0.1.1
       with:
         name: cilium
         path: install/kubernetes/cilium
         version: ${{ needs.setup-charts.outputs.chart-version }}
-        values_file_changes: |
-          {
-
-            "image.repository": "quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/cilium-ci",
-            "image.tag": "${{ inputs.image_tag }}",
-            "image.digest": "",
-            "image.useDigest": false,
-            "preflight.image.repository": "quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/cilium-ci",
-            "preflight.image.tag": "${{ inputs.image_tag }}",
-            "preflight.image.digest": "",
-            "preflight.image.useDigest": false,
-            "operator.image.repository": "quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/operator",
-            "operator.image.suffix": "-ci",
-            "operator.image.genericDigest": "",
-            "operator.image.azureDigest": "",
-            "operator.image.awsDigest": "",
-            "operator.image.alibabacloudDigest": "",
-            "operator.image.useDigest": false,
-            "operator.image.tag": "${{ inputs.image_tag }}",
-            "hubble.relay.image.repository": "quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/hubble-relay-ci",
-            "hubble.relay.image.tag": "${{ inputs.image_tag }}",
-            "hubble.relay.image.digest": "",
-            "hubble.relay.image.useDigest": false,
-            "clustermesh.apiserver.image.repository": "quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/clustermesh-apiserver-ci",
-            "clustermesh.apiserver.image.tag": "${{ inputs.image_tag }}",
-            "clustermesh.apiserver.image.digest": "",
-            "clustermesh.apiserver.image.useDigest": false
-          }
-        registry: quay.io
-        registry_namespace: ${{ env.QUAY_CHARTS_ORGANIZATION_DEV }}
+        values_file_changes: ${{ steps.values.outputs.json }}
+        registry: ${{ env.REGISTRY_DEV }}
+        registry_namespace: ${{ env.CHARTS_ORGANIZATION_DEV }}
         registry_username: ${{ secrets.QUAY_CHARTS_DEV_USERNAME }}
         registry_password: ${{ secrets.QUAY_CHARTS_DEV_PASSWORD }}
 
@@ -138,7 +165,7 @@ jobs:
       - push-charts
     steps:
     - name: Checkout GitHub Actions definitions
-      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
         ref: ${{ github.event.repository.default_branch }}
@@ -152,5 +179,5 @@ jobs:
         CHART_VERSION: ${{ needs.setup-charts.outputs.chart-version }}
       run: |
         echo "Example commands:"
-        echo helm template -n kube-system oci://quay.io/${{ env.QUAY_CHARTS_ORGANIZATION_DEV }}/cilium --version "$CHART_VERSION"
-        echo helm install cilium -n kube-system  oci://quay.io/${{ env.QUAY_CHARTS_ORGANIZATION_DEV }}/cilium --version "$CHART_VERSION"
+        echo helm template -n kube-system oci://${{ env.REGISTRY_DEV }}/${{ env.CHARTS_ORGANIZATION_DEV }}/cilium --version "$CHART_VERSION"
+        echo helm install cilium -n kube-system  oci://${{ env.REGISTRY_DEV }}/${{ env.CHARTS_ORGANIZATION_DEV }}/cilium --version "$CHART_VERSION"

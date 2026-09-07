@@ -23,7 +23,6 @@ import (
 	"github.com/cilium/cilium/daemon/k8s"
 	"github.com/cilium/cilium/pkg/clustermesh"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
-	"github.com/cilium/cilium/pkg/datapath/iptables/ipset"
 	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
 	"github.com/cilium/cilium/pkg/datapath/tables"
@@ -36,10 +35,12 @@ import (
 	"github.com/cilium/cilium/pkg/ipcache"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client/testutils"
 	k8sSynced "github.com/cilium/cilium/pkg/k8s/synced"
+	k8sTables "github.com/cilium/cilium/pkg/k8s/tables"
 	"github.com/cilium/cilium/pkg/k8s/watchers"
 	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/kvstore/store"
 	"github.com/cilium/cilium/pkg/loadbalancer"
+	"github.com/cilium/cilium/pkg/loadbalancer/reflectors"
 	"github.com/cilium/cilium/pkg/loadbalancer/writer"
 	"github.com/cilium/cilium/pkg/mtu"
 	"github.com/cilium/cilium/pkg/node"
@@ -57,6 +58,9 @@ import (
 )
 
 var TestTimeout = 5 * time.Second
+
+// Non-default device MTU for testing.
+const TestDeviceMTU = 1480
 
 // paramsOut holds the output parameters needed for running cells in the test.
 type paramsOut struct {
@@ -113,25 +117,27 @@ func TestPrivileged_TestWireGuardCell(t *testing.T) {
 	// getHive returns a new hive with Wireguard enabled/disabled.
 	getHive := func(wireguardEnabled bool) *hive.Hive {
 		return hive.New(
-			mtu.Cell,
 			nodeManager.Cell,
 			nodediscovery.Cell,
 			source.Cell,
 			watchers.Cell,
 			dial.ServiceResolverCell,
+			reflectors.K8sReflectorCell,
 			clustermesh.Cell,
 			writer.Cell,
-			ipset.Cell,
 			k8s.ResourcesCell,
+			k8sTables.PodTableCell,
 			cell.Config(envoyCfg.SecretSyncConfig{}),
 			k8sClient.FakeClientCell(),
 			kvstore.Cell(kvstore.DisabledBackendName),
 			node.LocalNodeStoreTestCell,
 
 			cell.Provide(
+				reflectors.NetnsCookieSupportFunc,
 				newWireguardAgent,
 				newWireguardConfig,
 
+				mtu.NewMTUTable,
 				regeneration.NewFence,
 				tables.NewDeviceTable,
 				tables.NewNodeAddressTable,
@@ -139,12 +145,15 @@ func TestPrivileged_TestWireGuardCell(t *testing.T) {
 				ipcache.NewIPIdentitySynchronizer,
 				statedb.RWTable[*tables.Device].ToTable,
 				statedb.RWTable[tables.NodeAddress].ToTable,
+				statedb.RWTable[mtu.RouteMTU].ToTable,
 
 				func() paramsOut {
 					return paramsOut{
 						WireguardConfig: Config{
 							UserConfig: UserConfig{
-								EnableWireguard:              wireguardEnabled,
+								EnableConfig: EnableConfig{
+									EnableWireguard: wireguardEnabled,
+								},
 								WireguardTrackAllIPsFallback: false,
 								WireguardPersistentKeepalive: 0,
 								NodeEncryptionOptOutLabels:   "",
@@ -157,7 +166,7 @@ func TestPrivileged_TestWireGuardCell(t *testing.T) {
 						},
 						TunnelConfig:     tunnel.Config{},
 						DaemonConfig:     option.Config,
-						LBConfig:         loadbalancer.Config{},
+						LBConfig:         loadbalancer.DefaultConfig,
 						LBExternalConfig: loadbalancer.ExternalConfig{},
 						LocalNode: node.LocalNode{
 							Node: nodeTypes.Node{
@@ -191,14 +200,24 @@ func TestPrivileged_TestWireGuardCell(t *testing.T) {
 			),
 
 			cell.Invoke(
-				func(a types.WireguardAgent, n *nodediscovery.NodeDiscovery, s *node.LocalNodeStore, u nodeManager.NodeManager, i *ipcache.IPCache, c k8sSynced.CacheStatus) {
+				func(a types.Agent, n *nodediscovery.NodeDiscovery, s *node.LocalNodeStore, u nodeManager.NodeManager, i *ipcache.IPCache, c k8sSynced.CacheStatus) {
 					wgAgent = a.(*Agent)
 					nodeDiscovery = n
 					manager = u
 					nodeStore = s
 					ipCache = i
 					cacheStatus = c
-				}),
+				},
+				func(db *statedb.DB, mtuTable statedb.RWTable[mtu.RouteMTU]) {
+					txn := db.WriteTxn(mtuTable)
+					mtuTable.Insert(txn, mtu.RouteMTU{
+						Prefix:    mtu.DefaultPrefixV4,
+						DeviceMTU: TestDeviceMTU,
+						RouteMTU:  TestDeviceMTU - mtu.WireguardOverhead,
+					})
+					txn.Commit()
+				},
+			),
 		)
 	}
 
@@ -217,10 +236,8 @@ func TestPrivileged_TestWireGuardCell(t *testing.T) {
 			link, err := safenetlink.LinkByName(types.IfaceName)
 			require.NoError(t, err)
 
-			// 4. Ensure the MTU is set accordingly (mtu-reconciler job).
-			require.EventuallyWithT(t, func(c *assert.CollectT) {
-				assert.Equal(c, mtu.EthernetMTU-mtu.WireguardOverhead, link.Attrs().MTU)
-			}, TestTimeout, 50*time.Millisecond)
+			// 4. Ensure the MTU is set accordingly.
+			require.Equal(t, TestDeviceMTU-mtu.WireguardOverhead, link.Attrs().MTU)
 
 			// 5. Ensure local node has been updated (localnode-updater job).
 			require.EventuallyWithT(t, func(c *assert.CollectT) {
@@ -255,8 +272,11 @@ func TestPrivileged_TestWireGuardCell(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, dev.Peers, 1)
 
-			// 6.d Close CacheStatus to unlock wait from the [*Agent.peerGarbageCollector].
+			// 6.d Signal that the initial Kubernetes node listing is complete. The
+			// cache status unblocks the peer garbage collector, while NodeSync
+			// completes the corresponding node table initializer.
 			close(cacheStatus)
+			manager.NodeSync()
 
 			// 6.e TriggerLabelInjection to unlock WaitForRevision from the [*Agent.peerGarbageCollector].
 			ipCache.TriggerLabelInjection()

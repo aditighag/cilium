@@ -1,5 +1,5 @@
 - name: 'misc-1'
-  kernel: '5.10'
+  kernel: '6.18'
   kube-proxy: 'iptables'
   kpr: 'true'
   devices: '{eth0,eth1}'
@@ -85,6 +85,5 @@
   ipv4: 'false'
   tunnel: 'vxlan'
   underlay: 'ipv6'
-  skip-upgrade: 'true'
   # L7 testing: Basic IPv6-only configuration, can skip
   test-l7: 'false'

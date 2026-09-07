@@ -5,29 +5,43 @@
 
 package config
 
-// BPFOverlay is a configuration struct for a Cilium datapath object. Warning:
-// do not instantiate directly! Always use [NewBPFOverlay] to ensure the default
-// values configured in the ELF are honored.
+import "github.com/cilium/cilium/pkg/datapath/types"
+
+// BPFOverlay is a configuration struct for a Cilium datapath object.
+//
+// Warning: do not instantiate directly! Always use [NewBPFOverlay] to ensure
+// the default values configured in the ELF are honored.
 type BPFOverlay struct {
-	// MTU of the device the bpf program is attached to (default: MTU set in
-	// node_config.h by agent).
+	// MTU of the device the bpf program is attached to.
 	DeviceMTU uint16 `config:"device_mtu"`
 	// Pass traffic with extended IP protocols.
 	EnableExtendedIPProtocols bool `config:"enable_extended_ip_protocols"`
+	// Enable IPv4 fragments tracking.
+	EnableIPv4Fragments bool `config:"enable_ipv4_fragments"`
+	// Enable IPv6 fragments tracking.
+	EnableIPv6Fragments bool `config:"enable_ipv6_fragments"`
 	// Use netkit devices for pods.
 	EnableNetkit bool `config:"enable_netkit"`
 	// Enable routes when service has 0 endpoints.
 	EnableNoServiceEndpointsRoutable bool `config:"enable_no_service_endpoints_routable"`
 	// Masquerade traffic to remote nodes.
 	EnableRemoteNodeMasquerade bool `config:"enable_remote_node_masquerade"`
+	// Ephemeral port range minimum.
+	EphemeralMin uint16 `config:"ephemeral_min"`
 	// Ifindex of the interface the bpf program is attached to.
 	InterfaceIfIndex uint32 `config:"interface_ifindex"`
 	// MAC address of the interface the bpf program is attached to.
-	InterfaceMAC [8]byte `config:"interface_mac"`
+	InterfaceMAC types.MACAddr `config:"interface_mac"`
 	// Masquerade address for IPv4 traffic.
-	NATIPv4Masquerade [4]byte `config:"nat_ipv4_masquerade"`
+	NATIPv4Masquerade types.V4Addr `config:"nat_ipv4_masquerade"`
 	// Masquerade address for IPv6 traffic.
-	NATIPv6Masquerade [16]byte `config:"nat_ipv6_masquerade"`
+	NATIPv6Masquerade types.V6Addr `config:"nat_ipv6_masquerade"`
+	// Whether to redirect to the proxy via cilium_net (hairpin) or via stack.
+	ProxyRedirectViaCiliumNet bool `config:"proxy_redirect_via_cilium_net"`
+	// Port number used for the overlay network.
+	TunnelPort uint16 `config:"tunnel_port"`
+	// The identifier of the tunnel protocol used for the overlay network.
+	TunnelProtocol uint8 `config:"tunnel_protocol"`
 	// VXLAN tunnel endpoint network mask.
 	VTEPMask uint32 `config:"vtep_mask"`
 
@@ -35,8 +49,9 @@ type BPFOverlay struct {
 }
 
 func NewBPFOverlay(node Node) *BPFOverlay {
-	return &BPFOverlay{0x5dc, false, false, false, false, 0x0, [8]byte{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0},
-		[4]byte{0x0, 0x0, 0x0, 0x0},
-		[16]byte{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0},
-		0x0, node}
+	return &BPFOverlay{0x0, false, false, false, false, false, false, 0x0, 0x0,
+		cast[types.MACAddr]([]byte{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}),
+		cast[types.V4Addr]([]byte{0x0, 0x0, 0x0, 0x0}),
+		cast[types.V6Addr]([]byte{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}),
+		false, 0x0, 0x0, 0x0, node}
 }

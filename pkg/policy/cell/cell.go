@@ -19,6 +19,7 @@ import (
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
 	policyapi "github.com/cilium/cilium/pkg/policy/api"
+	"github.com/cilium/cilium/pkg/policy/compute"
 	"github.com/cilium/cilium/pkg/policy/types"
 )
 
@@ -59,6 +60,7 @@ type policyRepoParams struct {
 	Logger            *slog.Logger
 	Lifecycle         cell.Lifecycle
 	Config            Config
+	DaemonConfig      *option.DaemonConfig
 	CertManager       certificatemanager.CertificateManager
 	IdentityManager   identitymanager.IDManager
 	ClusterInfo       cmtypes.ClusterInfo
@@ -67,9 +69,9 @@ type policyRepoParams struct {
 }
 
 func newPolicyRepo(params policyRepoParams) policy.PolicyRepository {
+	// Must be done before calling policy.NewPolicyRepository() below.
 	if params.Config.EnableWellKnownIdentities {
-		// Must be done before calling policy.NewPolicyRepository() below.
-		num := identity.InitWellKnownIdentities(option.Config, params.ClusterInfo)
+		num := identity.InitWellKnownIdentities(params.DaemonConfig.K8sNamespace, params.ClusterInfo)
 		metrics.Identity.WithLabelValues(identity.WellKnownIdentityType).Add(float64(num))
 		identity.WellKnown.ForEach(func(i *identity.Identity) {
 			for labelSource := range i.Labels.CollectSources() {
@@ -85,6 +87,7 @@ func newPolicyRepo(params policyRepoParams) policy.PolicyRepository {
 	// cache of label selector -> identities for policy peers.
 	policyRepo := policy.NewPolicyRepository(
 		params.Logger,
+		params.ClusterInfo,
 		identity.ListReservedIdentities(), // Load SelectorCache with reserved identities
 		params.CertManager,
 		params.L7RulesTranslator,
@@ -107,6 +110,7 @@ type policyUpdaterParams struct {
 
 	Logger           *slog.Logger
 	PolicyRepository policy.PolicyRepository
+	PolicyComputer   compute.PolicyRecomputer
 	EndpointManager  endpointmanager.EndpointManager
 }
 
@@ -114,7 +118,5 @@ func newPolicyUpdater(params policyUpdaterParams) *policy.Updater {
 	// policyUpdater: forces policy recalculation on all endpoints.
 	// Called for various events, such as named port changes
 	// or certain identity updates.
-	policyUpdater := policy.NewUpdater(params.Logger, params.PolicyRepository, params.EndpointManager)
-
-	return policyUpdater
+	return policy.NewUpdater(params.Logger, params.PolicyRepository, params.PolicyComputer, params.EndpointManager)
 }

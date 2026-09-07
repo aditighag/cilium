@@ -10,6 +10,7 @@ import (
 
 	"github.com/cilium/hive/hivetest"
 
+	eptypes "github.com/cilium/cilium/pkg/endpoint/types"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -42,7 +43,7 @@ func NewTestEndpoint(t testing.TB) TestEndpoint {
 		logger:      hivetest.Logger(t),
 		Id:          42,
 		Identity:    defaultIdentity,
-		MAC:         mac.MAC([]byte{0x02, 0x00, 0x60, 0x0D, 0xF0, 0x0D}),
+		MAC:         mac.MAC{0x02, 0x00, 0x60, 0x0D, 0xF0, 0x0D},
 		IfIndex:     0,
 		Opts:        opts,
 		NetNsCookie: 0,
@@ -56,7 +57,7 @@ func NewTestHostEndpoint(t testing.TB) TestEndpoint {
 		logger:   hivetest.Logger(t),
 		Id:       65535,
 		Identity: hostIdentity,
-		MAC:      mac.MAC([]byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06}),
+		MAC:      mac.MAC{0x01, 0x02, 0x03, 0x04, 0x05, 0x06},
 		IfIndex:  0,
 		Opts:     opts,
 		isHost:   true,
@@ -91,6 +92,8 @@ func (e *TestEndpoint) GetOptions() *option.IntOptions { return e.Opts }
 
 func (e *TestEndpoint) IsHost() bool { return e.isHost }
 
+func (e *TestEndpoint) GetRTInfo() (uint32, eptypes.RTInfoEncoding) { return 0, eptypes.RTInfoNone }
+
 func (e *TestEndpoint) GetPropertyValue(key string) any { return nil }
 
 func (e *TestEndpoint) IPv4Address() netip.Addr {
@@ -118,4 +121,12 @@ func (e *TestEndpoint) StateDir() string {
 		return e.State
 	}
 	return "test_loader"
+}
+
+func (e *TestEndpoint) GetK8sNamespace() string {
+	return ""
+}
+
+func (e *TestEndpoint) GetK8sPodName() string {
+	return ""
 }

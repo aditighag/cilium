@@ -42,10 +42,6 @@
 /* Import map definitions and some default values */
 #include <bpf/config/node.h>
 
-/* Overwrite (local) CLUSTER_ID defined in node_config.h */
-#undef CLUSTER_ID
-#define CLUSTER_ID 1
-
 /* Need to undef EVENT_SOURCE here since it is defined in
  * both of common.h and bpf_lxc.c.
  */
@@ -54,8 +50,13 @@
 /* Include an actual datapath code */
 #include "lib/bpf_lxc.h"
 
+/* Overwrite (local) cluster_id defined in clustermesh.h */
+ASSIGN_CONFIG(__u32, cluster_id, 1)
+
 /* Set the LXC source address to be the address of the backend pod */
 ASSIGN_CONFIG(union v4addr, endpoint_ipv4, { .be32 = BACKEND_IP})
+
+ASSIGN_CONFIG(bool, enable_conntrack_accounting, true)
 
 #include "lib/ipcache.h"
 #include "lib/policy.h"
@@ -122,28 +123,29 @@ pktgen_from_lxc(struct __ctx_buff *ctx, bool syn, bool ack)
 	return 0;
 }
 
-PKTGEN("tc", "01_overlay_to_lxc_syn")
+PKTGEN(PROG_TYPE, "01_overlay_to_lxc_syn")
 int overlay_to_lxc_syn_pktgen(struct __ctx_buff *ctx)
 {
 	return pktgen_to_lxc(ctx, true, false);
 }
 
-SETUP("tc", "01_overlay_to_lxc_syn")
+SETUP(PROG_TYPE, "01_overlay_to_lxc_syn")
 int overlay_to_lxc_syn_setup(struct __ctx_buff *ctx)
 {
 	/*
 	 * Apply policy based on the remote "real"
 	 * identity instead of remote-node identity.
 	 */
-	policy_add_ingress_allow_entry(CLIENT_IDENTITY, IPPROTO_TCP, BACKEND_PORT);
+	policy_add_ingress_allow_l3_l4_entry(CLIENT_IDENTITY, IPPROTO_TCP,
+					     BACKEND_PORT, 0);
 
 	/* Emulate metadata filled by ipv4_local_delivery on bpf_overlay */
-	local_delivery_fill_meta(ctx, CLIENT_IDENTITY, true, false, true, 0);
+	local_delivery_fill_meta(ctx, CLIENT_IDENTITY, true, false, false, true, 0);
 
 	return pod_receive_packet_by_tailcall(ctx);
 }
 
-CHECK("tc", "01_overlay_to_lxc_syn")
+CHECK(PROG_TYPE, "01_overlay_to_lxc_syn")
 int overlay_to_lxc_syn_check(struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -200,8 +202,8 @@ int overlay_to_lxc_syn_check(struct __ctx_buff *ctx)
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst port has changed");
 
-	if (l4->check != bpf_htons(0x1df4))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+	if (l4->check != bpf_htons(0x7d94))
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_htons(0x7d94));
 
 	/* Check ingress conntrack state is in the default CT */
 	tuple.daddr   = CLIENT_NODE_IP;
@@ -224,13 +226,13 @@ int overlay_to_lxc_syn_check(struct __ctx_buff *ctx)
 	test_finish();
 }
 
-PKTGEN("tc", "02_lxc_to_overlay_synack")
+PKTGEN(PROG_TYPE, "02_lxc_to_overlay_synack")
 int lxc_to_overlay_synack_pktgen(struct __ctx_buff *ctx)
 {
 	return pktgen_from_lxc(ctx, true, true);
 }
 
-SETUP("tc", "02_lxc_to_overlay_synack")
+SETUP(PROG_TYPE, "02_lxc_to_overlay_synack")
 int lxc_to_overlay_synack_setup(struct __ctx_buff *ctx)
 {
 	ipcache_v4_add_entry_with_flags(CLIENT_NODE_IP, 0, REMOTE_NODE_ID,
@@ -239,7 +241,7 @@ int lxc_to_overlay_synack_setup(struct __ctx_buff *ctx)
 	return pod_send_packet(ctx);
 }
 
-CHECK("tc", "02_lxc_to_overlay_synack")
+CHECK(PROG_TYPE, "02_lxc_to_overlay_synack")
 int lxc_to_overlay_ack_check(struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -296,8 +298,8 @@ int lxc_to_overlay_ack_check(struct __ctx_buff *ctx)
 	if (l4->dest != CLIENT_INTER_CLUSTER_SNAT_PORT)
 		test_fatal("dst port has changed");
 
-	if (l4->check != bpf_htons(0x1de4))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+	if (l4->check != bpf_htons(0x7d84))
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_htons(0x7d84));
 
 	/* Make sure we hit the conntrack entry */
 	tuple.saddr   = BACKEND_IP;
@@ -317,22 +319,22 @@ int lxc_to_overlay_ack_check(struct __ctx_buff *ctx)
 	test_finish();
 }
 
-PKTGEN("tc", "03_overlay_to_lxc_ack")
+PKTGEN(PROG_TYPE, "03_overlay_to_lxc_ack")
 int overlay_to_lxc_ack_pktgen(struct __ctx_buff *ctx)
 {
 	return pktgen_to_lxc(ctx, false, true);
 }
 
-SETUP("tc", "03_overlay_to_lxc_ack")
+SETUP(PROG_TYPE, "03_overlay_to_lxc_ack")
 int overlay_to_lxc_ack_setup(struct __ctx_buff *ctx)
 {
 	/* Emulate metadata filled by ipv4_local_delivery on bpf_overlay */
-	local_delivery_fill_meta(ctx, CLIENT_IDENTITY, true, false, true, 0);
+	local_delivery_fill_meta(ctx, CLIENT_IDENTITY, true, false, false, true, 0);
 
 	return pod_receive_packet_by_tailcall(ctx);
 }
 
-CHECK("tc", "03_overlay_to_lxc_ack")
+CHECK(PROG_TYPE, "03_overlay_to_lxc_ack")
 int overlay_to_lxc_ack_check(struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -389,8 +391,8 @@ int overlay_to_lxc_ack_check(struct __ctx_buff *ctx)
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst port has changed");
 
-	if (l4->check != bpf_htons(0x1de6))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+	if (l4->check != bpf_htons(0x7d86))
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_htons(0x7d86));
 
 	/* Make sure we hit the conntrack entry */
 	tuple.daddr   = CLIENT_NODE_IP;

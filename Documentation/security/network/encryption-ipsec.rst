@@ -20,34 +20,6 @@ Packets are not encrypted when they are destined to the same node from which
 they were sent. This behavior is intended. Encryption would provide no benefits
 in that case, given that the raw traffic can be observed on the node anyway.
 
-v1.18 Encrypted Overlay
-=========================
-Prior to v1.18, IPsec encryption was performed before tunnel encapsulation.
-From Cilium v1.18 and forward, Cilium's IPsec encryption datapath will send
-traffic for overlay encapsulation prior to IPsec encryption when tunnel mode is
-enabled.
-
-With this change, the security identities used for policy enforcement are
-encrypted on the wire. This is a security benefit.
-
-A disruption-less upgrade from v1.17 to v1.18 can only be achieved by fully
-patching v1.17 to its latest version. Migration specific code was added to
-newer v1.17 releases to support a disruption-less upgrade to v1.18.
-
-Once patched to the newest v1.17 stable release, a normal upgrade to v1.18 can
-be performed.
-
-.. note::
-
-   Because VXLAN is encrypted before being sent, operators see ESP
-   traffic between Kubernetes nodes.
-
-   This may result in the need to update firewall rules to allow ESP traffic
-   between nodes.
-   This is especially important in Google Cloud GKE environments.
-   The default firewall rules for the cluster's subnet may not allow ESP.
-
-
 Generate & Import the PSK
 =========================
 
@@ -81,7 +53,7 @@ following command:
 
        .. parsed-literal::
 
-          $ kubectl create -n kube-system secret generic cilium-ipsec-keys \
+          $ kubectl create -n kube-system secret generic cilium-ipsec-keys \\
               --from-literal=keys="3+ rfc4106(gcm(aes)) $(dd if=/dev/urandom count=20 bs=1 2> /dev/null | xxd -p -c 64) 128"
 
        .. attention::
@@ -115,8 +87,8 @@ Enable Encryption in Cilium
 
        .. parsed-literal::
 
-          cilium install |CHART_VERSION| \
-             --set encryption.enabled=true \
+          cilium install --version |CHART_VERSION| \\
+             --set encryption.enabled=true \\
              --set encryption.type=ipsec
 
     .. group-tab:: Helm
@@ -124,12 +96,10 @@ Enable Encryption in Cilium
        If you are deploying Cilium with Helm by following
        :ref:`k8s_install_helm`, pass the following options:
 
-       .. parsed-literal::
-
-           helm install cilium |CHART_RELEASE| \\
-             --namespace kube-system \\
-             --set encryption.enabled=true \\
-             --set encryption.type=ipsec
+       .. cilium-helm-install::
+          :namespace: kube-system
+          :set: encryption.enabled=true
+                encryption.type=ipsec
 
        ``encryption.enabled`` enables encryption of the traffic between
        Cilium-managed pods. ``encryption.type`` specifies the encryption method
@@ -166,9 +136,9 @@ interface as follows:
 
        .. parsed-literal::
 
-          cilium install |CHART_VERSION| \
-             --set encryption.enabled=true \
-             --set encryption.type=ipsec \
+          cilium install --version |CHART_VERSION| \\
+             --set encryption.enabled=true \\
+             --set encryption.type=ipsec \\
              --set encryption.ipsec.interface=ethX
 
     .. group-tab:: Helm
@@ -252,6 +222,14 @@ If you are using Cluster Mesh, you must apply the key rotation procedure
 to all clusters in the mesh. You might need to increase the transition time to
 allow for the new keys to be deployed and applied across all clusters,
 which you can do with the agent flag ``ipsec-key-rotation-duration``.
+
+In large clusters, key rotation can cause a "thundering herd" effect where all
+agents detect the key change simultaneously and update their CiliumNode resources
+at once, potentially overwhelming the Kubernetes API server. To mitigate this, 
+Cilium applies a random jitter delay before loading new keys. The jitter is
+randomly selected from ``[0, keyRotationDuration/10]``, ensuring agents have
+sufficient time to load new keys before the old keys are removed while spreading
+the load on the Kubernetes API server.
 
 Monitoring
 ==========

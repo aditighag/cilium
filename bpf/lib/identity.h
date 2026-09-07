@@ -4,9 +4,60 @@
 #pragma once
 
 #include <bpf/config/node.h>
+#include "export_type.h"
 
 #include "dbg.h"
 #include "clustermesh.h"
+
+enum identity {
+	UNKNOWN_ID = 0,
+	HOST_ID = 1,
+	WORLD_ID = 2,
+	UNMANAGED_ID = 3,
+	HEALTH_ID = 4,
+	INIT_ID = 5,
+	LOCAL_NODE_ID = 6,
+	REMOTE_NODE_ID = LOCAL_NODE_ID,
+	KUBE_APISERVER_NODE_ID = 7,
+	INGRESS_ID = 8,
+	WORLD_IPV4_ID = 9,
+	WORLD_IPV6_ID = 10,
+
+	/* These identities are used by the policy system for aggregation,
+	 * they're never applied to traffic or endpoints directly.
+	 */
+	AGGREGATE_CLUSTER_ID = 11, /* This ID is not used by endpoints, only policy map */
+	AGGREGATE_CLUSTER_MESH_ID = 12,
+	AGGREGATE_WORLD_ID = 13,
+	AGGREGATE_REMOTE_NODE_ID = 14,
+};
+
+EXPORT_TYPE(enum identity);
+
+/* TODO(tb): Replace this with a helper, enable_v4/v6 will be runtime configs at
+ * some point.
+ */
+#if defined ENABLE_IPV4 && defined ENABLE_IPV6
+#else
+# define WORLD_IPV4_ID WORLD_ID
+# define WORLD_IPV6_ID WORLD_ID
+#endif
+
+/**
+ * Minimal numeric identity value for a local (CIDR) identity.
+ *
+ * It must be in sync with the constant identity.MinLocalIdentity
+ * defined in the numericidentity.go file.
+ */
+#define CIDR_IDENTITY_RANGE_START ((1 << 24) + 1)
+/**
+ * Maximal numeric identity value for a local (CIDR) identity.
+ *
+ * It must be in sync with the constant identity.MaxLocalIdentity
+ * defined in the numericidentity.go file.
+ */
+#define CIDR_IDENTITY_RANGE_END ((1 << 24) + (1 << 16) - 1)
+
 /**
  * get_identity - returns source identity from the mark field
  *
@@ -31,10 +82,11 @@ get_identity(const struct __ctx_buff *ctx __maybe_unused)
 /* ctx->mark not available in XDP. */
 #if __ctx_is == __ctx_skb
 	__u32 cluster_id_lower = ctx->mark & CLUSTER_ID_LOWER_MASK;
-	__u32 cluster_id_upper = (ctx->mark & get_cluster_id_upper_mask()) >> (8 + IDENTITY_LEN);
-	__u32 identity = (ctx->mark >> 16) & IDENTITY_MAX;
+	__u32 cluster_id_upper = (ctx->mark & get_cluster_id_upper_mask()) >>
+				      (8 + IDENTITY_LOCAL_BITS);
+	__u32 identity = (ctx->mark >> 16) & IDENTITY_LOCAL_MAX;
 
-	return (cluster_id_lower | cluster_id_upper) << IDENTITY_LEN | identity;
+	return (cluster_id_lower | cluster_id_upper) << IDENTITY_LOCAL_BITS | identity;
 #else /* __ctx_is == __ctx_xdp */
 	return 0;
 #endif /* __ctx_is == __ctx_xdp */
@@ -62,13 +114,11 @@ set_identity_mark(struct __ctx_buff *ctx __maybe_unused, __u32 identity __maybe_
 		  __u32 magic __maybe_unused)
 {
 #if __ctx_is == __ctx_skb
-	__u32 cluster_id = (identity >> IDENTITY_LEN) & get_cluster_id_max();
-	__u32 cluster_id_lower = cluster_id & 0xFF;
-	__u32 cluster_id_upper = ((cluster_id & 0xFFFFFF00) << (8 + IDENTITY_LEN));
+	__u32 cluster_id = (identity >> IDENTITY_LOCAL_BITS) & CLUSTER_ID_MAX;
 
-	ctx->mark = (magic & MARK_MAGIC_KEY_MASK);
-	ctx->mark &= MARK_MAGIC_KEY_MASK;
-	ctx->mark |= (identity & IDENTITY_MAX) << 16 | cluster_id_lower | cluster_id_upper;
+	ctx->mark = format_cluster_id_mark(cluster_id);
+	ctx->mark |= magic & MARK_MAGIC_KEY_MASK;
+	ctx->mark |= (identity & IDENTITY_LOCAL_MAX) << 16;
 #endif
 }
 
@@ -78,6 +128,7 @@ static __always_inline bool identity_in_range(__u32 identity, __u32 range_start,
 }
 
 #define IDENTITY_LOCAL_SCOPE_MASK 0xFF000000
+#define IDENTITY_LOCAL_SCOPE_CIDR 0x01000000
 #define IDENTITY_LOCAL_SCOPE_REMOTE_NODE 0x02000000
 
 static __always_inline bool identity_is_host(__u32 identity)
@@ -109,6 +160,15 @@ static __always_inline bool identity_is_remote_node(__u32 identity)
 	return identity == REMOTE_NODE_ID ||
 		identity == KUBE_APISERVER_NODE_ID ||
 		(identity & IDENTITY_LOCAL_SCOPE_MASK) == IDENTITY_LOCAL_SCOPE_REMOTE_NODE;
+}
+
+/**
+ * identity_is_ingress is used to determine whether an identity is
+ * reserved ingress identity (used by L7 LB).
+ */
+static __always_inline bool identity_is_ingress(__u32 identity)
+{
+	return identity == INGRESS_ID;
 }
 
 /**
@@ -185,6 +245,23 @@ static __always_inline bool identity_is_cidr_range(__u32 identity)
 }
 
 /**
+ * identity_is_world returns true if a given identity belongs to extra-cluster
+ * (i.e. the world cidr range or a world identity).
+ */
+static __always_inline bool identity_is_world(__u32 identity)
+{
+#if defined ENABLE_IPV4 && defined ENABLE_IPV6
+	if (identity == WORLD_ID || identity == WORLD_IPV4_ID || identity == WORLD_IPV6_ID)
+		return true;
+#else
+	if (identity == WORLD_ID)
+		return true;
+#endif
+
+	return identity_is_cidr_range(identity);
+}
+
+/**
  * identity_is_cluster is used to determine whether an identity is assigned to
  * an entity inside the cluster.
  *
@@ -206,18 +283,7 @@ static __always_inline bool identity_is_cidr_range(__u32 identity)
  */
 static __always_inline bool identity_is_cluster(__u32 identity)
 {
-#if defined ENABLE_IPV4 && defined ENABLE_IPV6
-	if (identity == WORLD_ID || identity == WORLD_IPV4_ID || identity == WORLD_IPV6_ID)
-		return false;
-#else
-	if (identity == WORLD_ID)
-		return false;
-#endif
-
-	if (identity_is_cidr_range(identity))
-		return false;
-
-	return true;
+	return !identity_is_world(identity);
 }
 
 #if __ctx_is == __ctx_skb
@@ -245,7 +311,7 @@ static __always_inline __u32 inherit_identity_from_host(struct __ctx_buff *ctx, 
 		*identity = HOST_ID;
 	} else {
 #if defined ENABLE_IPV4 && defined ENABLE_IPV6
-		__u16 proto = ctx_get_protocol(ctx);
+		__be16 proto = ctx_get_protocol(ctx);
 
 		if (proto == bpf_htons(ETH_P_IP))
 			*identity = WORLD_IPV4_ID;
@@ -274,4 +340,67 @@ static __always_inline __u32 inherit_identity_from_host(struct __ctx_buff *ctx, 
 static __always_inline bool identity_is_local(__u32 identity)
 {
 	return (identity & IDENTITY_LOCAL_SCOPE_MASK) != 0;
+}
+
+static __always_inline __u32 get_tunnel_id(__u32 identity)
+{
+#if defined ENABLE_IPV4 && defined ENABLE_IPV6
+	if (identity == WORLD_IPV4_ID || identity == WORLD_IPV6_ID)
+		return WORLD_ID;
+#endif
+	return identity;
+}
+
+static __always_inline __u32 get_id_from_tunnel_id(__u32 tunnel_id, __be16 proto  __maybe_unused)
+{
+#if defined ENABLE_IPV4 && defined ENABLE_IPV6
+	if (tunnel_id == WORLD_ID) {
+		switch (proto) {
+		case bpf_htons(ETH_P_IP):
+			return WORLD_IPV4_ID;
+		case bpf_htons(ETH_P_IPV6):
+			return WORLD_IPV6_ID;
+		}
+	}
+#endif
+	return tunnel_id;
+}
+
+/**
+ * aggregate_for_identity returns the aggregated (i.e. wildcard) identity
+ * for the given leaf identity.
+ *
+ * This **must** match the implementation in pkg/policy/aggregate.go
+ */
+static __always_inline __u32 aggregate_for_identity(__u32 identity)
+{
+	/* aggregates must aggregate to themselves */
+	switch (identity) {
+	case 0:
+	case AGGREGATE_CLUSTER_ID:
+	case AGGREGATE_CLUSTER_MESH_ID:
+	case AGGREGATE_REMOTE_NODE_ID:
+	case AGGREGATE_WORLD_ID:
+		return identity;
+	}
+
+	/* Identities 0-99 are special, we cannot easily aggregate them. */
+	if (identity < 100)
+		return 0;
+
+	/* local (cidr) and remote-node identities do aggregate */
+	switch (identity & IDENTITY_LOCAL_SCOPE_MASK) {
+	case IDENTITY_LOCAL_SCOPE_REMOTE_NODE:
+		return AGGREGATE_REMOTE_NODE_ID;
+	case IDENTITY_LOCAL_SCOPE_CIDR:
+		return AGGREGATE_WORLD_ID;
+	}
+
+	/* identity is global scope and >= 100.
+	 * It must be an endpoint, either in cluster or cluster mesh.
+	 */
+	if (extract_cluster_id_from_identity(identity) == CONFIG(cluster_id))
+		return AGGREGATE_CLUSTER_ID;
+
+	return AGGREGATE_CLUSTER_MESH_ID;
 }

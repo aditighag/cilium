@@ -4,13 +4,12 @@
 package reflector
 
 import (
-	"path"
-
 	"github.com/cilium/hive/cell"
 
 	mcsapi "github.com/cilium/cilium/pkg/clustermesh/mcsapi/types"
 	service "github.com/cilium/cilium/pkg/clustermesh/store"
 	"github.com/cilium/cilium/pkg/clustermesh/types"
+	endpointslice "github.com/cilium/cilium/pkg/clustermesh/types/endpointslice"
 	"github.com/cilium/cilium/pkg/identity/cache"
 	"github.com/cilium/cilium/pkg/ipcache"
 	"github.com/cilium/cilium/pkg/kvstore"
@@ -20,18 +19,33 @@ import (
 var Cell = cell.Group(
 	cell.Provide(
 		Out(NewFactory(Endpoints, ipcache.IPIdentitiesPath,
-			WithStatePrefixOverride(path.Join(ipcache.IPIdentitiesPath, ipcache.DefaultAddressSpace)),
+			WithStatePrefixOverride(kvstore.JoinKey(ipcache.IPIdentitiesPath, ipcache.DefaultAddressSpace)),
 		)),
 
 		Out(NewFactory(Identities, cache.IdentitiesPath,
-			WithStatePrefixOverride(path.Join(cache.IdentitiesPath, "id")),
-			WithCachePrefixOverride(path.Join(kvstore.StateToCachePrefix(cache.IdentitiesPath), ClusterNamePlaceHolder, "id")),
+			WithStatePrefixOverride(kvstore.JoinKey(cache.IdentitiesPath, "id")),
+			WithCachePrefixOverride(kvstore.JoinKey(kvstore.StateToCachePrefix(cache.IdentitiesPath), ClusterNamePlaceHolder, "id")),
 		)),
 
 		Out(NewFactory(Nodes, node.NodeStorePrefix)),
 
-		Out(NewFactory(Services, service.ServiceStorePrefix,
+		func(serviceV2Cfg types.ServiceModeV2Config) out {
+			return out{Factory: NewFactory(Services, service.ServiceStorePrefix,
+				WithRevocation(),
+				WithEnabledOverride(func(cfg types.CiliumClusterConfig) bool {
+					if cfg.Capabilities.EndpointSlicesExportMode == types.EndpointSlicesExportModeEndpointSlicesOnly {
+						return false
+					}
+					return serviceV2Cfg.ServiceModeV2.ShouldExportLegacyServices()
+				}),
+			)}
+		},
+
+		Out(NewFactory(EndpointSlices, endpointslice.EndpointSliceStorePrefix,
 			WithRevocation(),
+			WithEnabledOverride(func(cfg types.CiliumClusterConfig) bool {
+				return cfg.Capabilities.EndpointSlicesExportMode != types.EndpointSlicesExportModeServicesOnly
+			}),
 		)),
 
 		Out(NewFactory(ServiceExports, mcsapi.ServiceExportStorePrefix,

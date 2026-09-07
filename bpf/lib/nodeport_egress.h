@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "auxvars.h"
 #include "drop.h"
 #include "nodeport.h"
 
@@ -20,11 +21,13 @@
 
 #ifdef ENABLE_IPV6
 static __always_inline bool
-nodeport_has_nat_conflict_ipv6(const struct ipv6hdr *ip6 __maybe_unused,
+nodeport_has_nat_conflict_ipv6(const struct __ctx_buff *ctx __maybe_unused,
+			       const struct ipv6hdr *ip6 __maybe_unused,
 			       struct ipv6_nat_target *target __maybe_unused)
 {
 #if defined(TUNNEL_MODE) && defined(IS_BPF_OVERLAY)
 	union v6addr router_ip = CONFIG(router_ipv6);
+
 	if (ipv6_addr_equals((union v6addr *)&ip6->saddr, &router_ip)) {
 		ipv6_addr_copy(&target->addr, &router_ip);
 		target->needs_ct = true;
@@ -34,77 +37,83 @@ nodeport_has_nat_conflict_ipv6(const struct ipv6hdr *ip6 __maybe_unused,
 #endif /* TUNNEL_MODE && IS_BPF_OVERLAY */
 
 #if defined(IS_BPF_HOST)
-	const union v6addr dr_addr = IPV6_DIRECT_ROUTING;
-
-	/* See comment in nodeport_has_nat_conflict_ipv4(). */
-	if (CONFIG(direct_routing_dev_ifindex) == CONFIG(interface_ifindex) &&
-	    ipv6_addr_equals((union v6addr *)&ip6->saddr, &dr_addr)) {
-		ipv6_addr_copy(&target->addr, &dr_addr);
+	__u32 magic = ctx->mark & MARK_MAGIC_HOST_MASK;
+	const struct endpoint_info *ep = __lookup_ip6_endpoint((union v6addr *)&ip6->saddr);
+	/* Detect if this is traffic generated from a local process or a
+	 * pod with host networking, including egress proxy traffic.
+	 *
+	 * If it is we want to either reserve the port to avoid conflicting
+	 * with pod egress NAT translation or translate if the source port is
+	 * already reserved.
+	 */
+	if (magic == MARK_MAGIC_HOST || (ep && (ep->flags & ENDPOINT_F_HOST))) {
+		ipv6_addr_copy(&target->addr, (union v6addr *)&ip6->saddr);
 		target->needs_ct = true;
-
 		return true;
 	}
-#endif /* IS_BPF_HOST */
+#endif
 
 	return false;
 }
 
 static __always_inline int nodeport_snat_fwd_ipv6(struct __ctx_buff *ctx,
 						  union v6addr *saddr,
-						  struct trace_ctx *trace,
-						  __s8 *ext_err)
+						  __s8 *ext_err, struct snat_v6_args *args)
 {
-	struct ipv6_nat_target target = {
-		.min_port = NODEPORT_PORT_MIN_NAT,
-		.max_port = NODEPORT_PORT_MAX_NAT,
-	};
-	struct ipv6_ct_tuple tuple = {};
-	int hdrlen, l4_off, ret;
+	int hdrlen, l4_off, ret = NAT_PUNT_TO_STACK;
+	fraginfo_t fraginfo = 0;
 	void *data, *data_end;
 	struct ipv6hdr *ip6;
-	fraginfo_t fraginfo;
+
+	select_nat_port_range_ipv6(&args->target);
 
 	if (!revalidate_data(ctx, &data, &data_end, &ip6))
 		return DROP_INVALID;
 
-	tuple.nexthdr = ip6->nexthdr;
-	hdrlen = ipv6_hdrlen_with_fraginfo(ctx, &tuple.nexthdr, &fraginfo);
+	args->tuple.nexthdr = ip6->nexthdr;
+	hdrlen = ipv6_hdrlen_with_fraginfo(ctx, &args->tuple.nexthdr, &fraginfo);
 	if (hdrlen < 0)
 		return hdrlen;
 
-	snat_v6_init_tuple(ip6, NAT_DIR_EGRESS, &tuple);
+	snat_v6_init_tuple(ip6, NAT_DIR_EGRESS, &args->tuple);
 	l4_off = ETH_HLEN + hdrlen;
 
-	if (lb_is_svc_proto(tuple.nexthdr) &&
-	    nodeport_has_nat_conflict_ipv6(ip6, &target))
+	if (lb_is_svc_proto(args->tuple.nexthdr) &&
+	    nodeport_has_nat_conflict_ipv6(ctx, ip6, &args->target))
 		goto apply_snat;
 
-	ret = snat_v6_needs_masquerade(ctx, &tuple, ip6, fraginfo, l4_off, &target);
+#if defined(ENABLE_MASQUERADE_IPV6) && defined(IS_BPF_HOST)
+	ret = snat_v6_needs_masquerade(ctx, fraginfo, l4_off);
+#endif /* ENABLE_MASQUERADE_IPV6 && IS_BPF_HOST */
 	if (IS_ERR(ret))
 		goto out;
 
 #if defined(ENABLE_EGRESS_GATEWAY_COMMON) && defined(IS_BPF_HOST)
-	if (target.egress_gateway) {
+	if (args->target.egress_gateway) {
+		if (ctx_egw_done(ctx))
+			goto apply_snat;
+
 		/* Stay on the desired egress interface: */
-		if (target.ifindex && target.ifindex == CONFIG(interface_ifindex))
+		if (args->target.ifindex && args->target.ifindex == CONFIG(interface_ifindex))
 			goto apply_snat;
 
 		/* Send packet to the correct egress interface, and SNAT it there. */
-		ret = egress_gw_fib_lookup_and_redirect_v6(ctx, &target.addr,
-							   &tuple.daddr, target.ifindex,
-							   ext_err);
+		ret = egress_gw_fib_lookup_and_redirect_v6(ctx, &args->target.addr,
+							   &args->tuple.daddr, args->target.ifindex,
+							   args->target.tbid, ext_err);
 		if (ret != CTX_ACT_OK)
 			return ret;
-
-		if (!revalidate_data(ctx, &data, &data_end, &ip6))
-			return DROP_INVALID;
 	}
 #endif
 
 apply_snat:
-	ipv6_addr_copy(saddr, &tuple.saddr);
-	ret = snat_v6_nat(ctx, &tuple, ip6, fraginfo, l4_off,
-			  &target, trace, ext_err);
+	ipv6_addr_copy(saddr, &args->tuple.saddr);
+	ret = snat_v6_nat(ctx, fraginfo, l4_off, ext_err);
+	if (CONFIG(nodeport_port_max_nat_ext) &&
+	    ret == DROP_NAT_NO_MAPPING) {
+		swap_nat_port_range_ipv6(&args->target);
+		ret = snat_v6_nat(ctx, fraginfo, l4_off, ext_err);
+	}
 	if (IS_ERR(ret))
 		goto out;
 
@@ -119,19 +128,23 @@ out:
 	return ret;
 }
 
+DEFINE_AUX(union v6addr, snat_fwd_saddr);
+
 __declare_tail(CILIUM_CALL_IPV6_NODEPORT_SNAT_FWD)
 int tail_handle_snat_fwd_ipv6(struct __ctx_buff *ctx)
 {
 	__u32 src_id = ctx_load_and_clear_meta(ctx, CB_SRC_LABEL);
-	struct trace_ctx trace = {
+	union v6addr *saddr = AUX(snat_fwd_saddr);
+	int ret;
+	__s8 ext_err = 0;
+	struct snat_v6_args *args = AUX(snat_v6_args);
+
+	args->trace = (struct trace_ctx){
 		.reason = TRACE_REASON_UNKNOWN,
 		.monitor = 0,
 	};
-	union v6addr saddr = {};
-	int ret;
-	__s8 ext_err = 0;
 
-	ret = nodeport_snat_fwd_ipv6(ctx, &saddr, &trace, &ext_err);
+	ret = nodeport_snat_fwd_ipv6(ctx, saddr, &ext_err, args);
 	if (IS_ERR(ret))
 		return send_drop_notify_error_ext(ctx, src_id, ret, ext_err, METRIC_EGRESS);
 
@@ -142,8 +155,8 @@ int tail_handle_snat_fwd_ipv6(struct __ctx_buff *ctx)
 	 */
 	if (ret == CTX_ACT_OK)
 		send_trace_notify6(ctx, NODEPORT_OBS_POINT_EGRESS, src_id, UNKNOWN_ID,
-				   &saddr, TRACE_EP_ID_UNKNOWN, CONFIG(interface_ifindex),
-				   trace.reason, trace.monitor);
+				   saddr, TRACE_EP_ID_UNKNOWN, CONFIG(interface_ifindex),
+				   args->trace.reason, args->trace.monitor);
 
 	return ret;
 }
@@ -156,8 +169,8 @@ nodeport_rev_dnat_fwd_ipv6(struct __ctx_buff *ctx, bool *snat_done,
 	struct bpf_fib_lookup_padded fib_params __maybe_unused = {};
 	struct lb6_reverse_nat nat_info __align_stack_8;
 	struct ipv6_ct_tuple tuple __align_stack_8 = {};
+	fraginfo_t fraginfo = 0;
 	void *data, *data_end;
-	fraginfo_t fraginfo;
 	struct ipv6hdr *ip6;
 	__u32 monitor = 0;
 	int ret, l4_off;
@@ -283,12 +296,13 @@ int tail_handle_nat_fwd_ipv6(struct __ctx_buff *ctx)
 
 #ifdef ENABLE_IPV4
 static __always_inline bool
-nodeport_has_nat_conflict_ipv4(const struct iphdr *ip4 __maybe_unused,
+nodeport_has_nat_conflict_ipv4(const struct __ctx_buff *ctx __maybe_unused,
+			       const struct iphdr *ip4 __maybe_unused,
 			       struct ipv4_nat_target *target __maybe_unused)
 {
 #if defined(TUNNEL_MODE) && defined(IS_BPF_OVERLAY)
-	if (ip4->saddr == IPV4_GATEWAY) {
-		target->addr = IPV4_GATEWAY;
+	if (ip4->saddr == CONFIG(router_ipv4).be32) {
+		target->addr = ip4->saddr;
 		target->needs_ct = true;
 
 		return true;
@@ -296,18 +310,21 @@ nodeport_has_nat_conflict_ipv4(const struct iphdr *ip4 __maybe_unused,
 #endif /* TUNNEL_MODE && IS_BPF_OVERLAY */
 
 #if defined(IS_BPF_HOST)
-	/* direct_routing_dev_ifindex == interface_ifindex cannot be moved into
-	 * preprocessor, as the values are known only during load time (templating).
-	 * This checks whether bpf_host is running on the direct routing device.
+	__u32 magic = ctx->mark & MARK_MAGIC_HOST_MASK;
+	const struct endpoint_info *ep = __lookup_ip4_endpoint(ip4->saddr);
+	/* Detect if this is traffic generated from a local process or a
+	 * pod with host networking, including egress proxy traffic.
+	 *
+	 * If it is we want to either reserve the port to avoid conflicting
+	 * with pod egress NAT translation or translate if the source port is
+	 * already reserved.
 	 */
-	if (CONFIG(direct_routing_dev_ifindex) == CONFIG(interface_ifindex) &&
-	    ip4->saddr == IPV4_DIRECT_ROUTING) {
-		target->addr = IPV4_DIRECT_ROUTING;
+	if (magic == MARK_MAGIC_HOST || (ep && (ep->flags & ENDPOINT_F_HOST))) {
+		target->addr = ip4->saddr;
 		target->needs_ct = true;
-
 		return true;
 	}
-#endif /* IS_BPF_HOST */
+#endif
 
 	return false;
 }
@@ -318,14 +335,7 @@ static __always_inline int nodeport_snat_fwd_ipv4(struct __ctx_buff *ctx,
 						  struct trace_ctx *trace,
 						  __s8 *ext_err)
 {
-	struct ipv4_nat_target target = {
-		.min_port = NODEPORT_PORT_MIN_NAT,
-		.max_port = NODEPORT_PORT_MAX_NAT,
-#if defined(ENABLE_CLUSTER_AWARE_ADDRESSING) && defined(ENABLE_INTER_CLUSTER_SNAT)
-		.cluster_id = cluster_id,
-#endif
-	};
-	struct ipv4_ct_tuple tuple = {};
+	struct snat_v4_args *args;
 	void *data, *data_end;
 	struct iphdr *ip4;
 	fraginfo_t fraginfo;
@@ -336,7 +346,13 @@ static __always_inline int nodeport_snat_fwd_ipv4(struct __ctx_buff *ctx,
 
 	fraginfo = ipfrag_encode_ipv4(ip4);
 
-	snat_v4_init_tuple(ip4, NAT_DIR_EGRESS, &tuple);
+	args = AUX(snat_v4_args);
+	select_nat_port_range_ipv4(&args->target);
+#if defined(ENABLE_CLUSTER_AWARE_ADDRESSING) && defined(ENABLE_INTER_CLUSTER_SNAT)
+	args->target.cluster_id = cluster_id,
+#endif
+
+	snat_v4_init_tuple(ip4, NAT_DIR_EGRESS, &args->tuple);
 	l4_off = ETH_HLEN + ipv4_hdrlen(ip4);
 
 	if (is_defined(IS_BPF_HOST) && is_defined(ENABLE_MASQUERADE_IPV4)) {
@@ -350,34 +366,53 @@ static __always_inline int nodeport_snat_fwd_ipv4(struct __ctx_buff *ctx,
 			 * parent interface.
 			 */
 			ret = ct_extract_ports4(ctx, ip4, fraginfo, l4_off,
-						CT_EGRESS, &tuple);
+						CT_EGRESS, &args->tuple);
 			if (ret < 0 && ret != DROP_CT_UNKNOWN_PROTO)
 				return ret;
 
 			if (ret != DROP_CT_UNKNOWN_PROTO &&
-			    ct_is_reply4(get_ct_map4(&tuple), &tuple))
+			    ct_is_reply4(get_ct_map4(&args->tuple), &args->tuple))
 				return redirect_neigh(ep->parent_ifindex, NULL, 0, 0);
 		}
 	}
 
-	if (lb_is_svc_proto(tuple.nexthdr) &&
-	    nodeport_has_nat_conflict_ipv4(ip4, &target))
+	if (lb_is_svc_proto(args->tuple.nexthdr) &&
+	    nodeport_has_nat_conflict_ipv4(ctx, ip4, &args->target))
 		goto apply_snat;
 
-	ret = snat_v4_needs_masquerade(ctx, &tuple, ip4, fraginfo, l4_off, &target);
+	ret = NAT_PUNT_TO_STACK;
+#if defined(TUNNEL_MODE) && defined(IS_BPF_OVERLAY)
+# if defined(ENABLE_CLUSTER_AWARE_ADDRESSING) && defined(ENABLE_INTER_CLUSTER_SNAT)
+	if (args->target.cluster_id != 0 &&
+	    args->target.cluster_id != CONFIG(cluster_id)) {
+		args->target.addr = CONFIG(ipv4_inter_cluster_snat).be32;
+		args->target.from_local_endpoint = true;
+
+		ret = NAT_NEEDED;
+	}
+# endif
+#endif /* TUNNEL_MODE && IS_BPF_OVERLAY */
+
+#if defined(ENABLE_MASQUERADE_IPV4) && defined(IS_BPF_HOST)
+	ret = snat_v4_needs_masquerade(ctx, fraginfo, l4_off);
+#endif /*ENABLE_MASQUERADE_IPV4 && IS_BPF_HOST */
 	if (IS_ERR(ret))
 		goto out;
 
 #if defined(ENABLE_EGRESS_GATEWAY_COMMON) && defined(IS_BPF_HOST)
-	if (target.egress_gateway) {
+	if (args->target.egress_gateway) {
+		/* from-overlay has already picked the correct egress interface: */
+		if (ctx_egw_done(ctx))
+			goto apply_snat;
+
 		/* Stay on the desired egress interface: */
-		if (target.ifindex && target.ifindex == CONFIG(interface_ifindex))
+		if (args->target.ifindex && args->target.ifindex == CONFIG(interface_ifindex))
 			goto apply_snat;
 
 		/* Send packet to the correct egress interface, and SNAT it there. */
-		ret = egress_gw_fib_lookup_and_redirect(ctx, target.addr,
-							tuple.daddr, target.ifindex,
-							ext_err);
+		ret = egress_gw_fib_lookup_and_redirect(ctx, args->target.addr,
+							args->tuple.daddr, args->target.ifindex,
+							args->target.tbid, ext_err);
 		if (ret != CTX_ACT_OK)
 			return ret;
 
@@ -387,9 +422,15 @@ static __always_inline int nodeport_snat_fwd_ipv4(struct __ctx_buff *ctx,
 #endif
 
 apply_snat:
-	*saddr = tuple.saddr;
-	ret = snat_v4_nat(ctx, &tuple, ip4, fraginfo, l4_off,
-			  &target, trace, ext_err);
+	*saddr = args->tuple.saddr;
+	ret = snat_v4_nat(ctx, &args->tuple, ip4, fraginfo, l4_off,
+			  &args->target, trace, ext_err);
+	if (CONFIG(nodeport_port_max_nat_ext) &&
+	    ret == DROP_NAT_NO_MAPPING) {
+		swap_nat_port_range_ipv4(&args->target);
+		ret = snat_v4_nat(ctx, &args->tuple, ip4, fraginfo, l4_off,
+				  &args->target, trace, ext_err);
+	}
 	if (IS_ERR(ret))
 		goto out;
 
@@ -590,8 +631,7 @@ lb_handle_health(struct __ctx_buff *ctx __maybe_unused, __be16 proto)
 	__sock_cookie key __maybe_unused;
 	int ret __maybe_unused;
 
-	if ((ctx->mark & MARK_MAGIC_HEALTH_IPIP_DONE) ==
-	    MARK_MAGIC_HEALTH_IPIP_DONE)
+	if (ctx->tc_index & TC_INDEX_F_SKIP_HEALTH_CHECK)
 		return CTX_ACT_OK;
 
 	switch (proto) {
@@ -615,10 +655,10 @@ lb_handle_health(struct __ctx_buff *ctx __maybe_unused, __be16 proto)
 			ret = dsr_set_ipip4_dev(ctx, val->peer.address, 0);
 			if (ret != 0)
 				return ret;
-			ctx->mark |= MARK_MAGIC_HEALTH_IPIP_DONE;
+			ctx->tc_index |= TC_INDEX_F_SKIP_HEALTH_CHECK;
 		}
 
-		return ctx_redirect(ctx, ENCAP4_IFINDEX, flags);
+		return ctx_redirect(ctx, CONFIG(encap4_ifindex), flags);
 	}
 #endif
 #if defined(ENABLE_IPV6) && DSR_ENCAP_MODE == DSR_ENCAP_IPIP
@@ -641,10 +681,10 @@ lb_handle_health(struct __ctx_buff *ctx __maybe_unused, __be16 proto)
 			ret = dsr_set_ipip6_dev(ctx, &val->peer.address, 0);
 			if (ret != 0)
 				return ret;
-			ctx->mark |= MARK_MAGIC_HEALTH_IPIP_DONE;
+			ctx->tc_index |= TC_INDEX_F_SKIP_HEALTH_CHECK;
 		}
 
-		return ctx_redirect(ctx, ENCAP6_IFINDEX, flags);
+		return ctx_redirect(ctx, CONFIG(encap6_ifindex), flags);
 	}
 #endif
 	default:
@@ -702,9 +742,6 @@ handle_nat_fwd(struct __ctx_buff *ctx, __u32 cluster_id, __u32 src_id,
 		break;
 #endif /* ENABLE_IPV6 */
 	default:
-		build_bug_on(!(NODEPORT_PORT_MIN_NAT <= NODEPORT_PORT_MAX_NAT));
-		build_bug_on(!(NODEPORT_PORT_MIN     <= NODEPORT_PORT_MAX));
-		build_bug_on(!(NODEPORT_PORT_MAX     <= NODEPORT_PORT_MIN_NAT));
 		break;
 	}
 	return ret;

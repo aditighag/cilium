@@ -14,6 +14,7 @@ import (
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/policy"
 	policycell "github.com/cilium/cilium/pkg/policy/cell"
+	"github.com/cilium/cilium/pkg/policy/compute"
 )
 
 var policyAPICell = cell.Module(
@@ -28,21 +29,24 @@ type policyAPIHandlerParams struct {
 
 	Log *slog.Logger
 
-	Repo     policy.PolicyRepository
-	Importer policycell.PolicyImporter
+	Repo           policy.PolicyRepository
+	PolicyComputer compute.PolicyRecomputer
+	Importer       policycell.PolicyImporter
 }
 
 type policyAPIHandlers struct {
 	cell.Out
 
-	PolicyGetPolicyHandler          policyrest.GetPolicyHandler
-	PolicyGetPolicySelectorsHandler policyrest.GetPolicySelectorsHandler
+	PolicyGetPolicyHandler                 policyrest.GetPolicyHandler
+	PolicyGetPolicySelectorsHandler        policyrest.GetPolicySelectorsHandler
+	PolicyGetPolicySubjectSelectorsHandler policyrest.GetPolicySubjectSelectorsHandler
 }
 
 func newPolicyAPIHandlers(params policyAPIHandlerParams) policyAPIHandlers {
 	return policyAPIHandlers{
-		PolicyGetPolicyHandler:          &getPolicyHandler{params},
-		PolicyGetPolicySelectorsHandler: &getPolicySelectorsHandler{params},
+		PolicyGetPolicyHandler:                 &getPolicyHandler{params},
+		PolicyGetPolicySelectorsHandler:        &getPolicySelectorsHandler{params},
+		PolicyGetPolicySubjectSelectorsHandler: &getPolicySubjectSelectorsHandler{params},
 	}
 }
 
@@ -69,4 +73,12 @@ type getPolicySelectorsHandler struct {
 
 func (h *getPolicySelectorsHandler) Handle(params policyrest.GetPolicySelectorsParams) middleware.Responder {
 	return policyrest.NewGetPolicySelectorsOK().WithPayload(h.Repo.GetSelectorCache().GetModel())
+}
+
+type getPolicySubjectSelectorsHandler struct {
+	policyAPIHandlerParams
+}
+
+func (h *getPolicySubjectSelectorsHandler) Handle(params policyrest.GetPolicySubjectSelectorsParams) middleware.Responder {
+	return policyrest.NewGetPolicySelectorsOK().WithPayload(h.Repo.GetSubjectSelectorCache().GetModel())
 }

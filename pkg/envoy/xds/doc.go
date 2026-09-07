@@ -35,8 +35,9 @@
 // access to resources of one or multiple resource types:
 //
 //	type ResourceSource interface {
-//	    GetResources(ctx context.Context, typeURL string, lastVersion *uint64,
-//	        nodeIP string, resourceNames []string) (*VersionedResources, error)
+//	    GetResources(typeURL string, lastVersion uint64, resourceNames []string) *VersionedResources
+//	    GetDeltaResources(typeURL string, lastAckedVersion uint64, subscriptions set.Set[string],
+//	        ackedResourceNames set.Set[string], forceResponseNames set.Set[string], forceEmptyResponse bool) *VersionedResources
 //	}
 //
 // Resource sets should implement the ResourceSet interface to provide
@@ -64,8 +65,8 @@
 //	ctx, cancel := context.WithTimeout(..., 5*time.Second)
 //	wg := completion.NewWaitGroup(ctx)
 //	nodes := []string{"10.0.0.1"} // Nodes to wait an ACK from.
-//	lds.Upsert(typeURL, "listener123", listenerA, nodes, wg.AddCompletion())
-//	lds.Delete(typeURL, "listener456", nodes, wg.AddCompletion())
+//	lds.Upsert(typeURL, "listener123", listenerA, nodes, wg, nil)
+//	lds.Delete(typeURL, "listener456", nodes, wg, nil)
 //	wg.Wait()
 //	cancel()
 package xds

@@ -8,36 +8,6 @@
 
 #include "bpf/compiler.h"
 
-#define __eval(x, ...) x ## __VA_ARGS__
-
-#define __and_00 0
-#define __and_01 0
-#define __and_10 0
-#define __and_11 1
-#define __and_0(y)  __eval(__and_0, y)
-#define __and_1(y)  __eval(__and_1, y)
-#define __and(x, y) __eval(__and_, x)(y)
-
-#define __or_00 0
-#define __or_01 1
-#define __or_10 1
-#define __or_11 1
-#define __or_0(y)  __eval(__or_0, y)
-#define __or_1(y)  __eval(__or_1, y)
-#define __or(x, y) __eval(__or_, x)(y)
-
-#define __or3_1(y, z)  1
-#define __or3_0(y, z)  __or(y, z)
-#define __or3(x, y, z) __eval(__or3_, x)(y, z)
-
-#define __or4_1(x, y, z) 1
-#define __or4_0(x, y, z) __eval(__or3_, x)(y, z)
-#define __or4(w, x, y, z) __eval(__or4_, w)(x, y, z)
-
-#define __not_0 1
-#define __not_1 0
-#define __not(x) __eval(__not_, x)
-
 #define CILIUM_CALL_DROP_NOTIFY			1
 #define CILIUM_CALL_ERROR_NOTIFY		2
 /*
@@ -98,7 +68,8 @@
 #define CILIUM_CALL_IPV6_NO_SERVICE			46
 #define CILIUM_CALL_MULTICAST_EP_DELIVERY		47
 #define CILIUM_CALL_IPV4_POLICY_DENIED			48
-#define CILIUM_CALL_SIZE				49
+#define CILIUM_CALL_IPV6_POLICY_DENIED			49
+#define CILIUM_CALL_SIZE				50
 
 /* Private per-EP map for internal tail calls. Its bpffs pin is replaced every
  * time the BPF object is loaded. An existing pinned map is never reused.

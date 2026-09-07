@@ -37,7 +37,7 @@ status:
           status: "False"
           type: ResolvedRefs
         - lastTransitionTime: "2025-07-01T05:23:50Z"
-          message: Listener not valid. None of the Allowed Route Kinds are supported.
+          message: "Listener not valid. None of the Allowed Route Kinds are supported."
           reason: Invalid
           status: "False"
           type: Accepted

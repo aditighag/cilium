@@ -24,10 +24,13 @@ import (
 	"github.com/cilium/cilium/pkg/maps/multicast"
 	"github.com/cilium/cilium/pkg/maps/nat"
 	"github.com/cilium/cilium/pkg/maps/neighborsmap"
+	"github.com/cilium/cilium/pkg/maps/netdev"
 	"github.com/cilium/cilium/pkg/maps/nodemap"
 	"github.com/cilium/cilium/pkg/maps/policymap"
+	"github.com/cilium/cilium/pkg/maps/registry"
 	"github.com/cilium/cilium/pkg/maps/signalmap"
 	"github.com/cilium/cilium/pkg/maps/srv6map"
+	"github.com/cilium/cilium/pkg/maps/subnet"
 	"github.com/cilium/cilium/pkg/maps/vtep"
 )
 
@@ -38,11 +41,18 @@ var Cell = cell.Module(
 
 	cell.Provide(newMapApiHandler),
 
+	// Provides the map spec registry which gets initialized by the specs defined in the datapath which
+	// can then be modified during hive construction and the modified specs used once started.
+	registry.Cell,
+
 	// Provides the auth.Map which contains the authentication state between Cilium security identities.
 	authmap.Cell,
 
 	// ConfigMap stores runtime configuration state for the Cilium datapath.
 	configmap.Cell,
+
+	// Provides access to eBPF map which stores network devices properties for datapath usage.
+	netdev.Cell,
 
 	// Receives datapath signals for GC fill-up events
 	// Note that we can't import this from ctmap package, as gc needs to import ctmap.
@@ -97,6 +107,9 @@ var Cell = cell.Module(
 
 	// Provides access to the vtep map.
 	vtep.Cell,
+
+	// Provides access to the subnet map.
+	subnet.Cell,
 )
 
 type mapApiHandlerOut struct {

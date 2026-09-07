@@ -9,7 +9,6 @@
 #define ENABLE_IPV4
 #define ENABLE_NODEPORT
 
-#define TUNNEL_PROTOCOL		TUNNEL_PROTOCOL_VXLAN
 #define ENCAP_IFINDEX		42
 #define TUNNEL_MODE
 
@@ -22,7 +21,6 @@
 #define FRONTEND_PORT		tcp_svc_one
 
 #define LB_IP			v4_node_two
-#define IPV4_DIRECT_ROUTING	LB_IP
 
 #define BACKEND_IP		v4_pod_three
 #define BACKEND_PORT		__bpf_htons(8080)
@@ -41,6 +39,9 @@ struct {
 	__uint(value_size, sizeof(struct mock_settings));
 	__uint(max_entries, 1);
 } settings_map __section_maps_btf;
+
+/* Set port ranges to have deterministic source port selection */
+#include "nodeport_defaults.h"
 
 #include "node_config.h"
 
@@ -98,11 +99,17 @@ int mock_skb_set_tunnel_key(__maybe_unused struct __sk_buff *skb,
 #include "lib/ipcache.h"
 #include "lib/lb.h"
 
+ASSIGN_CONFIG(__u8, tunnel_protocol, TUNNEL_PROTOCOL_VXLAN)
+
+ASSIGN_CONFIG(union v4addr, ipv4_direct_routing, { .be32 = LB_IP })
+
+ASSIGN_CONFIG(union v4addr, router_ipv4, { .be32 = 0xfffff50a })
+
 /* Test that a SVC request to an intermediate LB node gets DNATed and SNATed,
  * and flows back out on the overlay interface to a remote backend
  * (with WORLD_ID security identity).
  */
-PKTGEN("tc", "nodeport_overlay_nat_1_fwd")
+PKTGEN(PROG_TYPE, "nodeport_overlay_nat_1_fwd")
 int nodeport_overlay_nat_1_fwd_pktgen(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -129,7 +136,7 @@ int nodeport_overlay_nat_1_fwd_pktgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("tc", "nodeport_overlay_nat_1_fwd")
+SETUP(PROG_TYPE, "nodeport_overlay_nat_1_fwd")
 int nodeport_overlay_nat_1_fwd_setup(struct __ctx_buff *ctx)
 {
 	__u16 revnat_id = 1;
@@ -144,7 +151,7 @@ int nodeport_overlay_nat_1_fwd_setup(struct __ctx_buff *ctx)
 	return overlay_receive_packet(ctx);
 }
 
-CHECK("tc", "nodeport_overlay_nat_1_fwd")
+CHECK(PROG_TYPE, "nodeport_overlay_nat_1_fwd")
 int nodeport_overlay_nat_1_fwd_check(const struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -178,7 +185,7 @@ int nodeport_overlay_nat_1_fwd_check(const struct __ctx_buff *ctx)
 	if ((void *)l4 + sizeof(struct tcphdr) > data_end)
 		test_fatal("l4 out of bounds");
 
-	if (l3->saddr != IPV4_GATEWAY)
+	if (l3->saddr != CONFIG(router_ipv4).be32)
 		test_fatal("src IP hasn't been SNATed to gateway IP");
 
 	if (l3->daddr != BACKEND_IP)
@@ -206,7 +213,7 @@ int nodeport_overlay_nat_1_fwd_check(const struct __ctx_buff *ctx)
  * and flows back out on the overlay interface to the client
  * (preserving the backend's security identity).
  */
-PKTGEN("tc", "nodeport_overlay_nat_2_reply")
+PKTGEN(PROG_TYPE, "nodeport_overlay_nat_2_reply")
 int nodeport_overlay_nat_2_reply_pktgen(struct __ctx_buff *ctx)
 {
 	__be16 nat_source_port = 0;
@@ -225,7 +232,7 @@ int nodeport_overlay_nat_2_reply_pktgen(struct __ctx_buff *ctx)
 
 	l4 = pktgen__push_ipv4_udp_packet(&builder,
 					  (__u8 *)zero_mac, (__u8 *)zero_mac,
-					  BACKEND_IP, IPV4_GATEWAY,
+					  BACKEND_IP, CONFIG(router_ipv4).be32,
 					  BACKEND_PORT, nat_source_port);
 	if (!l4)
 		return TEST_ERROR;
@@ -240,7 +247,7 @@ int nodeport_overlay_nat_2_reply_pktgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("tc", "nodeport_overlay_nat_2_reply")
+SETUP(PROG_TYPE, "nodeport_overlay_nat_2_reply")
 int nodeport_overlay_nat_2_reply_setup(struct __ctx_buff *ctx)
 {
 	ipcache_v4_add_entry(CLIENT_IP, 0, CLIENT_SEC_IDENTITY,
@@ -249,7 +256,7 @@ int nodeport_overlay_nat_2_reply_setup(struct __ctx_buff *ctx)
 	return overlay_receive_packet(ctx);
 }
 
-CHECK("tc", "nodeport_overlay_nat_2_reply")
+CHECK(PROG_TYPE, "nodeport_overlay_nat_2_reply")
 int nodeport_overlay_nat_2_reply_check(const struct __ctx_buff *ctx)
 {
 	void *data, *data_end;

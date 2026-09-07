@@ -15,7 +15,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
-	eniTypes "github.com/cilium/cilium/pkg/aws/eni/types"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	k8sConst "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
 	k8sUtils "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/utils"
@@ -57,7 +56,7 @@ var (
 				},
 			}, {
 				EgressCommonRule: api.EgressCommonRule{
-					ToCIDR: []api.CIDR{"10.0.0.1"},
+					ToCIDR: []api.CIDR{"10.0.0.1/32"},
 				},
 			}, {
 				EgressCommonRule: api.EgressCommonRule{
@@ -98,7 +97,7 @@ var (
 				},
 			}, {
 				EgressCommonRule: api.EgressCommonRule{
-					ToCIDR: []api.CIDR{"10.0.0.1"},
+					ToCIDR: []api.CIDR{"10.0.0.1/32"},
 				},
 			}, {
 				EgressCommonRule: api.EgressCommonRule{
@@ -142,7 +141,7 @@ var (
 			},
 			{
 				EgressCommonRule: api.EgressCommonRule{
-					ToCIDR: []api.CIDR{"10.0.0.1"},
+					ToCIDR: []api.CIDR{"10.0.0.1/32"},
 				},
 			}, {
 				EgressCommonRule: api.EgressCommonRule{
@@ -223,7 +222,7 @@ var (
                 ]
             },{
                 "toCIDR": [
-                    "10.0.0.1"
+                    "10.0.0.1/32"
                 ]
             },{
                 "toCIDRSet": [
@@ -264,14 +263,14 @@ var (
 
 func sanitizeCNPRules(cnp *CiliumNetworkPolicy) error {
 	if cnp.Spec != nil {
-		if err := cnp.Spec.Sanitize(); err != nil {
+		if err := cnp.Spec.ValidateAndSanitize(); err != nil {
 			return err
 		}
 	}
 
 	if cnp.Specs != nil {
 		for _, rule := range cnp.Specs {
-			if err := rule.Sanitize(); err != nil {
+			if err := rule.ValidateAndSanitize(); err != nil {
 				return err
 			}
 		}
@@ -283,10 +282,10 @@ func sanitizeCNPRules(cnp *CiliumNetworkPolicy) error {
 func TestParseSpec(t *testing.T) {
 	es := api.NewESFromMatchRequirements(
 		map[string]string{
-			fmt.Sprintf("%s.role", labels.LabelSourceAny): "backend",
+			fmt.Sprintf("%s:role", labels.LabelSourceAny): "backend",
 		},
 		[]slim_metav1.LabelSelectorRequirement{{
-			Key:      fmt.Sprintf("%s.role", labels.LabelSourceAny),
+			Key:      fmt.Sprintf("%s:role", labels.LabelSourceAny),
 			Operator: "NotIn",
 			Values:   []string{"production"},
 		}},
@@ -316,11 +315,11 @@ func TestParseSpec(t *testing.T) {
 
 	expectedES := api.NewESFromMatchRequirements(
 		map[string]string{
-			fmt.Sprintf("%s.role", labels.LabelSourceAny):                           "backend",
-			fmt.Sprintf("%s.%s", labels.LabelSourceK8s, k8sConst.PodNamespaceLabel): "default",
+			fmt.Sprintf("%s:role", labels.LabelSourceAny):                           "backend",
+			fmt.Sprintf("%s:%s", labels.LabelSourceK8s, k8sConst.PodNamespaceLabel): "default",
 		},
 		[]slim_metav1.LabelSelectorRequirement{{
-			Key:      fmt.Sprintf("%s.role", labels.LabelSourceAny),
+			Key:      fmt.Sprintf("%s:role", labels.LabelSourceAny),
 			Operator: "NotIn",
 			Values:   []string{"production"},
 		}},
@@ -379,10 +378,10 @@ func TestParseSpec(t *testing.T) {
 func TestParseRules(t *testing.T) {
 	es := api.NewESFromMatchRequirements(
 		map[string]string{
-			fmt.Sprintf("%s.role", labels.LabelSourceAny): "backend",
+			fmt.Sprintf("%s:role", labels.LabelSourceAny): "backend",
 		},
 		[]slim_metav1.LabelSelectorRequirement{{
-			Key:      fmt.Sprintf("%s.role", labels.LabelSourceAny),
+			Key:      fmt.Sprintf("%s:role", labels.LabelSourceAny),
 			Operator: "NotIn",
 			Values:   []string{"production"},
 		}},
@@ -412,11 +411,11 @@ func TestParseRules(t *testing.T) {
 
 	expectedES := api.NewESFromMatchRequirements(
 		map[string]string{
-			fmt.Sprintf("%s.role", labels.LabelSourceAny):                           "backend",
-			fmt.Sprintf("%s.%s", labels.LabelSourceK8s, k8sConst.PodNamespaceLabel): "default",
+			fmt.Sprintf("%s:role", labels.LabelSourceAny):                           "backend",
+			fmt.Sprintf("%s:%s", labels.LabelSourceK8s, k8sConst.PodNamespaceLabel): "default",
 		},
 		[]slim_metav1.LabelSelectorRequirement{{
-			Key:      fmt.Sprintf("%s.role", labels.LabelSourceAny),
+			Key:      fmt.Sprintf("%s:role", labels.LabelSourceAny),
 			Operator: "NotIn",
 			Values:   []string{"production"},
 		}},
@@ -490,7 +489,7 @@ func TestParseWithNodeSelector(t *testing.T) {
 				},
 			}, {
 				EgressCommonRule: api.EgressCommonRule{
-					ToCIDR: []api.CIDR{"10.0.0.1"},
+					ToCIDR: []api.CIDR{"10.0.0.1/32"},
 				},
 			}, {
 				EgressCommonRule: api.EgressCommonRule{
@@ -579,8 +578,6 @@ func TestCiliumNodeInstanceID(t *testing.T) {
 	require.Empty(t, (*CiliumNode)(nil).InstanceID())
 	require.Empty(t, (&CiliumNode{}).InstanceID())
 	require.Equal(t, "foo", (&CiliumNode{Spec: NodeSpec{InstanceID: "foo"}}).InstanceID())
-	require.Equal(t, "foo", (&CiliumNode{Spec: NodeSpec{InstanceID: "foo", ENI: eniTypes.ENISpec{InstanceID: "bar"}}}).InstanceID())
-	require.Equal(t, "bar", (&CiliumNode{Spec: NodeSpec{ENI: eniTypes.ENISpec{InstanceID: "bar"}}}).InstanceID())
 }
 
 func BenchmarkSpecEquals(b *testing.B) {

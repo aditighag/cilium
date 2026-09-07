@@ -9,11 +9,14 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	"github.com/cilium/cilium/operator/pkg/gateway-api/helpers"
 )
 
-// indexGatewayByImplementation adds a value of `cilium` to the implementationGatewayIndex if
-// the Gateway has a GatewayClass that has the Cilium `controllerName`.
-func GenerateIndexerGatewayByImplementation(c client.Client, controllerName gatewayv1.GatewayController) client.IndexerFunc {
+// indexGatewayByImplementation adds the controller name to
+// indexers.ImplementationGatewayIndex if the Gateway has a GatewayClass with
+// that controller name.
+func GenerateIndexerGatewayByImplementation(c helpers.ClientReader, controllerName gatewayv1.GatewayController) client.IndexerFunc {
 	return func(rawObj client.Object) []string {
 		gw := rawObj.(*gatewayv1.Gateway)
 
@@ -24,7 +27,7 @@ func GenerateIndexerGatewayByImplementation(c client.Client, controllerName gate
 		}
 
 		if gwc.Spec.ControllerName == controllerName {
-			return []string{"cilium"}
+			return []string{string(controllerName)}
 		}
 
 		return []string{}

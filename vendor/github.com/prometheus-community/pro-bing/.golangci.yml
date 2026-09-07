@@ -2,13 +2,8 @@ version: "2"
 linters:
   enable:
     - misspell
+    - modernize
     - revive
-  settings:
-    revive:
-      rules:
-        - name: unused-parameter
-          severity: warning
-          disabled: true
   exclusions:
     generated: lax
     presets:
@@ -20,14 +15,6 @@ linters:
       - linters:
           - errcheck
         path: _test.go
-    paths:
-      - third_party$
-      - builtin$
-      - examples$
 formatters:
   exclusions:
     generated: lax
-    paths:
-      - third_party$
-      - builtin$
-      - examples$

@@ -5,6 +5,7 @@ package neighbor
 
 import (
 	"net/netip"
+	"slices"
 	"testing"
 
 	"github.com/cilium/hive/cell"
@@ -24,7 +25,7 @@ func TestForwardableIPManager(t *testing.T) {
 
 	h := hive.New(
 		ForwardableIPCell,
-		cell.Provide(NewCommonTestConfig(true, false)),
+		cell.Provide(NewCommonTestConfig(true, false, 100)),
 		cell.Invoke(func(
 			fim_ *ForwardableIPManager,
 			fip_ statedb.Table[*ForwardableIP],
@@ -105,6 +106,46 @@ func TestForwardableIPManager(t *testing.T) {
 	// Delete ip1:nodeOwner, should remove the node owner from the existing entry
 	// but keep the entry in the table
 	err = fim.Delete(ip1, nodeOwner)
+	require.NoError(t, err)
+	fis = statedb.Collect(fip.All(db.ReadTxn()))
+	require.ElementsMatch(t, fis, []*ForwardableIP{
+		{
+			IP:     ip1,
+			Owners: []ForwardableIPOwner{serviceOwner},
+		},
+	})
+
+	// Set atomically replaces all IPs for one owner while retaining ownership
+	// by others.
+	err = fim.Set(nodeOwner, slices.Values([]netip.Addr{ip1, ip2}))
+	require.NoError(t, err)
+	fis = statedb.Collect(fip.All(db.ReadTxn()))
+	require.ElementsMatch(t, fis, []*ForwardableIP{
+		{
+			IP:     ip1,
+			Owners: []ForwardableIPOwner{serviceOwner, nodeOwner},
+		},
+		{
+			IP:     ip2,
+			Owners: []ForwardableIPOwner{nodeOwner},
+		},
+	})
+
+	err = fim.Set(nodeOwner, slices.Values([]netip.Addr{ip2}))
+	require.NoError(t, err)
+	fis = statedb.Collect(fip.All(db.ReadTxn()))
+	require.ElementsMatch(t, fis, []*ForwardableIP{
+		{
+			IP:     ip1,
+			Owners: []ForwardableIPOwner{serviceOwner},
+		},
+		{
+			IP:     ip2,
+			Owners: []ForwardableIPOwner{nodeOwner},
+		},
+	})
+
+	err = fim.Set(nodeOwner, slices.Values([]netip.Addr{}))
 	require.NoError(t, err)
 	fis = statedb.Collect(fip.All(db.ReadTxn()))
 	require.ElementsMatch(t, fis, []*ForwardableIP{

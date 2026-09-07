@@ -10,7 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"path"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -64,6 +64,7 @@ func NewCmd() *cobra.Command {
 	rootCmd.Flags().String("etcd-initial-cluster-token", "clustermesh-apiserver", "Etcd initial cluster token. Used to prevent accidentally joining other etcd clusters that are reachable on the same L2 network domain.")
 	rootCmd.Flags().String("etcd-cluster-name", "clustermesh-apiserver", "Name of the etcd cluster. Must match what etcd is later started with.")
 	rootCmd.Flags().String("cluster-name", defaults.ClusterName, "Name of the Cilium cluster, used to set the username of the admin user in etcd. This is distinct from the etcd cluster's name.")
+	rootCmd.Flags().Bool("etcd-create-shared-remote-user", true, "Create the shared remote etcd user.")
 	rootCmd.Flags().Duration("timeout", time.Minute*2, "How long to wait for operations before exiting.")
 	rootCmd.Flags().Bool(option.DebugArg, false, "Debug log output.")
 	// Use Viper for configuration so that we can parse both command line flags and environment variables
@@ -96,7 +97,7 @@ func InitEtcdLocal(log *slog.Logger) (returnErr error) {
 	defer cancelFn()
 
 	if debug {
-		logging.SetLogLevelToDebug()
+		logging.SetLogLevel(slog.LevelDebug)
 	}
 	log.Debug("Debug logging enabled")
 
@@ -125,7 +126,7 @@ func InitEtcdLocal(log *slog.Logger) (returnErr error) {
 			logfields.EtcdDataDir, etcdDataDir,
 			logfields.Path, d.Name(),
 		)
-		err = os.RemoveAll(path.Join(etcdDataDir, d.Name()))
+		err = os.RemoveAll(filepath.Join(etcdDataDir, d.Name()))
 		if err != nil {
 			log.Error(
 				"Failed to remove pre-existing file/directory in etcd data directory",
@@ -248,7 +249,6 @@ func InitEtcdLocal(log *slog.Logger) (returnErr error) {
 	}()
 
 	// With the etcd server process launched, we need to construct an etcd client
-	//exhaustruct:ignore // Not all etcd config options are required.
 	config := clientv3.Config{
 		Context:   ctx,
 		Endpoints: []string{loopbackEndpoint},
@@ -270,7 +270,10 @@ func InitEtcdLocal(log *slog.Logger) (returnErr error) {
 		"Starting etcd init",
 		logfields.ClusterName, ciliumClusterName,
 	)
-	err = kvstoreEtcdInit.ClusterMeshEtcdInit(ctx, log, etcdClient, ciliumClusterName)
+	err = kvstoreEtcdInit.ClusterMeshEtcdInit(
+		ctx, log, etcdClient,
+		ciliumClusterName, vp.GetBool("etcd-create-shared-remote-user"),
+	)
 	if err != nil {
 		log.Error(
 			"Failed to initialise etcd",

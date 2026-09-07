@@ -14,7 +14,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	operator_k8s "github.com/cilium/cilium/operator/k8s"
-	"github.com/cilium/cilium/pkg/identity"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/identity/basicallocator"
 	"github.com/cilium/cilium/pkg/identity/key"
 	"github.com/cilium/cilium/pkg/idpool"
@@ -28,12 +28,12 @@ import (
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
-	"github.com/cilium/cilium/pkg/option"
 )
 
 type reconciler struct {
 	logger          *slog.Logger
 	ctx             context.Context
+	clusterInfo     cmtypes.ClusterInfo
 	clientset       k8sClient.Clientset
 	idAllocator     *basicallocator.BasicIDAllocator
 	desiredCIDState *CIDState
@@ -55,6 +55,7 @@ type reconciler struct {
 func newReconciler(
 	ctx context.Context,
 	logger *slog.Logger,
+	clusterInfo cmtypes.ClusterInfo,
 	clientset k8sClient.Clientset,
 	namespace resource.Resource[*slim_corev1.Namespace],
 	pod resource.Resource[*slim_corev1.Pod],
@@ -66,8 +67,8 @@ func newReconciler(
 ) (*reconciler, error) {
 	logger.InfoContext(ctx, "Creating CID controller Operator reconciler")
 
-	minIDValue := idpool.ID(identity.GetMinimalAllocationIdentity(option.Config.ClusterID))
-	maxIDValue := idpool.ID(identity.GetMaximumAllocationIdentity(option.Config.ClusterID))
+	minIDValue := idpool.ID(clusterInfo.MinimalAllocationIdentity())
+	maxIDValue := idpool.ID(clusterInfo.MaximumAllocationIdentity())
 	idAllocator := basicallocator.NewBasicIDAllocator(minIDValue, maxIDValue)
 
 	nsStore, err := namespace.Store(ctx)
@@ -98,6 +99,7 @@ func newReconciler(
 	r := &reconciler{
 		logger:          logger,
 		ctx:             ctx,
+		clusterInfo:     clusterInfo,
 		clientset:       clientset,
 		idAllocator:     idAllocator,
 		desiredCIDState: NewCIDState(logger),
@@ -279,7 +281,7 @@ func (r *reconciler) cidIsUsedInCEPOrCES(cidName string) bool {
 // 1. CID exists: No action.
 // 2. CID doesn't exist: Create CID.
 func (r *reconciler) allocateCIDForPod(pod *slim_corev1.Pod) error {
-	k8sLabels, err := GetRelevantLabelsForPod(r.logger, pod, r.nsStore)
+	k8sLabels, err := GetRelevantLabelsForPod(r.logger, pod, r.nsStore, r.clusterInfo)
 	if err != nil {
 		return fmt.Errorf("failed to get relevant labels for pod: %w", err)
 	}
@@ -346,13 +348,13 @@ func (r *reconciler) allocateCID(cidKey *key.GlobalIdentity) (string, bool, erro
 }
 
 // GetRelevantLabelsForPod returns the pod and namespace labels for a given pod
-func GetRelevantLabelsForPod(logger *slog.Logger, pod *slim_corev1.Pod, nsStore resource.Store[*slim_corev1.Namespace]) (map[string]string, error) {
+func GetRelevantLabelsForPod(logger *slog.Logger, pod *slim_corev1.Pod, nsStore resource.Store[*slim_corev1.Namespace], clusterInfo cmtypes.ClusterInfo) (map[string]string, error) {
 	ns, err := getNamespace(pod.Namespace, nsStore)
 	if err != nil {
 		return nil, err
 	}
 
-	_, labelsMap := k8s.GetPodMetadata(logger, ns, pod)
+	_, labelsMap := k8s.GetPodMetadata(logger, clusterInfo, ns, pod)
 	return labelsMap, nil
 }
 

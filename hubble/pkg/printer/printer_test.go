@@ -13,12 +13,16 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	flowpb "github.com/cilium/cilium/api/v1/flow"
 	observerpb "github.com/cilium/cilium/api/v1/observer"
 	"github.com/cilium/cilium/hubble/pkg/defaults"
+	"github.com/cilium/cilium/pkg/hubble/parser/fieldmask"
+	"github.com/cilium/cilium/pkg/monitor/api"
 	monitorAPI "github.com/cilium/cilium/pkg/monitor/api"
 )
 
@@ -54,51 +58,6 @@ var (
 			SubType: 133,
 		},
 		Summary: "TCP Flags: SYN",
-		IsReply: &wrapperspb.BoolValue{Value: false},
-	}
-
-	kafkaUnescapedFlow = flowpb.Flow{
-		Time: &timestamppb.Timestamp{
-			Seconds: 1234,
-			Nanos:   567800000,
-		},
-		Type:     flowpb.FlowType_L7,
-		NodeName: "k8s1",
-		Verdict:  flowpb.Verdict_DROPPED,
-		IP: &flowpb.IP{
-			Source:      "1.1.1.1",
-			Destination: "2.2.2.2",
-		},
-		Source: &flowpb.Endpoint{
-			Identity: 4,
-		},
-		Destination: &flowpb.Endpoint{
-			Identity: 12345,
-		},
-		L4: &flowpb.Layer4{
-			Protocol: &flowpb.Layer4_TCP{
-				TCP: &flowpb.TCP{
-					SourcePort:      31793,
-					DestinationPort: 8080,
-				},
-			},
-		},
-		L7: &flowpb.Layer7{
-			Type:      flowpb.L7FlowType_REQUEST,
-			LatencyNs: *proto.Uint64(10),
-			Record: &flowpb.Layer7_Kafka{Kafka: &flowpb.Kafka{
-				ApiKey:        "1234",
-				CorrelationId: *proto.Int32(1),
-				// Black color, arbitrary control char and carriage-returns are not allowed, will be escaped
-				// Printer output that uses color will have color control sequences unescaped
-				Topic: "my-topic\x1b[30mblack\x1b[0m\x1b\r",
-			}},
-		},
-		EventType: &flowpb.CiliumEventType{
-			Type:    monitorAPI.MessageTypeDrop,
-			SubType: 133,
-		},
-		Summary: "Kafka request 1234 correlation id 1 topic 'my-topic[^[30mblack[^[0m[^\\r'",
 		IsReply: &wrapperspb.BoolValue{Value: false},
 	}
 )
@@ -153,6 +112,21 @@ func TestPrinter_WriteProtoFlow(t *testing.T) {
 	policyAllowed.IsReply = nil
 	policyAllowed.TrafficDirection = flowpb.TrafficDirection_INGRESS
 	policyAllowed.IngressAllowedBy = []*flowpb.Policy{{Name: "my-policy", Namespace: "my-policy-namespace", Kind: "CiliumNetworkPolicy"}, {Name: "my-policy-2", Kind: "CiliumClusterwideNetworkPolicy"}}
+	policyAllowed.PolicyMatchType = api.PolicyMatchL3Only
+
+	policyAudited := proto.Clone(&f).(*flowpb.Flow)
+	policyAudited.EventType = &flowpb.CiliumEventType{
+		Type: monitorAPI.MessageTypePolicyVerdict,
+	}
+	policyAudited.Verdict = flowpb.Verdict_AUDIT
+	policyAudited.IsReply = nil
+	policyAudited.TrafficDirection = flowpb.TrafficDirection_EGRESS
+	policyAudited.EgressDeniedBy = []*flowpb.Policy{{Name: "my-policy", Namespace: "my-policy-namespace", Kind: "CiliumNetworkPolicy"}}
+
+	fmp, err := fieldmaskpb.New(&flowpb.Flow{}, defaults.FieldMask...)
+	require.NoError(t, err)
+	fm, err := fieldmask.New(fmp)
+	require.NoError(t, err)
 
 	type args struct {
 		f     *flowpb.Flow
@@ -191,19 +165,6 @@ Jan  1 00:20:34.567   1.1.1.1:31793   2.2.2.2:8080   Policy denied   DROPPED   T
 			wantErr: false,
 			expected: `TIMESTAMP             NODE   SOURCE          DESTINATION    TYPE            VERDICT   SUMMARY
 Jan  1 00:20:34.567   k8s1   1.1.1.1:31793   2.2.2.2:8080   Policy denied   DROPPED   TCP Flags: SYN`,
-		},
-		{
-			name: "tabular-terminal-escaped",
-			options: []Option{
-				WithColor("never"),
-				Writer(&buf),
-			},
-			args: args{
-				f: &kafkaUnescapedFlow,
-			},
-			wantErr: false,
-			expected: `TIMESTAMP             SOURCE          DESTINATION    TYPE            VERDICT   SUMMARY
-Jan  1 00:20:34.567   1.1.1.1:31793   2.2.2.2:8080   kafka-request   DROPPED   Kafka request 1234 correlation id 1 topic 'my-topic[^[30mblack[^[0m[^\r'`,
 		},
 		{
 			name: "compact",
@@ -320,7 +281,24 @@ Jan  1 00:20:34.567   1.1.1.1:31793   2.2.2.2:8080   kafka-request   DROPPED   K
 			wantErr: false,
 			expected: "Jan  1 00:20:34.567 [k8s1]: " +
 				"1.1.1.1:31793 (health) <> 2.2.2.2:8080 (ID:12345) " +
-				"policy-verdict:none INGRESS ALLOWED BY my-policy (CiliumNetworkPolicy), my-policy-2 (CiliumClusterwideNetworkPolicy) (TCP Flags: SYN)\n",
+				"policy-verdict:L3-Only INGRESS ALLOWED BY my-policy (CiliumNetworkPolicy), my-policy-2 (CiliumClusterwideNetworkPolicy) (TCP Flags: SYN)\n",
+		},
+		{
+			name: "compact-policy-verdict-audited-with-policy-name",
+			options: []Option{
+				Compact(),
+				WithColor("never"),
+				WithNodeName(),
+				WithPolicyNames(),
+				Writer(&buf),
+			},
+			args: args{
+				f: policyAudited,
+			},
+			wantErr: false,
+			expected: "Jan  1 00:20:34.567 [k8s1]: " +
+				"1.1.1.1:31793 (health) <> 2.2.2.2:8080 (ID:12345) " +
+				"policy-verdict:none EGRESS AUDITED BY my-policy (CiliumNetworkPolicy) (TCP Flags: SYN)\n",
 		},
 		{
 			name: "compact-direction-unknown",
@@ -337,36 +315,6 @@ Jan  1 00:20:34.567   1.1.1.1:31793   2.2.2.2:8080   kafka-request   DROPPED   K
 			expected: "Jan  1 00:20:34.567 [k8s1]: " +
 				"1.1.1.1:31793 (health) <> 2.2.2.2:8080 (ID:12345) " +
 				"Policy denied DROPPED (TCP Flags: SYN)\n",
-		},
-		{
-			name: "compact-terminal-escaped",
-			options: []Option{
-				Compact(),
-				WithColor("never"),
-				Writer(&buf),
-			},
-			args: args{
-				f: &kafkaUnescapedFlow,
-			},
-			wantErr: false,
-			expected: "Jan  1 00:20:34.567: " +
-				"1.1.1.1:31793 (health) -> 2.2.2.2:8080 (ID:12345) " +
-				"kafka-request DROPPED (Kafka request 1234 correlation id 1 topic 'my-topic[^[30mblack[^[0m[^\\r')\n",
-		},
-		{
-			name: "compact-terminal-escaped-colored",
-			options: []Option{
-				Compact(),
-				WithColor("always"),
-				Writer(&buf),
-			},
-			args: args{
-				f: &kafkaUnescapedFlow,
-			},
-			wantErr: false,
-			expected: "Jan  1 00:20:34.567: " +
-				"\x1b[36m1.1.1.1:\x1b[33m31793\x1b[0m\x1b[0m \x1b[35m(health)\x1b[0m -> \x1b[36m2.2.2.2:\x1b[33m8080\x1b[0m\x1b[0m \x1b[35m(ID:12345)\x1b[0m " +
-				"kafka-request \x1b[31mDROPPED\x1b[0m (Kafka request 1234 correlation id 1 topic 'my-topic[^[30mblack[^[0m[^\\r')\n",
 		},
 		{
 			name: "json",
@@ -407,27 +355,6 @@ Jan  1 00:20:34.567   1.1.1.1:31793   2.2.2.2:8080   kafka-request   DROPPED   K
 				`"Type":"L3_L4","node_name":"k8s1",` +
 				`"event_type":{"type":1,"sub_type":133},` +
 				`"is_reply":false,"Summary":"TCP Flags: SYN"}}`,
-		},
-		{
-			name: "jsonpb-terminal-escaped",
-			options: []Option{
-				JSONPB(),
-				WithColor("never"),
-				Writer(&buf),
-			},
-			args: args{
-				f: &kafkaUnescapedFlow,
-			},
-			wantErr: false,
-			expected: `{"flow":{"time":"1970-01-01T00:20:34.567800Z",` +
-				`"verdict":"DROPPED",` +
-				`"IP":{"source":"1.1.1.1","destination":"2.2.2.2"},` +
-				`"l4":{"TCP":{"source_port":31793,"destination_port":8080}},` +
-				`"source":{"identity":4},"destination":{"identity":12345},` +
-				`"Type":"L7","node_name":"k8s1",` +
-				`"l7":{"type":"REQUEST","latency_ns":"10","kafka":{"api_key":"1234","correlation_id":1,"topic":"my-topic\u001b[30mblack\u001b[0m\u001b\r"}},` +
-				`"event_type":{"type":1,"sub_type":133},` +
-				`"is_reply":false,"Summary":"Kafka request 1234 correlation id 1 topic 'my-topic[^[30mblack[^[0m[^\\r'"}}`,
 		},
 		{
 			name: "jsonpb_with_trace",
@@ -513,24 +440,6 @@ DESTINATION: 2.2.2.2:8080
     VERDICT: DENIED BY my-policy (CiliumNetworkPolicy)
     SUMMARY: TCP Flags: SYN`,
 		},
-		{
-			name: "dict-terminal-escaped",
-			options: []Option{
-				Dict(),
-				WithColor("never"),
-				Writer(&buf),
-			},
-			args: args{
-				f: &kafkaUnescapedFlow,
-			},
-			wantErr: false,
-			expected: `  TIMESTAMP: Jan  1 00:20:34.567
-     SOURCE: 1.1.1.1:31793
-DESTINATION: 2.2.2.2:8080
-       TYPE: kafka-request
-    VERDICT: DROPPED
-    SUMMARY: Kafka request 1234 correlation id 1 topic 'my-topic[^[30mblack[^[0m[^\r'`,
-		},
 	}
 	for _, tt := range tests {
 		buf.Reset()
@@ -538,10 +447,14 @@ DESTINATION: 2.2.2.2:8080
 			f := proto.Clone(tt.args.f).(*flowpb.Flow)
 			proto.Merge(f, tt.args.merge)
 
+			fc := &flowpb.Flow{}
+			fm.Copy(fc.ProtoReflect(), f.ProtoReflect())
+
 			p := New(tt.options...)
 			res := &observerpb.GetFlowsResponse{
-				ResponseTypes: &observerpb.GetFlowsResponse_Flow{Flow: f},
+				ResponseTypes: &observerpb.GetFlowsResponse_Flow{Flow: fc},
 			}
+
 			// writes a node status event into the error stream
 			if err := p.WriteProtoFlow(res); (err != nil) != tt.wantErr {
 				t.Errorf("WriteProtoFlow() error = %v, wantErr %v", err, tt.wantErr)
@@ -550,6 +463,123 @@ DESTINATION: 2.2.2.2:8080
 			require.Equal(t, strings.TrimSpace(tt.expected), strings.TrimSpace(buf.String()))
 		})
 	}
+}
+
+func TestPrinter_WriteProtoFlowExtensions(t *testing.T) {
+	buf := bytes.Buffer{}
+
+	// Use a service reference as a "known" extension
+	knownExt, err := anypb.New(
+		&flowpb.Service{
+			Name:      "foo",
+			Namespace: "bar",
+		},
+	)
+	require.NoError(t, err)
+
+	for _, tt := range []struct {
+		name     string
+		ext      *anypb.Any
+		options  []Option
+		wantErr  bool
+		expected string
+	}{
+		{
+			name: "json - known extension",
+			options: []Option{
+				JSONLegacy(),
+				WithColor("never"),
+				Writer(&buf),
+			},
+			ext:     knownExt,
+			wantErr: false,
+			expected: `{"time":"1970-01-01T00:20:34.567800Z",` +
+				`"verdict":"DROPPED",` +
+				`"IP":{"source":"1.1.1.1","destination":"2.2.2.2"},` +
+				`"l4":{"TCP":{"source_port":31793,"destination_port":8080}},` +
+				`"source":{"identity":4},"destination":{"identity":12345},` +
+				`"Type":"L3_L4","node_name":"k8s1",` +
+				`"event_type":{"type":1,"sub_type":133},` +
+				`"is_reply":false,"Summary":"TCP Flags: SYN",` +
+				`"extensions":{"@type":"type.googleapis.com/flow.Service","name":"foo","namespace":"bar"}}`,
+		},
+		{
+			name: "json - unknown extension",
+			options: []Option{
+				JSONLegacy(),
+				WithColor("never"),
+				Writer(&buf),
+			},
+			ext: &anypb.Any{
+				TypeUrl: "example.com/unknown-extension",
+				Value:   []byte{0xde, 0xad, 0xbe, 0xef},
+			},
+			wantErr: false,
+			expected: `{"time":"1970-01-01T00:20:34.567800Z",` +
+				`"verdict":"DROPPED",` +
+				`"IP":{"source":"1.1.1.1","destination":"2.2.2.2"},` +
+				`"l4":{"TCP":{"source_port":31793,"destination_port":8080}},` +
+				`"source":{"identity":4},"destination":{"identity":12345},` +
+				`"Type":"L3_L4","node_name":"k8s1",` +
+				`"event_type":{"type":1,"sub_type":133},` +
+				`"is_reply":false,"Summary":"TCP Flags: SYN"}`,
+		},
+		{
+			name: "jsonpb - known extension",
+			options: []Option{
+				JSONPB(),
+				Writer(&buf),
+			},
+			ext:     knownExt,
+			wantErr: false,
+			expected: `{"flow":{"time":"1970-01-01T00:20:34.567800Z",` +
+				`"verdict":"DROPPED",` +
+				`"IP":{"source":"1.1.1.1","destination":"2.2.2.2"},` +
+				`"l4":{"TCP":{"source_port":31793,"destination_port":8080}},` +
+				`"source":{"identity":4},"destination":{"identity":12345},` +
+				`"Type":"L3_L4","node_name":"k8s1",` +
+				`"event_type":{"type":1,"sub_type":133},` +
+				`"is_reply":false,"Summary":"TCP Flags: SYN",` +
+				`"extensions":{"@type":"type.googleapis.com/flow.Service","name":"foo","namespace":"bar"}}}`,
+		},
+		{
+			name: "jsonpb - unknown extension",
+			options: []Option{
+				JSONPB(),
+				Writer(&buf),
+			},
+			ext: &anypb.Any{
+				TypeUrl: "example.com/unknown-extension",
+				Value:   []byte{0xde, 0xad, 0xbe, 0xef},
+			},
+			wantErr: false,
+			expected: `{"flow":{"time":"1970-01-01T00:20:34.567800Z",` +
+				`"verdict":"DROPPED",` +
+				`"IP":{"source":"1.1.1.1","destination":"2.2.2.2"},` +
+				`"l4":{"TCP":{"source_port":31793,"destination_port":8080}},` +
+				`"source":{"identity":4},"destination":{"identity":12345},` +
+				`"Type":"L3_L4","node_name":"k8s1",` +
+				`"event_type":{"type":1,"sub_type":133},` +
+				`"is_reply":false,"Summary":"TCP Flags: SYN"}}`,
+		},
+	} {
+		buf.Reset()
+		t.Run(tt.name, func(t *testing.T) {
+			f := proto.Clone(&f).(*flowpb.Flow)
+			f.Extensions = tt.ext
+			p := New(tt.options...)
+			res := &observerpb.GetFlowsResponse{
+				ResponseTypes: &observerpb.GetFlowsResponse_Flow{Flow: f},
+			}
+
+			if err := p.WriteProtoFlow(res); (err != nil) != tt.wantErr {
+				t.Errorf("WriteProtoFlow() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			require.NoError(t, p.Close())
+			require.Equal(t, strings.TrimSpace(tt.expected), strings.TrimSpace(buf.String()))
+		})
+	}
+
 }
 
 func Test_getHostNames(t *testing.T) {
@@ -888,21 +918,6 @@ func Test_getFlowType(t *testing.T) {
 			want: "http-response",
 		},
 		{
-			name: "Kafka",
-			args: args{
-				f: &flowpb.Flow{
-					L7: &flowpb.Layer7{
-						Type:   flowpb.L7FlowType_REQUEST,
-						Record: &flowpb.Layer7_Kafka{},
-					},
-					EventType: &flowpb.CiliumEventType{
-						Type: monitorAPI.MessageTypeAccessLog,
-					},
-				},
-			},
-			want: "kafka-request",
-		},
-		{
 			name: "DNS",
 			args: args{
 				f: &flowpb.Flow{
@@ -960,14 +975,43 @@ func Test_getFlowType(t *testing.T) {
 			want: "policy-verdict:none INGRESS",
 		},
 		{
+			name: "Drop with extended reason",
+			args: args{
+				f: &flowpb.Flow{
+					Verdict: flowpb.Verdict_DROPPED,
+					EventType: &flowpb.CiliumEventType{
+						Type:    monitorAPI.MessageTypeDrop,
+						SubType: 132,
+					},
+					DropReasonDesc:    flowpb.DropReason_INVALID_SOURCE_IP,
+					ExtError:          7,
+					ExtDropReasonDesc: "Invalid source ip, 7",
+				},
+			},
+			want: "Invalid source ip, 7",
+		},
+		{
+			name: "Drop without extended reason falls back to subtype",
+			args: args{
+				f: &flowpb.Flow{
+					Verdict: flowpb.Verdict_DROPPED,
+					EventType: &flowpb.CiliumEventType{
+						Type:    monitorAPI.MessageTypeDrop,
+						SubType: 169,
+					},
+				},
+			},
+			want: monitorAPI.DropReason(169),
+		},
+		{
 			name: "SockLB pre-translate",
 			args: args{
 				f: &flowpb.Flow{
 					Verdict: flowpb.Verdict_TRACED,
 					EventType: &flowpb.CiliumEventType{
-						Type: monitorAPI.MessageTypeTraceSock,
+						Type:    monitorAPI.MessageTypeTraceSock,
+						SubType: int32(flowpb.SocketTranslationPoint_SOCK_XLATE_POINT_PRE_DIRECTION_FWD),
 					},
-					SockXlatePoint: flowpb.SocketTranslationPoint_SOCK_XLATE_POINT_PRE_DIRECTION_FWD,
 				},
 			},
 			want: "pre-xlate-fwd",
@@ -978,9 +1022,9 @@ func Test_getFlowType(t *testing.T) {
 				f: &flowpb.Flow{
 					Verdict: flowpb.Verdict_TRANSLATED,
 					EventType: &flowpb.CiliumEventType{
-						Type: monitorAPI.MessageTypeTraceSock,
+						Type:    monitorAPI.MessageTypeTraceSock,
+						SubType: int32(flowpb.SocketTranslationPoint_SOCK_XLATE_POINT_POST_DIRECTION_FWD),
 					},
-					SockXlatePoint: flowpb.SocketTranslationPoint_SOCK_XLATE_POINT_POST_DIRECTION_FWD,
 				},
 			},
 			want: "post-xlate-fwd",

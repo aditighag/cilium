@@ -32,14 +32,24 @@ static __always_inline bool eth_is_bcast(const union macaddr *a)
 	return !eth_addrcmp(a, &bcast);
 }
 
+/* Returns true if a carries no address, which is how an unset MAC is
+ * represented.
+ */
+static __always_inline bool eth_is_zero(const union macaddr *a)
+{
+	union macaddr zero = {};
+
+	return !eth_addrcmp(a, &zero);
+}
+
 static __always_inline bool eth_is_supported_ethertype(__be16 proto)
 {
 	/* non-Ethernet II unsupported */
 	return proto >= bpf_htons(ETH_P_802_3_MIN);
 }
 
-static __always_inline int eth_load_saddr(struct __ctx_buff *ctx, __u8 *mac,
-					  int off)
+static __always_inline int eth_load_saddr(const struct __ctx_buff *ctx,
+					  __u8 *mac, int off)
 {
 	return ctx_load_bytes(ctx, off + ETH_ALEN, mac, ETH_ALEN);
 }
@@ -69,8 +79,8 @@ static __always_inline int eth_store_saddr(struct __ctx_buff *ctx,
 #endif
 }
 
-static __always_inline int eth_load_daddr(struct __ctx_buff *ctx, __u8 *mac,
-					  int off)
+static __always_inline int eth_load_daddr(const struct __ctx_buff *ctx,
+					  __u8 *mac, int off)
 {
 	return ctx_load_bytes(ctx, off, mac, ETH_ALEN);
 }
@@ -101,8 +111,18 @@ static __always_inline int eth_store_daddr(struct __ctx_buff *ctx,
 }
 
 static __always_inline int eth_store_proto(struct __ctx_buff *ctx,
-					   const __u16 proto, int off)
+					   const __be16 proto, int off)
 {
 	return ctx_store_bytes(ctx, off + ETH_ALEN + ETH_ALEN,
 			       &proto, sizeof(proto), 0);
+}
+
+static __always_inline void eth_flip_addrs(struct ethhdr *eth)
+{
+	union macaddr tmp = {};
+
+	memcpy(tmp.addr, eth->h_dest, ETH_ALEN);
+
+	memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
+	memcpy(eth->h_source, tmp.addr, ETH_ALEN);
 }

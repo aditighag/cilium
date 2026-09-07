@@ -268,7 +268,7 @@ func (h *EndpointPatchEndpointIDHandler) Handle(params endpointapi.PatchEndpoint
 
 	// Validate the template. Assignment afterwards is atomic.
 	// Note: newEp's labels are ignored.
-	newEp, err2 := h.endpointCreator.NewEndpointFromChangeModel(params.HTTPRequest.Context(), epTemplate)
+	newEp, err2 := h.endpointCreator.NewEndpointFromChangeModel(epTemplate)
 	if err2 != nil {
 		r.Error(err2, endpointapi.PutEndpointIDInvalidCode)
 		return api.Error(endpointapi.PutEndpointIDInvalidCode, err2)
@@ -300,8 +300,6 @@ func (h *EndpointPatchEndpointIDHandler) Handle(params endpointapi.PatchEndpoint
 
 	// FIXME: Support changing these?
 	//  - container ID
-	//  - docker network id
-	//  - docker endpoint id
 	//
 	//  Support arbitrary changes? Support only if unset?
 	reason, err := ep.ProcessChangeRequest(newEp, validStateTransition)
@@ -312,7 +310,8 @@ func (h *EndpointPatchEndpointIDHandler) Handle(params endpointapi.PatchEndpoint
 
 	if reason != "" {
 		regenMetadata := &regeneration.ExternalRegenerationMetadata{
-			Reason:            reason,
+			Reason:            regeneration.ReasonEndpointUpdate,
+			Message:           reason,
 			RegenerationLevel: regeneration.RegenerateWithDatapath,
 		}
 		if !<-ep.Regenerate(regenMetadata) {

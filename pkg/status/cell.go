@@ -19,10 +19,12 @@ import (
 	"github.com/cilium/cilium/pkg/auth"
 	"github.com/cilium/cilium/pkg/clustermesh"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
+	"github.com/cilium/cilium/pkg/datapath/connector"
+	"github.com/cilium/cilium/pkg/datapath/linux/bandwidth"
 	"github.com/cilium/cilium/pkg/datapath/linux/bigtcp"
+	ipsec "github.com/cilium/cilium/pkg/datapath/linux/ipsec/types"
 	datapathTables "github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
-	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/health"
 	hubblecell "github.com/cilium/cilium/pkg/hubble/cell"
 	hubblemetricscell "github.com/cilium/cilium/pkg/hubble/metrics/cell"
@@ -37,7 +39,6 @@ import (
 	"github.com/cilium/cilium/pkg/maps/policymap"
 	monitoragent "github.com/cilium/cilium/pkg/monitor/agent"
 	"github.com/cilium/cilium/pkg/node"
-	"github.com/cilium/cilium/pkg/nodediscovery"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/promise"
 	"github.com/cilium/cilium/pkg/proxy"
@@ -75,13 +76,13 @@ type statusParams struct {
 	DaemonConfig *option.DaemonConfig
 	LBConfig     loadbalancer.Config
 	KPRConfig    kpr.KPRConfig
-	IPsecConfig  datapath.IPsecConfig
+	IPsecConfig  ipsec.Config
 
 	DaemonConfigPromise promise.Promise[*option.DaemonConfig]
 
 	AuthManager      *auth.AuthManager
-	BigTCPConfig     *bigtcp.Configuration
-	BandwidthManager datapath.BandwidthManager
+	BigTCPConfig     bigtcp.Config
+	BandwidthManager bandwidth.Manager
 	CiliumHealth     health.CiliumHealthManager
 	KVStoreClient    kvstore.Client
 	Clientset        k8sClient.Clientset
@@ -99,11 +100,14 @@ type statusParams struct {
 	MaglevConfig     maglev.Config
 	MonitorAgent     monitoragent.Agent
 	NodeLocalStore   *node.LocalNodeStore
-	NodeDiscovery    *nodediscovery.NodeDiscovery
+
+	ClusterSizeDependantInterval node.ClusterSizeDependantIntervalFunc
+
 	PolicyMapFactory policymap.Factory
 	TunnelConfig     tunnel.Config
-	WireguardAgent   wgTypes.WireguardAgent
+	WireguardAgent   wgTypes.Agent
 	ZtunnelConfig    zconfig.Config
+	ConnectorConfig  connector.Config
 }
 
 // Config is the collector configuration

@@ -86,7 +86,7 @@ func (c *k8sStatusMockClient) setDaemonSet(namespace, name, filter string, desir
 
 	c.status = map[string]*models.StatusResponse{}
 
-	for i := int32(0); i < available; i++ {
+	for i := range available {
 		podName := fmt.Sprintf("%s-%d", name, i)
 		c.addPod(namespace, podName, filter, []corev1.Container{{Image: "cilium:1.8"}}, corev1.PodStatus{Phase: corev1.PodRunning})
 
@@ -103,7 +103,7 @@ func (c *k8sStatusMockClient) setDaemonSet(namespace, name, filter string, desir
 		}
 	}
 
-	for i := int32(0); i < unavailable; i++ {
+	for i := range unavailable {
 		podName := fmt.Sprintf("%s-%d", name, i+available)
 		c.addPod(namespace, podName, filter, []corev1.Container{{Image: "cilium:1.9"}}, corev1.PodStatus{Phase: corev1.PodFailed})
 		c.status[podName] = &models.StatusResponse{
@@ -228,6 +228,42 @@ func TestStatus(t *testing.T) {
 	assert.NotNil(t, status)
 	assert.Len(t, status.Errors["cilium"]["cilium"].Errors, 1)
 	assert.Regexp(t, ".*is rolling out.*", status.Errors["cilium"]["cilium"].Errors[0].Error())
+}
+
+func TestPodStatusSkipsSupersededRejection(t *testing.T) {
+	client := newK8sStatusMockClient()
+	collector, err := NewK8sStatusCollector(client, fakeParameters)
+	assert.NoError(t, err)
+
+	const relaySelector = "k8s-app=hubble-relay"
+
+	// A leftover replica rejected by admission (TaintToleration) sits next to a
+	// healthy running sibling created by the ReplicaSet. The rejected pod must
+	// not be counted as an error.
+	client.addPod("kube-system", "hubble-relay-running", relaySelector,
+		[]corev1.Container{{Image: "hubble-relay:1.9"}},
+		corev1.PodStatus{Phase: corev1.PodRunning})
+	client.addPod("kube-system", "hubble-relay-rejected", relaySelector,
+		[]corev1.Container{{Image: "hubble-relay:1.9"}},
+		corev1.PodStatus{Phase: corev1.PodFailed, Reason: "TaintToleration", Message: "Pod was rejected"})
+
+	status := newStatus()
+	err = collector.podStatus(context.Background(), status, defaults.RelayDeploymentName, relaySelector, nil)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, status.totalErrors())
+	assert.Equal(t, 1, status.PhaseCount[defaults.RelayDeploymentName][string(corev1.PodFailed)])
+
+	// A pod that actually ran and crashed carries an empty pod-level Reason and
+	// must still be surfaced as an error.
+	client.reset()
+	client.addPod("kube-system", "hubble-relay-crashed", relaySelector,
+		[]corev1.Container{{Image: "hubble-relay:1.9"}},
+		corev1.PodStatus{Phase: corev1.PodFailed})
+
+	status = newStatus()
+	err = collector.podStatus(context.Background(), status, defaults.RelayDeploymentName, relaySelector, nil)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, status.totalErrors())
 }
 
 func TestFormat(t *testing.T) {

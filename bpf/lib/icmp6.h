@@ -1,14 +1,14 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#if !defined(__LIB_ICMP6__) && defined(ENABLE_IPV6)
-#define __LIB_ICMP6__
+#pragma once
 
 #include <linux/icmpv6.h>
 #include <linux/in.h>
-#include "common.h"
+#include "icmp_wsum.h"
 #include "eth.h"
 #include "drop.h"
+#include "drop_reasons.h"
 #include "eps.h"
 
 #define ICMP6_TYPE_OFFSET offsetof(struct icmp6hdr, icmp6_type)
@@ -17,6 +17,8 @@
 #define ICMP6_ND_OPTS (sizeof(struct ipv6hdr) + sizeof(struct icmp6hdr) + sizeof(struct in6_addr))
 #define ICMP6_ND_OPT_LEN 8
 
+#define ICMP6_RS_MSG_TYPE		133
+#define ICMP6_RA_MSG_TYPE		134
 #define ICMP6_NS_MSG_TYPE		135
 #define ICMP6_NA_MSG_TYPE		136
 #define ICMP6_RR_MSG_TYPE		138
@@ -34,7 +36,8 @@
 #define ACTION_UNKNOWN_ICMP6_NS DROP_UNKNOWN_TARGET
 #endif
 
-static __always_inline int icmp6_load_type(struct __ctx_buff *ctx, int l4_off, __u8 *type)
+static __always_inline int icmp6_load_type(const struct __ctx_buff *ctx, int l4_off,
+					   __u8 *type)
 {
 	return ctx_load_bytes(ctx, l4_off + ICMP6_TYPE_OFFSET, type, sizeof(*type));
 }
@@ -355,9 +358,8 @@ static __always_inline int __icmp6_handle_ns(struct __ctx_buff *ctx, int nh_off)
 
 	cilium_dbg(ctx, DBG_ICMP6_NS, target.p3, target.p4);
 
-	if (ipv6_addr_equals(&target, &router)) {
+	if (ipv6_addr_equals(&target, &router))
 		return icmp6_send_ndisc_adv(ctx, nh_off, &router_mac, true);
-	}
 
 #ifdef USE_LOOPBACK_LB
 	union v6addr service_loopback = CONFIG(service_loopback_ipv6);
@@ -365,7 +367,7 @@ static __always_inline int __icmp6_handle_ns(struct __ctx_buff *ctx, int nh_off)
 	if (ipv6_addr_equals(&target, &service_loopback)) {
 		union macaddr source_mac;
 
-		if (ctx_load_bytes(ctx, ETH_ALEN, source_mac.addr, ETH_ALEN) < 0)
+		if (eth_load_saddr(ctx, source_mac.addr, 0) < 0)
 			return DROP_INVALID;
 		return icmp6_send_ndisc_adv(ctx, nh_off, &source_mac, false);
 	}
@@ -494,7 +496,7 @@ icmp6_host_handle(struct __ctx_buff *ctx, int l4_off, __s8 *ext_err, bool handle
 	 * |      ICMPv6-mult-list-done      |   CTX_ACT_OK    |  132 |
 	 * |      ICMPv6-router-solici       |   CTX_ACT_OK    |  133 |
 	 * |      ICMPv6-router-advert       |   CTX_ACT_OK    |  134 |
-	 * |     ICMPv6-neighbor-solicit     | icmp6_handle_ns |  135 |
+	 * |     ICMPv6-neighbor-solicit     |   CTX_ACT_OK    |  135 |
 	 * |      ICMPv6-neighbor-advert     |   CTX_ACT_OK    |  136 |
 	 * |     ICMPv6-redirect-message     |  CTX_ACT_DROP   |  137 |
 	 * |      ICMPv6-router-renumber     |   CTX_ACT_OK    |  138 |
@@ -521,9 +523,6 @@ icmp6_host_handle(struct __ctx_buff *ctx, int l4_off, __s8 *ext_err, bool handle
 	 * |       ICMPv6-unallocated        |  CTX_ACT_DROP   |      |
 	 * |       ICMPv6-unassigned         |  CTX_ACT_DROP   |      |
 	 */
-
-	if (type == ICMP6_NS_MSG_TYPE)
-		return CTX_ACT_OK;
 
 	if (type == ICMPV6_ECHO_REQUEST || type == ICMPV6_ECHO_REPLY)
 		/* Decision is deferred to the host policies. */
@@ -574,4 +573,121 @@ bool icmp6_ndisc_validate(struct __ctx_buff *ctx, const struct ipv6hdr *ip6,
 	return true;
 }
 
-#endif
+#define ICMPV6_PACKET_MAX_SAMPLE_SIZE (IPV6_MIN_MTU \
+				       - sizeof(struct ipv6hdr) \
+				       - sizeof(struct icmp6hdr))
+
+/* The IPv6 pseudo-header */
+struct ipv6_pseudo_header_t {
+	union {
+		struct header {
+			struct in6_addr src_ip;
+			struct in6_addr dst_ip;
+			__be32 top_level_length;
+			__u8 zero[3];
+			__u8 next_header;
+		} __packed fields;
+		__u16 words[20];
+	};
+};
+
+static __always_inline
+int generate_icmp6_reply(struct __ctx_buff *ctx, __u8 icmp_type, __u8 icmp_code,
+			 __u32 icmp_data)
+{
+	__u64 full_len = ctx_full_len(ctx);
+	struct ipv6hdr *ip6, *inner_ip6;
+	__u64 new_len, sample_len;
+	void *data, *data_end;
+	struct ethhdr *ethhdr;
+	struct icmp6hdr *icmphdr;
+	struct ipv6_pseudo_header_t pseudo_header;
+	__wsum csum;
+	int i;
+	int ret;
+
+	/* Trim down to sample size */
+	if (full_len < sizeof(struct ethhdr))
+		return DROP_INVALID;
+
+	sample_len = ICMPV6_PACKET_MAX_SAMPLE_SIZE;
+	new_len = sizeof(struct ethhdr) + sample_len;
+	if (new_len > full_len) {
+		new_len = full_len;
+		sample_len = full_len - sizeof(struct ethhdr);
+	}
+
+	ctx_adjust_troom(ctx, (__s32)(new_len - full_len));
+
+	data = ctx_data(ctx);
+	data_end = ctx_data_end(ctx);
+
+	/* Calculate the unfolded checksum of the ICMPv6 sample */
+	csum = icmp_wsum_accumulate(data + sizeof(struct ethhdr), data_end, (int)sample_len);
+
+	/* We need to insert a IPv6 and ICMPv6 header before the original packet.
+	 * Make that room.
+	 */
+
+	ret = ctx_adjust_hroom(ctx, sizeof(*ip6) + sizeof(*icmphdr),
+			       BPF_ADJ_ROOM_MAC, BPF_F_ADJ_ROOM_NO_CSUM_RESET);
+	if (ret < 0)
+		return DROP_INVALID;
+
+	/* changing size invalidates pointers, so we need to re-fetch them. */
+	data = ctx_data(ctx);
+	data_end = ctx_data_end(ctx);
+
+	/* Bound check all headers at once. */
+	ethhdr = data;
+	ip6 = (void *)ethhdr + sizeof(*ethhdr);
+	icmphdr = (void *)ip6 + sizeof(*ip6);
+	inner_ip6 = (void *)icmphdr + sizeof(*icmphdr);
+	if ((void *)inner_ip6 + sizeof(*inner_ip6) > data_end)
+		return DROP_INVALID;
+
+	/* Write reversed eth header, ready for egress */
+	eth_flip_addrs(ethhdr);
+	ethhdr->h_proto = bpf_htons(ETH_P_IPV6);
+
+	/* Write reversed ip header, ready for egress */
+	ip6->version = 6;
+	ip6->priority = 0;
+	ip6->flow_lbl[0] = 0;
+	ip6->flow_lbl[1] = 0;
+	ip6->flow_lbl[2] = 0;
+	ip6->payload_len = bpf_htons(sizeof(struct icmp6hdr) + (__u16)sample_len);
+	ip6->nexthdr = IPPROTO_ICMPV6;
+	ip6->hop_limit = IPDEFTTL;
+	ipv6_addr_copy((union v6addr *)&ip6->daddr,
+		       (const union v6addr *)&inner_ip6->saddr);
+	ipv6_addr_copy((union v6addr *)&ip6->saddr,
+		       (const union v6addr *)&inner_ip6->daddr);
+
+	/* Write reversed icmp header */
+	icmphdr->icmp6_type = icmp_type;
+	icmphdr->icmp6_code = icmp_code;
+	icmphdr->icmp6_cksum = 0;
+	icmphdr->icmp6_dataun.un_data32[0] = 0;
+
+	if (icmp_type == ICMPV6_PKT_TOOBIG)
+		icmphdr->icmp6_mtu = icmp_data;
+
+	csum += csum_diff(icmphdr, 0, icmphdr, sizeof(*icmphdr), 0);
+
+	/* Fill pseudo header */
+	memcpy(&pseudo_header.fields.src_ip, &ip6->saddr, sizeof(struct in6_addr));
+	memcpy(&pseudo_header.fields.dst_ip, &ip6->daddr, sizeof(struct in6_addr));
+	pseudo_header.fields.top_level_length = bpf_htonl(sizeof(struct icmp6hdr) +
+						(__u32)sample_len);
+	__bpf_memzero(pseudo_header.fields.zero, sizeof(pseudo_header.fields.zero));
+	pseudo_header.fields.next_header = IPPROTO_ICMPV6;
+
+	#pragma unroll
+	for (i = 0; i < (int)(sizeof(pseudo_header.words) / sizeof(__u16)); i++)
+		csum += pseudo_header.words[i];
+
+	icmphdr->icmp6_cksum = csum_fold(csum);
+
+	return 0;
+}

@@ -4,14 +4,10 @@
 package endpoint
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/netip"
 	"os"
@@ -48,7 +44,7 @@ type EndpointParser interface {
 
 // ReadEPsFromDirNames returns a mapping of endpoint ID to endpoint of endpoints
 // from a list of directory names that can possible contain an endpoint.
-func ReadEPsFromDirNames(ctx context.Context, logger *slog.Logger, parser EndpointParser, basePath string, eptsDirNames []string) map[uint16]*Endpoint {
+func ReadEPsFromDirNames(ctx context.Context, logger *slog.Logger, parser EndpointParser, basePath string, eptsDirNames []string) (map[uint16]*Endpoint, int) {
 	completeEPDirNames, incompleteEPDirNames := partitionEPDirNamesByRestoreStatus(eptsDirNames)
 
 	if len(incompleteEPDirNames) > 0 {
@@ -69,6 +65,7 @@ func ReadEPsFromDirNames(ctx context.Context, logger *slog.Logger, parser Endpoi
 	}
 
 	possibleEPs := map[uint16]*Endpoint{}
+	failed := 0
 	for _, epDirName := range completeEPDirNames {
 		epDir := filepath.Join(basePath, epDirName)
 
@@ -77,15 +74,17 @@ func ReadEPsFromDirNames(ctx context.Context, logger *slog.Logger, parser Endpoi
 			logfields.Path, epDir,
 		)
 
-		state, err := findEndpointState(scopedLogger, epDir)
+		state, err := findEndpointState(epDir)
 		if err != nil {
 			scopedLogger.Warn("Couldn't find state, ignoring endpoint", logfields.Error, err)
+			failed++
 			continue
 		}
 
 		ep, err := parser.ParseEndpoint(state)
 		if err != nil {
 			scopedLogger.Warn("Unable to parse the C header file", logfields.Error, err)
+			failed++
 			continue
 		}
 		if _, ok := possibleEPs[ep.ID]; ok {
@@ -104,56 +103,14 @@ func ReadEPsFromDirNames(ctx context.Context, logger *slog.Logger, parser Endpoi
 			node.SetEndpointID(ep.GetID())
 		}
 	}
-	return possibleEPs
+
+	return possibleEPs, failed
 }
 
 // findEndpointState finds the JSON representation of an endpoint's state in
 // a directory.
-//
-// It prefers reading from the endpoint state JSON file and falls back to
-// reading from the header.
-func findEndpointState(logger *slog.Logger, dir string) ([]byte, error) {
-	state, err := os.ReadFile(filepath.Join(dir, common.EndpointStateFileName))
-	if err == nil {
-		logger.Debug("Restore from JSON file")
-		return state, nil
-	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-
-	// Fall back to reading state from the C header.
-	// Remove this at some point in the far future.
-	f, err := os.Open(filepath.Join(dir, common.CHeaderFileName))
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	logger.Debug("Restore from C header file")
-
-	br := bufio.NewReader(f)
-	var line []byte
-	for {
-		b, err := br.ReadBytes('\n')
-		if errors.Is(err, io.EOF) {
-			return nil, os.ErrNotExist
-		}
-		if err != nil {
-			return nil, err
-		}
-		if bytes.Contains(b, []byte(ciliumCHeaderPrefix)) {
-			line = b
-			break
-		}
-	}
-
-	epSlice := bytes.Split(line, []byte{':'})
-	if len(epSlice) != 2 {
-		return nil, fmt.Errorf("invalid format %q. Should contain a single ':'", line)
-	}
-
-	return base64.StdEncoding.AppendDecode(nil, epSlice[1])
+func findEndpointState(dir string) ([]byte, error) {
+	return os.ReadFile(filepath.Join(dir, common.EndpointStateFileName))
 }
 
 // partitionEPDirNamesByRestoreStatus partitions the provided list of directory
@@ -211,7 +168,8 @@ func (e *Endpoint) RegenerateAfterRestore(regenerator *Regenerator, resolveMetad
 	e.RunRestoredMetadataResolver(resolveMetadata)
 
 	regenerationMetadata := &regeneration.ExternalRegenerationMetadata{
-		Reason:            "syncing state to host",
+		Reason:            regeneration.ReasonEndpointRestore,
+		Message:           "syncing state to host",
 		RegenerationLevel: regeneration.RegenerateWithDatapath,
 	}
 	if buildSuccess := <-e.Regenerate(regenerationMetadata); !buildSuccess {
@@ -424,39 +382,37 @@ func (e *Endpoint) restoreIdentity(regenerator *Regenerator) error {
 // toSerializedEndpoint converts the Endpoint to its corresponding
 // serializableEndpoint, which contains all of the fields that are needed upon
 // restoring an Endpoint after cilium-agent restarts.
+// e.mutex must be held.
 func (e *Endpoint) toSerializedEndpoint() *serializableEndpoint {
 	return &serializableEndpoint{
-		ID:                       e.ID,
-		ContainerName:            e.GetContainerName(),
-		ContainerID:              e.GetContainerID(),
-		ContainerNetnsPath:       e.containerNetnsPath,
-		DockerNetworkID:          e.dockerNetworkID,
-		DockerEndpointID:         e.dockerEndpointID,
-		IfName:                   e.ifName,
-		IfIndex:                  e.ifIndex,
-		ParentIfIndex:            e.parentIfIndex,
-		ContainerIfName:          e.containerIfName,
-		DisableLegacyIdentifiers: e.disableLegacyIdentifiers,
-		Labels:                   e.labels,
-		LXCMAC:                   e.mac,
-		IPv6:                     e.IPv6,
-		IPv6IPAMPool:             e.IPv6IPAMPool,
-		IPv4:                     e.IPv4,
-		IPv4IPAMPool:             e.IPv4IPAMPool,
-		NodeMAC:                  e.nodeMAC,
-		SecurityIdentity:         e.SecurityIdentity,
-		Options:                  e.Options,
-		DNSRules:                 e.DNSRules,
-		DNSRulesV2:               e.DNSRulesV2,
-		DNSHistory:               e.DNSHistory,
-		DNSZombies:               e.DNSZombies,
-		K8sPodName:               e.K8sPodName,
-		K8sNamespace:             e.K8sNamespace,
-		K8sUID:                   e.K8sUID,
-		DatapathConfiguration:    e.DatapathConfiguration,
-		CiliumEndpointUID:        e.ciliumEndpointUID,
-		Properties:               e.properties,
-		NetnsCookie:              e.NetNsCookie,
+		ID:                    e.ID,
+		ContainerID:           e.GetContainerID(),
+		ContainerNetnsPath:    e.containerNetnsPath,
+		IfName:                e.ifName,
+		IfIndex:               e.ifIndex,
+		ParentIfIndex:         e.parentIfIndex,
+		ContainerIfName:       e.containerIfName,
+		IsSecondaryInterface:  e.isSecondaryInterface,
+		Labels:                e.labels,
+		MAC:                   e.mac,
+		IPv6:                  e.IPv6,
+		IPv6IPAMPool:          e.IPv6IPAMPool,
+		IPv4:                  e.IPv4,
+		IPv4IPAMPool:          e.IPv4IPAMPool,
+		NodeMAC:               e.nodeMAC,
+		SecurityIdentity:      e.SecurityIdentity,
+		Options:               e.Options,
+		DNSRules:              e.DNSRules,
+		DNSHistory:            e.DNSHistory,
+		DNSZombies:            e.DNSZombies,
+		K8sPodName:            e.K8sPodName,
+		K8sNamespace:          e.K8sNamespace,
+		K8sUID:                e.K8sUID,
+		DatapathConfiguration: e.DatapathConfiguration,
+		CiliumEndpointUID:     e.ciliumEndpointUID,
+		Properties:            e.properties,
+		NetnsCookie:           e.NetNsCookie,
+		RTInfo:                e.rtInfo,
 	}
 }
 
@@ -473,23 +429,12 @@ type serializableEndpoint struct {
 	// ID of the endpoint, unique in the scope of the node
 	ID uint16
 
-	// containerName is the name given to the endpoint by the container runtime
-	ContainerName string
-
-	// containerID is the container ID that docker has assigned to the endpoint
+	// containerID is the container ID associated with the endpoint.
 	// Note: The JSON tag was kept for backward compatibility.
 	ContainerID string `json:"dockerID,omitempty"`
 
 	// ContainerNetnsPath is the path to the container's network namespace
 	ContainerNetnsPath string
-
-	// dockerNetworkID is the network ID of the libnetwork network if the
-	// endpoint is a docker managed container which uses libnetwork
-	DockerNetworkID string
-
-	// dockerEndpointID is the Docker network endpoint ID if managed by
-	// libnetwork
-	DockerEndpointID string
 
 	// ifName is the name of the host facing interface (veth pair) which
 	// connects into the endpoint
@@ -506,17 +451,16 @@ type serializableEndpoint struct {
 	// ContainerIfName is the name of the container facing interface (veth pair).
 	ContainerIfName string
 
-	// DisableLegacyIdentifiers disables lookup using legacy endpoint identifiers
-	// (container name, container id, pod name) for this endpoint.
-	DisableLegacyIdentifiers bool
+	// IsSecondaryInterface reports whether this endpoint represents a seondary interface in
+	// case of more than once interface per pod.
+	IsSecondaryInterface bool
 
 	// Labels is the endpoint's label configuration
 	Labels labels.OpLabels `json:"OpLabels"`
 
-	// mac is the MAC address of the endpoint
-	//
-	// FIXME: Rename this field to MAC
-	LXCMAC mac.MAC // Container MAC address.
+	// MAC is the MAC address of the endpoint (container facing interface).
+	// Note: The JSON tag was kept for backward compatibility.
+	MAC mac.MAC `json:"LXCMAC"`
 
 	// IPv6 is the IPv6 address of the endpoint
 	IPv6 netip.Addr
@@ -540,12 +484,14 @@ type serializableEndpoint struct {
 	// Options determine the datapath configuration of the endpoint.
 	Options *option.IntOptions
 
-	// DNSRules is the collection of current DNS rules for this endpoint.
-	DNSRules restore.DNSRules
+	// DNSRulesUnused is the legacy V1 collection of DNS rules for this endpoint.
+	// Keep the original JSON key for backwards compatibility.
+	DNSRulesUnused restore.DNSRules `json:"DNSRules,omitempty"`
 
-	// DNSRulesV2 is the collection of current DNS rules for this endpoint,
+	// DNSRules is the collection of current DNS rules for this endpoint,
 	// that conform to using V2 of the PortProto key.
-	DNSRulesV2 restore.DNSRules
+	// Keep the original JSON key for backwards compatibility.
+	DNSRules restore.DNSRules `json:"DNSRulesV2,omitempty"`
 
 	// DNSHistory is the collection of still-valid DNS responses intercepted for
 	// this endpoint.
@@ -581,6 +527,10 @@ type serializableEndpoint struct {
 
 	// NetnsCookie is the network namespace cookie of the Endpoint.
 	NetnsCookie uint64
+
+	// RTInfo is a routing domain identifier, typically a FIB table ID, used
+	// for pod egress routing.
+	RTInfo uint32
 }
 
 // UnmarshalJSON expects that the contents of `raw` are a serializableEndpoint,
@@ -603,6 +553,7 @@ func (ep *Endpoint) UnmarshalJSON(raw []byte) error {
 }
 
 // MarshalJSON marshals the Endpoint as its serializableEndpoint representation.
+// e.mutex must be held.
 func (ep *Endpoint) MarshalJSON() ([]byte, error) {
 	return json.Marshal(ep.toSerializedEndpoint())
 }
@@ -611,18 +562,15 @@ func (ep *Endpoint) fromSerializedEndpoint(r *serializableEndpoint) {
 	ep.ID = r.ID
 	ep.createdAt = time.Now()
 	ep.initialEnvoyPolicyComputed = make(chan struct{})
-	ep.containerName.Store(&r.ContainerName)
 	ep.containerID.Store(&r.ContainerID)
 	ep.containerNetnsPath = r.ContainerNetnsPath
-	ep.dockerNetworkID = r.DockerNetworkID
-	ep.dockerEndpointID = r.DockerEndpointID
 	ep.ifName = r.IfName
 	ep.ifIndex = r.IfIndex
 	ep.parentIfIndex = r.ParentIfIndex
 	ep.containerIfName = r.ContainerIfName
-	ep.disableLegacyIdentifiers = r.DisableLegacyIdentifiers
+	ep.isSecondaryInterface = r.IsSecondaryInterface
 	ep.labels = r.Labels
-	ep.mac = r.LXCMAC
+	ep.mac = r.MAC
 	ep.IPv6 = r.IPv6
 	ep.IPv6IPAMPool = r.IPv6IPAMPool
 	ep.IPv4 = r.IPv4
@@ -630,7 +578,6 @@ func (ep *Endpoint) fromSerializedEndpoint(r *serializableEndpoint) {
 	ep.nodeMAC = r.NodeMAC
 	ep.SecurityIdentity = r.SecurityIdentity
 	ep.DNSRules = r.DNSRules
-	ep.DNSRulesV2 = r.DNSRulesV2
 	ep.DNSHistory = r.DNSHistory
 	ep.DNSZombies = r.DNSZombies
 	ep.K8sPodName = r.K8sPodName
@@ -645,4 +592,5 @@ func (ep *Endpoint) fromSerializedEndpoint(r *serializableEndpoint) {
 		ep.properties = map[string]any{}
 	}
 	ep.NetNsCookie = r.NetnsCookie
+	ep.rtInfo = r.RTInfo
 }

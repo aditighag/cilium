@@ -17,6 +17,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/clock"
 
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	cilium_api_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
@@ -51,6 +52,7 @@ type params struct {
 
 	Logger              *slog.Logger
 	Config              config
+	ClusterInfo         cmtypes.ClusterInfo
 	Lifecycle           cell.Lifecycle
 	Clientset           k8sClient.Clientset
 	SharedCfg           SharedConfig
@@ -66,6 +68,7 @@ type params struct {
 
 type Controller struct {
 	logger              *slog.Logger
+	clusterInfo         cmtypes.ClusterInfo
 	clientset           k8sClient.Clientset
 	reconciler          *reconciler
 	jobGroup            job.Group
@@ -109,6 +112,7 @@ func registerController(p params) {
 
 	cidController := &Controller{
 		logger:                   p.Logger,
+		clusterInfo:              p.ClusterInfo,
 		clientset:                p.Clientset,
 		namespace:                p.Namespace,
 		pod:                      p.Pod,
@@ -160,8 +164,6 @@ func (c *Controller) Start(ctx cell.HookContext) error {
 }
 
 func (c *Controller) Stop(_ cell.HookContext) error {
-	c.resourceQueue.ShutDown()
-
 	return nil
 }
 
@@ -218,7 +220,7 @@ func (c *Controller) startEventProcessing() {
 
 func (c *Controller) initReconciler(ctx context.Context) error {
 	var err error
-	c.reconciler, err = newReconciler(ctx, c.logger, c.clientset, c.namespace, c.pod, c.ciliumIdentity, c.ciliumEndpoint, c.ciliumEndpointSlice, c.cesEnabled, c)
+	c.reconciler, err = newReconciler(ctx, c.logger, c.clusterInfo, c.clientset, c.namespace, c.pod, c.ciliumIdentity, c.ciliumEndpoint, c.ciliumEndpointSlice, c.cesEnabled, c)
 	if err != nil {
 		return fmt.Errorf("cid reconciler failed to init: %w", err)
 	}
@@ -229,6 +231,11 @@ func (c *Controller) initReconciler(ctx context.Context) error {
 func (c *Controller) runResourceWorker(ctx context.Context) error {
 	c.logger.InfoContext(ctx, "Starting resource worker")
 	defer c.logger.InfoContext(ctx, "Stopping resource worker")
+
+	go func() {
+		<-ctx.Done()
+		c.resourceQueue.ShutDown()
+	}()
 
 	for c.processNextItem() {
 		select {

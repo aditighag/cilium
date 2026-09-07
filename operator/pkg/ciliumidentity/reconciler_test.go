@@ -6,21 +6,24 @@ package ciliumidentity
 import (
 	"context"
 	"fmt"
-	"reflect"
 	"testing"
 	"time"
 
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/hive/hivetest"
 	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8sTesting "k8s.io/client-go/testing"
 
 	"github.com/cilium/cilium/operator/k8s"
 	cidtest "github.com/cilium/cilium/operator/pkg/ciliumidentity/testutils"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/hive"
 	"github.com/cilium/cilium/pkg/identity/key"
+	ciliumio "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
 	capi_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	capi_v2a1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client/testutils"
@@ -82,7 +85,8 @@ func testNewReconciler(t *testing.T, ctx context.Context, enableCES bool) (*reco
 	reconciler, _ := newReconciler(
 		ctx,
 		tlog,
-		fakeClient.Clientset,
+		cmtypes.DefaultClusterInfo,
+		fakeClient,
 		namespace,
 		pod,
 		ciliumIdentity,
@@ -230,12 +234,8 @@ func TestReconcileCID(t *testing.T) {
 				t.Errorf("Unexpected error during reconciliation: %v", err)
 			}
 
-			if !reflect.DeepEqual(createCID, tc.expectedCreate) {
-				t.Errorf("Unexpected createCID result: got %v, want %v", createCID, tc.expectedCreate)
-			}
-			if !reflect.DeepEqual(updateCID, tc.expectedUpdate) {
-				t.Errorf("Unexpected updateCID result: got %v, want %v", updateCID, tc.expectedUpdate)
-			}
+			assert.Equal(t, tc.expectedCreate, createCID)
+			assert.Equal(t, tc.expectedUpdate, updateCID)
 			if deleteCIDName != tc.expectedDelete {
 				t.Errorf("Unexpected deleteCIDName result: got %v, want %v", deleteCIDName, tc.expectedDelete)
 			}
@@ -404,7 +404,7 @@ func TestReconcilePod(t *testing.T) {
 				}
 
 				expectedLbs := key.GetCIDKeyFromLabels(
-					k8sUtils.SanitizePodLabels(tc.newPod.ObjectMeta.Labels, ns1, "", ""),
+					k8sUtils.SanitizePodLabels(tc.newPod.ObjectMeta.Labels, ns1, "", cmtypes.DefaultClusterInfo.Name),
 					labels.LabelSourceK8s,
 				).GetAsMap()
 
@@ -478,6 +478,28 @@ func TestReconcileNS(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGetRelevantLabelsForPodDoesNotIncludeGeneratedNamedPorts(t *testing.T) {
+	ctx := t.Context()
+	reconciler, _, _, cleanupFunc := testNewReconciler(t, ctx, false)
+	defer cleanupFunc()
+
+	ns := cidtest.NewNamespace("ns1", nil)
+	require.NoError(t, reconciler.nsStore.CacheStore().Add(ns))
+
+	pod := cidtest.NewPod("pod1", ns.Name, testLbsA, "node1")
+	pod.Spec.Containers = []slim_corev1.Container{{
+		Ports: []slim_corev1.ContainerPort{{
+			Name:          "http",
+			ContainerPort: 8080,
+			Protocol:      slim_corev1.ProtocolTCP,
+		}},
+	}}
+
+	k8sLabels, err := GetRelevantLabelsForPod(hivetest.Logger(t), pod, reconciler.nsStore, reconciler.clusterInfo)
+	require.NoError(t, err)
+	require.NotContains(t, k8sLabels, ciliumio.NamedPortsIdentityLabelName)
 }
 
 func TestHandleStoreCIDMatch(t *testing.T) {

@@ -74,7 +74,7 @@ type IPMetadata any
 // is otherwise read-only.
 type namedPortMultiMapUpdater interface {
 	types.NamedPortMultiMap
-	Update(old, new types.NamedPortMap) (namedPortChanged bool)
+	Update(epID identity.NumericIdentity, old, new types.NamedPortMap) (namedPortChanged bool)
 }
 
 // merge overwrites the field in 'resourceInfo' corresponding to 'info'. This
@@ -131,6 +131,8 @@ func (m *resourceInfo) unmerge(logger *slog.Logger, info IPMetadata) {
 		m.requestedIdentity = ipcachetypes.RequestedIdentity(identity.IdentityUnknown)
 	case ipcachetypes.EndpointFlags:
 		m.endpointFlags = ipcachetypes.EndpointFlags{}
+	case ipcachetypes.AllMetadata:
+		*m = resourceInfo{}
 	default:
 		logger.Error(
 			"BUG: Invalid IPMetadata passed to ipinfo.unmerge()",
@@ -392,4 +394,29 @@ func (s *prefixInfo) flatten(scopedLog *slog.Logger) *resourceInfo {
 	}
 
 	return out
+}
+
+func (s *prefixInfo) highestPrecedenceSource() source.Source {
+	if len(s.byResource) == 0 {
+		return source.Unspec
+	}
+	if len(s.byResource) == 1 {
+		for _, info := range s.byResource {
+			return info.source
+		}
+	}
+
+	var bestSrc source.Source
+	for _, info := range s.byResource {
+		if info.source == source.KubeAPIServer {
+			return info.source
+		}
+		if bestSrc == "" {
+			bestSrc = info.source
+		} else if bestSrc != info.source && source.AllowOverwrite(bestSrc, info.source) {
+			bestSrc = info.source
+		}
+	}
+
+	return bestSrc
 }

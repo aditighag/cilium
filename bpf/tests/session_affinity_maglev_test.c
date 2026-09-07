@@ -14,9 +14,6 @@
 #define TEST_REVNAT		       1
 #define LB_MAGLEV_EXTERNAL
 
-/* Skip ingress policy checks, not needed to validate hairpin flow */
-#define USE_BPF_PROG_FOR_INGRESS_POLICY
-
 #define CLIENT_ID1    1
 #define CLIENT_ID2    2
 #define CLIENT_IP1    v4_ext_one
@@ -44,10 +41,9 @@ static volatile const __u8 base_backend_mac[ETH_ALEN] = {
 
 #include "node_config.h"
 
-#undef LB_SELECTION
-#define LB_SELECTION LB_SELECTION_MAGLEV
 #undef LB_MAGLEV_LUT_SIZE
 #define LB_MAGLEV_LUT_SIZE 20
+#define LB_DEFAULT_ALG LB_SELECTION_MAGLEV
 
 /* Define a mock maglev map that would be used by the LB code */
 struct lb6_maglev_map_inner {
@@ -124,8 +120,15 @@ long mock_fib_lookup(__maybe_unused void *ctx, struct bpf_fib_lookup *params,
 #include "lib/bpf_xdp.h"
 #include "lib/lb.h"
 
+/* Set port ranges to have deterministic source port selection */
+#include "nodeport_defaults.h"
+
+ASSIGN_CONFIG(bool, enable_endpoint_routes, true)
+ASSIGN_CONFIG(__u32, hash_init4_seed, 0xcafe)
+ASSIGN_CONFIG(__u32, hash_init6_seed, 0xeb9f)
+
 static __always_inline int
-generate_packet(struct __ctx_buff *ctx, int client_id, __u16 src_port)
+generate_packet(struct __ctx_buff *ctx, int client_id, __be16 src_port)
 {
 	__u8 *src_mac;
 	__u32 src_ip;
@@ -178,7 +181,7 @@ static __always_inline void setup_test(void)
 	 */
 	__u32 affinity_timeout = 0x2000064;
 
-	__lb_v4_add_service(FRONTEND_IP, FRONTEND_PORT, IPPROTO_TCP, IPPROTO_TCP,
+	__lb_v4_add_service(FRONTEND_IP, FRONTEND_PORT, IPPROTO_TCP,
 			    LB_MAGLEV_LUT_SIZE, TEST_REVNAT, SVC_FLAG_ROUTABLE, 0,
 			    true, affinity_timeout);
 
@@ -260,13 +263,13 @@ check_packet(const struct __ctx_buff *ctx, int backend_id)
 
 /* ------------------------------------------------------------------------------ */
 
-PKTGEN("xdp", "session_affinity_maglev_client_1_port_1")
+PKTGEN(PROG_TYPE, "session_affinity_maglev_client_1_port_1")
 int generate_packet_1_1(struct __ctx_buff *ctx)
 {
 	return generate_packet(ctx, CLIENT_ID1, CLIENT_PORT1);
 }
 
-SETUP("xdp", "session_affinity_maglev_client_1_port_1")
+SETUP(PROG_TYPE, "session_affinity_maglev_client_1_port_1")
 int setup_1_1(struct __ctx_buff *ctx)
 {
 	setup_test();
@@ -274,7 +277,7 @@ int setup_1_1(struct __ctx_buff *ctx)
 	return xdp_receive_packet(ctx);
 }
 
-CHECK("xdp", "session_affinity_maglev_client_1_port_1")
+CHECK(PROG_TYPE, "session_affinity_maglev_client_1_port_1")
 int test_1_1(__maybe_unused const struct __ctx_buff *ctx)
 {
 	/* Client 1 always maps to the backend 13 */
@@ -283,13 +286,13 @@ int test_1_1(__maybe_unused const struct __ctx_buff *ctx)
 
 /* ------------------------------------------------------------------------------ */
 
-PKTGEN("xdp", "session_affinity_maglev_client_1_port_2")
+PKTGEN(PROG_TYPE, "session_affinity_maglev_client_1_port_2")
 int generate_packet_1_2(struct __ctx_buff *ctx)
 {
 	return generate_packet(ctx, CLIENT_ID1, CLIENT_PORT2);
 }
 
-SETUP("xdp", "session_affinity_maglev_client_1_port_2")
+SETUP(PROG_TYPE, "session_affinity_maglev_client_1_port_2")
 int setup_1_2(struct __ctx_buff *ctx)
 {
 	setup_test();
@@ -297,7 +300,7 @@ int setup_1_2(struct __ctx_buff *ctx)
 	return xdp_receive_packet(ctx);
 }
 
-CHECK("xdp", "session_affinity_maglev_client_1_port_2")
+CHECK(PROG_TYPE, "session_affinity_maglev_client_1_port_2")
 int test_1_2(__maybe_unused const struct __ctx_buff *ctx)
 {
 	/* Client 1 always maps to the backend 13 */
@@ -306,13 +309,13 @@ int test_1_2(__maybe_unused const struct __ctx_buff *ctx)
 
 /* ------------------------------------------------------------------------------ */
 
-PKTGEN("xdp", "session_affinity_maglev_client_1_port_3")
+PKTGEN(PROG_TYPE, "session_affinity_maglev_client_1_port_3")
 int generate_packet_1_3(struct __ctx_buff *ctx)
 {
 	return generate_packet(ctx, CLIENT_ID1, CLIENT_PORT3);
 }
 
-SETUP("xdp", "session_affinity_maglev_client_1_port_3")
+SETUP(PROG_TYPE, "session_affinity_maglev_client_1_port_3")
 int setup_1_3(struct __ctx_buff *ctx)
 {
 	setup_test();
@@ -320,7 +323,7 @@ int setup_1_3(struct __ctx_buff *ctx)
 	return xdp_receive_packet(ctx);
 }
 
-CHECK("xdp", "session_affinity_maglev_client_1_port_3")
+CHECK(PROG_TYPE, "session_affinity_maglev_client_1_port_3")
 int test_1_3(__maybe_unused const struct __ctx_buff *ctx)
 {
 	/* Client 1 always maps to the backend 13 */
@@ -329,13 +332,13 @@ int test_1_3(__maybe_unused const struct __ctx_buff *ctx)
 
 /* ------------------------------------------------------------------------------ */
 
-PKTGEN("xdp", "session_affinity_maglev_client_2_port_1")
+PKTGEN(PROG_TYPE, "session_affinity_maglev_client_2_port_1")
 int generate_packet_2_1(struct __ctx_buff *ctx)
 {
 	return generate_packet(ctx, CLIENT_ID2, CLIENT_PORT1);
 }
 
-SETUP("xdp", "session_affinity_maglev_client_2_port_1")
+SETUP(PROG_TYPE, "session_affinity_maglev_client_2_port_1")
 int setup_2_1(struct __ctx_buff *ctx)
 {
 	setup_test();
@@ -343,7 +346,7 @@ int setup_2_1(struct __ctx_buff *ctx)
 	return xdp_receive_packet(ctx);
 }
 
-CHECK("xdp", "session_affinity_maglev_client_2_port_1")
+CHECK(PROG_TYPE, "session_affinity_maglev_client_2_port_1")
 int test_2_1(__maybe_unused const struct __ctx_buff *ctx)
 {
 	/* Client 2 always maps to the backend 14 */
@@ -352,13 +355,13 @@ int test_2_1(__maybe_unused const struct __ctx_buff *ctx)
 
 /* ------------------------------------------------------------------------------ */
 
-PKTGEN("xdp", "session_affinity_maglev_client_2_port_2")
+PKTGEN(PROG_TYPE, "session_affinity_maglev_client_2_port_2")
 int generate_packet_2_2(struct __ctx_buff *ctx)
 {
 	return generate_packet(ctx, CLIENT_ID2, CLIENT_PORT2);
 }
 
-SETUP("xdp", "session_affinity_maglev_client_2_port_2")
+SETUP(PROG_TYPE, "session_affinity_maglev_client_2_port_2")
 int setup_2_2(struct __ctx_buff *ctx)
 {
 	setup_test();
@@ -366,7 +369,7 @@ int setup_2_2(struct __ctx_buff *ctx)
 	return xdp_receive_packet(ctx);
 }
 
-CHECK("xdp", "session_affinity_maglev_client_2_port_2")
+CHECK(PROG_TYPE, "session_affinity_maglev_client_2_port_2")
 int test_2_2(__maybe_unused const struct __ctx_buff *ctx)
 {
 	/* Client 2 always maps to the backend 14 */
@@ -375,13 +378,13 @@ int test_2_2(__maybe_unused const struct __ctx_buff *ctx)
 
 /* ------------------------------------------------------------------------------ */
 
-PKTGEN("xdp", "session_affinity_maglev_client_2_port_3")
+PKTGEN(PROG_TYPE, "session_affinity_maglev_client_2_port_3")
 int generate_packet_2_3(struct __ctx_buff *ctx)
 {
 	return generate_packet(ctx, CLIENT_ID2, CLIENT_PORT3);
 }
 
-SETUP("xdp", "session_affinity_maglev_client_2_port_3")
+SETUP(PROG_TYPE, "session_affinity_maglev_client_2_port_3")
 int setup_2_3(struct __ctx_buff *ctx)
 {
 	setup_test();
@@ -389,7 +392,7 @@ int setup_2_3(struct __ctx_buff *ctx)
 	return xdp_receive_packet(ctx);
 }
 
-CHECK("xdp", "session_affinity_maglev_client_2_port_3")
+CHECK(PROG_TYPE, "session_affinity_maglev_client_2_port_3")
 int test_2_3(__maybe_unused const struct __ctx_buff *ctx)
 {
 	/* Client 2 always maps to the backend 14 */

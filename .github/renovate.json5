@@ -38,6 +38,8 @@
     ".github/actions/e2e/**",
     ".github/actions/kvstore/**",
     ".github/actions/gather-metrics/**",
+    ".github/actions/get-runner-ip/**",
+    ".github/actions/wait-for-images/**",
     ".github/actions/merge-artifacts/**",
     ".github/actions/post-logic/**",
     ".github/actions/ginkgo/**",
@@ -46,8 +48,11 @@
     ".github/actions/ipsec/configs.yaml",
     ".github/workflows/**",
     ".github/ISSUE_TEMPLATE/bug_report.yaml",
+    "Documentation/requirements-min/requirements.txt",
     "cilium-cli/**",
+    "pkg/azure/**",
     "images/**",
+    "examples/datapath-plugin/*",
     "examples/hubble/*",
     "go.mod",
     "go.sum",
@@ -72,6 +77,8 @@
   // If removed, we would fall back on the config:base preset, which ignores any
   // paths that match 'examples/*' (which we explicitly do not want to ignore).
   "ignorePaths": [
+    // These files are pinned to a specific action on the branch
+    ".github/workflows/call-backport-label-updater*",
     // This file is deprecated and no longer present in main
     "images/cilium-test/Dockerfile"
   ],
@@ -79,7 +86,14 @@
     // 'google/oss-fuzz' is ignored from the updates because it's currently
     // unversioned and it would be receiving an update every time the upstream
     // repository would receive a new commit.
-    "google/oss-fuzz"
+    "google/oss-fuzz",
+    // 'google-github-actions/auth' is deliberately pinned a few commits ahead
+    // of the newest tag, to a commit that carries the STS token exchange retry
+    // fix (google-github-actions/auth#532). 'pinDigests' plus the
+    // 'auto-merge-trusted-deps' membership below would otherwise re-pin the
+    // digest back to v3.0.0 and silently revert it. Drop this entry once
+    // upstream tags a release above v3.0.0 containing that fix.
+    "google-github-actions/auth"
   ],
   "pinDigests": true,
   // We don't want to separate major and minor upgrades in separate PRs since
@@ -91,9 +105,9 @@
   "pruneStaleBranches": true,
   "baseBranchPatterns": [
     "main",
+    "v1.20",
+    "v1.19",
     "v1.18",
-    "v1.17",
-    "v1.16"
   ],
   "vulnerabilityAlerts": {
     "enabled": true
@@ -109,12 +123,81 @@
     "^make -C install/kubernetes$",
     "^make -C Documentation update-helm-values$",
     "^make -C Documentation update-cmdref$",
-    "^make generate-k8s-api$",
+    "^make -C Documentation update-requirements$",
     "^make manifests$",
-    "^make GO='contrib/scripts/builder.sh go' generate-apis$"
+    "^make GO='contrib/scripts/builder.sh go' generate-apis$",
+    "^make GO='contrib/scripts/builder.sh go' generate-k8s-api$",
+    "^go mod tidy$",
+    "^go mod vendor$"
   ],
+  // The gomod manager runs 'mod upgrade' (the gomodUpdateImportPaths step)
+  // before 'go mod vendor', so its 'go list' honours the default -mod=vendor
+  // and trips over the not-yet-synced vendor/modules.txt. '-mod=mod' makes it
+  // ignore the vendor directory. '-modcacherw' has to be repeated because this
+  // replaces the value the manager sets itself.
+  // See https://github.com/renovatebot/renovate/issues/21010
+  "customEnvVariables": {
+    "GOFLAGS": "-modcacherw -mod=mod"
+  },
   "assignAutomerge": true,
   "packageRules": [
+    {
+      // Dependency cooldown: skip versions published less than 5 days ago
+      "matchUpdateTypes": ["major", "minor", "patch"],
+      "minimumReleaseAge": "5 days"
+    },
+    {
+      // Docker Hub is the only Docker registry that currently supports release
+      // timestamps, causing updates to be never proposed by Renovate for all
+      // other registries. Hence, let's enable the "timestamp-optional" option,
+      // which unfortunately effectively disables the cooldown period for them.
+      // https://docs.renovatebot.com/key-concepts/minimum-release-age/#which-registries-support-release-timestamps
+      "matchDatasources": ["docker"],
+      "minimumReleaseAgeBehaviour": "timestamp-optional",
+    },
+    {
+      // No cooldown for the Go toolchain. It is pinned twice, as the golang
+      // image and as the workflow go-version, and the rule above already exempts
+      // the image half, so a fresh Go patch would otherwise land in one half of
+      // the 'base-images' group and not the other.
+      "matchPackageNames": ["docker.io/library/golang", "go"],
+      "minimumReleaseAge": "0 days",
+    },
+    {
+      // Do not pin or update digests for self-referenced cilium/cilium GitHub
+      // Actions and reusable workflows (e.g.,
+      // cilium/cilium/.github/actions/set-commit-status@<sha> # main or
+      // cilium/cilium/.github/workflows/foo.yaml@<sha> # v1.17). These are
+      // internal references within the same repository.
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchPackageNames": [
+        "cilium/cilium"
+      ],
+      "matchUpdateTypes": [
+        "digest",
+        "pinDigest"
+      ],
+      "enabled": false
+    },
+    {
+      // Do not pin digests for the golangci/golangci-lint dependency that the
+      // github-actions manager auto-extracts from the 'version:' input of the
+      // golangci/golangci-lint-action step. A plain 'version: vX.Y.Z' value has
+      // nowhere to store a commit SHA, so Renovate can never apply the digest
+      // pin and the whole grouped branch fails with "update failure". The
+      // version itself is still tracked through the
+      // 'datasource=docker depName=golangci/golangci-lint' comment handled by
+      // the custom regex manager.
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchPackageNames": [
+        "golangci/golangci-lint"
+      ],
+      "pinDigests": false
+    },
     {
       "matchPackageNames": [
         "bufbuild/buf", // Protocol buffer toolkit
@@ -163,8 +246,10 @@
         "quay.io/lvh-images/{/,}**", // LVH images
         "sigs.k8s.io/{/,}**" // Kubernetes official SIG repo
       ],
-      "automerge": true,
-      "automergeType": "pr",
+      // Open as draft so CODEOWNERS are only requested once ciliumbot has
+      // been added and the auto-approve workflow can mark the PR ready.
+      // GitHub auto-merge is also enabled by the auto-approve workflow.
+      "draftPR": true,
       "groupName": "auto-merge-trusted-deps",
       // Replace the list of reviewers with just ciliumbot
       "reviewers": [
@@ -188,7 +273,10 @@
       ],
       "groupName": "all-dependencies",
       "matchPackageNames": [
-        "!quay.io/goswagger/swagger"
+        "!quay.io/goswagger/swagger",
+        // cilium-envoy is excluded because it has its own grouping rule that
+        // combines updates from both dockerfile and regex managers into a single PR.
+        "!quay.io/cilium/cilium-envoy"
       ]
     },
     {
@@ -199,8 +287,10 @@
       ],
       "groupName": "goswagger",
       "separateMajorMinor": true,
-      "automerge": true,
-      "automergeType": "pr",
+      // Open as draft so CODEOWNERS are only requested once ciliumbot has
+      // been added and the auto-approve workflow can mark the PR ready.
+      // GitHub auto-merge is also enabled by the auto-approve workflow.
+      "draftPR": true,
       // Replace the list of reviewers with just ciliumbot
       "reviewers":[
         "ciliumbot",
@@ -220,10 +310,51 @@
         "go.mod",
         "go.sum"
       ],
+      // Separate major upgrades from minor/patch. A major upgrade rewrites
+      // import paths across the tree and can still need manual work when the
+      // new major breaks API, so it must not be able to hold up the minor/patch
+      // updates sharing a branch. With this set, a dependency that has both a
+      // minor and a major available still gets its minor update here (and its
+      // major in the group below).
+      "separateMajorMinor": true,
       "postUpdateOptions": [
         // update source import paths on major updates
         "gomodUpdateImportPaths"
       ],
+      "postUpgradeTasks": {
+        "commands": [
+          "go mod tidy",
+          "go mod vendor"
+        ],
+        "executionMode": "update"
+      },
+      "matchBaseBranches": [
+        "main"
+      ]
+    },
+    {
+      // Go module major upgrades, isolated into their own PR so that a major
+      // needing manual work does not sit on the minor/patch group's branch.
+      "groupName": "all go dependencies main (major)",
+      "groupSlug": "all-go-deps-major-main",
+      "matchFileNames": [
+        "go.mod",
+        "go.sum"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "postUpdateOptions": [
+        // update source import paths on major updates
+        "gomodUpdateImportPaths"
+      ],
+      "postUpgradeTasks": {
+        "commands": [
+          "go mod tidy",
+          "go mod vendor"
+        ],
+        "executionMode": "update"
+      },
       "matchBaseBranches": [
         "main"
       ]
@@ -245,7 +376,7 @@
       ],
     },
     {
-      // Do not allow any updates into stable branches.
+      // Do not allow any updates into stable branches, except for k8s.io patch updates.
       "enabled": false,
       "groupName": "all go dependencies stable",
       "groupSlug": "all-go-deps-stable",
@@ -255,7 +386,58 @@
       ],
       "matchBaseBranches": [
         "!main"
+      ],
+      "matchDepNames": [
+        // Exclude k8s.io and sigs.k8s.io from this rule - they have their own rule below
+        "!/^k8s\\.io/",
+        "!/^sigs\\.k8s\\.io/"
       ]
+    },
+    {
+      // Required so that Renovate creates a separate patch-only PR (staying
+      // within the current minor) even when a newer minor is also available.
+      // Without this, the global separateMinorPatch:false causes Renovate to
+      // produce a single "minor"-typed PR, which is then blocked by the
+      // "k8s major/minor updates disabled" rule and the patch PR never appears.
+      "matchDepNames": [
+        "/^k8s\\.io/",
+        "/^sigs\\.k8s\\.io/"
+      ],
+      "matchBaseBranches": [
+        "!main"
+      ],
+      "separateMajorMinor": true,
+      "separateMinorPatch": true,
+    },
+    {
+      // k8s.io dependencies: allow patch updates on stable branches
+      "enabled": true,
+      "groupName": "k8s.io patch updates stable",
+      "groupSlug": "k8s-patch-stable",
+      "matchFileNames": [
+        "go.mod",
+        "go.sum"
+      ],
+      "matchDepNames": [
+        "/^k8s\\.io/",
+        "/^sigs\\.k8s\\.io/"
+      ],
+      "matchUpdateTypes": [
+        "patch",
+        "digest"
+      ],
+      "matchBaseBranches": [
+        "!main"
+      ],
+      "postUpgradeTasks": {
+        "commands": [
+          "go mod tidy",
+          "go mod vendor",
+          "make GO='contrib/scripts/builder.sh go' generate-k8s-api",
+          "make manifests"
+        ],
+        "executionMode": "update"
+      }
     },
     {
       "enabled": false,
@@ -286,9 +468,17 @@
         // dependency manually.
         "/github.com/onsi/ginkgo/",
         "/github.com/onsi/gomega/*/",
-        // We can't update to helm v4 until https://github.com/helm/helm/issues/31525 is fixed
-        "helm.sh/helm/*"
+        // The version upgrade from 9.0.4 to 9.1.0 breaks our CI
+        "sphinx"
       ]
+    },
+    {
+      // Do not update sigs.k8s.io/network-policy-api to the 0.1.8 tag
+      // as it does not contain apis/v1alpha2
+      "matchDepNames": [
+        "sigs.k8s.io/network-policy-api"
+      ],
+      "allowedVersions": "!/^v?0\\.1\\.8$/"
     },
     {
       // Grouped these together because they require a re-creation of the base
@@ -322,6 +512,11 @@
       "matchFileNames": [
         "install/kubernetes/Makefile.values"
       ],
+      "matchPackageNames": [
+        // cilium-envoy is excluded because it has its own grouping rule that
+        // combines updates from both dockerfile and regex managers into a single PR.
+        "!quay.io/cilium/cilium-envoy"
+      ],
       // This is required as otherwise patch version updates into stable branches
       // are also skipped if a minor version update is available at the same time.
       "separateMinorPatch": true,
@@ -343,24 +538,10 @@
         "!main",
       ],
       "matchDepNames": [
-        // Explicitly allow certgen updates.
+        // Explicitly allow certgen and cilium-envoy updates.
         "!quay.io/cilium/certgen",
+        "!quay.io/cilium/cilium-envoy"
       ]
-    },
-    {
-      "matchFileNames": [
-        "install/kubernetes/Makefile.values"
-      ],
-      "matchPackageNames": [
-        "ghcr.io/spiffe/spire-agent",
-        "ghcr.io/spiffe/spire-server"
-      ],
-      "matchBaseBranches": [
-        "main"
-      ],
-      // We need to manually fix some regressions caused by spire, thus we won't
-      // be upgrading to 1.10 until we fix it.
-      "allowedVersions": "<1.10"
     },
     {
       "matchPackageNames": [
@@ -368,30 +549,66 @@
       ],
       "allowedVersions": "24.04",
       "matchBaseBranches": [
+        "v1.20",
+        "v1.19",
         "v1.18",
-        "v1.17",
         "main"
       ]
     },
-    {
-      "matchPackageNames": [
-        "docker.io/library/ubuntu"
-      ],
-      "allowedVersions": "22.04",
-      "matchBaseBranches": [
-        "v1.16"
-      ]
-    },
+    // Toolchain ceilings for v1.20, which targets Go 1.26. golangci-lint is
+    // compiled with the Go toolchain the branch installs, so raising the branch's
+    // Go version means raising both entries of its bucket.
     {
       "matchPackageNames": [
         "docker.io/library/golang",
         "go"
       ],
-      "allowedVersions": "<1.25",
+      "allowedVersions": "<1.27",
       "matchBaseBranches": [
+        "v1.20"
+      ]
+    },
+    {
+      "matchPackageNames": [
+        "golangci/golangci-lint"
+      ],
+      "allowedVersions": "<2.14",
+      "matchBaseBranches": [
+        "v1.20"
+      ]
+    },
+    // Toolchain ceilings for v1.19 and v1.18, which target Go 1.25.
+    {
+      "matchPackageNames": [
+        "docker.io/library/golang",
+        "go"
+      ],
+      "allowedVersions": "<1.26",
+      "matchBaseBranches": [
+        "v1.19",
         "v1.18",
-        "v1.17",
-        "v1.16"
+      ]
+    },
+    {
+      // v1.18 already sits past this, on a v2.13.1 that only works because the
+      // branch has no .custom-gcl.yaml plugin binary to build.
+      "matchPackageNames": [
+        "golangci/golangci-lint"
+      ],
+      "allowedVersions": "<2.13",
+      "matchBaseBranches": [
+        "v1.19",
+        "v1.18",
+      ]
+    },
+    {
+      "matchPackageNames": [
+        "docker.io/library/alpine"
+      ],
+      "allowedVersions": "<3.24",
+      "matchBaseBranches": [
+        "v1.20",
+        "v1.19"
       ]
     },
     {
@@ -401,16 +618,6 @@
       "allowedVersions": "<3.23",
       "matchBaseBranches": [
         "v1.18"
-      ]
-    },
-    {
-      "matchPackageNames": [
-        "docker.io/library/alpine"
-      ],
-      "allowedVersions": "<3.20",
-      "matchBaseBranches": [
-        "v1.17",
-        "v1.16",
       ]
     },
     {
@@ -470,17 +677,6 @@
       "matchDepNames": [
         "golangci/golangci-lint",
         "golangci/golangci-lint-action"
-      ]
-    },
-    {
-      // Do not allow any updates into stable branches.
-      "enabled": false,
-      "matchDepNames": [
-        "golangci/golangci-lint",
-        "golangci/golangci-lint-action"
-      ],
-      "matchBaseBranches": [
-        "!main",
       ]
     },
     {
@@ -607,39 +803,53 @@
       }
     },
     {
-      // k8s dependencies will be updated manually along with tests
+      "matchFileNames": [
+        "Documentation/requirements-min/requirements.txt"
+      ],
+      "pinDigests": false,
+      "postUpgradeTasks": {
+        "commands": [
+          "make -C Documentation update-requirements"
+        ],
+        "fileFilters": [
+          "Documentation/requirements.txt"
+        ],
+        "executionMode": "update"
+      }
+    },
+    {
+      // Only allow minor and patch updates for Documentation dependencies, no major updates
+      "enabled": false,
+      "matchFileNames": [
+        "Documentation/requirements-min/requirements.txt"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ]
+    },
+    {
+      // k8s major/minor updates are disabled on all branches.
+      // On main, they will be updated manually along with tests.
+      // On stable branches, patch updates are allowed via the "k8s.io patch updates stable" rule.
       "enabled": false,
       "matchUpdateTypes": [
         "major",
         "minor"
       ],
       "matchDepNames": [
-        "/k8s.io/*/",
-        "/sigs.k8s.io/*/"
+        "/^k8s\\.io/",
+        "/^sigs\\.k8s\\.io/"
       ]
-    },
-    {
-      // Allow k8s.io patch updates on all branches
-      // (overrides the "all go dependencies stable" rule)
-      "groupName": "auto-merge-trusted-deps",
-      "matchDepNames": [
-        "/k8s.io/*/",
-        "/sigs.k8s.io/*/"
-      ],
-      "matchUpdateTypes": [
-        "patch"
-      ],
-      "enabled": true
     },
     {
       "matchDepNames": [
         // k8s dependencies will be updated manually along with tests
-        "/k8s.io/*/",
-        "/sigs.k8s.io/*/"
+        "/^k8s\\.io/",
+        "/^sigs\\.k8s\\.io/"
       ],
       "postUpgradeTasks": {
         "commands": [
-          "make generate-k8s-api",
+          "make GO='contrib/scripts/builder.sh go' generate-k8s-api",
           "make manifests"
         ],
         "executionMode": "update"
@@ -664,11 +874,22 @@
       "matchPackageNames": [
         "protocolbuffers/protobuf",
         "protocolbuffers/protobuf-go",
-        "quay.io/goswagger/swagger"
       ],
       "postUpgradeTasks": {
         "commands": [
           "make GO='contrib/scripts/builder.sh go' generate-apis"
+        ],
+        "executionMode": "update"
+      }
+    },
+    {
+      "matchPackageNames": [
+        "quay.io/goswagger/swagger"
+      ],
+      "postUpgradeTasks": {
+        "commands": [
+          "make GO='contrib/scripts/builder.sh go' generate-apis",
+          "make GO='contrib/scripts/builder.sh go' generate-k8s-api"
         ],
         "executionMode": "update"
       }
@@ -682,7 +903,8 @@
         "quay.io/cilium/startup-script",
         "quay.io/cilium/image-tester",
       ],
-      "versioning": "regex:^(?<major>\\d+)-[a-f0-9]{7}$"
+      "versioning": "regex:^(?<major>\\d+)-[a-f0-9]{7}$",
+      "maxMajorIncrement": 0
     },
     {
       // Images from the image-tools repository that have a semantic + timestamp-based versioning scheme
@@ -706,37 +928,57 @@
       "versioning": "regex:^(?<major>\\d+)\\.(?<minor>\\d+)-(?<patch>\\d+)-[a-f0-9]{7}$",
     },
     {
+      // echo-advanced uses a date + semver versioning scheme: v20251204-v1.4.1
+      "matchDepNames": [
+        "gcr.io/k8s-staging-gateway-api/echo-advanced"
+      ],
+      "versioning": "regex:^v(?<major>\\d+)-v(?<minor>\\d+)\\.(?<patch>\\d+)\\.(?<build>\\d+)$"
+    },
+    {
       // Avoid updating minor or major version for github.com/envoyproxy/go-control-plane/envoy
       // as we need to update cilium-envoy accordingly.
       "matchPackageNames": [
         "github.com/envoyproxy/go-control-plane/envoy",
+        "github.com/envoyproxy/go-control-plane",
       ],
       "matchUpdateTypes": [
         "patch",
       ]
     },
     {
+      // cilium-envoy is referenced in both images/cilium/Dockerfile and
+      // install/kubernetes/Makefile.values. Without explicit grouping,
+      // Renovate creates separate PRs for each manager. The groupSlug ensures
+      // both updates use the same branch name and get combined into a single
+      // PR.
       "groupName": "cilium-envoy",
+      "groupSlug": "cilium-envoy",
       "matchDepNames": [
         "quay.io/cilium/cilium-envoy"
       ],
       "versioning": "regex:v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-(?<build>\\d+).*$",
-      "allowedVersions": "/^v1\\.34\\.([0-9]+)-([0-9]+)-.*$/",
+      "allowedVersions": "/^v1\\.38\\.([0-9]+)-([0-9]+)-.*$/",
       "matchBaseBranches": [
-        "v1.18",
-        "v1.17",
-        "v1.16"
+        "main",
       ]
     },
     {
+      // cilium-envoy is referenced in both images/cilium/Dockerfile and
+      // install/kubernetes/Makefile.values. Without explicit grouping,
+      // Renovate creates separate PRs for each manager. The groupSlug ensures
+      // both updates use the same branch name and get combined into a single
+      // PR.
       "groupName": "cilium-envoy",
+      "groupSlug": "cilium-envoy",
       "matchDepNames": [
         "quay.io/cilium/cilium-envoy"
       ],
       "versioning": "regex:v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-(?<build>\\d+).*$",
-      "allowedVersions": "/^v1\\.35\\.([0-9]+)-([0-9]+)-.*$/",
+      "allowedVersions": "/^v1\\.37\\.([0-9]+)-([0-9]+)-.*$/",
       "matchBaseBranches": [
-        "main"
+        "v1.20",
+        "v1.19",
+        "v1.18"
       ]
     },
     {
@@ -827,21 +1069,6 @@
         "!main",
       ]
     },
-    {
-      // Temporarily disable all etcd updates on v1.16 and v1.17, because newer
-      // versions are compiled with go 1.24.8 or later, which includes a breaking
-      // change in IP addresses parsing affecting the clustermesh-apiserver usage.
-      // See cilium/cilium#42818 for more details and the fix, which is intended
-      // to be backported once we built up sufficient confidence.
-      "enabled": false,
-      "matchDepNames": [
-        "gcr.io/etcd-development/etcd"
-      ],
-      "matchBaseBranches": [
-        "v1.16",
-        "v1.17",
-      ]
-    }
   ],
   "kubernetes": {
     "managerFilePatterns": [
@@ -901,6 +1128,7 @@
         "# renovate: datasource=(?<datasource>.*?) depName=(?<depName>.*?)\\s+.+kernel: '(?<currentValue>.*)'",
         "# renovate: datasource=(?<datasource>.*?) depName=(?<depName>.*)\\s+.+kernel: \"(?<currentValue>.*)\"",
         "# renovate: datasource=(?<datasource>.*?) depName=(?<depName>.*)\\s+.+image-version: \"(?<currentValue>.*)\"",
+        "# renovate: datasource=(?<datasource>.*?) depName=(?<depName>.*)\\s+.+lvhImage: \"(?<currentValue>.*)\"",
         "# renovate: datasource=(?<datasource>.*?)\\s+.+kube-image: \"(?<depName>.*):(?<currentValue>.*)@(?<currentDigest>sha256:[a-f0-9]+)\"",
         "# renovate: datasource=(?<datasource>.*?) depName=(?<depName>.*?) branch=(?<currentValue>.*?)\\s+.+_ref: (?<currentDigest>.*)"
       ]
@@ -964,7 +1192,7 @@
       // similar to the examples shown here:
       //   https://docs.renovatebot.com/modules/manager/regex/#advanced-capture
       "matchStrings": [
-        "# renovate: datasource=(?<datasource>.*?)\\s+.+_REPO:=(?<depName>.*?)\\s+.+_VERSION:=(?<currentValue>.*)\\s+.+_DIGEST:=(?<currentDigest>sha256:[a-f0-9]+)"
+        "# renovate: datasource=(?<datasource>.*?)\\s+.+_REPO[:?]=(?<depName>.*?)\\s+.+_VERSION[:?]=(?<currentValue>.*)\\s+.+_DIGEST[:?]=(?<currentDigest>sha256:[a-f0-9]+)"
       ]
     },
     {

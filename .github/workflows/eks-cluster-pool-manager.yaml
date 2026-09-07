@@ -22,7 +22,7 @@ permissions:
 
 env:
   # renovate: datasource=github-releases depName=eksctl-io/eksctl
-  eksctl_version: v0.221.0
+  eksctl_version: v0.230.0
 
 jobs:
   generate-cleanup-matrix:
@@ -34,7 +34,7 @@ jobs:
       empty: ${{ steps.set-matrix.outputs.empty }}
     steps:
       - name: Checkout context ref (trusted)
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -62,36 +62,39 @@ jobs:
           echo "empty=false" >> $GITHUB_OUTPUT
 
   cleanup-old-clusters:
+    permissions:
+      # To be able to trigger eks-cluster-delete.yaml workflow
+      actions: write
+      # To be able to access the repository with actions/checkout
+      contents: read
+      # To be able to request the JWT from GitHub's OIDC provider
+      id-token: write
     name: Cleanup clusters older than 6 hours
     runs-on: ubuntu-24.04
     needs: generate-cleanup-matrix
     if: ${{ needs.generate-cleanup-matrix.outputs.empty == 'false' }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       matrix: ${{ fromJson(needs.generate-cleanup-matrix.outputs.matrix) }}
       fail-fast: false
     steps:
       - name: Checkout code
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Install eksctl CLI
-        run: |
-          curl -LO "https://github.com/eksctl-io/eksctl/releases/download/${{ env.eksctl_version }}/eksctl_$(uname -s)_amd64.tar.gz"
-          sudo tar -xzvf "eksctl_$(uname -s)_amd64.tar.gz" -C /usr/bin
-          rm "eksctl_$(uname -s)_amd64.tar.gz"
-
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
         with:
           role-to-assume: ${{ secrets.AWS_PR_ASSUME_ROLE }}
           aws-region: ${{ matrix.region }}
+
 
       - name: List and delete old clusters
         env:
           REGION: ${{ matrix.region }}
           MAX_AGE_HOURS: 6
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -e
 
@@ -119,9 +122,16 @@ jobs:
             fi
           done
 
-          # List all EKS clusters with the usage tag and fetch all needed information at once
-          CLUSTERS_JSON=$(aws eks list-clusters --region ${REGION} --query clusters --output text | \
-            xargs -I {} aws eks describe-cluster --region ${REGION} --name {} --query 'cluster.{name:name, tags:tags, createdAt:createdAt}' --output json 2>/dev/null || echo "[]")
+          # List all EKS clusters and fetch all needed information at once
+          CLUSTERS_JSON=$(aws eks list-clusters --region ${REGION} --output json | jq -r '.clusters[]' | \
+            xargs -I {} aws eks describe-cluster --region ${REGION} --name {} \
+              --query 'cluster.{name:name, tags:tags, createdAt:createdAt}' --output json | \
+            jq -s '.')
+
+          if [ -z "${CLUSTERS_JSON}" ] || [ "${CLUSTERS_JSON}" = "[]" ]; then
+            echo "No EKS clusters found in region ${REGION}"
+            exit 0
+          fi
 
           # Filter clusters by usage tag and extract needed information
           FILTERED_CLUSTERS=$(echo "${CLUSTERS_JSON}" | jq -r --arg tag_value "${{ github.repository_owner }}-${{ github.event.repository.name }}" \
@@ -156,7 +166,7 @@ jobs:
               S3_BUCKET="${{ format('{0}-{1}-eks-kubeconfig-pool', github.repository_owner, github.event.repository.name) }}"
               if [ -n "${S3_BUCKET}" ]; then
                 echo "Checking if kubeconfig for cluster ${cluster} exists in S3 bucket ${S3_BUCKET}"
-                KUBECONFIG_EXISTS=$(aws s3 ls "s3://${S3_BUCKET}/kubeconfig-pool/" --recursive --region ${REGION} | grep -c "${cluster}-" || echo "0")
+                KUBECONFIG_EXISTS=$(aws s3 ls "s3://${S3_BUCKET}/kubeconfig-pool/" --recursive --region ${REGION} | grep -c "${cluster}-" || true)
 
                 if [ "${KUBECONFIG_EXISTS}" -eq "0" ]; then
                   echo "Kubeconfig for cluster ${cluster} not found in S3 pool - cluster is being used, skipping deletion"
@@ -170,12 +180,64 @@ jobs:
                 aws s3 rm "s3://${S3_BUCKET}/kubeconfig-pool/" --recursive --exclude "*" --include "${cluster}-*" --region ${REGION} || true
               fi
 
-              # Delete the cluster
-              eksctl delete cluster --name ${cluster} --region ${REGION} --wait || {
-                echo "Failed to delete cluster ${cluster}, continuing..."
+              # Trigger the eks-cluster-delete workflow to delete the cluster
+              echo "Triggering eks-cluster-delete workflow for cluster ${cluster} in region ${REGION}"
+              gh workflow run eks-cluster-delete.yaml \
+                -f cluster_name="${cluster}" \
+                -f region="${REGION}" || {
+                echo "Failed to trigger delete workflow for cluster ${cluster}, continuing..."
               }
             else
               echo "Cluster ${cluster} is not old enough to delete (age: ${CLUSTER_AGE_HOURS} hours, threshold: ${MAX_AGE_HOURS} hours)"
+            fi
+          done
+
+  cleanup-unassociated-eips:
+    name: Cleanup unassociated EIPs
+    runs-on: ubuntu-24.04
+    needs: [generate-cleanup-matrix, cleanup-old-clusters]
+    if: ${{ always() && needs.generate-cleanup-matrix.outputs.empty == 'false' }}
+    timeout-minutes: 20
+    strategy:
+      matrix: ${{ fromJson(needs.generate-cleanup-matrix.outputs.matrix) }}
+      fail-fast: false
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ secrets.AWS_PR_ASSUME_ROLE }}
+          aws-region: ${{ matrix.region }}
+
+      - name: Find and release unassociated EIPs
+        env:
+          REGION: ${{ matrix.region }}
+        run: |
+          set -e
+
+          echo "Checking for unassociated EIPs in region: ${REGION}"
+
+          # Find all unassociated EIPs with names starting with "eksctl-cilium-pool"
+          EIPS_JSON=$(aws ec2 describe-addresses \
+            --region "${REGION}" \
+            --query "Addresses[?AssociationId==\`null\`].[AllocationId,Tags[?Key==\`Name\`].Value|[0]]" \
+            --output json | jq -r '.[] | select(.[1] != null and (.[1] | startswith("eksctl-cilium-pool"))) | @json')
+
+          if [ -z "${EIPS_JSON}" ]; then
+            echo "No unassociated EIPs found with 'eksctl-cilium-pool' prefix in region ${REGION}"
+            exit 0
+          fi
+
+          echo "${EIPS_JSON}" | while read -r eip_info; do
+            if [ -n "${eip_info}" ]; then
+              ALLOCATION_ID=$(echo "${eip_info}" | jq -r '.[0]')
+
+              aws ec2 release-address \
+                --region "${REGION}" \
+                --allocation-id "${ALLOCATION_ID}" || {
+                echo "Failed to release EIP ${ALLOCATION_ID}, continuing..."
+              }
+
+              echo "Successfully released EIP: ${ALLOCATION_ID}"
             fi
           done
 
@@ -187,7 +249,7 @@ jobs:
       empty: ${{ steps.set-matrix.outputs.empty }}
     steps:
       - name: Checkout context ref (trusted)
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -209,19 +271,36 @@ jobs:
           jq '{ "include": [ .include[] | select(.default) ] }' eks.json > /tmp/eks-defaults.json
           jq '{ "include": [ .include[] | select(.default) ] }' aws-cni.json > /tmp/aws-cni-defaults.json
 
-          # Expand matrix with different addon configurations
+          # Expand matrix with different addon configurations.
+          #
+          # The "zones" field MUST match what the conformance-eks.yaml /
+          # conformance-aws-cni.yaml consumers compute from the region, because
+          # setup-eks-cluster hashes "<addons> <zones>" into the pool key. If
+          # the pool clusters are created with a different zone set than the PR
+          # jobs search for, the pool key never matches, every PR leg creates a
+          # brand-new (NAT-gateway-consuming) cluster instead of claiming a
+          # pooled one, and the region eventually hits its NAT gateway quota.
+          # Consumer derivation (keep in sync): ZONE_1 = <region>a for us-west-1
+          # (us-west-1b rejects subnets), else <region>b; ZONE_2 = <region>c.
           cat > /tmp/expand-addons.jq << 'EOF'
+          def zones: (if .region == "us-west-1" then .region + "a" else .region + "b" end) + " " + .region + "c";
           {
             "include": [
               # all-addons configuration from aws-cni versions
               (.aws_cni.include[] | . + {
                 "addons": "coredns kube-proxy vpc-cni",
-                "addons_name": "all-addons"
+                "addons_name": "all-addons",
+                "zones": (. | zones),
+                "az_cluster": (if .region == "us-west-1" then .region + "a" else .region + "b" end),
+                "az_external": (.region + "c")
               }),
               # coredns-kubeproxy configuration from eks versions
               (.eks.include[] | . + {
                 "addons": "coredns kube-proxy",
-                "addons_name": "coredns-kubeproxy"
+                "addons_name": "coredns-kubeproxy",
+                "zones": (. | zones),
+                "az_cluster": (if .region == "us-west-1" then .region + "a" else .region + "b" end),
+                "az_external": (.region + "c")
               })
             ]
           }
@@ -247,7 +326,7 @@ jobs:
       fail-fast: false
     steps:
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
         with:
           role-to-assume: ${{ secrets.AWS_PR_ASSUME_ROLE }}
           aws-region: ${{ matrix.region }}
@@ -306,7 +385,7 @@ jobs:
       id-token: write
     name: Create EKS clusters for pool
     runs-on: ubuntu-24.04
-    needs: [cleanup-old-clusters, generate-create-matrix, ensure-s3-bucket]
+    needs: [cleanup-old-clusters, cleanup-unassociated-eips, generate-create-matrix, ensure-s3-bucket]
     if: ${{ always() && needs.generate-create-matrix.outputs.empty == 'false' }}
     timeout-minutes: 30
     strategy:
@@ -314,18 +393,18 @@ jobs:
       fail-fast: false
     steps:
       - name: Checkout code
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install eksctl CLI
         run: |
-          curl -LO "https://github.com/eksctl-io/eksctl/releases/download/${{ env.eksctl_version }}/eksctl_$(uname -s)_amd64.tar.gz"
+          curl -fL --retry 5 --retry-all-errors --retry-delay 3 -O "https://github.com/eksctl-io/eksctl/releases/download/${{ env.eksctl_version }}/eksctl_$(uname -s)_amd64.tar.gz"
           sudo tar -xzvf "eksctl_$(uname -s)_amd64.tar.gz" -C /usr/bin
           rm "eksctl_$(uname -s)_amd64.tar.gz"
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
         with:
           role-to-assume: ${{ secrets.AWS_PR_ASSUME_ROLE }}
           aws-region: ${{ matrix.region }}
@@ -391,7 +470,9 @@ jobs:
         if: ${{ steps.check-pool.outputs.should_create == 'true' }}
         run: |
           TIMESTAMP=$(date +%s)
-          CLUSTER_NAME="cilium-pool-${{ matrix.version }}-${{ matrix.addons_name }}-${TIMESTAMP}"
+          # Add random suffix to prevent race conditions when multiple jobs run in parallel
+          RANDOM_SUFFIX=$(head -c 4 /dev/urandom | xxd -p)
+          CLUSTER_NAME="cilium-pool-${{ matrix.version }}-${{ matrix.addons_name }}-${TIMESTAMP}-${RANDOM_SUFFIX}"
           # Sanitize cluster name (replace dots with dashes)
           CLUSTER_NAME="${CLUSTER_NAME//./-}"
           echo "cluster_name=${CLUSTER_NAME}" >> $GITHUB_OUTPUT
@@ -446,6 +527,9 @@ jobs:
           owner: "eks-cluster-pool-manager"
           version: ${{ matrix.version }}
           spot: false
+          nodes_without_cilium: 2
+          az_cluster: ${{ matrix.az_cluster }}
+          az_external: ${{ matrix.az_external }}
 
       - name: Upload kubeconfig to S3 pool
         if: ${{ steps.check-pool.outputs.should_create == 'true' }}
@@ -488,7 +572,7 @@ jobs:
           echo "Removing lock file: s3://${S3_BUCKET}/${LOCK_KEY}"
           aws s3 rm "s3://${S3_BUCKET}/${LOCK_KEY}" --region ${REGION} || true
 
-      - name: Cleanup lock file on failure
+      - name: Cleanup on failure
         if: ${{ failure() && steps.check-pool.outputs.should_create == 'true' }}
         env:
           S3_BUCKET: ${{ steps.check-pool.outputs.s3_bucket }}
@@ -497,21 +581,75 @@ jobs:
           TIMESTAMP: ${{ steps.cluster-name.outputs.timestamp }}
           REGION: ${{ matrix.region }}
         run: |
+          echo "Cleaning up after failure for cluster: ${CLUSTER_NAME}"
+
+          # Remove lock file
           LOCK_KEY="locks/${KUBECONFIG_PATH_SAFE}/${CLUSTER_NAME}-${TIMESTAMP}.lock"
-          echo "Removing lock file after failure: s3://${S3_BUCKET}/${LOCK_KEY}"
+          echo "Removing lock file: s3://${S3_BUCKET}/${LOCK_KEY}"
           aws s3 rm "s3://${S3_BUCKET}/${LOCK_KEY}" --region ${REGION} || true
+
+          # Delete any CloudFormation stacks created for this cluster
+          echo "Checking for CloudFormation stacks to clean up..."
+          for stack in $(aws cloudformation list-stacks --region ${REGION} \
+            --stack-status-filter CREATE_COMPLETE CREATE_IN_PROGRESS CREATE_FAILED ROLLBACK_COMPLETE ROLLBACK_IN_PROGRESS \
+            --query "StackSummaries[?starts_with(StackName, 'eksctl-${CLUSTER_NAME}')].StackName" \
+            --output text 2>/dev/null || echo ""); do
+            if [ -n "${stack}" ]; then
+              echo "Deleting CloudFormation stack: ${stack}"
+              aws cloudformation delete-stack --stack-name "${stack}" --region ${REGION} || true
+            fi
+          done
+
+          # Clean up orphaned IAM roles for this cluster
+          echo "Checking for orphaned IAM roles..."
+          for role in $(aws iam list-roles --query "Roles[?starts_with(RoleName, 'eksctl-${CLUSTER_NAME}')].RoleName" --output text 2>/dev/null || echo ""); do
+            if [ -n "${role}" ]; then
+              echo "Cleaning up IAM role: ${role}"
+
+              # Detach managed policies
+              for policy in $(aws iam list-attached-role-policies --role-name "${role}" --query "AttachedPolicies[].PolicyArn" --output text 2>/dev/null || echo ""); do
+                if [ -n "${policy}" ]; then
+                  echo "  Detaching policy: ${policy}"
+                  aws iam detach-role-policy --role-name "${role}" --policy-arn "${policy}" || true
+                fi
+              done
+
+              # Delete inline policies
+              for policy in $(aws iam list-role-policies --role-name "${role}" --query "PolicyNames[]" --output text 2>/dev/null || echo ""); do
+                if [ -n "${policy}" ]; then
+                  echo "  Deleting inline policy: ${policy}"
+                  aws iam delete-role-policy --role-name "${role}" --policy-name "${policy}" || true
+                fi
+              done
+
+              # Remove from instance profiles
+              for profile in $(aws iam list-instance-profiles-for-role --role-name "${role}" --query "InstanceProfiles[].InstanceProfileName" --output text 2>/dev/null || echo ""); do
+                if [ -n "${profile}" ]; then
+                  echo "  Removing from instance profile: ${profile}"
+                  aws iam remove-role-from-instance-profile --role-name "${role}" --instance-profile-name "${profile}" || true
+                  aws iam delete-instance-profile --instance-profile-name "${profile}" || true
+                fi
+              done
+
+              # Delete the role
+              echo "  Deleting role: ${role}"
+              aws iam delete-role --role-name "${role}" || true
+            fi
+          done
+
+          echo "Cleanup complete"
 
   report-status:
     name: Report pool status
     runs-on: ubuntu-24.04
-    needs: [generate-cleanup-matrix, cleanup-old-clusters, create-clusters]
+    needs: [generate-cleanup-matrix, cleanup-old-clusters, cleanup-unassociated-eips, create-clusters]
     if: ${{ always() && needs.generate-cleanup-matrix.outputs.empty == 'false' }}
     timeout-minutes: 10
     strategy:
       matrix: ${{ fromJson(needs.generate-cleanup-matrix.outputs.matrix) }}
     steps:
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
         with:
           role-to-assume: ${{ secrets.AWS_PR_ASSUME_ROLE }}
           aws-region: ${{ matrix.region }}
@@ -542,8 +680,10 @@ jobs:
 
           # List all running clusters with our usage tag
           echo "Running EKS clusters:"
-          CLUSTERS_JSON=$(aws eks list-clusters --region ${REGION} --query clusters --output text | \
-            xargs -I {} aws eks describe-cluster --region ${REGION} --name {} --query 'cluster.{name:name, tags:tags, createdAt:createdAt}' --output json 2>/dev/null || echo "[]")
+          CLUSTERS_JSON=$(aws eks list-clusters --region ${REGION} --output json | jq -r '.clusters[]' | \
+            xargs -I {} aws eks describe-cluster --region ${REGION} --name {} \
+              --query 'cluster.{name:name, tags:tags, createdAt:createdAt}' --output json | \
+            jq -s '.')
 
           # Filter and display clusters by usage tag
           FILTERED_CLUSTERS=$(echo "${CLUSTERS_JSON}" | jq -r --arg tag_value "${{ github.repository_owner }}-${{ github.event.repository.name }}" \

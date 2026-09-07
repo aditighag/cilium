@@ -16,10 +16,12 @@ and observing BGP state on Cilium (`bgp/*`).
 For creating and observing GoBGP instances that can be used to peer with Cilium, use the `gobgp/*` commands:
 
 ```
-gobgp/add-peer [-s] [--server-asn=uint32] ip remote-asn
-	Add a new peer the GoBGP server instance
-gobgp/add-server [-r] [--router-id=string] asn ip port
-	Add a new GoBGP server instance
+gobgp/add-server name config-file
+	Add a new GoBGP server instance from a native GoBGP configuration file
+gobgp/delete-server name
+	Delete an existing GoBGP server instance
+gobgp/reload-server name config-file
+	Reload the configuration of a running GoBGP server instance
 gobgp/peers [-os] [--out=string] [--server-asn=uint32]
 	List peers on the GoBGP server
 gobgp/routes [-os] [--out=string] [--server-asn=uint32] [afi] [safi]
@@ -27,6 +29,22 @@ gobgp/routes [-os] [--out=string] [--server-asn=uint32] [afi] [safi]
 gobgp/wait-state [-st] [--server-asn=uint32] [--timeout=duration] peer state
 	Wait until the GoBGP peer is in the specified state
 ```
+
+`gobgp/add-server` and `gobgp/reload-server` take a `config-file` argument: a
+path (resolved relative to the test's working directory, typically an embedded
+`-- name.toml --` txtar section) to a GoBGP configuration file in the same
+schema `gobgpd` itself reads (TOML is used in this directory's tests, matching
+upstream GoBGP's own documentation, but YAML/JSON are also supported and
+auto-detected from the file extension).
+
+`gobgp/add-server` applies the whole file the same way `gobgpd` applies its
+config file at startup (via GoBGP's own `InitialConfig`); `gobgp/reload-server`
+applies a new file to an already-running server the same way `gobgpd` reloads on
+`SIGHUP` (via GoBGP's own `UpdateConfig`), diffing it against the last-applied
+configuration and adding, removing or updating peers/policies to match. Global
+parameters cannot be changed by `reload-server` (GoBGP cannot rebind those on a
+running server) - use `gobgp/delete-server` followed by `gobgp/add-server`
+instead.
 
 **Important**: Each test should use unique peering IPs, as the tests are executed in parallel.
 These should be passed to the test infra via the `test-peering-ips` arg in the shebang at the beginning of the test,
@@ -43,11 +61,11 @@ message about duplicate IPs across the tests.
 To observe / assert the state Cilium BGP Control Plane, use the `bgp/*` commands:
 
 ```
-bgp/peers [-o] [--out=string]
+bgp/peers [-fo] [--format=string] [--no-uptime] [--out=string] 
 	List BGP peers on Cilium
-bgp/route-policies [-or] [--out=string] [--router-asn=uint32]
+bgp/route-policies [-io] [--instance=string] [--out=string] 
 	List BGP route policies on Cilium
-bgp/routes [-opr] [--out=string] [--peer=string] [--router-asn=uint32] [available|advertised] [afi] [safi]
+bgp/routes [--no-age] <table type> <afi> <safi>
 	List BGP routes on Cilium
 ```
 

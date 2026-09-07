@@ -8,7 +8,7 @@
   # L7 testing: Basic VXLAN + host firewall - moderate interaction, test on schedule only
   test-l7: 'false'
 - name: 'kube-proxy-2'
-  kernel: '5.10'
+  kernel: '6.18'
   kube-proxy: 'iptables'
   kpr: 'false'
   tunnel: 'disabled'
@@ -17,7 +17,7 @@
   # L7 testing: Disabled tunnel + host firewall - moderate interaction, test on schedule only
   test-l7: 'false'
 - name: 'kube-proxy-3'
-  kernel: '5.10'
+  kernel: '6.18'
   kube-proxy: 'iptables'
   kpr: 'false'
   tunnel: 'disabled'
@@ -31,10 +31,9 @@
   kpr: 'false'
   tunnel: 'geneve'
   endpoint-routes: 'true'
-  misc: 'socketLB.enabled=false,nodePort.enabled=true,bpf.masquerade=true'
+  misc: 'socketLB.enabled=false,bpf.masquerade=true'
   local-redirect-policy: 'true'
   node-local-dns: 'true'
-  skip-include-conn-disrupt-test-ns-traffic: 'true'
   # L7 testing: Node local DNS requires DNS proxy testing
   test-l7: 'true'
 - name: 'kube-proxy-5'
@@ -43,7 +42,6 @@
   kpr: 'false'
   tunnel: 'disabled'
   encryption: 'wireguard'
-  encryption-node: 'false'
   encryption-strict-mode: 'true'
   misc: 'socketLB.enabled=true'
   local-redirect-policy: 'true'
@@ -68,6 +66,5 @@
   tunnel: 'vxlan'
   underlay: 'ipv6'
   encryption: 'wireguard'
-  skip-upgrade: 'true'
   # L7 testing: IPv6-only configuration - covered by other wireguard tests, can skip
   test-l7: 'false'

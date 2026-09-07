@@ -12,15 +12,12 @@
 /* Enable code paths under test*/
 #define ENABLE_IPV4
 
-/* Skip ingress policy checks */
-#define USE_BPF_PROG_FOR_INGRESS_POLICY
-
 #include "lib/bpf_lxc.h"
 
 /* Set the LXC source address to be the address of pod one */
 ASSIGN_CONFIG(union v4addr, endpoint_ipv4, { .be32 = v4_pod_one})
-ASSIGN_CONFIG(union v4addr, service_loopback_ipv4, { .be32 = v4_svc_loopback })
 ASSIGN_CONFIG(bool, enable_no_service_endpoints_routable, false)
+ASSIGN_CONFIG(bool, enable_endpoint_routes, true)
 
 #include "lib/endpoint.h"
 #include "lib/ipcache.h"
@@ -66,7 +63,7 @@ static __always_inline int build_packet(struct __ctx_buff *ctx,
 }
 
 /* Test that a packet for a SVC without any backend does not get dropped (enable_no_endpoints_routable=false). */
-SETUP("tc", "tc_lb_no_backend_nonroutable")
+SETUP(PROG_TYPE, "tc_lb_no_backend_nonroutable")
 int tc_lb_no_backend_nonroutable_setup(struct __ctx_buff *ctx)
 {
 	int ret;
@@ -84,7 +81,7 @@ int tc_lb_no_backend_nonroutable_setup(struct __ctx_buff *ctx)
 	return pod_send_packet(ctx);
 }
 
-CHECK("tc", "tc_lb_no_backend_nonroutable")
+CHECK(PROG_TYPE, "tc_lb_no_backend_nonroutable")
 int tc_lb_no_backend_nonroutable_check(const struct __ctx_buff *ctx)
 {
 	__u32 expected_status = TC_ACT_OK;
@@ -109,7 +106,7 @@ int tc_lb_no_backend_nonroutable_check(const struct __ctx_buff *ctx)
 }
 
 /* Test that a packet for a SVC without any backend with eTP=Local gets dropped. */
-SETUP("tc", "tc_lb_no_backend_nonroutable_etp")
+SETUP(PROG_TYPE, "tc_lb_no_backend_nonroutable_etp")
 int tc_lb_no_backend_nonroutable_etp_setup(struct __ctx_buff *ctx)
 {
 	int ret;
@@ -127,7 +124,7 @@ int tc_lb_no_backend_nonroutable_etp_setup(struct __ctx_buff *ctx)
 	return pod_send_packet(ctx);
 }
 
-CHECK("tc", "tc_lb_no_backend_nonroutable_etp")
+CHECK(PROG_TYPE, "tc_lb_no_backend_nonroutable_etp")
 int tc_lb_no_backend_nonroutable_etp_check(const struct __ctx_buff *ctx)
 {
 	__u32 expected_status = TC_ACT_SHOT;

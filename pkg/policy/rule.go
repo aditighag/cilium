@@ -7,10 +7,9 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/cilium/proxy/pkg/policy/api/kafka"
-
 	"github.com/cilium/cilium/pkg/identity"
 	ipcachetypes "github.com/cilium/cilium/pkg/ipcache/types"
+	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/policy/api"
 	"github.com/cilium/cilium/pkg/policy/types"
 )
@@ -45,6 +44,16 @@ func (r *rule) IsPeerSelector() bool {
 	return false
 }
 
+func (r *rule) GetRuleLabels(cs CachedSelector) labels.LabelArrayList {
+	if cs == r.subjectSelector {
+		ro := r.origin()
+		if ro != NilRuleOrigin {
+			return ro.GetLabelArrayList()
+		}
+	}
+	return nil
+}
+
 func (r *rule) String() string {
 	return r.Subject.Key()
 }
@@ -64,33 +73,15 @@ func (epd *PerSelectorPolicy) appendL7WildcardRule(policyContext PolicyContext) 
 		} else {
 			policyContext.PolicyTrace("   Merging HTTP wildcard rule, equal rule already exists: %+v\n", rule)
 		}
-	case len(epd.L7Rules.Kafka) > 0:
-		rule := kafka.PortRule{}
-		rule.Sanitize()
-		if !rule.Exists(epd.L7Rules.Kafka) {
-			policyContext.PolicyTrace("   Merging Kafka wildcard rule: %+v\n", rule)
-			epd.L7Rules.Kafka = append(epd.L7Rules.Kafka, rule)
-		} else {
-			policyContext.PolicyTrace("   Merging Kafka wildcard rule, equal rule already exists: %+v\n", rule)
-		}
 	case len(epd.L7Rules.DNS) > 0:
 		// Wildcarding at L7 for DNS is specified via allowing all via
 		// MatchPattern!
 		rule := api.PortRuleDNS{MatchPattern: "*"}
-		rule.Sanitize()
 		if !rule.Exists(epd.L7Rules) {
 			policyContext.PolicyTrace("   Merging DNS wildcard rule: %+v\n", rule)
 			epd.L7Rules.DNS = append(epd.L7Rules.DNS, rule)
 		} else {
 			policyContext.PolicyTrace("   Merging DNS wildcard rule, equal rule already exists: %+v\n", rule)
-		}
-	case epd.L7Rules.L7Proto != "" && len(epd.L7Rules.L7) > 0:
-		rule := api.PortRuleL7{}
-		if !rule.Exists(epd.L7Rules) {
-			policyContext.PolicyTrace("   Merging L7 wildcard rule: %+v\n", rule)
-			epd.L7Rules.L7 = append(epd.L7Rules.L7, rule)
-		} else {
-			policyContext.PolicyTrace("   Merging L7 wildcard rule, equal rule already exists: %+v\n", rule)
 		}
 	}
 	return epd.L7Rules
@@ -155,15 +146,43 @@ func (l7Rules *PerSelectorPolicy) mergeRedirect(newL7Rules *PerSelectorPolicy) e
 func (existingFilter *L4Filter) mergePortProto(policyCtx PolicyContext, filterToMerge *L4Filter) (err error) {
 	selectorCache := policyCtx.GetSelectorCache()
 
-	for cs, newL7Rules := range filterToMerge.PerSelectorPolicies {
-		newPriority := newL7Rules.GetPriority()
+	// only filters on the same Tier may be merged
+	if existingFilter.Tier != filterToMerge.Tier {
+		return fmt.Errorf("cannot merge filters with different tiers (%d != %d)",
+			existingFilter.Tier, filterToMerge.Tier)
+	}
+
+	// Iterate through each PerSelectorPolicy for each existing CachedSelector.
+	// Note that 'newPolicy' can be 'nil' for a zero-valued PerSelectorPolicy
+	// (== allow of highest precedence without any L7 rules nor TLS contexts).
+	for cs, newPolicy := range filterToMerge.PerSelectorPolicies {
+		newRuleOrigin := filterToMerge.RuleOrigin[cs]
+		newPriority := newPolicy.GetPriority()
 
 		// 'cs' will be merged or moved (see below), either way it needs
-		// to be removed from the map it is in now.
+		// to be removed from the maps it is in now.
 		delete(filterToMerge.PerSelectorPolicies, cs)
+		delete(filterToMerge.RuleOrigin, cs)
 
-		if l7Rules, ok := existingFilter.PerSelectorPolicies[cs]; ok {
-			// existing filter already has 'cs', release and merge L7 rules
+		// Get the existing PerSelectorPolicies for this CachedSelector, if it exists
+		if existingPolicy, ok := existingFilter.PerSelectorPolicies[cs]; !ok {
+			// 'cs' is not in the existing filter yet
+
+			// Update selector owner to the existing filter
+			selectorCache.ChangeUser(cs, filterToMerge, existingFilter)
+
+			// Move L7 rules over.
+			existingFilter.PerSelectorPolicies[cs] = newPolicy
+
+			// add rule origin for 'cs' to the existing filter
+			existingFilter.RuleOrigin[cs] = newRuleOrigin
+
+			if cs.IsWildcard() {
+				existingFilter.wildcard = cs
+			}
+		} else {
+			// existing filter already has 'cs', release duplicate cached selector and
+			// merge per-selector policies
 			selectorCache.RemoveSelector(cs, filterToMerge)
 
 			// skip merging for reserved:none, as it is never
@@ -175,63 +194,74 @@ func (existingFilter *L4Filter) mergePortProto(policyCtx PolicyContext, filterTo
 				continue
 			}
 
-			if l7Rules.Equal(newL7Rules) {
-				continue // identical rules need no merging
+			existingRuleOrigin := existingFilter.RuleOrigin[cs]
+
+			if existingPolicy.Equal(newPolicy) {
+				// identical rules for the same selector need no merging, but could
+				// still have different rule origin so merge them
+				existingFilter.RuleOrigin[cs] = existingRuleOrigin.Merge(newRuleOrigin)
+				continue
 			}
 
-			priority := l7Rules.GetPriority()
+			priority := existingPolicy.GetPriority()
 			// Check if either rule takes precedence due to precedence level or deny.
-			if priority < newPriority || (priority == newPriority && l7Rules.GetDeny()) {
-				// Later level newL7Rules has no effect.
+			if priority < newPriority || (priority == newPriority && existingPolicy.HasPrecedenceOver(newPolicy)) {
+				// Lower precedence newPolicy has no effect.
 				// Same level deny takes takes precedence over any other rule.
+				// Rule origins are not merged, existingRuleOrigin is retained.
 				continue
-			} else if priority > newPriority || (priority == newPriority && newL7Rules.GetDeny()) {
-				// Earlier level (or same level deny) newL7Rules takes precedence.
+			}
+			if priority > newPriority || (priority == newPriority && newPolicy.HasPrecedenceOver(existingPolicy)) {
+				// Earlier level (or same level deny) newPolicy takes precedence.
 				// Overwrite existing filter.
-				existingFilter.PerSelectorPolicies[cs] = newL7Rules
+				existingFilter.PerSelectorPolicies[cs] = newPolicy
+				existingFilter.RuleOrigin[cs] = newRuleOrigin
 				continue
 			}
 
 			// Merge two non-identical sets of allow rules on the same precedence level
 
+			// Merge the rule origin metadata
+			existingFilter.RuleOrigin[cs] = existingRuleOrigin.Merge(newRuleOrigin)
+
 			// One of the rules may be a nil rule, expand it to an empty non-nil rule
-			if l7Rules == nil {
-				l7Rules = &PerSelectorPolicy{}
+			if existingPolicy == nil {
+				existingPolicy = &PerSelectorPolicy{Verdict: types.Allow}
 			}
-			if newL7Rules == nil {
-				newL7Rules = &PerSelectorPolicy{}
+			if newPolicy == nil {
+				newPolicy = &PerSelectorPolicy{Verdict: types.Allow}
 			}
 
 			// Merge Redirect
-			if err := l7Rules.mergeRedirect(newL7Rules); err != nil {
+			if err := existingPolicy.mergeRedirect(newPolicy); err != nil {
 				policyCtx.PolicyTrace("   Merge conflict: %s\n", err.Error())
 				return err
 			}
 
-			if l7Rules.Authentication == nil || newL7Rules.Authentication == nil {
-				if newL7Rules.Authentication != nil {
-					l7Rules.Authentication = newL7Rules.Authentication
+			if existingPolicy.Authentication == nil || newPolicy.Authentication == nil {
+				if newPolicy.Authentication != nil {
+					existingPolicy.Authentication = newPolicy.Authentication
 				}
-			} else if !newL7Rules.Authentication.DeepEqual(l7Rules.Authentication) {
-				policyCtx.PolicyTrace("   Merge conflict: mismatching auth types %s/%s\n", newL7Rules.Authentication.Mode, l7Rules.Authentication.Mode)
-				return fmt.Errorf("cannot merge conflicting authentication types (%s/%s)", newL7Rules.Authentication.Mode, l7Rules.Authentication.Mode)
+			} else if !newPolicy.Authentication.DeepEqual(existingPolicy.Authentication) {
+				policyCtx.PolicyTrace("   Merge conflict: mismatching auth types %s/%s\n", newPolicy.Authentication.Mode, existingPolicy.Authentication.Mode)
+				return fmt.Errorf("cannot merge conflicting authentication types (%s/%s)", newPolicy.Authentication.Mode, existingPolicy.Authentication.Mode)
 			}
 
-			if l7Rules.TerminatingTLS == nil || newL7Rules.TerminatingTLS == nil {
-				if newL7Rules.TerminatingTLS != nil {
-					l7Rules.TerminatingTLS = newL7Rules.TerminatingTLS
+			if existingPolicy.TerminatingTLS == nil || newPolicy.TerminatingTLS == nil {
+				if newPolicy.TerminatingTLS != nil {
+					existingPolicy.TerminatingTLS = newPolicy.TerminatingTLS
 				}
-			} else if !newL7Rules.TerminatingTLS.Equal(l7Rules.TerminatingTLS) {
-				policyCtx.PolicyTrace("   Merge conflict: mismatching terminating TLS contexts %s/%s\n", newL7Rules.TerminatingTLS, l7Rules.TerminatingTLS)
-				return fmt.Errorf("cannot merge conflicting terminating TLS contexts for cached selector %s: (%s/%s)", cs.String(), newL7Rules.TerminatingTLS, l7Rules.TerminatingTLS)
+			} else if !newPolicy.TerminatingTLS.Equal(existingPolicy.TerminatingTLS) {
+				policyCtx.PolicyTrace("   Merge conflict: mismatching terminating TLS contexts %s/%s\n", newPolicy.TerminatingTLS, existingPolicy.TerminatingTLS)
+				return fmt.Errorf("cannot merge conflicting terminating TLS contexts for cached selector %s: (%s/%s)", cs.String(), newPolicy.TerminatingTLS, existingPolicy.TerminatingTLS)
 			}
-			if l7Rules.OriginatingTLS == nil || newL7Rules.OriginatingTLS == nil {
-				if newL7Rules.OriginatingTLS != nil {
-					l7Rules.OriginatingTLS = newL7Rules.OriginatingTLS
+			if existingPolicy.OriginatingTLS == nil || newPolicy.OriginatingTLS == nil {
+				if newPolicy.OriginatingTLS != nil {
+					existingPolicy.OriginatingTLS = newPolicy.OriginatingTLS
 				}
-			} else if !newL7Rules.OriginatingTLS.Equal(l7Rules.OriginatingTLS) {
-				policyCtx.PolicyTrace("   Merge conflict: mismatching originating TLS contexts %s/%s\n", newL7Rules.OriginatingTLS, l7Rules.OriginatingTLS)
-				return fmt.Errorf("cannot merge conflicting originating TLS contexts for cached selector %s: (%s/%s)", cs.String(), newL7Rules.OriginatingTLS, l7Rules.OriginatingTLS)
+			} else if !newPolicy.OriginatingTLS.Equal(existingPolicy.OriginatingTLS) {
+				policyCtx.PolicyTrace("   Merge conflict: mismatching originating TLS contexts %s/%s\n", newPolicy.OriginatingTLS, existingPolicy.OriginatingTLS)
+				return fmt.Errorf("cannot merge conflicting originating TLS contexts for cached selector %s: (%s/%s)", cs.String(), newPolicy.OriginatingTLS, existingPolicy.OriginatingTLS)
 			}
 
 			// For now we simply merge the set of allowed SNIs from different rules
@@ -256,67 +286,44 @@ func (existingFilter *L4Filter) mergePortProto(policyCtx PolicyContext, filterTo
 			// Note however that SNI rules are typically used with `toFQDNs`, each of
 			// which defines a separate destination, so that SNIs for different
 			// `toFQDNs` will not be merged together.
-			l7Rules.ServerNames = l7Rules.ServerNames.Merge(newL7Rules.ServerNames)
+			existingPolicy.ServerNames = existingPolicy.ServerNames.Merge(newPolicy.ServerNames)
 
 			// L7 rules can be applied with SNI filtering only if the TLS is also
 			// terminated
-			if len(l7Rules.ServerNames) > 0 && !l7Rules.L7Rules.IsEmpty() && l7Rules.TerminatingTLS == nil {
-				policyCtx.PolicyTrace("   Merge conflict: cannot use SNI filtering with L7 rules without TLS termination: %v\n", l7Rules.ServerNames)
-				return fmt.Errorf("cannot merge L7 rules for cached selector %s with SNI filtering without TLS termination: %v", cs.String(), l7Rules.ServerNames)
+			if len(existingPolicy.ServerNames) > 0 && !existingPolicy.L7Rules.IsEmpty() && existingPolicy.TerminatingTLS == nil {
+				policyCtx.PolicyTrace("   Merge conflict: cannot use SNI filtering with L7 rules without TLS termination: %v\n", existingPolicy.ServerNames)
+				return fmt.Errorf("cannot merge L7 rules for cached selector %s with SNI filtering without TLS termination: %v", cs.String(), existingPolicy.ServerNames)
 			}
 
 			// empty L7 rules effectively wildcard L7. When merging with a non-empty
 			// rule, the empty must be expanded to an actual wildcard rule for the
 			// specific L7
-			if !l7Rules.HasL7Rules() && newL7Rules.HasL7Rules() {
-				l7Rules.L7Rules = newL7Rules.appendL7WildcardRule(policyCtx)
-				existingFilter.PerSelectorPolicies[cs] = l7Rules
+			if !existingPolicy.HasL7Rules() && newPolicy.HasL7Rules() {
+				existingPolicy.L7Rules = newPolicy.appendL7WildcardRule(policyCtx)
+				existingFilter.PerSelectorPolicies[cs] = existingPolicy
 				continue
 			}
-			if l7Rules.HasL7Rules() && !newL7Rules.HasL7Rules() {
-				l7Rules.appendL7WildcardRule(policyCtx)
-				existingFilter.PerSelectorPolicies[cs] = l7Rules
+			if existingPolicy.HasL7Rules() && !newPolicy.HasL7Rules() {
+				existingPolicy.appendL7WildcardRule(policyCtx)
+				existingFilter.PerSelectorPolicies[cs] = existingPolicy
 				continue
 			}
 
 			// We already know from the L7Parser.Merge() above that there are no
 			// conflicting parser types, and rule validation only allows one type of L7
 			// rules in a rule, so we can just merge the rules here.
-			for _, newRule := range newL7Rules.HTTP {
-				if !newRule.Exists(l7Rules.L7Rules) {
-					l7Rules.HTTP = append(l7Rules.HTTP, newRule)
+			for _, newRule := range newPolicy.HTTP {
+				if !newRule.Exists(existingPolicy.L7Rules) {
+					existingPolicy.HTTP = append(existingPolicy.HTTP, newRule)
 				}
 			}
-			for _, newRule := range newL7Rules.Kafka {
-				if !newRule.Exists(l7Rules.L7Rules.Kafka) {
-					l7Rules.Kafka = append(l7Rules.Kafka, newRule)
-				}
-			}
-			if l7Rules.L7Proto == "" && newL7Rules.L7Proto != "" {
-				l7Rules.L7Proto = newL7Rules.L7Proto
-			}
-			for _, newRule := range newL7Rules.L7 {
-				if !newRule.Exists(l7Rules.L7Rules) {
-					l7Rules.L7 = append(l7Rules.L7, newRule)
-				}
-			}
-			for _, newRule := range newL7Rules.DNS {
-				if !newRule.Exists(l7Rules.L7Rules) {
-					l7Rules.DNS = append(l7Rules.DNS, newRule)
+			for _, newRule := range newPolicy.DNS {
+				if !newRule.Exists(existingPolicy.L7Rules) {
+					existingPolicy.DNS = append(existingPolicy.DNS, newRule)
 				}
 			}
 			// Update the pointer in the map in case it was newly allocated
-			existingFilter.PerSelectorPolicies[cs] = l7Rules
-		} else { // 'cs' is not in the existing filter yet
-			// Update selector owner to the existing filter
-			selectorCache.ChangeUser(cs, filterToMerge, existingFilter)
-
-			// Move L7 rules over.
-			existingFilter.PerSelectorPolicies[cs] = newL7Rules
-
-			if cs.IsWildcard() {
-				existingFilter.wildcard = cs
-			}
+			existingFilter.PerSelectorPolicies[cs] = existingPolicy
 		}
 	}
 
@@ -328,21 +335,24 @@ func (existingFilter *L4Filter) mergePortProto(policyCtx PolicyContext, filterTo
 // port and protocol with the contents of the provided PortRule. If the rule
 // being merged has conflicting L7 rules with those already in the provided
 // L4PolicyMap for the specified port-protocol tuple, it returns an error.
-func (resMap *l4PolicyMap) addFilter(policyCtx PolicyContext, entry *types.PolicyEntry, portRule api.Ports, p api.PortProtocol) (int, error) {
+func (resMap *L4PolicyMap) addFilter(policyCtx PolicyContext, entry *types.PolicyEntry, portRule api.Ports, p api.PortProtocol) (int, error) {
 	// Create a new L4Filter
 	filterToMerge, err := createL4Filter(policyCtx, entry, portRule, p)
 	if err != nil {
 		return 0, err
 	}
 
-	err = resMap.addL4Filter(policyCtx, p, filterToMerge)
+	err = resMap.addL4Filter(policyCtx, filterToMerge)
 	if err != nil {
 		return 0, err
 	}
+
+	// Currently we return '1' here even if all of the filterToMerge was skipped due to priority
+	// in mergePortProto called by addL4Filter.
 	return 1, err
 }
 
-func (resMap *l4PolicyMap) mergeL4Filter(policyCtx PolicyContext, rule *rule) (int, error) {
+func (resMap *L4PolicyMap) mergeL4Filter(policyCtx PolicyContext, rule *rule) (int, error) {
 	found := 0
 
 	// short-circuit if no endpoint is selected
@@ -355,7 +365,7 @@ func (resMap *l4PolicyMap) mergeL4Filter(policyCtx PolicyContext, rule *rule) (i
 		err error
 	)
 
-	// L3-only rule (with requirements folded into peerEndpoints).
+	// L3-only rule.
 	if rule.L4.Len() == 0 && len(rule.L3) > 0 {
 		cnt, err = resMap.addFilter(policyCtx, &rule.PolicyEntry, &api.PortRule{}, api.PortProtocol{Port: "0", Protocol: api.ProtoAny})
 		if err != nil {
@@ -366,7 +376,7 @@ func (resMap *l4PolicyMap) mergeL4Filter(policyCtx PolicyContext, rule *rule) (i
 	found += cnt
 
 	err = rule.L4.Iterate(func(ports api.Ports) error {
-		if !rule.Deny {
+		if !rule.IsDeny() {
 			policyCtx.PolicyTrace("      Allows port %v\n", ports.GetPortProtocols())
 		} else {
 			policyCtx.PolicyTrace("      Denies port %v\n", ports.GetPortProtocols())
@@ -374,17 +384,8 @@ func (resMap *l4PolicyMap) mergeL4Filter(policyCtx PolicyContext, rule *rule) (i
 
 		pr := ports.GetPortRule()
 		if pr != nil {
-			if pr.Rules != nil && pr.Rules.L7Proto != "" {
-				policyCtx.PolicyTrace("        l7proto: \"%s\"\n", pr.Rules.L7Proto)
-			}
 			if !pr.Rules.IsEmpty() {
 				for _, l7 := range pr.Rules.HTTP {
-					policyCtx.PolicyTrace("          %+v\n", l7)
-				}
-				for _, l7 := range pr.Rules.Kafka {
-					policyCtx.PolicyTrace("          %+v\n", l7)
-				}
-				for _, l7 := range pr.Rules.L7 {
 					policyCtx.PolicyTrace("          %+v\n", l7)
 				}
 			}
@@ -414,12 +415,18 @@ func (resMap *l4PolicyMap) mergeL4Filter(policyCtx PolicyContext, rule *rule) (i
 	return found, err
 }
 
+func (pms *L4PolicyMaps) ensureTier(tier types.Tier) {
+	for len(*pms) <= int(tier) {
+		*pms = append(*pms, makeL4PolicyMap())
+	}
+}
+
 // resolveL4Policy analyzes the rule against the given SearchContext, and
 // merges it with any prior-generated policy within the provided L4Policy.
 //
 // If policyCtx.IsIngress() returns true, an ingress policy isresolved,
 // otherwise an egress policy is resolved.
-func (result *l4PolicyMap) resolveL4Policy(
+func (result *L4PolicyMaps) resolveL4Policy(
 	policyCtx PolicyContext,
 	state *traceState,
 	r *rule,
@@ -428,13 +435,13 @@ func (result *l4PolicyMap) resolveL4Policy(
 	found, foundDeny := 0, 0
 
 	policyCtx.SetOrigin(r.origin())
-
-	cnt, err := result.mergeL4Filter(policyCtx, r)
+	result.ensureTier(r.Tier)
+	cnt, err := (*result)[r.Tier].mergeL4Filter(policyCtx, r)
 	if err != nil {
 		return err
 	}
 	if cnt > 0 {
-		if r.Deny {
+		if r.IsDeny() {
 			foundDeny += cnt
 		} else {
 			found += cnt

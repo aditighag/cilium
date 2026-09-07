@@ -58,7 +58,6 @@ func TestEndpointSelectorMarshalling(t *testing.T) {
 				LabelSelector:             &slim_metav1.LabelSelector{},
 				cachedLabelSelectorString: "&LabelSelector{MatchLabels:map[string]string{},MatchExpressions:[]LabelSelectorRequirement{},}",
 				Generated:                 false,
-				sanitized:                 true,
 			},
 			sanitizedOutputJSON: `{}`,
 			expectedErr:         false,
@@ -73,11 +72,10 @@ func TestEndpointSelectorMarshalling(t *testing.T) {
 			},
 			sanitizedExepected: EndpointSelector{
 				LabelSelector: &slim_metav1.LabelSelector{
-					MatchLabels: map[string]string{"any.app": "frontend"},
+					MatchLabels: map[string]string{"any:app": "frontend"},
 				},
-				cachedLabelSelectorString: "&LabelSelector{MatchLabels:map[string]string{any.app: frontend,},MatchExpressions:[]LabelSelectorRequirement{},}",
+				cachedLabelSelectorString: "&LabelSelector{MatchLabels:map[string]string{any:app: frontend,},MatchExpressions:[]LabelSelectorRequirement{},}",
 				Generated:                 false,
-				sanitized:                 true,
 			},
 			sanitizedOutputJSON: `{"matchLabels":{"any:app":"frontend"}}`,
 			expectedErr:         false,
@@ -92,11 +90,10 @@ func TestEndpointSelectorMarshalling(t *testing.T) {
 			},
 			sanitizedExepected: EndpointSelector{
 				LabelSelector: &slim_metav1.LabelSelector{
-					MatchLabels: map[string]string{"k8s.app": "frontend"},
+					MatchLabels: map[string]string{"k8s:app": "frontend"},
 				},
-				cachedLabelSelectorString: "&LabelSelector{MatchLabels:map[string]string{k8s.app: frontend,},MatchExpressions:[]LabelSelectorRequirement{},}",
+				cachedLabelSelectorString: "&LabelSelector{MatchLabels:map[string]string{k8s:app: frontend,},MatchExpressions:[]LabelSelectorRequirement{},}",
 				Generated:                 false,
-				sanitized:                 true,
 			},
 			sanitizedOutputJSON: `{"matchLabels":{"k8s:app":"frontend"}}`,
 			expectedErr:         false,
@@ -119,15 +116,14 @@ func TestEndpointSelectorMarshalling(t *testing.T) {
 				LabelSelector: &slim_metav1.LabelSelector{
 					MatchExpressions: []slim_metav1.LabelSelectorRequirement{
 						{
-							Key:      "any.role",
+							Key:      "any:role",
 							Operator: slim_metav1.LabelSelectorOpIn,
 							Values:   []string{"database"},
 						},
 					},
 				},
-				cachedLabelSelectorString: "&LabelSelector{MatchLabels:map[string]string{},MatchExpressions:[]LabelSelectorRequirement{LabelSelectorRequirement{Key:any.role,Operator:In,Values:[database],},},}",
+				cachedLabelSelectorString: "&LabelSelector{MatchLabels:map[string]string{},MatchExpressions:[]LabelSelectorRequirement{LabelSelectorRequirement{Key:any:role,Operator:In,Values:[database],},},}",
 				Generated:                 false,
-				sanitized:                 true,
 			},
 			sanitizedOutputJSON: `{"matchExpressions":[{"key":"any:role","operator":"In","values":["database"]}]}`,
 			expectedErr:         false,
@@ -150,15 +146,14 @@ func TestEndpointSelectorMarshalling(t *testing.T) {
 				LabelSelector: &slim_metav1.LabelSelector{
 					MatchExpressions: []slim_metav1.LabelSelectorRequirement{
 						{
-							Key:      "k8s.role",
+							Key:      "k8s:role",
 							Operator: slim_metav1.LabelSelectorOpIn,
 							Values:   []string{"database"},
 						},
 					},
 				},
-				cachedLabelSelectorString: "&LabelSelector{MatchLabels:map[string]string{},MatchExpressions:[]LabelSelectorRequirement{LabelSelectorRequirement{Key:k8s.role,Operator:In,Values:[database],},},}",
+				cachedLabelSelectorString: "&LabelSelector{MatchLabels:map[string]string{},MatchExpressions:[]LabelSelectorRequirement{LabelSelectorRequirement{Key:k8s:role,Operator:In,Values:[database],},},}",
 				Generated:                 false,
-				sanitized:                 true,
 			},
 			sanitizedOutputJSON: `{"matchExpressions":[{"key":"k8s:role","operator":"In","values":["database"]}]}`,
 			expectedErr:         false,
@@ -171,7 +166,6 @@ func TestEndpointSelectorMarshalling(t *testing.T) {
 				LabelSelector:             &slim_metav1.LabelSelector{},
 				cachedLabelSelectorString: "&LabelSelector{MatchLabels:map[string]string{},MatchExpressions:[]LabelSelectorRequirement{},}",
 				Generated:                 false,
-				sanitized:                 true,
 			},
 			sanitizedOutputJSON: `{}`,
 			expectedErr:         true,
@@ -193,18 +187,17 @@ func TestEndpointSelectorMarshalling(t *testing.T) {
 			},
 			sanitizedExepected: EndpointSelector{
 				LabelSelector: &slim_metav1.LabelSelector{
-					MatchLabels: map[string]string{"any.app": "frontend"},
+					MatchLabels: map[string]string{"any:app": "frontend"},
 					MatchExpressions: []slim_metav1.LabelSelectorRequirement{
 						{
-							Key:      "any.role",
+							Key:      "any:role",
 							Operator: slim_metav1.LabelSelectorOpIn,
 							Values:   []string{"database"},
 						},
 					},
 				},
-				cachedLabelSelectorString: "&LabelSelector{MatchLabels:map[string]string{any.app: frontend,},MatchExpressions:[]LabelSelectorRequirement{LabelSelectorRequirement{Key:any.role,Operator:In,Values:[database],},},}",
+				cachedLabelSelectorString: "&LabelSelector{MatchLabels:map[string]string{any:app: frontend,},MatchExpressions:[]LabelSelectorRequirement{LabelSelectorRequirement{Key:any:role,Operator:In,Values:[database],},},}",
 				Generated:                 false,
-				sanitized:                 true,
 			},
 			sanitizedOutputJSON: `{"matchLabels":{"any:app":"frontend"},"matchExpressions":[{"key":"any:role","operator":"In","values":["database"]}]}`,
 			expectedErr:         false,
@@ -226,18 +219,17 @@ func TestEndpointSelectorMarshalling(t *testing.T) {
 			},
 			sanitizedExepected: EndpointSelector{
 				LabelSelector: &slim_metav1.LabelSelector{
-					MatchLabels: map[string]string{"k8s.app": "frontend"},
+					MatchLabels: map[string]string{"k8s:app": "frontend"},
 					MatchExpressions: []slim_metav1.LabelSelectorRequirement{
 						{
-							Key:      "k8s.role",
+							Key:      "k8s:role",
 							Operator: slim_metav1.LabelSelectorOpIn,
 							Values:   []string{"database"},
 						},
 					},
 				},
-				cachedLabelSelectorString: "&LabelSelector{MatchLabels:map[string]string{k8s.app: frontend,},MatchExpressions:[]LabelSelectorRequirement{LabelSelectorRequirement{Key:k8s.role,Operator:In,Values:[database],},},}",
+				cachedLabelSelectorString: "&LabelSelector{MatchLabels:map[string]string{k8s:app: frontend,},MatchExpressions:[]LabelSelectorRequirement{LabelSelectorRequirement{Key:k8s:role,Operator:In,Values:[database],},},}",
 				Generated:                 false,
-				sanitized:                 true,
 			},
 			sanitizedOutputJSON: `{"matchLabels":{"k8s:app":"frontend"},"matchExpressions":[{"key":"k8s:role","operator":"In","values":["database"]}]}`,
 			expectedErr:         false,
@@ -259,18 +251,17 @@ func TestEndpointSelectorMarshalling(t *testing.T) {
 			},
 			sanitizedExepected: EndpointSelector{
 				LabelSelector: &slim_metav1.LabelSelector{
-					MatchLabels: map[string]string{"k8s.app": "frontend"},
+					MatchLabels: map[string]string{"k8s:app": "frontend"},
 					MatchExpressions: []slim_metav1.LabelSelectorRequirement{
 						{
-							Key:      "any.role",
+							Key:      "any:role",
 							Operator: slim_metav1.LabelSelectorOpIn,
 							Values:   []string{"database"},
 						},
 					},
 				},
-				cachedLabelSelectorString: "&LabelSelector{MatchLabels:map[string]string{k8s.app: frontend,},MatchExpressions:[]LabelSelectorRequirement{LabelSelectorRequirement{Key:any.role,Operator:In,Values:[database],},},}",
+				cachedLabelSelectorString: "&LabelSelector{MatchLabels:map[string]string{k8s:app: frontend,},MatchExpressions:[]LabelSelectorRequirement{LabelSelectorRequirement{Key:any:role,Operator:In,Values:[database],},},}",
 				Generated:                 false,
-				sanitized:                 true,
 			},
 			sanitizedOutputJSON: `{"matchLabels":{"k8s:app":"frontend"},"matchExpressions":[{"key":"any:role","operator":"In","values":["database"]}]}`,
 			expectedErr:         false,
@@ -286,8 +277,9 @@ func TestEndpointSelectorMarshalling(t *testing.T) {
 				require.ErrorContains(t, err, "unexpected end of JSON input")
 				require.Equal(t, tt.expected, es)
 
-				err = es.Sanitize()
+				err = es.Validate()
 				require.NoError(t, err)
+				es.Sanitize()
 				require.Equal(t, tt.sanitizedExepected, es, "Sanitized EndpointSelector")
 
 				marshalledData, err := json.Marshal(es)
@@ -303,12 +295,14 @@ func TestEndpointSelectorMarshalling(t *testing.T) {
 			require.NoError(t, err)
 			require.Equalf(t, tt.inputJSON, string(esMarshalled), "Marshalled EndpointSelector")
 
-			err = es.Sanitize()
+			err = es.Validate()
 			require.NoError(t, err)
+			es.Sanitize()
 			require.Equal(t, tt.sanitizedExepected, es, "Sanitized EndpointSelector")
 
-			err = es.Sanitize()
+			err = es.Validate()
 			require.NoError(t, err)
+			es.Sanitize()
 			require.Equal(t, tt.sanitizedExepected, es, "Idempotent EndpointSelector sanitization")
 
 			esSanitizedMarshalled, err := json.Marshal(es)
@@ -318,8 +312,9 @@ func TestEndpointSelectorMarshalling(t *testing.T) {
 			sanitizedEs := EndpointSelector{}
 			err = json.Unmarshal(esSanitizedMarshalled, &sanitizedEs)
 			require.NoError(t, err)
-			err = sanitizedEs.Sanitize()
+			err = sanitizedEs.Validate()
 			require.NoError(t, err)
+			sanitizedEs.Sanitize()
 			require.Equal(t, tt.sanitizedExepected, sanitizedEs, "Idempotent EndpointSelector sanitization and marshalling")
 		})
 	}
@@ -346,7 +341,7 @@ func TestEndpointSelectorSanitize(t *testing.T) {
 				},
 			},
 			NewESFromK8sLabelSelector("", &slim_metav1.LabelSelector{
-				MatchLabels: map[string]string{"any.app": "frontend"},
+				MatchLabels: map[string]string{"any:app": "frontend"},
 			}),
 			false,
 		},
@@ -358,7 +353,7 @@ func TestEndpointSelectorSanitize(t *testing.T) {
 				},
 			},
 			NewESFromK8sLabelSelector("", &slim_metav1.LabelSelector{
-				MatchLabels: map[string]string{"k8s.app": "frontend"},
+				MatchLabels: map[string]string{"k8s:app": "frontend"},
 			}),
 			false,
 		},
@@ -366,7 +361,7 @@ func TestEndpointSelectorSanitize(t *testing.T) {
 			"EndpointSelector from Cilium Labels",
 			NewESFromLabels(labels.Label{Key: "app", Source: "k8s", Value: "frontend"}),
 			NewESFromK8sLabelSelector("", &slim_metav1.LabelSelector{
-				MatchLabels: map[string]string{"k8s.app": "frontend"},
+				MatchLabels: map[string]string{"k8s:app": "frontend"},
 			}),
 			false,
 		},
@@ -380,34 +375,18 @@ func TestEndpointSelectorSanitize(t *testing.T) {
 			EndpointSelector{},
 			true,
 		},
-		{
-			"Idempotent Sanitize",
-			EndpointSelector{
-				LabelSelector: &slim_metav1.LabelSelector{
-					MatchLabels: map[string]string{"k8s.app": "frontend"},
-				},
-				sanitized: true,
-			},
-			EndpointSelector{
-				LabelSelector: &slim_metav1.LabelSelector{
-					MatchLabels: map[string]string{"k8s.app": "frontend"},
-				},
-				sanitized: true,
-			},
-			false,
-		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := tt.input.Sanitize()
+			err := tt.input.Validate()
 			if tt.shouldFail {
-				require.False(t, tt.input.sanitized)
 				require.ErrorContains(t, err, "invalid label selector")
 				return
 			}
 
 			require.NoError(t, err)
+			tt.input.Sanitize()
 			require.Equal(t, tt.expected, tt.input)
 		})
 	}

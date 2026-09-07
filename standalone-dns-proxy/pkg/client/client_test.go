@@ -13,7 +13,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/hive/hivetest"
@@ -28,7 +27,9 @@ import (
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/rate"
 	"github.com/cilium/cilium/pkg/testutils"
+	"github.com/cilium/cilium/pkg/time"
 	"github.com/cilium/cilium/pkg/u8proto"
+	"github.com/cilium/cilium/standalone-dns-proxy/pkg/metrics"
 
 	pb "github.com/cilium/cilium/api/v1/standalone-dns-proxy"
 )
@@ -125,6 +126,7 @@ func setupClientAndServer(t *testing.T) (ConnectionHandler, *mockFqdnDataServer,
 			return newMockDialConfig(lis)
 		},
 			newGRPCClient),
+		cell.Provide(metrics.NewMetrics),
 		cell.Invoke(func(_c ConnectionHandler) {
 			connHandler = _c
 		}),

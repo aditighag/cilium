@@ -10,19 +10,19 @@
 Cilium is a networking, observability, and security solution with an eBPF-based
 dataplane. It provides a simple flat Layer 3 network with the ability to span
 multiple clusters in either a native routing or overlay mode. It is L7-protocol
-aware and can enforce network policies on L3-L7 using an identity based security
+aware and can enforce network policies on L3-L7 using an identity-based security
 model that is decoupled from network addressing.
 
 Cilium implements distributed load balancing for traffic between pods and to
 external services, and is able to fully replace kube-proxy, using efficient
-hash tables in eBPF allowing for almost unlimited scale. It also supports
-advanced functionality like integrated ingress and egress gateway, bandwidth
-management and service mesh, and provides deep network and security visibility and monitoring.
+hash tables in eBPF, allowing for almost unlimited scale. It also supports
+advanced functionality like integrated ingress and egress gateways, bandwidth
+management, and service mesh, and provides deep network and security visibility and monitoring.
 
 A new Linux kernel technology called eBPF_ is at the foundation of Cilium. It
 supports dynamic insertion of eBPF bytecode into the Linux kernel at various
 integration points such as: network IO, application sockets, and tracepoints to
-implement security, networking and visibility logic. eBPF is highly efficient
+implement security, networking, and visibility logic. eBPF is highly efficient
 and flexible. To learn more about eBPF, visit `eBPF.io`_.
 
 .. image:: Documentation/images/cilium-overview.png
@@ -50,17 +50,17 @@ The Cilium community maintains minor stable releases for the last three minor
 Cilium versions. Older Cilium stable versions from minor releases prior to that
 are considered EOL.
 
-For upgrades to new minor releases please consult the `Cilium Upgrade Guide`_.
+For upgrades to new minor releases, please consult the `Cilium Upgrade Guide`_.
 
 Listed below are the actively maintained release branches along with their latest
 patch release, corresponding image pull tags and their release notes:
 
 +---------------------------------------------------------+------------+------------------------------------+----------------------------------------------------------------------------+
-| `v1.18 <https://github.com/cilium/cilium/tree/v1.18>`__ | 2025-12-17 | ``quay.io/cilium/cilium:v1.18.5``  | `Release Notes <https://github.com/cilium/cilium/releases/tag/v1.18.5>`__  |
+| `v1.20 <https://github.com/cilium/cilium/tree/v1.20>`__ | 2026-08-18 | ``quay.io/cilium/cilium:v1.20.1``  | `Release Notes <https://github.com/cilium/cilium/releases/tag/v1.20.1>`__  |
 +---------------------------------------------------------+------------+------------------------------------+----------------------------------------------------------------------------+
-| `v1.17 <https://github.com/cilium/cilium/tree/v1.17>`__ | 2025-12-17 | ``quay.io/cilium/cilium:v1.17.11`` | `Release Notes <https://github.com/cilium/cilium/releases/tag/v1.17.11>`__ |
+| `v1.19 <https://github.com/cilium/cilium/tree/v1.19>`__ | 2026-08-18 | ``quay.io/cilium/cilium:v1.19.7``  | `Release Notes <https://github.com/cilium/cilium/releases/tag/v1.19.7>`__  |
 +---------------------------------------------------------+------------+------------------------------------+----------------------------------------------------------------------------+
-| `v1.16 <https://github.com/cilium/cilium/tree/v1.16>`__ | 2025-12-17 | ``quay.io/cilium/cilium:v1.16.18`` | `Release Notes <https://github.com/cilium/cilium/releases/tag/v1.16.18>`__ |
+| `v1.18 <https://github.com/cilium/cilium/tree/v1.18>`__ | 2026-08-18 | ``quay.io/cilium/cilium:v1.18.13`` | `Release Notes <https://github.com/cilium/cilium/releases/tag/v1.18.13>`__ |
 +---------------------------------------------------------+------------+------------------------------------+----------------------------------------------------------------------------+
 
 Architectures
@@ -81,12 +81,12 @@ on this is available on `Cilium SBOM`_.
 Development
 ===========
 
-For development and testing purpose, the Cilium community publishes snapshots,
-early release candidates (RC) and CI container images build from the `main
+For development and testing purposes, the Cilium community publishes snapshots,
+early release candidates (RC) and CI container images built from the `main
 branch <https://github.com/cilium/cilium/commits/main>`_. These images are
 not for use in production.
 
-For testing upgrades to new development releases please consult the latest
+For testing upgrades to new development releases, please consult the latest
 development build of the `Cilium Upgrade Guide`_.
 
 Listed below are branches for testing along with their snapshots or RC releases,
@@ -95,7 +95,7 @@ corresponding image pull tags and their release notes where applicable:
 +----------------------------------------------------------------------------+------------+-----------------------------------------+---------------------------------------------------------------------------------+
 | `main <https://github.com/cilium/cilium/commits/main>`__                   | daily      | ``quay.io/cilium/cilium-ci:latest``     | N/A                                                                             |
 +----------------------------------------------------------------------------+------------+-----------------------------------------+---------------------------------------------------------------------------------+
-| `v1.19.0-pre.3 <https://github.com/cilium/cilium/commits/v1.19.0-pre.3>`__ | 2025-12-01 | ``quay.io/cilium/cilium:v1.19.0-pre.3`` | `Release Notes <https://github.com/cilium/cilium/releases/tag/v1.19.0-pre.3>`__ |
+| `v1.21.0-pre.0 <https://github.com/cilium/cilium/commits/v1.21.0-pre.0>`__ | 2026-08-03 | ``quay.io/cilium/cilium:v1.21.0-pre.0`` | `Release Notes <https://github.com/cilium/cilium/releases/tag/v1.21.0-pre.0>`__ |
 +----------------------------------------------------------------------------+------------+-----------------------------------------+---------------------------------------------------------------------------------+
 
 Functionality Overview
@@ -110,13 +110,13 @@ CNI (Container Network Interface)
 fast, scalable, and secure networking layer for Kubernetes clusters. Built
 on eBPF, it offers several deployment options:
 
-* **Overlay networking:** encapsulation-based virtual network spanning all
+* **Overlay networking:** an encapsulation-based virtual network spanning all
   hosts with support for VXLAN and Geneve. It works on almost any network
   infrastructure as the only requirement is IP connectivity between hosts
   which is typically already given.
 
 * **Native routing mode:** Use of the regular routing table of the Linux
-  host. The network is required to be capable of routing the IP addresses
+  host. The network must be capable of routing the IP addresses
   of the application containers. It integrates with cloud routers, routing
   daemons, and IPv6-native infrastructure.
 
@@ -133,7 +133,7 @@ Load Balancing
 
 Cilium implements distributed load balancing for traffic between application
 containers and to/from external services. The load balancing is implemented
-in eBPF using efficient hashtables enabling high service density and low
+in eBPF using efficient hash tables, enabling high service density and low
 latency at scale.
 
 * **East-west load balancing** rewrites service connections at the socket
@@ -173,8 +173,8 @@ manipulated whenever a container is started anywhere in the cluster.
 In order to avoid this situation which limits scale, Cilium assigns a
 security identity to groups of application containers which share identical
 security policies. The identity is then associated with all network packets
-emitted by the application containers, allowing to validate the identity at
-the receiving node.
+emitted by the application containers, allowing the identity to be validated
+at the receiving node.
 
 * **Identity-based security** removes reliance on brittle IP addresses.
 
@@ -200,7 +200,7 @@ Service Mesh
 
 With Cilium `Service Mesh <https://cilium.io/use-cases/service-mesh/>`_,
 operators gain the benefits of fine-grained traffic control, encryption, observability,
-access control, without the cost and complexity of traditional proxy-based
+and access control without the cost and complexity of traditional proxy-based
 designs. Key features include:
 
 * **Mutual authentication** with automatic identity-based encryption between
@@ -208,7 +208,7 @@ designs. Key features include:
 
 * **L7-aware policy enforcement** for security and compliance.
 
-* **Deep integration with the Kubernetes Gateway API :** Acts as a
+* **Deep integration with the Kubernetes Gateway API:** Acts as a
   `Gateway API <https://cilium.io/use-cases/gateway-api/>`_ compliant data
   plane, allowing you to declaratively manage ingress, traffic splitting, and
   routing behavior using Kubernetes-native CRDs.
@@ -237,7 +237,7 @@ Getting Started
 ===============
 
 * `Why Cilium?`_
-* `Getting Started`_
+* `Getting Started <gs_>`_
 * `Architecture and Concepts`_
 * `Installing Cilium`_
 * `Frequently Asked Questions`_
@@ -256,12 +256,12 @@ Cilium, ask questions, and share your experiences.
 Special Interest Groups (SIG)
 -----------------------------
 
-See `Special Interest groups
+See `Special Interest Groups
 <https://github.com/cilium/community/blob/main/sigs.yaml>`_ for a list of all SIGs and their meeting times.
 
 Developer meetings
 ------------------
-The Cilium developer community hangs out on Zoom to chat. Everybody is welcome.
+The Cilium developer community hangs out on Zoom to chat. Everyone is welcome.
 
 * Weekly, Wednesday,
   5:00 pm `Europe/Zurich time <https://time.is/Canton_of_Zurich>`__ (CET/CEST),
@@ -296,18 +296,18 @@ The BPF code templates are dual-licensed under the
 and the `2-Clause BSD License <bsd-license_>`__
 (you can use the terms of either license, at your option).
 
-.. _`Cilium Upgrade Guide`: https://docs.cilium.io/en/stable/operations/upgrade/
-.. _`Why Cilium?`: https://docs.cilium.io/en/stable/overview/intro
-.. _`Getting Started`: https://docs.cilium.io/en/stable/#getting-started
-.. _`Architecture and Concepts`: https://docs.cilium.io/en/stable/overview/component-overview/
-.. _`Installing Cilium`: https://docs.cilium.io/en/stable/gettingstarted/k8s-install-default/
-.. _`Frequently Asked Questions`: https://github.com/cilium/cilium/issues?utf8=%E2%9C%93&q=is%3Aissue+label%3Akind%2Fquestion+
+.. _Cilium Upgrade Guide: https://docs.cilium.io/en/stable/operations/upgrade/
+.. _Why Cilium?: https://docs.cilium.io/en/stable/overview/intro
+.. _gs: https://docs.cilium.io/en/stable/#getting-started
+.. _Architecture and Concepts: https://docs.cilium.io/en/stable/overview/component-overview/
+.. _Installing Cilium: https://docs.cilium.io/en/stable/gettingstarted/k8s-install-default/
+.. _Frequently Asked Questions: https://github.com/cilium/cilium/issues?utf8=%E2%9C%93&q=is%3Aissue+label%3Akind%2Fquestion+
 .. _Contributing: https://docs.cilium.io/en/stable/contributing/development/
 .. _Prerequisites: https://docs.cilium.io/en/stable/operations/system_requirements/
-.. _`eBPF`: https://ebpf.io
-.. _`eBPF.io`: https://ebpf.io
-.. _`Meeting Notes and Zoom Info`: https://docs.google.com/document/d/1Y_4chDk4rznD6UgXPlPvn3Dc7l-ZutGajUv1eF0VDwQ/edit#
-.. _`APAC Meeting Notes and Zoom Info`: https://docs.google.com/document/d/1egv4qLydr0geP-GjQexYKm4tz3_tHy-LCBjVQcXcT5M/edit#
+.. _eBPF: https://ebpf.io
+.. _eBPF.io: https://ebpf.io
+.. _Meeting Notes and Zoom Info: https://docs.google.com/document/d/1IqLRvTvnK5SQ1SMM8g8R_k2TeeRUwWmOYqjYWZs6MiM/edit#
+.. _APAC Meeting Notes and Zoom Info: https://docs.google.com/document/d/1egv4qLydr0geP-GjQexYKm4tz3_tHy-LCBjVQcXcT5M/edit#
 
 .. |go-report| image:: https://goreportcard.com/badge/github.com/cilium/cilium
     :alt: Go Report Card
@@ -334,7 +334,7 @@ and the `2-Clause BSD License <bsd-license_>`__
     :target: gpl-license_
 
 .. |slack| image:: https://img.shields.io/badge/slack-cilium-brightgreen.svg?logo=slack
-    :alt: Join the Cilium slack channel
+    :alt: Join the Cilium Slack channel
     :target: https://slack.cilium.io
 
 .. |cii| image:: https://bestpractices.coreinfrastructure.org/projects/1269/badge
@@ -353,9 +353,9 @@ and the `2-Clause BSD License <bsd-license_>`__
     :alt: FOSSA Status
     :target: https://app.fossa.com/projects/custom%2B162%2Fgit%40github.com%3Acilium%2Fcilium.git?ref=badge_shield
 
-.. |gateway-api| image:: https://img.shields.io/badge/Gateway%20API%20Conformance%20v1.2.0-Cilium-green
+.. |gateway-api| image:: https://img.shields.io/badge/Gateway%20API%20Conformance%20v1.6-Cilium-green
     :alt: Gateway API Status
-    :target: https://github.com/kubernetes-sigs/gateway-api/tree/main/conformance/reports/v1.2.0/cilium-cilium
+    :target: https://github.com/kubernetes-sigs/gateway-api/tree/main/conformance/reports/v1.6/cilium
 
 .. |codespaces| image:: https://img.shields.io/badge/Open_in_GitHub_Codespaces-gray?logo=github
     :alt: Github Codespaces

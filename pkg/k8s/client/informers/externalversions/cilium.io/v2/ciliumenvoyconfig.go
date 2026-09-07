@@ -15,16 +15,45 @@ import (
 	ciliumiov2 "github.com/cilium/cilium/pkg/k8s/client/listers/cilium.io/v2"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
+	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	watch "k8s.io/apimachinery/pkg/watch"
 	cache "k8s.io/client-go/tools/cache"
 )
 
 // CiliumEnvoyConfigInformer provides access to a shared informer and lister for
-// CiliumEnvoyConfigs.
+// CiliumEnvoyConfigs. Prefer using the type-safe variant (see [TypedCiliumEnvoyConfigInformer]).
 type CiliumEnvoyConfigInformer interface {
 	Informer() cache.SharedIndexInformer
 	Lister() ciliumiov2.CiliumEnvoyConfigLister
 }
+
+// TypedCiliumEnvoyConfigInformer provides access to a shared informer and lister for
+// CiliumEnvoyConfigs, including the type-safe TypedInformer variant.
+// It is a superset of CiliumEnvoyConfigInformer.
+type TypedCiliumEnvoyConfigInformer interface {
+	Informer() cache.SharedIndexInformer
+	TypedInformer() CiliumEnvoyConfigIndexInformer
+	Lister() ciliumiov2.CiliumEnvoyConfigLister
+}
+
+// CiliumEnvoyConfigIndexInformer is a wrapper around the underlying [cache.SharedIndexInformer]
+// with type-safe variants of several methods.
+type CiliumEnvoyConfigIndexInformer cache.TypedSharedIndexInformer[*apisciliumiov2.CiliumEnvoyConfig]
+
+// CiliumEnvoyConfigHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerFuncs] for CiliumEnvoyConfig.
+type CiliumEnvoyConfigHandlerFuncs = cache.TypedResourceEventHandlerFuncs[*apisciliumiov2.CiliumEnvoyConfig]
+
+// CiliumEnvoyConfigDetailedHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerDetailedFuncs] for CiliumEnvoyConfig.
+type CiliumEnvoyConfigDetailedHandlerFuncs = cache.TypedResourceEventHandlerDetailedFuncs[*apisciliumiov2.CiliumEnvoyConfig]
+
+// CiliumEnvoyConfigFilteringHandler is a specialization of [cache.TypedFilteringResourceEventHandler] for CiliumEnvoyConfig.
+type CiliumEnvoyConfigFilteringHandler = cache.TypedFilteringResourceEventHandler[*apisciliumiov2.CiliumEnvoyConfig]
+
+// CiliumEnvoyConfigIndexers is a specialization of [cache.TypedIndexers] for CiliumEnvoyConfig.
+type CiliumEnvoyConfigIndexers = cache.TypedIndexers[*apisciliumiov2.CiliumEnvoyConfig]
+
+// DeletedCiliumEnvoyConfig is a specialization of [cache.DeletedObject] for CiliumEnvoyConfig.
+type DeletedCiliumEnvoyConfig = cache.DeletedObject[*apisciliumiov2.CiliumEnvoyConfig]
 
 type ciliumEnvoyConfigInformer struct {
 	factory          internalinterfaces.SharedInformerFactory
@@ -35,55 +64,132 @@ type ciliumEnvoyConfigInformer struct {
 // NewCiliumEnvoyConfigInformer constructs a new informer for CiliumEnvoyConfig type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedCiliumEnvoyConfigInformer]).
 func NewCiliumEnvoyConfigInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers) cache.SharedIndexInformer {
-	return NewFilteredCiliumEnvoyConfigInformer(client, namespace, resyncPeriod, indexers, nil)
+	return NewCiliumEnvoyConfigInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers})
+}
+
+// NewTypedCiliumEnvoyConfigInformer constructs a new informer for CiliumEnvoyConfig type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedCiliumEnvoyConfigInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers CiliumEnvoyConfigIndexers) CiliumEnvoyConfigIndexInformer {
+	return NewTypedCiliumEnvoyConfigInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers)})
 }
 
 // NewFilteredCiliumEnvoyConfigInformer constructs a new informer for CiliumEnvoyConfig type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedFilteredCiliumEnvoyConfigInformer]).
 func NewFilteredCiliumEnvoyConfigInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) cache.SharedIndexInformer {
-	return cache.NewSharedIndexInformer(
+	return NewTypedCiliumEnvoyConfigInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers, TweakListOptions: tweakListOptions})
+}
+
+// NewTypedFilteredCiliumEnvoyConfigInformer constructs a new informer for CiliumEnvoyConfig type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedFilteredCiliumEnvoyConfigInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers CiliumEnvoyConfigIndexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) CiliumEnvoyConfigIndexInformer {
+	return NewTypedCiliumEnvoyConfigInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers), TweakListOptions: tweakListOptions})
+}
+
+// NewCiliumEnvoyConfigInformerWithOptions constructs a new informer for CiliumEnvoyConfig type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedCiliumEnvoyConfigInformerWithOptions]).
+func NewCiliumEnvoyConfigInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) cache.SharedIndexInformer {
+	return NewTypedCiliumEnvoyConfigInformerWithOptions(client, namespace, options)
+}
+
+// NewTypedCiliumEnvoyConfigInformerWithOptions constructs a new informer for CiliumEnvoyConfig type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedCiliumEnvoyConfigInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) CiliumEnvoyConfigIndexInformer {
+	gvr := schema.GroupVersionResource{Group: "cilium.io", Version: "v2", Resource: "ciliumenvoyconfigs"}
+	identifier := options.InformerName.WithResource(gvr)
+	tweakListOptions := options.TweakListOptions
+	return cache.NewTypedSharedIndexInformer[*apisciliumiov2.CiliumEnvoyConfig](cache.NewSharedIndexInformerWithOptions(
 		cache.ToListWatcherWithWatchListSemantics(&cache.ListWatch{
-			ListFunc: func(options v1.ListOptions) (runtime.Object, error) {
+			ListFunc: func(opts v1.ListOptions) (runtime.Object, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.CiliumV2().CiliumEnvoyConfigs(namespace).List(context.Background(), options)
+				return client.CiliumV2().CiliumEnvoyConfigs(namespace).List(context.Background(), opts)
 			},
-			WatchFunc: func(options v1.ListOptions) (watch.Interface, error) {
+			WatchFunc: func(opts v1.ListOptions) (watch.Interface, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.CiliumV2().CiliumEnvoyConfigs(namespace).Watch(context.Background(), options)
+				return client.CiliumV2().CiliumEnvoyConfigs(namespace).Watch(context.Background(), opts)
 			},
-			ListWithContextFunc: func(ctx context.Context, options v1.ListOptions) (runtime.Object, error) {
+			ListWithContextFunc: func(ctx context.Context, opts v1.ListOptions) (runtime.Object, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.CiliumV2().CiliumEnvoyConfigs(namespace).List(ctx, options)
+				return client.CiliumV2().CiliumEnvoyConfigs(namespace).List(ctx, opts)
 			},
-			WatchFuncWithContext: func(ctx context.Context, options v1.ListOptions) (watch.Interface, error) {
+			WatchFuncWithContext: func(ctx context.Context, opts v1.ListOptions) (watch.Interface, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.CiliumV2().CiliumEnvoyConfigs(namespace).Watch(ctx, options)
+				return client.CiliumV2().CiliumEnvoyConfigs(namespace).Watch(ctx, opts)
 			},
 		}, client),
 		&apisciliumiov2.CiliumEnvoyConfig{},
-		resyncPeriod,
-		indexers,
-	)
+		cache.SharedIndexInformerOptions{
+			ResyncPeriod: options.ResyncPeriod,
+			Indexers:     options.Indexers,
+			Identifier:   identifier,
+		},
+	))
 }
 
 func (f *ciliumEnvoyConfigInformer) defaultInformer(client versioned.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
-	return NewFilteredCiliumEnvoyConfigInformer(client, f.namespace, resyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, f.tweakListOptions)
+	return NewTypedCiliumEnvoyConfigInformerWithOptions(client, f.namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, InformerName: f.factory.InformerName(), TweakListOptions: f.tweakListOptions})
 }
 
 func (f *ciliumEnvoyConfigInformer) Informer() cache.SharedIndexInformer {
-	return f.factory.InformerFor(&apisciliumiov2.CiliumEnvoyConfig{}, f.defaultInformer)
+	return f.TypedInformer()
+}
+
+func (f *ciliumEnvoyConfigInformer) TypedInformer() CiliumEnvoyConfigIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*apisciliumiov2.CiliumEnvoyConfig](f.factory.InformerFor(&apisciliumiov2.CiliumEnvoyConfig{}, f.defaultInformer))
 }
 
 func (f *ciliumEnvoyConfigInformer) Lister() ciliumiov2.CiliumEnvoyConfigLister {
 	return ciliumiov2.NewCiliumEnvoyConfigLister(f.Informer().GetIndexer())
+}
+
+// ToTypedCiliumEnvoyConfigInformer converts an untyped informer into a TypedCiliumEnvoyConfigInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *CiliumEnvoyConfig. If that is not the case, calling type-safe methods of the returned
+// TypedCiliumEnvoyConfigInformer leads to runtime panics. A safer alternative is to pass
+// around a TypedCiliumEnvoyConfigInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToTypedCiliumEnvoyConfigInformer(informer CiliumEnvoyConfigInformer) TypedCiliumEnvoyConfigInformer {
+	if informer, ok := informer.(TypedCiliumEnvoyConfigInformer); ok {
+		return informer
+	}
+	return &ciliumEnvoyConfigTypedInformerAdapter{informer}
+}
+
+type ciliumEnvoyConfigTypedInformerAdapter struct {
+	CiliumEnvoyConfigInformer
+}
+
+func (a *ciliumEnvoyConfigTypedInformerAdapter) TypedInformer() CiliumEnvoyConfigIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*apisciliumiov2.CiliumEnvoyConfig](a.Informer())
+}
+
+// ToCiliumEnvoyConfigIndexInformer converts an untyped informer into a CiliumEnvoyConfigIndexInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *CiliumEnvoyConfig. If that is not the case, calling type-safe methods of the returned
+// CiliumEnvoyConfigIndexInformer leads to runtime panics. A safer alternative is to pass
+// around a CiliumEnvoyConfigIndexInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToCiliumEnvoyConfigIndexInformer(informer cache.SharedIndexInformer) CiliumEnvoyConfigIndexInformer {
+	if informer, ok := informer.(CiliumEnvoyConfigIndexInformer); ok {
+		return informer
+	}
+	return cache.NewTypedSharedIndexInformer[*apisciliumiov2.CiliumEnvoyConfig](informer)
 }

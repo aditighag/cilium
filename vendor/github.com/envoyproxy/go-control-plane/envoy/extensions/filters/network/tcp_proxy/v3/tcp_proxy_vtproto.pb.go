@@ -163,6 +163,30 @@ func (m *TcpProxy_TunnelingConfig) MarshalToSizedBufferVTStrict(dAtA []byte) (in
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
 	}
+	if len(m.Formatters) > 0 {
+		for iNdEx := len(m.Formatters) - 1; iNdEx >= 0; iNdEx-- {
+			if vtmsg, ok := interface{}(m.Formatters[iNdEx]).(interface {
+				MarshalToSizedBufferVTStrict([]byte) (int, error)
+			}); ok {
+				size, err := vtmsg.MarshalToSizedBufferVTStrict(dAtA[:i])
+				if err != nil {
+					return 0, err
+				}
+				i -= size
+				i = protohelpers.EncodeVarint(dAtA, i, uint64(size))
+			} else {
+				encoded, err := proto.Marshal(m.Formatters[iNdEx])
+				if err != nil {
+					return 0, err
+				}
+				i -= len(encoded)
+				copy(dAtA[i:], encoded)
+				i = protohelpers.EncodeVarint(dAtA, i, uint64(len(encoded)))
+			}
+			i--
+			dAtA[i] = 0x52
+		}
+	}
 	if len(m.RequestIdMetadataKey) > 0 {
 		i -= len(m.RequestIdMetadataKey)
 		copy(dAtA[i:], m.RequestIdMetadataKey)
@@ -372,6 +396,16 @@ func (m *TcpProxy_TcpAccessLogOptions) MarshalToSizedBufferVTStrict(dAtA []byte)
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
 	}
+	if m.FlushAccessLogOnStart {
+		i--
+		if m.FlushAccessLogOnStart {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i--
+		dAtA[i] = 0x18
+	}
 	if m.FlushAccessLogOnConnected {
 		i--
 		if m.FlushAccessLogOnConnected {
@@ -424,6 +458,44 @@ func (m *TcpProxy) MarshalToSizedBufferVTStrict(dAtA []byte) (int, error) {
 	if m.unknownFields != nil {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
+	}
+	if m.CheckDrainClose != nil {
+		size, err := (*wrapperspb.BoolValue)(m.CheckDrainClose).MarshalToSizedBufferVTStrict(dAtA[:i])
+		if err != nil {
+			return 0, err
+		}
+		i -= size
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(size))
+		i--
+		dAtA[i] = 0x1
+		i--
+		dAtA[i] = 0xc2
+	}
+	if m.ProxyProtocolTlvMergePolicy != 0 {
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.ProxyProtocolTlvMergePolicy))
+		i--
+		dAtA[i] = 0x1
+		i--
+		dAtA[i] = 0xb8
+	}
+	if m.MaxEarlyDataBytes != nil {
+		size, err := (*wrapperspb.UInt32Value)(m.MaxEarlyDataBytes).MarshalToSizedBufferVTStrict(dAtA[:i])
+		if err != nil {
+			return 0, err
+		}
+		i -= size
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(size))
+		i--
+		dAtA[i] = 0x1
+		i--
+		dAtA[i] = 0xb2
+	}
+	if m.UpstreamConnectMode != 0 {
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.UpstreamConnectMode))
+		i--
+		dAtA[i] = 0x1
+		i--
+		dAtA[i] = 0xa8
 	}
 	if m.MaxDownstreamConnectionDurationJitterPercentage != nil {
 		if vtmsg, ok := interface{}(m.MaxDownstreamConnectionDurationJitterPercentage).(interface {
@@ -830,6 +902,18 @@ func (m *TcpProxy_TunnelingConfig) SizeVT() (n int) {
 	if l > 0 {
 		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
 	}
+	if len(m.Formatters) > 0 {
+		for _, e := range m.Formatters {
+			if size, ok := interface{}(e).(interface {
+				SizeVT() int
+			}); ok {
+				l = size.SizeVT()
+			} else {
+				l = proto.Size(e)
+			}
+			n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
+		}
+	}
 	n += len(m.unknownFields)
 	return n
 }
@@ -873,6 +957,9 @@ func (m *TcpProxy_TcpAccessLogOptions) SizeVT() (n int) {
 		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
 	}
 	if m.FlushAccessLogOnConnected {
+		n += 2
+	}
+	if m.FlushAccessLogOnStart {
 		n += 2
 	}
 	n += len(m.unknownFields)
@@ -995,6 +1082,20 @@ func (m *TcpProxy) SizeVT() (n int) {
 		} else {
 			l = proto.Size(m.MaxDownstreamConnectionDurationJitterPercentage)
 		}
+		n += 2 + l + protohelpers.SizeOfVarint(uint64(l))
+	}
+	if m.UpstreamConnectMode != 0 {
+		n += 2 + protohelpers.SizeOfVarint(uint64(m.UpstreamConnectMode))
+	}
+	if m.MaxEarlyDataBytes != nil {
+		l = (*wrapperspb.UInt32Value)(m.MaxEarlyDataBytes).SizeVT()
+		n += 2 + l + protohelpers.SizeOfVarint(uint64(l))
+	}
+	if m.ProxyProtocolTlvMergePolicy != 0 {
+		n += 2 + protohelpers.SizeOfVarint(uint64(m.ProxyProtocolTlvMergePolicy))
+	}
+	if m.CheckDrainClose != nil {
+		l = (*wrapperspb.BoolValue)(m.CheckDrainClose).SizeVT()
 		n += 2 + l + protohelpers.SizeOfVarint(uint64(l))
 	}
 	n += len(m.unknownFields)

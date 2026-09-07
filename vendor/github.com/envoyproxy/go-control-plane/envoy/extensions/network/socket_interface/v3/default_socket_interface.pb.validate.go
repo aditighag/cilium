@@ -101,7 +101,7 @@ type DefaultSocketInterfaceMultiError []error
 
 // Error returns a concatenation of all the error messages it wraps.
 func (m DefaultSocketInterfaceMultiError) Error() string {
-	var msgs []string
+	msgs := make([]string, 0, len(m))
 	for _, err := range m {
 		msgs = append(msgs, err.Error())
 	}
@@ -278,6 +278,38 @@ func (m *IoUringOptions) validate(all bool) error {
 		}
 	}
 
+	if wrapper := m.GetWriteHighWatermarkBytes(); wrapper != nil {
+
+		if wrapper.GetValue() < 4096 {
+			err := IoUringOptionsValidationError{
+				field:  "WriteHighWatermarkBytes",
+				reason: "value must be greater than or equal to 4096",
+			}
+			if !all {
+				return err
+			}
+			errors = append(errors, err)
+		}
+
+	}
+
+	if wrapper := m.GetWriteLowWatermarkBytes(); wrapper != nil {
+
+		if wrapper.GetValue() < 1024 {
+			err := IoUringOptionsValidationError{
+				field:  "WriteLowWatermarkBytes",
+				reason: "value must be greater than or equal to 1024",
+			}
+			if !all {
+				return err
+			}
+			errors = append(errors, err)
+		}
+
+	}
+
+	// no validation rules for EnableMultishotReceive
+
 	if len(errors) > 0 {
 		return IoUringOptionsMultiError(errors)
 	}
@@ -292,7 +324,7 @@ type IoUringOptionsMultiError []error
 
 // Error returns a concatenation of all the error messages it wraps.
 func (m IoUringOptionsMultiError) Error() string {
-	var msgs []string
+	msgs := make([]string, 0, len(m))
 	for _, err := range m {
 		msgs = append(msgs, err.Error())
 	}

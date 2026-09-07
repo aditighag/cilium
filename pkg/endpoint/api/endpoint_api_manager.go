@@ -9,7 +9,8 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
-	"net"
+	"net/netip"
+	"strconv"
 	"sync"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -21,12 +22,12 @@ import (
 	"github.com/cilium/cilium/pkg/annotation"
 	"github.com/cilium/cilium/pkg/api"
 	"github.com/cilium/cilium/pkg/datapath/linux/bandwidth"
-	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/endpoint"
 	endpointcreator "github.com/cilium/cilium/pkg/endpoint/creator"
 	endpointid "github.com/cilium/cilium/pkg/endpoint/id"
 	endpointmetadata "github.com/cilium/cilium/pkg/endpoint/metadata"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
+	endpointtypes "github.com/cilium/cilium/pkg/endpoint/types"
 	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/ipam"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
@@ -56,7 +57,7 @@ type endpointAPIManager struct {
 	endpointCreations EndpointCreationManager
 	endpointMetadata  endpointmetadata.EndpointMetadataFetcher
 
-	bandwidthManager datapath.BandwidthManager
+	bandwidthManager bandwidth.Manager
 	clientset        k8sClient.Clientset
 	cniConfigManager cni.CNIConfigManager
 	ipam             *ipam.IPAM
@@ -139,7 +140,7 @@ func (m *endpointAPIManager) CreateEndpoint(ctx context.Context, epTemplate *mod
 	apiLabels := labels.NewLabelsFromModel(epTemplate.Labels)
 	epTemplate.Labels = nil
 
-	ep, err := m.endpointCreator.NewEndpointFromChangeModel(ctx, epTemplate)
+	ep, err := m.endpointCreator.NewEndpointFromChangeModel(epTemplate)
 	if err != nil {
 		return invalidDataError(ep, fmt.Errorf("unable to parse endpoint parameters: %w", err))
 	}
@@ -182,6 +183,10 @@ func (m *endpointAPIManager) CreateEndpoint(ctx context.Context, epTemplate *mod
 	if len(apiLabels) > 0 {
 		if lbls := apiLabels.FindReserved(); lbls != nil {
 			return invalidDataError(ep, fmt.Errorf("not allowed to add reserved labels: %s", lbls))
+		}
+
+		if apiLabels.IsGenerated() {
+			return invalidDataError(ep, fmt.Errorf("not allowed to add generated labels: %s", apiLabels))
 		}
 
 		apiLabels, _ = labelsfilter.Filter(apiLabels)
@@ -230,7 +235,7 @@ func (m *endpointAPIManager) CreateEndpoint(ctx context.Context, epTemplate *mod
 			ep.Logger("api").Warn("Unable to fetch kubernetes labels", logfields.Error, err)
 		} else {
 			ep.SetPod(pod)
-			ep.SetK8sMetadata(k8sMetadata.ContainerPorts)
+			ep.SetK8sMetadata(k8sMetadata.NamedPorts)
 			identityLbls.MergeLabels(k8sMetadata.IdentityLabels)
 			infoLabels.MergeLabels(k8sMetadata.InfoLabels)
 			if _, ok := pod.Annotations[bandwidth.IngressBandwidth]; ok && !m.bandwidthManager.Enabled() {
@@ -247,7 +252,7 @@ func (m *endpointAPIManager) CreateEndpoint(ctx context.Context, epTemplate *mod
 					logfields.Annotations, pod.Annotations,
 				)
 			}
-			if hwAddr, ok := pod.Annotations[annotation.PodAnnotationMAC]; !ep.GetDisableLegacyIdentifiers() && ok {
+			if hwAddr, ok := pod.Annotations[annotation.PodAnnotationMAC]; !ep.IsSecondaryInterface() && ok {
 				mac, err := mac.ParseMAC(hwAddr)
 				if err != nil {
 					m.logger.Error("Unable to parse MAC address",
@@ -257,6 +262,18 @@ func (m *endpointAPIManager) CreateEndpoint(ctx context.Context, epTemplate *mod
 					return invalidDataError(ep, err)
 				}
 				ep.SetMac(mac)
+			}
+
+			if tid, ok := pod.Annotations[annotation.FIBTableID]; option.Config.EnableFibTableIDAnnotation && ok {
+				if tidInt, err := strconv.ParseUint(tid, 10, 32); err == nil {
+					ep.SetRTInfo(uint32(tidInt), endpointtypes.RTInfoFIB)
+				} else {
+					m.logger.Warn("Unable to parse fib-table-id annotation as uint32, pod will use default routing table.",
+						logfields.K8sPodName, epTemplate.K8sPodName,
+						logfields.Annotation, annotation.FIBTableID,
+						logfields.Error, err,
+					)
+				}
 			}
 		}
 	}
@@ -302,7 +319,8 @@ func (m *endpointAPIManager) CreateEndpoint(ctx context.Context, epTemplate *mod
 
 	if !regenTriggered {
 		regenMetadata := &regeneration.ExternalRegenerationMetadata{
-			Reason:            "Initial build on endpoint creation",
+			Reason:            regeneration.ReasonEndpointInit,
+			Message:           "Initial build on endpoint creation",
 			RegenerationLevel: regeneration.RegenerateWithDatapath,
 		}
 		build, err := ep.SetRegenerateStateIfAlive(regenMetadata)
@@ -323,17 +341,17 @@ func (m *endpointAPIManager) CreateEndpoint(ctx context.Context, epTemplate *mod
 	// The endpoint has been successfully created, stop the expiration
 	// timers of all attached IPs
 	if addressing := epTemplate.Addressing; addressing != nil {
-		if uuid := addressing.IPV4ExpirationUUID; uuid != "" {
-			if ip := net.ParseIP(addressing.IPV4); ip != nil {
-				pool := ipam.PoolOrDefault(addressing.IPV4PoolName)
+		if uuid := addressing.IPv4ExpirationUUID; uuid != "" {
+			if ip, err := netip.ParseAddr(addressing.IPv4); err == nil {
+				pool := ipam.PoolOrDefault(addressing.IPv4PoolName)
 				if err := m.ipam.StopExpirationTimer(ip, pool, uuid); err != nil {
 					return m.errorDuringCreation(ep, err)
 				}
 			}
 		}
-		if uuid := addressing.IPV6ExpirationUUID; uuid != "" {
-			if ip := net.ParseIP(addressing.IPV6); ip != nil {
-				pool := ipam.PoolOrDefault(addressing.IPV6PoolName)
+		if uuid := addressing.IPv6ExpirationUUID; uuid != "" {
+			if ip, err := netip.ParseAddr(addressing.IPv6); err == nil {
+				pool := ipam.PoolOrDefault(addressing.IPv6PoolName)
 				if err := m.ipam.StopExpirationTimer(ip, pool, uuid); err != nil {
 					return m.errorDuringCreation(ep, err)
 				}
@@ -348,13 +366,14 @@ func (m *endpointAPIManager) CreateEndpoint(ctx context.Context, epTemplate *mod
 // testing purposes.
 var handleOutdatedPodInformerRetryPeriod = 100 * time.Millisecond
 
+// handleOutdatedPodInformer is only used when creating new Endpoints, never for restored endpoints!
 func (m *endpointAPIManager) handleOutdatedPodInformer(ctx context.Context, ep *endpoint.Endpoint) (pod *slim_corev1.Pod, k8sMetadata *endpoint.K8sMetadata, err error) {
 	var once sync.Once
 
 	// Average attempt is every 100ms.
 	err = resiliency.Retry(ctx, handleOutdatedPodInformerRetryPeriod, 20, func(_ context.Context, _ int) (bool, error) {
 		var err2 error
-		pod, k8sMetadata, err2 = m.endpointMetadata.FetchK8sMetadataForEndpoint(ep.K8sNamespace, ep.K8sPodName, ep.K8sUID)
+		pod, k8sMetadata, err2 = m.endpointMetadata.FetchK8sMetadataForEndpoint(ep.K8sNamespace, ep.K8sPodName, ep.K8sUID, true)
 		if ep.K8sUID == "" {
 			// If the CNI did not set the UID, then don't retry and just exit
 			// out of the loop to proceed as normal.
@@ -480,8 +499,7 @@ func (m *endpointAPIManager) EndpointUpdate(id string, cfg *models.EndpointConfi
 	}
 
 	if err := ep.Update(cfg); err != nil {
-		var updateValidationError endpoint.UpdateValidationError
-		if errors.As(err, &updateValidationError) {
+		if _, ok := errors.AsType[endpoint.UpdateValidationError](err); ok {
 			return api.Error(PatchEndpointIDConfigInvalidCode, err)
 		}
 		return api.Error(PatchEndpointIDConfigFailedCode, err)

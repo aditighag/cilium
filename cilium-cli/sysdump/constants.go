@@ -26,6 +26,10 @@ const (
 	ciliumSPIREServerConfigMapName     = defaults.SPIREServerConfigMapName
 	ciliumSPIREAgentConfigMapName      = defaults.SPIREAgentConfigMapName
 	clustermeshApiserverDeploymentName = defaults.ClusterMeshDeploymentName
+	clustermeshCertgenCronJobName      = "clustermesh-apiserver-generate-certs"
+	gkeConfigMapsName                  = "gke-config-maps"
+	gkeHubbleConfigMap                 = "cilium-hubble-config"
+	gkeOverrideConfigMap               = "cilium-config-emergency-override"
 	hubbleContainerName                = "hubble"
 	hubbleDaemonSetName                = "hubble"
 	ciliumEnvoyDaemonSetName           = "cilium-envoy"
@@ -33,8 +37,6 @@ const (
 	ciliumEnvoyConfigMapName           = defaults.EnvoyConfigMapName
 	hubbleRelayConfigMapName           = defaults.RelayConfigMapName
 	hubbleRelayContainerName           = defaults.RelayContainerName
-	hubbleRelayDeploymentName          = defaults.RelayDeploymentName
-	hubbleUIDeploymentName             = defaults.HubbleUIDeploymentName
 	hubbleGenerateCertsCronJob         = defaults.HubbleGenerateCertsCronJobName
 	spireServerContainerName           = "spire-server"
 	redacted                           = "XXXXXX"
@@ -64,6 +66,7 @@ const (
 	ciliumEtcdSecretFileName                 = "cilium-etcd-secrets-secret-<ts>.yaml"
 	ciliumIdentitiesFileName                 = "ciliumidentities-<ts>.yaml"
 	ciliumCIDRGroupsFileName                 = "ciliumcidrgroups-<ts>.yaml"
+	ciliumL2AnnouncementPoliciesFileName     = "ciliuml2announcementpolicies-<ts>.yaml"
 	ciliumLocalRedirectPoliciesFileName      = "ciliumlocalredirectpolicies-<ts>.yaml"
 	ciliumLogsFileName                       = "logs-%s-%s-<ts>.log"
 	ciliumPreviousLogsFileName               = "logs-%s-%s-<ts>-prev.log"
@@ -71,8 +74,9 @@ const (
 	ciliumNodesFileName                      = "ciliumnodes-<ts>.yaml"
 	ciliumNodeConfigsFileName                = "ciliumnodeconfigs-<ts>.yaml"
 	ciliumOperatorDeploymentFileName         = "cilium-operator-deployment-<ts>.yaml"
-	ciliumPodIPPoolsFileName                 = "ciliumpodippools-<ts>.yaml"
 	clustermeshApiserverDeploymentFileName   = "clustermesh-apiserver-deployment-<ts>.yaml"
+	clustermeshCertgenCronJobFileName        = "clustermesh-generate-certs-cronjob-<ts>.yaml"
+	clustermeshCertManagerCertsFileName      = "clustermesh-certificates-<ts>.yaml"
 	metricsFileName                          = "metrics-%s-%s-<ts>.txt"
 	cniConfigMapFileName                     = "cni-configmap-<ts>.yaml"
 	cniConfigFileName                        = "cniconf-%s-%s-<ts>.txt"
@@ -81,6 +85,8 @@ const (
 	ciliumHelmValuesFileName                 = "cilium-helm-values-<ts>.yaml"
 	tetragonHelmMetadataFileName             = "tetragon-helm-metadata-<ts>.yaml"
 	tetragonHelmValuesFileName               = "tetragon-helm-values-<ts>.yaml"
+	gkeCiliumHubbleConfigFileName            = "gke-cilium-hubble-config-<ts>.yaml"
+	gkeCiliumOverrideConfigFileName          = "gke-cilium-override-config-<ts>.yaml"
 	gopsFileName                             = "gops-%s-%s-<ts>-%s.txt"
 	hubbleDaemonsetFileName                  = "hubble-daemonset-<ts>.yaml"
 	hubbleFlowsFileName                      = "hubble-flows-%s-<ts>.json"
@@ -97,6 +103,7 @@ const (
 	kubernetesLeasesFileName                 = "k8s-leases-<ts>.yaml"
 	kubernetesMetricsFileName                = "k8s-metrics-<ts>.yaml"
 	kubernetesTopNodesFileName               = "k8s-node-memory-cpu-usage-<ts>.txt"
+	kubernetesNodeDiskUsageFileName          = "k8s-node-disk-usage-<ts>.txt"
 	kubernetesTopPodsFileName                = "k8s-pod-memory-cpu-usage-<ts>.txt"
 	kubernetesNamespacesFileName             = "k8s-namespaces-<ts>.yaml"
 	kubernetesNetworkPoliciesFileName        = "k8s-networkpolicies-<ts>.yaml"
@@ -109,12 +116,15 @@ const (
 	timestampPlaceholderFileName             = "<ts>"
 	gatewayClassesFileName                   = "gatewayapi-gatewayclasses-<ts>.yaml"
 	gatewaysFileName                         = "gatewayapi-gateways-<ts>.yaml"
+	listenerSetsFileName                     = "gatewayapi-listenersets-<ts>.yaml"
 	httpRoutesFileName                       = "gatewayapi-httproutes-<ts>.yaml"
 	tlsRoutesFileName                        = "gatewayapi-tlsroutes-<ts>.yaml"
 	grpcRoutesFileName                       = "gatewayapi-grpcroutes-<ts>.yaml"
 	tcpRoutesFileName                        = "gatewayapi-tcroutes-<ts>.yaml"
 	udpRoutesFileName                        = "gatewayapi-udproutes-<ts>.yaml"
+	backendTLSPoliciesFileName               = "gatewayapi-backendtlspolicies-<ts>.yaml"
 	referenceGrantsFileName                  = "gatewayapi-referencegrants-<ts>.yaml"
+	ciliumGatewayClassConfigsFileName        = "ciliumgatewayclassconfigs-<ts>.yaml"
 	ingressClassesFileName                   = "ingressclasses-<ts>.yaml"
 	k8sResourceFileName                      = "%s-<ts>.yaml"
 )
@@ -123,7 +133,6 @@ const (
 	ciliumBugtoolCommand = "cilium-bugtool"
 	dirMode              = 0700
 	fileMode             = 0600
-	gopsCommand          = "/bin/gops"
 	gopsPID              = "1"
 	rmCommand            = "rm"
 	timeFormat           = "20060102-150405"
@@ -179,10 +188,22 @@ var (
 		Version:  "v1",
 	}
 
+	listenerSet = schema.GroupVersionResource{
+		Group:    "gateway.networking.k8s.io",
+		Resource: "listenersets",
+		Version:  "v1",
+	}
+
 	referenceGrant = schema.GroupVersionResource{
 		Group:    "gateway.networking.k8s.io",
 		Resource: "referencegrants",
 		Version:  "v1beta1",
+	}
+
+	backendTLSPolicy = schema.GroupVersionResource{
+		Group:    "gateway.networking.k8s.io",
+		Resource: "backendtlspolicies",
+		Version:  "v1",
 	}
 
 	httpRoute = schema.GroupVersionResource{
@@ -200,18 +221,24 @@ var (
 	tcpRoute = schema.GroupVersionResource{
 		Group:    "gateway.networking.k8s.io",
 		Resource: "tcproutes",
-		Version:  "v1alpha2",
+		Version:  "v1",
 	}
 
 	udpRoute = schema.GroupVersionResource{
 		Group:    "gateway.networking.k8s.io",
 		Resource: "udproutes",
-		Version:  "v1alpha2",
+		Version:  "v1",
 	}
 
 	grpcRoute = schema.GroupVersionResource{
 		Group:    "gateway.networking.k8s.io",
 		Resource: "grpcroutes",
 		Version:  "v1alpha2",
+	}
+
+	ciliumGatewayClassConfig = schema.GroupVersionResource{
+		Group:    "cilium.io",
+		Resource: "ciliumgatewayclassconfigs",
+		Version:  "v2alpha1",
 	}
 )

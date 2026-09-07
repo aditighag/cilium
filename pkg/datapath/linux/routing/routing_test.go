@@ -87,7 +87,7 @@ func TestPrivilegedConfigureRouteWithIncompatibleIP(t *testing.T) {
 	setupLinuxRoutingSuite(t)
 
 	_, ri := getFakes(t, ipamOption.IPAMENI, true, false)
-	err := ri.Configure(nil, 1500, false)
+	err := ri.Configure(netip.Addr{}, 1500, false)
 	require.Error(t, err)
 	require.ErrorContains(t, err, "IP not compatible")
 }
@@ -209,35 +209,31 @@ func runConfigureThenDelete(t *testing.T, ri RoutingInfo, ip netip.Addr, mtu int
 }
 
 func runConfigure(t *testing.T, ri RoutingInfo, ip netip.Addr, mtu int) {
-	err := ri.Configure(ip.AsSlice(), mtu, false)
+	err := ri.Configure(ip, mtu, false)
 	require.NoError(t, err)
 }
 
 // verifyMasqueradeRules checks that rules are consistent with the masquerading configuration:
-// - If masquerading is enabled, rules need to have the 'to' field (example: 'from 10.194.0.56 to 10.0.0.0/8 lookup 3')
-// - If masquerading is disabled or if ri.CIDRs has 0.0.0.0/0, the 'to' field should not be there
+//   - An unconditional rule (from <IP> lookup <table>) must always be present for correct ENI routing.
+//   - No CIDR-specific rules (with 'to' field) should be present.
 func verifyMasqueradeRules(t *testing.T, rules []netlink.Rule, ri RoutingInfo, ip netip.Addr) {
 	t.Helper()
 
-	hasZeroCidr := false
-	for _, cidr := range ri.CIDRs {
-		if cidr.IP.IsUnspecified() {
-			hasZeroCidr = true
-			break
-		}
-	}
-
+	var hasUnconditionalRule bool
 	for _, rule := range rules {
 		if rule.Src != nil && rule.Src.IP.Equal(ip.AsSlice()) {
-			if ri.Masquerade && !hasZeroCidr && rule.Dst == nil {
-				require.Fail(t, "rule is missing the 'to' field with masquerading enabled")
-			} else if ri.Masquerade && hasZeroCidr && rule.Dst != nil {
-				require.Fail(t, "rule has the 'to' field with a 0.0.0.0/0 CIDR")
-			} else if !ri.Masquerade && rule.Dst != nil {
-				require.Fail(t, "rule has the 'to' field despite masquerading being disabled")
+			// Should not have CIDR-specific rules
+			if rule.Dst != nil {
+				require.Fail(t, "unexpected CIDR-specific rule found; only unconditional rule should be present")
+			}
+			if rule.Dst == nil {
+				hasUnconditionalRule = true
 			}
 		}
 	}
+
+	// The unconditional rule must always be present for correct ENI routing.
+	require.True(t, hasUnconditionalRule, "unconditional egress rule (from <IP> lookup <table>) must be present")
 }
 
 func runDelete(t *testing.T, ip netip.Addr) {
@@ -280,7 +276,7 @@ func createDummyDevice(t *testing.T, macAddr mac.MAC) func() {
 			// NOTE: This name must be less than 16 chars, source:
 			// https://elixir.bootlin.com/linux/v5.6/source/include/uapi/linux/if.h#L33
 			Name:         "linuxrout-test",
-			HardwareAddr: net.HardwareAddr(macAddr),
+			HardwareAddr: macAddr.HardwareAddr(),
 		},
 	}
 	err := netlink.LinkAdd(dummy)
@@ -303,15 +299,15 @@ func getFakes(t *testing.T, ipamMode string, masquerade bool, withZeroCIDR bool)
 	logger := hivetest.Logger(t)
 
 	fakeGateway := "192.168.2.1"
-	fakeSubnet1CIDR := "192.168.0.0/16"
-	fakeSubnet2CIDR := "192.170.0.0/16"
-	fakeMAC := "00:11:22:33:44:55"
+	fakeSubnet1CIDR := netip.MustParsePrefix("192.168.0.0/16")
+	fakeSubnet2CIDR := netip.MustParsePrefix("192.170.0.0/16")
+	fakeMAC := mac.MustParseMAC("00:11:22:33:44:55")
 
-	var cidrs []string
+	var cidrs []netip.Prefix
 	if masquerade {
-		cidrs = []string{fakeSubnet1CIDR, fakeSubnet2CIDR}
+		cidrs = []netip.Prefix{fakeSubnet1CIDR, fakeSubnet2CIDR}
 		if withZeroCIDR {
-			cidrs = []string{"0.0.0.0/0"}
+			cidrs = []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")}
 		}
 	}
 

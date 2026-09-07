@@ -15,9 +15,9 @@ import (
 	"github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/controller"
 	"github.com/cilium/cilium/pkg/dial"
-	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/node"
 )
 
 type StatusFunc func() *models.RemoteCluster
@@ -33,6 +33,9 @@ type Configuration struct {
 	// ClusterInfo is the id/name of the local cluster.
 	ClusterInfo types.ClusterInfo
 
+	// ClusterIDsManager reserves IDs advertised by remote clusters.
+	ClusterIDsManager ClusterIDsManager
+
 	// RemoteClientFactory is the factory to create new backend instances.
 	RemoteClientFactory RemoteClientFactoryFn
 
@@ -40,7 +43,7 @@ type Configuration struct {
 	NewRemoteCluster RemoteClusterCreatorFunc
 
 	// ClusterSizeDependantInterval allows to calculate intervals based on cluster size.
-	ClusterSizeDependantInterval kvstore.ClusterSizeDependantIntervalFunc
+	ClusterSizeDependantInterval node.ClusterSizeDependantIntervalFunc
 
 	// Resolvers, if provided, are used to create a custom dialer to connect to etcd.
 	Resolvers []dial.Resolver
@@ -139,6 +142,8 @@ func (cm *clusterMesh) newRemoteCluster(name, path string) *remoteCluster {
 		name:                         name,
 		configPath:                   path,
 		clusterSizeDependantInterval: cm.conf.ClusterSizeDependantInterval,
+		localClusterInfo:             cm.conf.ClusterInfo,
+		clusterIDsManager:            cm.conf.ClusterIDsManager,
 
 		resolvers: cm.conf.Resolvers,
 
@@ -225,9 +230,7 @@ func (cm *clusterMesh) remove(name string) {
 	delete(cm.clusters, name)
 	cm.conf.Metrics.TotalRemoteClusters.Set(float64(len(cm.clusters)))
 
-	cm.wg.Add(1)
-	go func() {
-		defer cm.wg.Done()
+	cm.wg.Go(func() {
 
 		// Run onRemove in a separate go routing as potentially slow, to avoid
 		// blocking the processing of further events in the meanwhile.
@@ -243,7 +246,7 @@ func (cm *clusterMesh) remove(name string) {
 			cm.addLocked(name, path)
 		}
 		cm.mutex.Unlock()
-	}()
+	})
 
 	cm.conf.Logger.Debug("Remote cluster configuration removed", fieldClusterName, name)
 }

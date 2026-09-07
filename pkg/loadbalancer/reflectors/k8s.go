@@ -11,7 +11,7 @@ import (
 	"iter"
 	"log/slog"
 	"maps"
-	"net"
+	"net/netip"
 	"slices"
 	"strings"
 	"sync"
@@ -23,7 +23,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 
-	daemonK8s "github.com/cilium/cilium/daemon/k8s"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/container"
 	"github.com/cilium/cilium/pkg/k8s"
@@ -31,9 +30,11 @@ import (
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	slim_discoveryv1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/discovery/v1"
+	k8sTables "github.com/cilium/cilium/pkg/k8s/tables"
 	"github.com/cilium/cilium/pkg/k8s/utils"
 	k8sUtils "github.com/cilium/cilium/pkg/k8s/utils"
 	"github.com/cilium/cilium/pkg/loadbalancer"
+	reflectorEndpoints "github.com/cilium/cilium/pkg/loadbalancer/reflectors/endpoints"
 	"github.com/cilium/cilium/pkg/loadbalancer/writer"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -45,13 +46,6 @@ import (
 const (
 	// reflectorBufferSize is the maximum size of the event buffer.
 	reflectorBufferSize = 500
-
-	// reflectorWaitTime is the maximum amount of time to try and fill the buffer.
-	// A higher wait time will reduce processing of transient states and increases
-	// throughput as it gives bigger batches downstream for processing. Batching
-	// also helps to combine related objects, e.g. a Service may have multiple
-	// associated EndpointSlices and preferably these would be processed together.
-	reflectorWaitTime = 500 * time.Millisecond
 
 	// K8sInitializerPrefix is the StateDB initializer prefix used here. This can
 	// be used to wait for the tables to be populated just from k8s even when
@@ -65,8 +59,9 @@ var K8sReflectorCell = cell.Module(
 	"k8s-reflector",
 	"Reflects load-balancing state from Kubernetes",
 
+	cell.Provide(provideK8sReflector),
 	cell.ProvidePrivate(newEventStream),
-	cell.Invoke(RegisterK8sReflector),
+	cell.Invoke(func(_ K8sReflectorRegistered) {}),
 )
 
 type reflectorParams struct {
@@ -78,7 +73,7 @@ type reflectorParams struct {
 	JobGroup               job.Group
 	Clientset              client.Clientset
 	EventStream            stream.Observable[event]
-	Pods                   statedb.Table[daemonK8s.LocalPod]
+	Pods                   statedb.Table[k8sTables.LocalPod]
 	Writer                 *writer.Writer
 	Config                 loadbalancer.Config
 	ExtConfig              loadbalancer.ExternalConfig
@@ -88,12 +83,19 @@ type reflectorParams struct {
 	SVCMetrics             SVCMetrics `optional:"true"`
 }
 
+type K8sReflectorRegistered struct{}
+
+func provideK8sReflector(p reflectorParams) K8sReflectorRegistered {
+	RegisterK8sReflector(p)
+	return K8sReflectorRegistered{}
+}
+
 func (p reflectorParams) waitTime() time.Duration {
 	if p.TestConfig != nil {
 		// Use a much lower wait time in tests to trigger more edge cases and make them faster.
 		return 10 * time.Millisecond
 	}
-	return reflectorWaitTime
+	return p.Config.ReflectorWaitTime
 }
 
 func RegisterK8sReflector(p reflectorParams) {
@@ -104,17 +106,22 @@ func RegisterK8sReflector(p reflectorParams) {
 		p.SVCMetrics = NewSVCMetricsNoop()
 	}
 
-	podsComplete := p.Writer.RegisterInitializer(K8sInitializerPrefix + "pods")
 	epsComplete := p.Writer.RegisterInitializer(K8sInitializerPrefix + "endpoints")
 	svcComplete := p.Writer.RegisterInitializer(K8sInitializerPrefix + "services")
 	p.JobGroup.Add(
 		job.OneShot("reflect-services-endpoints", func(ctx context.Context, health cell.Health) error {
 			return runServiceEndpointsReflector(ctx, health, p, svcComplete, epsComplete)
 		}),
-		job.OneShot("reflect-pods", func(ctx context.Context, health cell.Health) error {
-			return runPodReflector(ctx, health, p, podsComplete)
-		}),
 	)
+
+	if p.ExtConfig.KubeProxyReplacement {
+		podsComplete := p.Writer.RegisterInitializer(K8sInitializerPrefix + "pods")
+		p.JobGroup.Add(
+			job.OneShot("reflect-pods", func(ctx context.Context, health cell.Health) error {
+				return runPodReflector(ctx, health, p, podsComplete)
+			}),
+		)
+	}
 }
 
 func runPodReflector(ctx context.Context, health cell.Health, p reflectorParams, initComplete func(writer.WriteTxn)) error {
@@ -134,21 +141,16 @@ func runPodReflector(ctx context.Context, health cell.Health, p reflectorParams,
 
 	rh := newReflectorHealth(health, p.Log)
 
-	processBuffer := func(txn writer.WriteTxn, buf iter.Seq2[types.NamespacedName, statedb.Change[daemonK8s.LocalPod]]) {
+	processBuffer := func(txn writer.WriteTxn, buf iter.Seq2[types.NamespacedName, statedb.Change[k8sTables.LocalPod]]) {
 		for _, change := range buf {
 			obj := change.Object.Pod
-			if obj.Spec.HostNetwork {
-				continue
-			}
 
 			podName := obj.Namespace + "/" + obj.Name
-			if change.Deleted {
+			if change.Deleted || obj.Spec.HostNetwork {
 				rh.update(podName, nil)
-				if p.ExtConfig.KubeProxyReplacement {
-					if err := deleteHostPort(p, txn, obj); err != nil {
-						p.Log.Error("BUG: Unexpected failure in deleteHostPort",
-							logfields.Error, err)
-					}
+				if err := deleteHostPort(p, txn, obj); err != nil {
+					p.Log.Error("BUG: Unexpected failure in deleteHostPort",
+						logfields.Error, err)
 				}
 			} else {
 				switch obj.Status.Phase {
@@ -156,11 +158,9 @@ func runPodReflector(ctx context.Context, health cell.Health, p reflectorParams,
 					// Pod has been terminated. Clean up the HostPort already even before the Pod object
 					// has been removed to free up the HostPort for other pods.
 					rh.update(podName, nil)
-					if p.ExtConfig.KubeProxyReplacement {
-						if err := deleteHostPort(p, txn, obj); err != nil {
-							p.Log.Error("BUG: Unexpected failure in deleteHostPort",
-								logfields.Error, err)
-						}
+					if err := deleteHostPort(p, txn, obj); err != nil {
+						p.Log.Error("BUG: Unexpected failure in deleteHostPort",
+							logfields.Error, err)
 					}
 				case slim_corev1.PodRunning:
 					var err error
@@ -171,9 +171,7 @@ func runPodReflector(ctx context.Context, health cell.Health, p reflectorParams,
 						continue
 					}
 
-					if p.ExtConfig.KubeProxyReplacement {
-						err = upsertHostPort(p.HaveNetNSCookieSupport, p.Config, p.ExtConfig, p.Log, txn, p.Writer, obj)
-					}
+					err = upsertHostPort(p.HaveNetNSCookieSupport, p.Config, p.ExtConfig, p.Log, txn, p.Writer, obj)
 					rh.update(podName, err)
 				}
 			}
@@ -187,9 +185,9 @@ func runPodReflector(ctx context.Context, health cell.Health, p reflectorParams,
 			reflectorBufferSize,
 			p.waitTime(),
 
-			func(buf *container.InsertOrderedMap[types.NamespacedName, statedb.Change[daemonK8s.LocalPod]], change statedb.Change[daemonK8s.LocalPod]) *container.InsertOrderedMap[types.NamespacedName, statedb.Change[daemonK8s.LocalPod]] {
+			func(buf *container.InsertOrderedMap[types.NamespacedName, statedb.Change[k8sTables.LocalPod]], change statedb.Change[k8sTables.LocalPod]) *container.InsertOrderedMap[types.NamespacedName, statedb.Change[k8sTables.LocalPod]] {
 				if buf == nil {
-					buf = container.NewInsertOrderedMap[types.NamespacedName, statedb.Change[daemonK8s.LocalPod]]()
+					buf = container.NewInsertOrderedMap[types.NamespacedName, statedb.Change[k8sTables.LocalPod]]()
 				}
 				pod := change.Object
 				buf.Insert(types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}, change)
@@ -281,7 +279,7 @@ func runServiceEndpointsReflector(ctx context.Context, health cell.Health, p ref
 		}
 	}
 
-	currentEndpoints := map[string]endpointsEvent{}
+	currentEndpoints := reflectorEndpoints.Cache{}
 	processEndpointsEvent := func(txn writer.WriteTxn, key bufferKey, val bufferValue) {
 		switch val.kind {
 		case resource.Sync:
@@ -293,19 +291,9 @@ func runServiceEndpointsReflector(ctx context.Context, health cell.Health, p ref
 			}
 
 			// Delete all previous endpoints
-			for _, ev := range currentEndpoints {
-				for addr, prevBe := range ev.backends {
-					addrs := make([]loadbalancer.L3n4Addr, 0, len(prevBe.Ports))
-					for l4Addr := range prevBe.Ports {
-						addrs = append(addrs, loadbalancer.NewL3n4Addr(
-							l4Addr.Protocol,
-							addr,
-							l4Addr.Port,
-							loadbalancer.ScopeExternal))
-					}
-					if err := p.Writer.ReleaseBackends(txn, ev.svcName, slices.Values(addrs)); err != nil {
-						p.Log.Error("BUG: Unexpected failure to delete backends", logfields.Error, err)
-					}
+			for name, addrs := range currentEndpoints.All() {
+				if err := p.Writer.DeleteBackendsByAddress(txn, name, source.Kubernetes, writer.LocalClusterID, addrs); err != nil {
+					p.Log.Error("BUG: Unexpected failure to delete backends", logfields.Error, err)
 				}
 			}
 			clear(currentEndpoints)
@@ -317,16 +305,19 @@ func runServiceEndpointsReflector(ctx context.Context, health cell.Health, p ref
 				// UpsertBackend refreshes the frontends already.
 				servicesToRefresh.Delete(name)
 
-				// Convert [k8s.Endpoints] to [loadbalancer.BackendParams]
-				backends := convertEndpoints(p.Log, p.ExtConfig, name, maps.All(eps.Backends))
+				// Convert [k8s.Endpoints] to [loadbalancer.Backend]
+				backends := reflectorEndpoints.Convert(p.Log, p.ExtConfig, name, maps.All(eps.Backends))
 
-				err := p.Writer.UpsertBackends(txn, name, source.Kubernetes, backends)
+				err := p.Writer.UpsertBackends(txn, name, source.Kubernetes, writer.LocalClusterID, backends)
 				rh.update("eps:"+name.String(), err)
-
-				currentEndpoints[eps.EndpointSliceName] = endpointsEvent{
-					name:     eps.EndpointSliceName,
-					backends: eps.Backends,
+				if err != nil {
+					continue
 				}
+				currentEndpoints.Update(reflectorEndpoints.Endpoints{
+					Name:        eps.EndpointSliceName,
+					ServiceName: name,
+					Backends:    eps.Backends,
+				})
 			}
 
 			// Refresh the remaining frontends that now have no backends.
@@ -345,48 +336,16 @@ func runServiceEndpointsReflector(ctx context.Context, health cell.Health, p ref
 			)
 			var err error
 
-			// Convert [k8s.Endpoints] to [loadbalancer.BackendParams]
-			backends := convertEndpoints(p.Log, p.ExtConfig, name, allEps.Backends())
+			// Convert [k8s.Endpoints] to [loadbalancer.Backend]
+			backends := reflectorEndpoints.Convert(p.Log, p.ExtConfig, name, allEps.Backends())
 
-			// Find orphaned backends. We are using iter.Seq to avoid unnecessary allocations.
-			var orphans iter.Seq[loadbalancer.L3n4Addr] = func(yield func(loadbalancer.L3n4Addr) bool) {
-				for ep := range allEps.All() {
-					previous, found := currentEndpoints[ep.name]
-					if !found {
-						continue
-					}
-					for addr, prevBe := range previous.backends {
-						be, foundBe := ep.backends[addr]
-						for l4Addr := range prevBe.Ports {
-							foundPort := false
-							if foundBe {
-								_, foundPort = be.Ports[l4Addr]
-							}
-							if !foundPort {
-								if !yield(
-									loadbalancer.NewL3n4Addr(
-										l4Addr.Protocol,
-										addr,
-										l4Addr.Port,
-										loadbalancer.ScopeExternal,
-									)) {
-									return
-								}
-							}
-						}
-					}
-				}
+			err = p.Writer.UpsertAndReleaseBackends(txn, name, source.Kubernetes, writer.LocalClusterID, backends, currentEndpoints.Orphans(allEps.All()))
+			if err != nil {
+				rh.update("eps:"+name.String(), err)
+				return
 			}
 
-			err = p.Writer.UpsertAndReleaseBackends(txn, name, source.Kubernetes, backends, orphans)
-
-			for ep := range allEps.All() {
-				if len(ep.backends) == 0 {
-					delete(currentEndpoints, ep.name)
-				} else {
-					currentEndpoints[ep.name] = ep
-				}
-			}
+			currentEndpoints.UpdateMany(allEps.All())
 
 			rh.update("eps:"+name.String(), err)
 
@@ -450,72 +409,9 @@ type bufferKey struct {
 type bufferValue struct {
 	kind             resource.EventKind
 	svc              *slim_corev1.Service
-	allEndpoints     allEndpoints
+	allEndpoints     reflectorEndpoints.AllEndpoints
 	endpointsReplace []*k8s.Endpoints
 	servicesReplace  []*slim_corev1.Service
-}
-
-type endpointsEvent struct {
-	name     string
-	svcName  loadbalancer.ServiceName
-	backends map[cmtypes.AddrCluster]*k8s.Backend
-}
-
-// allEndpoints holds one or more [k8s.Endpoints] that target the same service within a single buffer.
-// This type is designed to avoid allocations for the usual case of single endpoint slice per service.
-type allEndpoints struct {
-	head endpointsEvent
-	tail []endpointsEvent
-}
-
-func (ae allEndpoints) insert(deleted bool, ep *k8s.Endpoints) allEndpoints {
-	ev := endpointsEvent{
-		name:    ep.EndpointSliceName,
-		svcName: ep.ServiceName,
-	}
-	if !deleted {
-		ev.backends = ep.Backends
-	}
-
-	if ae.head.name == "" || ae.head.name == ev.name {
-		ae.head = ev
-		return ae
-	}
-	for i, x := range ae.tail {
-		if ev.name == x.name {
-			ae.tail[i] = ev
-			return ae
-		}
-	}
-	ae.tail = append(ae.tail, ev)
-	return ae
-}
-
-func (ae *allEndpoints) All() iter.Seq[endpointsEvent] {
-	return func(yield func(endpointsEvent) bool) {
-		if ae.head.name != "" {
-			if !yield(ae.head) {
-				return
-			}
-		}
-		for _, ep := range ae.tail {
-			if !yield(ep) {
-				return
-			}
-		}
-	}
-}
-
-func (ae *allEndpoints) Backends() iter.Seq2[cmtypes.AddrCluster, *k8s.Backend] {
-	return func(yield func(cmtypes.AddrCluster, *k8s.Backend) bool) {
-		for ep := range ae.All() {
-			for addr, be := range ep.backends {
-				if !yield(addr, be) {
-					return
-				}
-			}
-		}
-	}
 }
 
 // buffer for holding a batch of service or endpoint events
@@ -542,11 +438,11 @@ func bufferInsert(buf buffer, ev event) buffer {
 			resource.Key{Name: ev.obj.ServiceName.Name(), Namespace: ev.obj.ServiceName.Namespace()},
 			false,
 		}
-		var allEps allEndpoints
+		var allEps reflectorEndpoints.AllEndpoints
 		if old, ok := buf.Get(key); ok {
 			allEps = old.allEndpoints
 		}
-		allEps = allEps.insert(false, ev.obj)
+		allEps = allEps.Insert(false, ev.obj)
 		buf.Insert(key, bufferValue{
 			kind:         resource.Upsert,
 			allEndpoints: allEps,
@@ -556,13 +452,13 @@ func bufferInsert(buf buffer, ev event) buffer {
 			resource.Key{Name: ev.obj.ServiceName.Name(), Namespace: ev.obj.ServiceName.Namespace()},
 			false,
 		}
-		var allEps allEndpoints
+		var allEps reflectorEndpoints.AllEndpoints
 		if old, ok := buf.Get(key); ok {
 			allEps = old.allEndpoints
 		}
-		allEps = allEps.insert(true, ev.obj)
+		allEps = allEps.Insert(true, ev.obj)
 		// Since we may merge a mixture of Upsert and Delete events together we handle
-		// deletion as an Upsert of [endpointsEvent] with nil backends.
+		// deletion as an Upsert of [endpoints.Endpoints] with nil backends.
 		buf.Insert(key, bufferValue{
 			kind:         resource.Upsert,
 			allEndpoints: allEps,
@@ -641,7 +537,7 @@ func upsertHostPort(netnsCookie HaveNetNSCookieSupport, config loadbalancer.Conf
 
 	type podServices struct {
 		service loadbalancer.Service
-		bes     []loadbalancer.BackendParams
+		bes     []loadbalancer.Backend
 		fes     sets.Set[loadbalancer.FrontendParams]
 	}
 
@@ -707,7 +603,7 @@ func upsertHostPort(netnsCookie HaveNetNSCookieSupport, config loadbalancer.Conf
 				ipv4 = ipv4 || addr.Is4()
 				ipv6 = ipv6 || addr.Is6()
 
-				bep := loadbalancer.BackendParams{
+				bep := loadbalancer.Backend{
 					Address: loadbalancer.NewL3n4Addr(
 						proto,
 						addr,
@@ -719,28 +615,28 @@ func upsertHostPort(netnsCookie HaveNetNSCookieSupport, config loadbalancer.Conf
 				svc.bes = append(svc.bes, bep)
 			}
 
-			feIP := net.ParseIP(p.HostIP)
-			if feIP != nil && feIP.IsLoopback() && !netnsCookie() {
+			feIP, err := netip.ParseAddr(p.HostIP)
+			if err == nil && feIP.IsLoopback() && !netnsCookie() {
 				log.Warn("The requested loopback address for hostIP is not supported for kernels which don't provide netns cookies. Ignoring.",
 					logfields.HostIP, feIP)
 				continue
 			}
 
-			feIPs := []net.IP{}
+			feIPs := []netip.Addr{}
 
 			// When HostIP is explicitly set, then we need to expose *only*
 			// on this address but not via other addresses. When it's not set,
 			// then expose via all local addresses. Same when the user provides
 			// an unspecified address (0.0.0.0 / [::]).
-			if feIP != nil && !feIP.IsUnspecified() {
+			if feIP.IsValid() && !feIP.IsUnspecified() {
 				// Migrate the loopback address into a 0.0.0.0 / [::]
 				// surrogate, thus internal datapath handling can be
 				// streamlined. It's not exposed for traffic from outside.
 				if feIP.IsLoopback() {
-					if feIP.To4() != nil {
-						feIP = net.IPv4zero
+					if feIP.Is4() {
+						feIP = netip.IPv4Unspecified()
 					} else {
-						feIP = net.IPv6zero
+						feIP = netip.IPv6Unspecified()
 					}
 					svc.service.LoopbackHostPort = true
 				} else if svc.service.LoopbackHostPort {
@@ -750,17 +646,17 @@ func upsertHostPort(netnsCookie HaveNetNSCookieSupport, config loadbalancer.Conf
 					continue
 				}
 				feIPs = append(feIPs, feIP)
-			} else if feIP == nil {
+			} else if !feIP.IsValid() {
 				if ipv4 {
-					feIPs = append(feIPs, net.IPv4zero)
+					feIPs = append(feIPs, netip.IPv4Unspecified())
 				}
 				if ipv6 {
-					feIPs = append(feIPs, net.IPv6zero)
+					feIPs = append(feIPs, netip.IPv6Unspecified())
 				}
 			}
 
 			for _, feIP := range feIPs {
-				addr := cmtypes.MustAddrClusterFromIP(feIP)
+				addr := cmtypes.AddrClusterFrom(feIP, 0)
 				fe := loadbalancer.FrontendParams{
 					Type:        loadbalancer.SVCTypeHostPort,
 					ServiceName: serviceName,
@@ -867,8 +763,15 @@ type replaceEndpointsEvent struct {
 
 func (replaceEndpointsEvent) isEvent() {}
 
-func endpointsEvents(log *slog.Logger, c client.Clientset) stream.Observable[event] {
-	lw := k8sUtils.ListerWatcherFromTyped(c.Slim().DiscoveryV1().EndpointSlices(""))
+func endpointsEvents(log *slog.Logger, c client.Clientset, cfg k8s.ConfigParams) (stream.Observable[event], error) {
+	optsModifier, err := utils.GetEndpointSliceListOptionsModifier(cfg.Config.K8sServiceProxyName, cfg.WatchConfig.EnableHeadlessServiceWatch)
+	if err != nil {
+		return nil, err
+	}
+	lw := k8sUtils.ListerWatcherWithModifiers(
+		k8sUtils.ListerWatcherFromTyped(c.Slim().DiscoveryV1().EndpointSlices("")),
+		optsModifier,
+	)
 	return stream.Map(
 		k8s.ListerWatcherToObservable(lw),
 		func(ev k8s.CacheStoreEvent) event {
@@ -892,7 +795,7 @@ func endpointsEvents(log *slog.Logger, c client.Clientset) stream.Observable[eve
 			default:
 				panic(fmt.Sprintf("unexpected k8s.CacheStoreEventKind: %#v", ev.Kind))
 			}
-		})
+		}), nil
 }
 
 func serviceEvents(cs client.Clientset, cfg k8s.ConfigParams) (stream.Observable[event], error) {
@@ -936,9 +839,13 @@ func newEventStream(log *slog.Logger, cs client.Clientset, cfg k8s.ConfigParams)
 	if err != nil {
 		return nil, err
 	}
+	epsEvents, err := endpointsEvents(log, cs, cfg)
+	if err != nil {
+		return nil, err
+	}
 	return joinObservables(
 		svcEvents,
-		endpointsEvents(log, cs),
+		epsEvents,
 	), nil
 }
 

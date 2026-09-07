@@ -32,6 +32,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 
 	"github.com/cilium/cilium/api/v1/models"
+	bgpConfig "github.com/cilium/cilium/pkg/bgp/config"
 	cnpv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/synced"
 	"github.com/cilium/cilium/test/config"
@@ -739,34 +740,6 @@ func (kub *Kubectl) GetNumCiliumNodes() int {
 	return len(strings.Split(res.SingleOut(), " ")) - len(GetNodesWithoutCilium())
 }
 
-// CreateSecret is a wrapper around `kubernetes create secret
-// <resourceName>.
-func (kub *Kubectl) CreateSecret(secretType, name, namespace, args string) *CmdRes {
-	kub.Logger().Debug(fmt.Sprintf("creating secret %s in namespace %s", name, namespace))
-	kub.ExecShort(fmt.Sprintf("kubectl delete secret %s %s -n %s", secretType, name, namespace))
-	return kub.ExecShort(fmt.Sprintf("kubectl create secret %s %s -n %s %s", secretType, name, namespace, args))
-}
-
-// ExecKafkaPodCmd executes shell command with arguments arg in the specified pod residing in the specified
-// namespace. It returns the stdout of the command that was executed.
-// The kafka producer and consumer scripts do not return error if command
-// leads to TopicAuthorizationException or any other error. Hence the
-// function needs to also take into account the stderr messages returned.
-func (kub *Kubectl) ExecKafkaPodCmd(namespace string, pod string, arg string) error {
-	command := fmt.Sprintf("%s exec -n %s %s -- %s", KubectlCmd, namespace, pod, arg)
-	res := kub.Exec(command)
-	if !res.WasSuccessful() {
-		return fmt.Errorf("ExecKafkaPodCmd: command '%s' failed %s",
-			res.GetCmd(), res.OutputPrettyPrint())
-	}
-
-	if strings.Contains(res.Stderr(), "ERROR") {
-		return fmt.Errorf("ExecKafkaPodCmd: command '%s' failed '%s'",
-			res.GetCmd(), res.OutputPrettyPrint())
-	}
-	return nil
-}
-
 // ExecPodCmd executes command cmd in the specified pod residing in the specified
 // namespace. It returns a pointer to CmdRes with all the output
 func (kub *Kubectl) ExecPodCmd(namespace string, pod string, cmd string, options ...ExecOptions) *CmdRes {
@@ -884,19 +857,6 @@ func (kub *Kubectl) GetPodsIPs(namespace string, filter string) (map[string]stri
 	jsonFilter := `{range .items[*]}{@.metadata.name}{"="}{@.status.podIP}{"\n"}{end}`
 	res := kub.ExecShort(fmt.Sprintf("%s -n %s get pods -l %s -o jsonpath='%s'",
 		KubectlCmd, namespace, filter, jsonFilter))
-	if !res.WasSuccessful() {
-		return nil, fmt.Errorf("cannot retrieve pods: %s", res.CombineOutput())
-	}
-	return res.KVOutput(), nil
-}
-
-// GetPodsHostIPs returns a map with pod name as a key and host IP name as value. It
-// only gets pods in the given namespace that match the provided filter. It
-// returns an error if pods cannot be retrieved correctly
-func (kub *Kubectl) GetPodsHostIPs(namespace string, label string) (map[string]string, error) {
-	jsonFilter := `{range .items[*]}{@.metadata.name}{"="}{@.status.hostIP}{"\n"}{end}`
-	res := kub.ExecShort(fmt.Sprintf("%s -n %s get pods -l %s -o jsonpath='%s'",
-		KubectlCmd, namespace, label, jsonFilter))
 	if !res.WasSuccessful() {
 		return nil, fmt.Errorf("cannot retrieve pods: %s", res.CombineOutput())
 	}
@@ -1054,12 +1014,6 @@ func (kub *Kubectl) getNodeIPByLabel(label string, external bool, ipFamily v1.IP
 // An error is returned if a node cannot be found.
 func (kub *Kubectl) GetNodeIPByLabel(label string, external bool) (string, error) {
 	return kub.getNodeIPByLabel(label, external, v1.IPv4Protocol)
-}
-
-// GetNodeIPv6ByLabel returns the IPv6 of the node with cilium.io/ci-node=label.
-// An error is returned if a node cannot be found.
-func (kub *Kubectl) GetNodeIPv6ByLabel(label string, external bool) (string, error) {
-	return kub.getNodeIPByLabel(label, external, v1.IPv6Protocol)
 }
 
 func (kub *Kubectl) getIfaceByIPAddr(label string, ipAddr string) (string, error) {
@@ -2177,13 +2131,6 @@ func (kub *Kubectl) WaitTerminatingPods(timeout time.Duration) error {
 // WaitTerminatingPodsInNs waits until all nodes that are in `Terminating`
 // state are deleted correctly in the platform. In case of excedding the
 // given timeout (in seconds) it returns an error.
-func (kub *Kubectl) WaitTerminatingPodsInNs(ns string, timeout time.Duration) error {
-	return kub.WaitTerminatingPodsInNsWithFilter(ns, "", timeout)
-}
-
-// WaitTerminatingPodsInNs waits until all nodes that are in `Terminating`
-// state are deleted correctly in the platform. In case of excedding the
-// given timeout (in seconds) it returns an error.
 func (kub *Kubectl) WaitTerminatingPodsInNsWithFilter(ns, filter string, timeout time.Duration) error {
 	var innerErr error
 
@@ -2671,40 +2618,6 @@ func (kub *Kubectl) CiliumExecMustSucceedOnAll(ctx context.Context, cmd string, 
 	}
 }
 
-// CiliumNodesWait waits until all nodes in the Kubernetes cluster are annotated
-// with Cilium annotations. Its runtime is bounded by a maximum of `HelperTimeout`.
-// When a node is annotated with said annotations, it indicates
-// that the tunnels in the nodes are set up and that cross-node traffic can be
-// tested. Returns an error if the timeout is exceeded for waiting for the nodes
-// to be annotated.
-func (kub *Kubectl) CiliumNodesWait() (bool, error) {
-	body := func() bool {
-		filter := `{range .items[*]}{@.metadata.name}{"="}{@.spec.addresses[?(@.type=="CiliumInternalIP")].ip}{"\n"}{end}`
-		data := kub.ExecShort(fmt.Sprintf(
-			"%s get ciliumnodes -o jsonpath='%s'", KubectlCmd, filter))
-		if !data.WasSuccessful() {
-			return false
-		}
-		result := data.KVOutput()
-		for k, v := range result {
-			if IsNodeWithoutCilium(k) {
-				continue
-			}
-			if v == "" {
-				kub.Logger().Infof("Kubernetes node '%v' does not have Cilium metadata", k)
-				return false
-			}
-			kub.Logger().Infof("Kubernetes node '%v' IPv4 address: '%v'", k, v)
-		}
-		return true
-	}
-	err := WithTimeout(body, "Kubernetes node does not have cilium metadata", &TimeoutConfig{Timeout: HelperTimeout})
-	if err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
 // LoadedPolicyInFirstAgent returns the policy as loaded in the first cilium
 // agent that is found in the cluster
 func (kub *Kubectl) LoadedPolicyInFirstAgent() (string, error) {
@@ -2965,7 +2878,7 @@ func (kub *Kubectl) CiliumCheckReport(ctx context.Context) {
 	table.Flush()
 
 	controllersFilter := `{range .controllers[*]}{.name}{"="}{.status.consecutive-failure-count}::{.status.last-failure-msg}{"\n"}{end}`
-	var failedControllers string
+	var failedControllers strings.Builder
 	for _, pod := range pods {
 		prefix := ""
 		status := kub.CiliumExecContext(ctx, pod, "cilium-dbg status --all-controllers -o json")
@@ -2987,17 +2900,17 @@ func (kub *Kubectl) CiliumCheckReport(ctx context.Context) {
 			if status[0] != "" {
 				failed++
 				prefix = "⚠️  "
-				failedControllers += fmt.Sprintf("controller %s failure '%s'\n", name, status[1])
+				fmt.Fprintf(&failedControllers, "controller %s failure '%s'\n", name, status[1])
 			}
 		}
 		statusFilter := `Status: {.cilium.state}  Health: {.cluster.ciliumHealth.state}` +
-			` Nodes "{.cluster.nodes[*].name}" ContainerRuntime: {.container-runtime.state}` +
+			` Nodes "{.cluster.nodes[*].name}"` +
 			` Kubernetes: {.kubernetes.state} KVstore: {.kvstore.state}`
 		data, _ := status.Filter(statusFilter)
 		fmt.Fprintf(CheckLogs, "%sCilium agent '%s': %s Controllers: Total %d Failed %d\n",
 			prefix, pod, data, total, failed)
-		if failedControllers != "" {
-			fmt.Fprintf(CheckLogs, "Failed controllers:\n %s", failedControllers)
+		if failedControllers.Len() > 0 {
+			fmt.Fprintf(CheckLogs, "Failed controllers:\n %s", failedControllers.String())
 		}
 	}
 }
@@ -4118,7 +4031,7 @@ func (kub *Kubectl) CleanupCiliumComponents() {
 			"role":               "cilium-config-agent",
 		}
 
-		crdsToDelete = synced.AllCiliumCRDResourceNames()
+		crdsToDelete = synced.AllCiliumCRDResourceNames(bgpConfig.DefaultConfig)
 	)
 
 	wg.Add(len(resourcesToDelete))
@@ -4198,7 +4111,11 @@ func (kub *Kubectl) ensureKubectlVersion() error {
 		rcVersion = fmt.Sprintf("v%s.0", GetCurrentK8SEnv())
 	}
 	res = kub.Exec(
-		fmt.Sprintf("curl -sSLo %s https://dl.k8s.io/release/%s/bin/linux/amd64/kubectl && chmod +x %s",
+		// --retry-all-errors is required because a transient TLS/SSL connect
+		// failure to dl.k8s.io surfaces as curl exit 35, which is not part of
+		// curl's default --retry set. Mirrors the download retry convention
+		// applied to the .github/ workflows and composite actions in #47167.
+		fmt.Sprintf("curl -sSfLo %s --retry 5 --retry-all-errors --retry-delay 3 https://dl.k8s.io/release/%s/bin/linux/amd64/kubectl && chmod +x %s",
 			path, rcVersion, path))
 	if !res.WasSuccessful() {
 		return fmt.Errorf("failed to download kubectl")
@@ -4226,26 +4143,6 @@ func (kub *Kubectl) NslookupInPod(namespace, pod string, target string) (err err
 // Cilium into the cluster.
 func (kub *Kubectl) CiliumOptions() map[string]string {
 	return kub.ciliumOptions
-}
-
-// WaitForServiceFrontend waits until the service frontend with the given ipAddr
-// appears in "cilium-dbg bpf lb list --frontends" on the given node.
-func (kub *Kubectl) WaitForServiceFrontend(nodeName, ipAddr string) error {
-	ciliumPod, err := kub.GetCiliumPodOnNodeByName(nodeName)
-	if err != nil {
-		return err
-	}
-
-	body := func() bool {
-		ctx, cancel := context.WithTimeout(context.Background(), ShortCommandTimeout)
-		defer cancel()
-		cmd := fmt.Sprintf(`cilium-dbg bpf lb list --frontends | grep -q %s`, ipAddr)
-		return kub.CiliumExecContext(ctx, ciliumPod, cmd).WasSuccessful()
-	}
-
-	return WithTimeout(body,
-		fmt.Sprintf("frontend entry for %s was not found in time", ipAddr),
-		&TimeoutConfig{Timeout: HelperTimeout})
 }
 
 func (kub *Kubectl) AddVXLAN(nodeName, remote, dev, addr string, vxlanId int) *CmdRes {
@@ -4297,24 +4194,53 @@ func serviceAddressKey(ip, port, proto, scope string) string {
 }
 
 func (kub *Kubectl) CollectFeatures() {
-	ctx, cancel := context.WithTimeout(context.Background(), MidCommandTimeout)
-	defer cancel()
-
 	testPath, err := CreateReportDirectory()
 	if err != nil {
 		log.WithError(err).Errorf("cannot create test result path '%s'", testPath)
 		return
 	}
 
+	// Collect each report format under its own MidCommandTimeout rather than a
+	// single shared one: the metrics fetch dominates the budget, so sharing one
+	// context between the two collections risks starving the second of time.
+	kub.collectFeatureStatus(testPath, "markdown", "md")
+	kub.collectFeatureStatus(testPath, "json", "json")
+}
+
+// collectFeatureStatus runs `cilium-cli features status` for a single output
+// format, writing the report next to the other test_results. It uses its own
+// MidCommandTimeout so each format gets the full budget.
+func (kub *Kubectl) collectFeatureStatus(testPath, format, ext string) {
+	ctx, cancel := context.WithTimeout(context.Background(), MidCommandTimeout)
+	defer cancel()
+
 	// We need to get into the root directory because the CLI doesn't yet
 	// support absolute path. Once https://github.com/cilium/cilium-cli/pull/1552
 	// is installed in test VM images, we can remove this.
-	res := kub.ExecContext(ctx, fmt.Sprintf("cilium-cli features status -o markdown --output-file='%s/feature-status-%s.md'", testPath, ginkgoext.GetTestName()))
+	//
+	// The output path is double-quoted, not single-quoted: some test names
+	// contain an apostrophe (e.g. "Checks the pod's mac address"), which
+	// GetTestName keeps. Under single quotes the apostrophe would terminate the
+	// quoted string and the shell would drop it, so cilium-cli would receive a
+	// path without the apostrophe while CreateReportDirectory created the
+	// directory with it, and the write would fail with "no such file or
+	// directory". Double quotes preserve the apostrophe and keep both in sync.
+	res := kub.ExecContext(ctx, fmt.Sprintf("cilium-cli features status -o %s --output-file=\"%s/feature-status-%s.%s\"", format, testPath, ginkgoext.GetTestName(), ext))
 	if !res.WasSuccessful() {
-		log.WithError(res.GetError()).Errorf("failed to collect feature status :%s", res.CombineOutput().String())
+		recordFeatureStatusError(testPath, format, res)
 	}
-	res = kub.ExecContext(ctx, fmt.Sprintf("cilium-cli features status -o json --output-file='%s/feature-status-%s.json'", testPath, ginkgoext.GetTestName()))
-	if !res.WasSuccessful() {
-		log.WithError(res.GetError()).Errorf("failed to collect feature status :%s", res.CombineOutput().String())
+}
+
+// recordFeatureStatusError logs a failed 'features status' collection and also
+// persists its combined output to a file under testPath. The command runs
+// inside the test VM and only ever logged to the (ephemeral) VM console, so on
+// a passing run the failure left no downloadable trace. Writing it next to the
+// other test_results artifacts makes the real error visible after the fact.
+func recordFeatureStatusError(testPath, format string, res *CmdRes) {
+	out := res.CombineOutput().String()
+	log.WithError(res.GetError()).Errorf("failed to collect feature status :%s", out)
+	errFile := filepath.Join(testPath, fmt.Sprintf("feature-status-error-%s-%s.log", ginkgoext.GetTestName(), format))
+	if writeErr := os.WriteFile(errFile, []byte(out), 0o644); writeErr != nil {
+		log.WithError(writeErr).Errorf("cannot write feature status error log '%s'", errFile)
 	}
 }

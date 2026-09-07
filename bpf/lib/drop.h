@@ -45,6 +45,7 @@ struct drop_notify {
 				*/
 	__u8		pad2[3];
 	__u64		ip_trace_id;
+
 	DROP_EXTENSION
 };
 
@@ -87,9 +88,9 @@ int tail_drop_notify(struct __ctx_buff *ctx)
 	};
 	struct drop_notify msg;
 
-	if (EVENTS_MAP_RATE_LIMIT > 0) {
-		settings.bucket_size = EVENTS_MAP_BURST_LIMIT;
-		settings.tokens_per_topup = EVENTS_MAP_RATE_LIMIT;
+	if (CONFIG(events_map_rate_limit) > 0) {
+		settings.bucket_size = CONFIG(events_map_burst_limit);
+		settings.tokens_per_topup = CONFIG(events_map_rate_limit);
 		if (!ratelimit_check_and_take(&rkey, &settings))
 			return exitcode;
 	}

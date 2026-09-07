@@ -22,12 +22,14 @@ import (
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
 	"github.com/cilium/cilium/pkg/policy/api"
+	"github.com/cilium/cilium/pkg/policy/types"
 	"github.com/cilium/cilium/pkg/testutils"
 	"github.com/cilium/cilium/pkg/time"
 	"github.com/cilium/cilium/pkg/u8proto"
 	"github.com/cilium/cilium/standalone-dns-proxy/pkg/client"
 	"github.com/cilium/cilium/standalone-dns-proxy/pkg/lookup"
 	"github.com/cilium/cilium/standalone-dns-proxy/pkg/messagehandler"
+	"github.com/cilium/cilium/standalone-dns-proxy/pkg/metrics"
 )
 
 var (
@@ -73,6 +75,7 @@ func setupTestEnv(t *testing.T) *StandaloneDNSProxy {
 			bootstrap.Cell,
 			lookup.Cell,
 			messagehandler.Cell,
+			ReadinessCell,
 			cell.Provide(
 				func() *option.DaemonConfig {
 					return &option.DaemonConfig{
@@ -80,7 +83,9 @@ func setupTestEnv(t *testing.T) *StandaloneDNSProxy {
 						ToFQDNsProxyPort: 1001,
 					}
 				},
+				metrics.NewMetrics,
 				NewStandaloneDNSProxy,
+				NewReadinessStatusProvider,
 			)),
 		cell.Invoke(func(_s *StandaloneDNSProxy) {
 			sdp = _s
@@ -118,6 +123,7 @@ func addDataToDNSTable(t *testing.T, sdp *StandaloneDNSProxy, epID uint32, pp re
 	}
 	dnsRule := make(policy.L7DataMap)
 	dnsRule[&client.DNSServerIdentity{Identities: serverID}] = &policy.PerSelectorPolicy{
+		Verdict: types.Allow,
 		L7Rules: api.L7Rules{
 			DNS: pat,
 		},

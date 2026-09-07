@@ -12,9 +12,6 @@
 #define ENABLE_IPV4 1
 #define ENABLE_SCTP 1
 
-/* Use to-container for ingress policy: */
-#define USE_BPF_PROG_FOR_INGRESS_POLICY 1
-
 #define ctx_redirect_peer mock_ctx_redirect_peer
 static __always_inline __maybe_unused int
 mock_ctx_redirect_peer(const struct __sk_buff *ctx __maybe_unused, int ifindex __maybe_unused,
@@ -27,7 +24,7 @@ mock_ctx_redirect_peer(const struct __sk_buff *ctx __maybe_unused, int ifindex _
 
 /* Set the LXC source address to be the address of pod one */
 ASSIGN_CONFIG(union v4addr, endpoint_ipv4, { .be32 = v4_pod_one })
-ASSIGN_CONFIG(union v4addr, service_loopback_ipv4, { .be32 = v4_svc_loopback })
+ASSIGN_CONFIG(bool, enable_endpoint_routes, true)
 
 #include "lib/endpoint.h"
 #include "lib/ipcache.h"
@@ -44,7 +41,7 @@ ASSIGN_CONFIG(union v4addr, service_loopback_ipv4, { .be32 = v4_svc_loopback })
 /* Test that sending a packet from a pod to its own service gets source nat-ed
  * and that it is forwarded to the correct veth.
  */
-SETUP("tc", "hairpin_sctp_flow_1_forward_v4")
+SETUP(PROG_TYPE, "hairpin_sctp_flow_1_forward_v4")
 int hairpin_flow_forward_setup(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -88,7 +85,7 @@ int hairpin_flow_forward_setup(struct __ctx_buff *ctx)
 	return pod_send_packet(ctx);
 }
 
-CHECK("tc", "hairpin_sctp_flow_1_forward_v4")
+CHECK(PROG_TYPE, "hairpin_sctp_flow_1_forward_v4")
 int hairpin_flow_forward_check(__maybe_unused const struct __ctx_buff *ctx)
 {
 	void *data;
@@ -98,6 +95,8 @@ int hairpin_flow_forward_check(__maybe_unused const struct __ctx_buff *ctx)
 	struct sctphdr *l4;
 
 	test_init();
+
+	endpoint_v4_del_entry(v4_pod_one);
 
 	data = (void *)(long)ctx->data;
 	data_end = (void *)(long)ctx->data_end;
@@ -138,7 +137,7 @@ int hairpin_flow_forward_check(__maybe_unused const struct __ctx_buff *ctx)
 }
 
 /* Let backend's ingress path create its CT own entry: */
-PKTGEN("tc", "hairpin_sctp_flow_2_forward_ingress_v4")
+PKTGEN(PROG_TYPE, "hairpin_sctp_flow_2_forward_ingress_v4")
 int hairpin_flow_forward_ingress_pktgen(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -170,13 +169,13 @@ int hairpin_flow_forward_ingress_pktgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("tc", "hairpin_sctp_flow_2_forward_ingress_v4")
+SETUP(PROG_TYPE, "hairpin_sctp_flow_2_forward_ingress_v4")
 int hairpin_flow_forward_ingress_setup(struct __ctx_buff *ctx)
 {
 	return pod_receive_packet(ctx);
 }
 
-CHECK("tc", "hairpin_sctp_flow_2_forward_ingress_v4")
+CHECK(PROG_TYPE, "hairpin_sctp_flow_2_forward_ingress_v4")
 int hairpin_flow_forward_ingress_check(__maybe_unused const struct __ctx_buff *ctx)
 {
 	void *data;
@@ -226,7 +225,7 @@ int hairpin_flow_forward_ingress_check(__maybe_unused const struct __ctx_buff *c
 }
 
 /* Test that a packet in the reverse direction gets translated back. */
-SETUP("tc", "hairpin_sctp_flow_3_reverse_v4")
+SETUP(PROG_TYPE, "hairpin_sctp_flow_3_reverse_v4")
 int hairpin_flow_rev_setup(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -234,6 +233,8 @@ int hairpin_flow_rev_setup(struct __ctx_buff *ctx)
 	volatile const __u8 *dst = mac_two;
 	struct iphdr *l3;
 	struct sctphdr *l4;
+
+	endpoint_v4_add_entry(v4_pod_one, 0, 0, 0, 0, 0, NULL, NULL);
 
 	/* Init packet builder */
 	pktgen__init(&builder, ctx);
@@ -258,7 +259,7 @@ int hairpin_flow_rev_setup(struct __ctx_buff *ctx)
 	return pod_send_packet(ctx);
 }
 
-CHECK("tc", "hairpin_sctp_flow_3_reverse_v4")
+CHECK(PROG_TYPE, "hairpin_sctp_flow_3_reverse_v4")
 int hairpin_flow_rev_check(__maybe_unused const struct __ctx_buff *ctx)
 {
 	void *data;
@@ -268,6 +269,8 @@ int hairpin_flow_rev_check(__maybe_unused const struct __ctx_buff *ctx)
 	struct sctphdr *l4;
 
 	test_init();
+
+	endpoint_v4_del_entry(v4_pod_one);
 
 	data = (void *)(long)ctx->data;
 	data_end = (void *)(long)ctx->data_end;
@@ -304,7 +307,7 @@ int hairpin_flow_rev_check(__maybe_unused const struct __ctx_buff *ctx)
 	test_finish();
 }
 
-PKTGEN("tc", "hairpin_sctp_flow_4_reverse_ingress_v4")
+PKTGEN(PROG_TYPE, "hairpin_sctp_flow_4_reverse_ingress_v4")
 int hairpin_sctp_flow_4_reverse_ingress_v4_pktgen(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -336,13 +339,13 @@ int hairpin_sctp_flow_4_reverse_ingress_v4_pktgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("tc", "hairpin_sctp_flow_4_reverse_ingress_v4")
+SETUP(PROG_TYPE, "hairpin_sctp_flow_4_reverse_ingress_v4")
 int hairpin_sctp_flow_4_reverse_ingress_v4_setup(struct __ctx_buff *ctx)
 {
 	return pod_receive_packet(ctx);
 }
 
-CHECK("tc", "hairpin_sctp_flow_4_reverse_ingress_v4")
+CHECK(PROG_TYPE, "hairpin_sctp_flow_4_reverse_ingress_v4")
 int hairpin_sctp_flow_4_reverse_ingress_v4_check(const struct __ctx_buff *ctx)
 {
 	void *data;

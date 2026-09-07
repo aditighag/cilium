@@ -55,6 +55,7 @@ func RegisterReflector[Obj any](jobGroup job.Group, db *statedb.DB, cfg Reflecto
 		db:              db,
 		table:           targetTable,
 		source:          source,
+		log:             slog.Default(),
 	}
 	wtxn := db.WriteTxn(targetTable)
 	r.initDone = targetTable.RegisterInitializer(wtxn, r.ReflectorConfig.Name)
@@ -78,9 +79,8 @@ func OnDemandTable[Obj any](jobs job.Registry, health cell.Health, log *slog.Log
 	lc := &cell.DefaultLifecycle{}
 	// Job group for the reflector that will be started when the table
 	// is acquired.
-	jg := jobs.NewGroup(
+	jg := jobs.WithLifecycle(lc).NewGroup(
 		health,
-		lc,
 		job.WithLogger(log),
 	)
 
@@ -295,6 +295,10 @@ type ReflectorConfig[Obj any] struct {
 	// ClearTableOnStop if true will cause all inserted objects to be deleted (using QueryAll)
 	// when the reflector is stopped.
 	ClearTableOnStop bool
+
+	// InitWait is an optional channel reflector waits for during setup phase.
+	// This blocks starting the processing loop to wait on any dependencies to be initialized.
+	InitWait <-chan struct{}
 }
 
 // JobName returns the name of the background reflector job.
@@ -387,6 +391,15 @@ func (r *k8sReflector[Obj]) run(ctx context.Context, health cell.Health) error {
 		health.OK("Waiting for CRD registration")
 		if _, err := r.CRDSync.Await(ctx); err != nil {
 			return err
+		}
+	}
+
+	if r.InitWait != nil {
+		health.OK("Waiting for reflector initializer")
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-r.InitWait:
 		}
 	}
 
@@ -517,19 +530,23 @@ func (r *k8sReflector[Obj]) run(ctx context.Context, health cell.Health) error {
 						}
 
 						numUpserted++
-						inserted.Insert(string(indexer.ObjectToKey(obj)))
+						if key, exists := indexer.ObjectToKey(obj); exists {
+							inserted.Insert(string(key))
+						}
 					}
 				}
 			}
 
 			// Delete the remaining objects that we did not insert.
 			for obj := range queryAll(txn, table) {
-				if !inserted.Has(string(indexer.ObjectToKey(obj))) {
-					if _, _, err := table.Delete(txn, obj); err != nil {
-						r.log.Error("BUG: Delete failed", logfields.Error, err)
-						continue
+				if key, exists := indexer.ObjectToKey(obj); exists {
+					if !inserted.Has(string(key)) {
+						if _, _, err := table.Delete(txn, obj); err != nil {
+							r.log.Error("BUG: Delete failed", logfields.Error, err)
+							continue
+						}
+						numDeleted++
 					}
-					numDeleted++
 				}
 			}
 
@@ -570,6 +587,7 @@ func (r *k8sReflector[Obj]) run(ctx context.Context, health cell.Health) error {
 		health.OK(fmt.Sprintf("%d upserted, %d deleted, %d total objects", numUpserted, numDeleted, numTotal))
 	}
 
+	health.OK("Starting resource events stream observer")
 	errs := make(chan error)
 	src.Observe(
 		ctx,
@@ -689,8 +707,10 @@ func (*cacheStoreListener) Get(obj any) (item any, exists bool, err error) {
 func (*cacheStoreListener) GetByKey(key string) (item any, exists bool, err error) {
 	panic("unimplemented")
 }
-func (*cacheStoreListener) List() []any        { panic("unimplemented") }
-func (*cacheStoreListener) ListKeys() []string { panic("unimplemented") }
-func (*cacheStoreListener) Resync() error      { panic("unimplemented") }
+func (*cacheStoreListener) List() []any                          { panic("unimplemented") }
+func (*cacheStoreListener) ListKeys() []string                   { panic("unimplemented") }
+func (*cacheStoreListener) Resync() error                        { panic("unimplemented") }
+func (*cacheStoreListener) LastStoreSyncResourceVersion() string { return "" }
+func (*cacheStoreListener) Bookmark(string)                      {}
 
 var _ cache.Store = &cacheStoreListener{}

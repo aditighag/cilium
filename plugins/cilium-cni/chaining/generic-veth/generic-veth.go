@@ -13,8 +13,10 @@ import (
 	cniVersion "github.com/containernetworking/cni/pkg/version"
 	"github.com/vishvananda/netlink"
 
+	"github.com/cilium/cilium/api/v1/client/daemon"
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/client"
+	"github.com/cilium/cilium/pkg/datapath/link"
 	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	endpointid "github.com/cilium/cilium/pkg/endpoint/id"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -51,9 +53,10 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
 		}
 	}()
 	var (
-		hostMac, vethHostName, vethLXCMac, vethLXCName, vethIP, vethIPv6 string
-		vethHostIdx, peerIndex                                           int
-		peer                                                             netlink.Link
+		vethHostName, vethLXCName, vethIP, vethIPv6 string
+		hostMac, vethLXCMac                         mac.MAC
+		vethHostIdx, peerIndex                      int
+		peer                                        netlink.Link
 	)
 
 	ns, err := netns.OpenPinned(pluginCtx.Args.Netns)
@@ -79,7 +82,9 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
 				continue
 			}
 
-			vethLXCMac = link.Attrs().HardwareAddr.String()
+			// A link with no usable MAC leaves vethLXCMac unset; it is
+			// reported along with the other missing attributes below.
+			vethLXCMac, _ = mac.FromHardwareAddr(link.Attrs().HardwareAddr)
 			vethLXCName = link.Attrs().Name
 
 			veth, ok := link.(*netlink.Veth)
@@ -176,7 +181,7 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
 		return
 	}
 
-	hostMac = peer.Attrs().HardwareAddr.String()
+	hostMac, _ = mac.FromHardwareAddr(peer.Attrs().HardwareAddr)
 	vethHostName = peer.Attrs().Name
 	vethHostIdx = peer.Attrs().Index
 
@@ -184,7 +189,10 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
 	case vethHostName == "":
 		err = errors.New("unable to determine name of veth pair on the host side")
 		return
-	case vethLXCMac == "":
+	case !hostMac.IsValid():
+		err = errors.New("unable to determine MAC address of veth pair on the host side")
+		return
+	case !vethLXCMac.IsValid():
 		err = errors.New("unable to determine MAC address of veth pair on the container side")
 		return
 	case vethIP == "" && vethIPv6 == "":
@@ -198,8 +206,8 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
 	var disabled = false
 	ep := &models.EndpointChangeRequest{
 		Addressing: &models.AddressPair{
-			IPV4: vethIP,
-			IPV6: vethIPv6,
+			IPv4: vethIP,
+			IPv6: vethIPv6,
 		},
 		ContainerID:            pluginCtx.Args.ContainerID,
 		State:                  models.EndpointStateWaitingDashForDashIdentity.Pointer(),
@@ -242,11 +250,11 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
 		err = fmt.Errorf("unable to create endpoint: %w", err)
 		return
 	}
-	if newEp != nil && newEp.Status != nil && newEp.Status.Networking != nil && newEp.Status.Networking.Mac != "" &&
+	if newEp != nil && newEp.Status != nil && newEp.Status.Networking != nil && newEp.Status.Networking.Mac.IsValid() &&
 		newEp.Status.Networking.Mac != vethLXCMac {
 
 		err = ns.Do(func() error {
-			return mac.ReplaceMacAddressWithLinkName(vethLXCName, newEp.Status.Networking.Mac)
+			return link.SetHardwareAddr(vethLXCName, newEp.Status.Networking.Mac)
 		})
 		if err != nil {
 			err = fmt.Errorf("unable to set MAC address on interface %s: %w", vethLXCName, err)
@@ -254,7 +262,7 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
 		}
 		for i := range prevRes.Interfaces {
 			if prevRes.Interfaces[i].Name == vethLXCName {
-				prevRes.Interfaces[i].Mac = newEp.Status.Networking.Mac
+				prevRes.Interfaces[i].Mac = newEp.Status.Networking.Mac.String()
 			}
 		}
 	}
@@ -266,8 +274,7 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
 }
 
 func (f *GenericVethChainer) Delete(ctx context.Context, pluginCtx chainingapi.PluginContext, delClient *lib.DeletionFallbackClient) (err error) {
-	req := &models.EndpointBatchDeleteRequest{ContainerID: pluginCtx.Args.ContainerID}
-	if err := delClient.EndpointDeleteMany(req); err != nil {
+	if err := delClient.EndpointDelete(pluginCtx.Args.ContainerID, pluginCtx.Args.IfName); err != nil {
 		if errors.Is(err, lib.ErrClientFailure) {
 			pluginCtx.Logger.Error("Failed to delete endpoint", logfields.Error, err)
 			return err
@@ -307,7 +314,7 @@ func (f *GenericVethChainer) Check(ctx context.Context, pluginCtx chainingapi.Pl
 }
 
 func (f *GenericVethChainer) Status(ctx context.Context, pluginCtx chainingapi.PluginContext, cli *client.Client) error {
-	if _, err := cli.Daemon.GetHealthz(nil); err != nil {
+	if _, err := cli.Daemon.GetHealthzContext(ctx, daemon.NewGetHealthzParams()); err != nil {
 		return cniTypes.NewError(types.CniErrPluginNotAvailable, "DaemonHealthzFailed",
 			fmt.Sprintf("Cilium agent healthz check failed: %s", client.Hint(err)))
 	}

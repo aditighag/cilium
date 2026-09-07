@@ -32,9 +32,8 @@
 /* This must be a mask and all offsets guaranteed to be less than that. */
 #define __CTX_OFF_MAX			0xff
 
-#ifndef HAVE_XDP_LOAD_BYTES
 static __always_inline __maybe_unused int
-xdp_load_bytes(const struct xdp_md *ctx, __u64 off, void *to, const __u64 len)
+xdp_load_bytes_asm(const struct xdp_md *ctx, __u64 off, void *to, const __u64 len)
 {
 	void *from;
 	int ret;
@@ -60,12 +59,19 @@ xdp_load_bytes(const struct xdp_md *ctx, __u64 off, void *to, const __u64 len)
 		memcpy(to, from, len);
 	return ret;
 }
-#endif
 
-#ifndef HAVE_XDP_STORE_BYTES
 static __always_inline __maybe_unused int
-xdp_store_bytes(const struct xdp_md *ctx, __u64 off, const void *from,
-		const __u64 len, __u64 flags __maybe_unused)
+ctx_load_bytes(const struct xdp_md *ctx, __u64 off, void *to, const __u64 len)
+{
+	if (bpf_core_enum_value_exists(enum bpf_func_id, BPF_FUNC_xdp_load_bytes))
+		return xdp_load_bytes(ctx, (__u32)off, to, (__u32)len);
+
+	return xdp_load_bytes_asm(ctx, off, to, len);
+}
+
+static __always_inline __maybe_unused int
+xdp_store_bytes_asm(const struct xdp_md *ctx, __u64 off, const void *from,
+		    const __u64 len, __u64 flags __maybe_unused)
 {
 	void *to;
 	int ret;
@@ -88,10 +94,17 @@ xdp_store_bytes(const struct xdp_md *ctx, __u64 off, const void *from,
 		memcpy(to, from, len);
 	return ret;
 }
-#endif
 
-#define ctx_load_bytes			xdp_load_bytes
-#define ctx_store_bytes			xdp_store_bytes
+static __always_inline __maybe_unused int
+ctx_store_bytes(const struct xdp_md *ctx, __u64 off, const void *from,
+		const __u64 len, __u64 flags)
+{
+	if (bpf_core_enum_value_exists(enum bpf_func_id, BPF_FUNC_xdp_store_bytes))
+		return xdp_store_bytes((struct xdp_md *)ctx, (__u32)off, from,
+				       (__u32)len, flags);
+
+	return xdp_store_bytes_asm(ctx, off, from, len, flags);
+}
 
 /* Fyi, remapping to stubs helps to assert that the code is not in
  * use since it otherwise triggers a verifier error.
@@ -273,67 +286,87 @@ static __always_inline __maybe_unused int
 ctx_adjust_hroom(struct xdp_md *ctx, const __s32 len_diff, const __u32 mode,
 		 const __u64 flags __maybe_unused)
 {
-	const __u32 move_len_v4_geneve = 14 + 20 + 8 + 8; /* eth, ipv4, udp, geneve */
 	const __u32 move_len_v4 = 14 + 20;
 	const __u32 move_len_v6 = 14 + 40;
+	__u32 move_len = 0;
 	int ret;
 
 	/* Note: when bumping len_diff, consider headroom on popular NICs. */
 	build_bug_on(len_diff <= 0 || len_diff >= 128);
-	build_bug_on(mode != BPF_ADJ_ROOM_NET);
 
 	ret = xdp_adjust_head(ctx, -len_diff);
+	if (ret)
+		return ret;
 
 	/* XXX: Note, this hack is currently tailored to NodePort DSR
 	 * requirements and not a generic helper. If needed elsewhere,
 	 * this must be made more generic.
 	 */
-	if (!ret) {
-		__u32 move_len = 0;
 
-		/* Based on the specified `len_diff`, we now *guess* at what
-		 * location the free space is needed.
-		 *
-		 * We either want to push some additional headers to the front
-		 * (move_len == 0), or insert headers at an offset (move_len > 0).
-		 */
+	/* Based on the specified `mode` and `len_diff`, we now *guess* at what
+	 * location the free space is needed.
+	 *
+	 * We either want to push some additional headers to the front
+	 * (move_len == 0), or insert headers at an offset (move_len > 0).
+	 */
+	switch (mode) {
+	case BPF_ADJ_ROOM_MAC:
+		move_len = sizeof(struct ethhdr);
 
 		switch (len_diff) {
+		/* ICMP error reply */
 		case 28: /* struct {iphdr + icmphdr} */
+		case 48: /* struct {ipv6hdr + icmp6hdr} */
 			break;
-		case 12: /* struct geneve_dsr_opt4 */
-			move_len = move_len_v4_geneve;
-			break;
-		case 20: /* struct iphdr */
-		case 8:  /* struct dsr_opt_v4 */
-			move_len = move_len_v4;
-			break;
+
+		/* IPv4 Overlay encap: */
 		case 50: /* struct {ethhdr + iphdr + udphdr + genevehdr / vxlanhdr} */
+			break;
+
+		/* Geneve DSR: */
 		case 50 + 12: /* geneve with IPv4 DSR option */
 		case 50 + 24: /* geneve with IPv6 DSR option */
 			break;
-		case 48: /* struct {ipv6hdr + icmp6hdr} */
+		default:
+			__throw_build_bug();
+		}
+		break;
+	case BPF_ADJ_ROOM_NET:
+		switch (len_diff) {
+		/* IPIP DSR */
+		case 20: /* struct iphdr */
+			move_len = move_len_v4;
 			break;
 		case 40: /* struct ipv6hdr */
+			move_len = move_len_v6;
+			break;
+
+		/* IP-opt DSR */
+		case 8:  /* struct dsr_opt_v4 */
+			move_len = move_len_v4;
+			break;
 		case 24: /* struct dsr_opt_v6 */
 			move_len = move_len_v6;
 			break;
 		default:
 			__throw_build_bug();
 		}
+		break;
+	default:
+		__throw_build_bug();
+	}
 
-		/* Move existing headers to the front, to create space for
-		 * inserting additional headers.
-		 */
-		if (move_len) {
-			void *data_end = ctx_data_end(ctx);
-			void *data = ctx_data(ctx);
+	/* Move existing headers to the front, to create space for
+	 * inserting additional headers.
+	 */
+	if (move_len) {
+		void *data_end = ctx_data_end(ctx);
+		void *data = ctx_data(ctx);
 
-			if (data + len_diff + move_len <= data_end)
-				__bpf_memmove_fwd(data, data + len_diff, move_len);
-			else
-				ret = -EFAULT;
-		}
+		if (data + len_diff + move_len <= data_end)
+			__bpf_memmove_fwd(data, data + len_diff, move_len);
+		else
+			ret = -EFAULT;
 	}
 
 	return ret;
@@ -343,7 +376,7 @@ static __always_inline __maybe_unused int
 ctx_redirect(const struct xdp_md *ctx, int ifindex, const __u32 flags)
 {
 	if ((__u32)ifindex == ctx->ingress_ifindex)
-		return XDP_TX;
+		return CTX_ACT_TX;
 
 	return redirect(ifindex, flags);
 }
@@ -357,15 +390,8 @@ ctx_redirect_peer(const struct xdp_md *ctx __maybe_unused,
 	__throw_build_bug();
 }
 
-#ifdef HAVE_XDP_GET_BUFF_LEN
 static __always_inline __maybe_unused __u64
-ctx_full_len(const struct xdp_md *ctx)
-{
-	return xdp_get_buff_len((struct xdp_md *)ctx);
-}
-#else
-static __always_inline __maybe_unused __u64
-ctx_full_len(const struct xdp_md *ctx)
+xdp_full_len_asm(const struct xdp_md *ctx)
 {
 	__u64 len;
 	/* Compute the length using inline assembly as clang
@@ -381,7 +407,15 @@ ctx_full_len(const struct xdp_md *ctx)
 		     : "r1", "r2");
 	return len;
 }
-#endif
+
+static __always_inline __maybe_unused __u64
+ctx_full_len(const struct xdp_md *ctx)
+{
+	if (bpf_core_enum_value_exists(enum bpf_func_id, BPF_FUNC_xdp_get_buff_len))
+		return xdp_get_buff_len((struct xdp_md *)ctx);
+
+	return xdp_full_len_asm(ctx);
+}
 
 static __always_inline __maybe_unused __u32
 ctx_wire_len(const struct xdp_md *ctx)
@@ -433,7 +467,7 @@ ctx_load_and_clear_meta(const struct xdp_md *ctx __maybe_unused, const __u64 off
 	return 0;
 }
 
-static __always_inline __maybe_unused __u16
+static __always_inline __maybe_unused __be16
 ctx_get_protocol(const struct xdp_md *ctx)
 {
 	void *data_end = ctx_data_end(ctx);

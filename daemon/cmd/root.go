@@ -19,7 +19,6 @@ import (
 )
 
 func NewAgentCmd(hfn func() *hive.Hive) *cobra.Command {
-	bootstrapStats.overall.Start()
 	h := hfn()
 
 	rootCmd := &cobra.Command{
@@ -64,6 +63,7 @@ func NewAgentCmd(hfn func() *hive.Hive) *cobra.Command {
 
 	rootCmd.AddCommand(
 		cmdref.NewCmd(rootCmd),
+		newMetricsCmd(),
 		hive.CiliumShellCmd,
 		h.Command(),
 	)

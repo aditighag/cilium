@@ -13,8 +13,8 @@ import (
 	"github.com/spf13/pflag"
 
 	"github.com/cilium/cilium/pkg/datapath/loader"
-	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/endpoint"
+	"github.com/cilium/cilium/pkg/endpoint/types"
 	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/endpointstate"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -43,7 +43,7 @@ type epBPFProgWatchdogParams struct {
 	RestorerPromise promise.Promise[endpointstate.Restorer]
 
 	EndpointManager endpointmanager.EndpointManager
-	Orchestrator    datapath.Orchestrator
+	Orchestrator    types.Orchestrator
 }
 
 // Cell triggers a job to ensure device tc programs remain loaded.
@@ -90,17 +90,19 @@ type endpointBPFProgWatchdog struct {
 	logger *slog.Logger
 
 	endpointManager endpointmanager.EndpointManager
-	orchestrator    datapath.Orchestrator
+	orchestrator    types.Orchestrator
 }
 
 func (r *endpointBPFProgWatchdog) checkEndpointBPFPrograms(ctx context.Context) error {
 	eps := r.endpointManager.GetEndpoints()
+	epsWithoutProgramsLoaded := map[uint16]string{}
+
 	for _, ep := range eps {
 		if ep.GetState() != endpoint.StateReady {
 			continue
 		}
 
-		if ep.IsProperty(endpoint.PropertyWithouteBPFDatapath) {
+		if ep.IsProperty(types.PropertyWithouteBPFDatapath) {
 			// Skip Endpoints without BPF datapath
 			continue
 		}
@@ -117,27 +119,29 @@ func (r *endpointBPFProgWatchdog) checkEndpointBPFPrograms(ctx context.Context) 
 			return fmt.Errorf("failed to assert if endpoint BPF programs need to be reloaded: %w", err)
 		}
 
-		// We've detected missing bpf progs for this endpoint.
-		// Trigger bpf progs reload.
-		if !loaded {
-			return r.reloadBPFPrograms(ctx, len(eps))
+		// Collect all endpoints without the programs loaded before triggering
+		// the reload below. An Endpoint being deleted also detaches the programs
+		// while the host device still exists, so check if the Endpoint is still
+		// alive. Both the StateReady check above and loaded were fetched earlier.
+		// Otherwise, we will false warn of programs being unloaded.
+		if !loaded && ep.IsAlive() {
+			epsWithoutProgramsLoaded[ep.ID] = ep.GetK8sNamespaceAndCEPName()
 		}
 	}
 
-	return nil
-}
+	if len(epsWithoutProgramsLoaded) > 0 {
+		r.logger.Warn(
+			"Detected unexpected endpoint BPF program removal. "+
+				"Consider investigating whether other software running on this machine is removing Cilium's endpoint BPF programs. "+
+				"If endpoint BPF programs are removed, the associated pods will lose connectivity and only reinstating the programs will restore connectivity.",
+			logfields.Endpoints, epsWithoutProgramsLoaded,
+			logfields.Total, len(eps),
+		)
 
-func (r *endpointBPFProgWatchdog) reloadBPFPrograms(ctx context.Context, endpointCount int) error {
-	r.logger.Warn(
-		"Detected unexpected endpoint BPF program removal. "+
-			"Consider investigating whether other software running on this machine is removing Cilium's endpoint BPF programs. "+
-			"If endpoint BPF programs are removed, the associated pods will lose connectivity and only reinstating the programs will restore connectivity.",
-		logfields.Count, endpointCount,
-	)
-
-	if err := r.orchestrator.Reinitialize(ctx); err != nil {
-		r.logger.Error("Failed to reload Cilium endpoints BPF programs", logfields.Error, err)
-		return fmt.Errorf("failed to reload Cilium endpoints BPF programs: %w", err)
+		if err := r.orchestrator.Reinitialize(ctx); err != nil {
+			r.logger.Error("Failed to reload Cilium endpoints BPF programs", logfields.Error, err)
+			return fmt.Errorf("failed to reload Cilium endpoints BPF programs: %w", err)
+		}
 	}
 
 	return nil

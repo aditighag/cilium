@@ -8,8 +8,10 @@ import (
 	"net/netip"
 	"testing"
 
-	gobgp "github.com/osrg/gobgp/v3/api"
-	"github.com/osrg/gobgp/v3/pkg/server"
+	gobgp "github.com/osrg/gobgp/v4/api"
+	"github.com/osrg/gobgp/v4/pkg/apiutil"
+	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
+	"github.com/osrg/gobgp/v4/pkg/server"
 	"github.com/stretchr/testify/require"
 
 	"github.com/cilium/cilium/pkg/bgp/types"
@@ -38,26 +40,28 @@ func TestPathConversions(t *testing.T) {
 			path, err := ToGoBGPPath(&tt.Path)
 			require.NoError(t, err)
 
-			res, err := s.AddPath(context.TODO(), &gobgp.AddPathRequest{
-				Path: path,
+			res, err := s.AddPath(apiutil.AddPathRequest{
+				Paths: []*apiutil.Path{path},
 			})
 			require.NoError(t, err)
-			require.NotZero(t, res.Uuid)
+			require.NotZero(t, res)
+			require.NotZero(t, res[0].UUID)
 
-			req := &gobgp.ListPathRequest{
-				Family: path.Family,
+			req := apiutil.ListPathRequest{
+				Family:    path.Family,
+				TableType: gobgp.TableType_TABLE_TYPE_GLOBAL,
 			}
-			err = s.ListPath(context.TODO(), req, func(destination *gobgp.Destination) {
-				paths, err := ToAgentPaths(destination.Paths)
+			err = s.ListPath(req, func(prefix bgp.NLRI, paths []*apiutil.Path) {
+				pathArr, err := ToAgentPaths(paths)
 				require.NoError(t, err)
-				require.NotZero(t, paths)
-				require.Equal(t, tt.Path.NLRI, paths[0].NLRI)
-				require.Len(t, paths[0].PathAttributes, len(tt.Path.PathAttributes))
+				require.NotZero(t, pathArr)
+				require.Equal(t, tt.Path.NLRI, pathArr[0].NLRI)
+				require.Len(t, pathArr[0].PathAttributes, len(tt.Path.PathAttributes))
 				for i := range tt.Path.PathAttributes {
 					// byte-compare encoded path attributes
 					data1, err := tt.Path.PathAttributes[i].Serialize()
 					require.NoError(t, err)
-					data2, err := paths[0].PathAttributes[i].Serialize()
+					data2, err := pathArr[0].PathAttributes[i].Serialize()
 					require.NoError(t, err)
 					require.Equal(t, data1, data2)
 				}
@@ -82,7 +86,7 @@ func TestToGoBGPPeer(t *testing.T) {
 				Conf: &gobgp.PeerConf{
 					NeighborAddress: "10.0.0.1",
 				},
-				AfiSafis: defaultSafiAfi,
+				AfiSafis: defaultAfiSafi,
 			},
 		},
 		{
@@ -94,7 +98,7 @@ func TestToGoBGPPeer(t *testing.T) {
 				Conf: &gobgp.PeerConf{
 					NeighborAddress: "fd00::1",
 				},
-				AfiSafis: defaultSafiAfi,
+				AfiSafis: defaultAfiSafi,
 			},
 		},
 		{
@@ -108,7 +112,7 @@ func TestToGoBGPPeer(t *testing.T) {
 					NeighborAddress: "10.0.0.1",
 					PeerAsn:         65000,
 				},
-				AfiSafis: defaultSafiAfi,
+				AfiSafis: defaultAfiSafi,
 			},
 		},
 		{
@@ -122,7 +126,7 @@ func TestToGoBGPPeer(t *testing.T) {
 					NeighborAddress: "10.0.0.1",
 					AuthPassword:    "password",
 				},
-				AfiSafis: defaultSafiAfi,
+				AfiSafis: defaultAfiSafi,
 			},
 		},
 		{
@@ -141,27 +145,7 @@ func TestToGoBGPPeer(t *testing.T) {
 					Enabled:     true,
 					MultihopTtl: 10,
 				},
-				AfiSafis: defaultSafiAfi,
-			},
-		},
-		{
-			name: "RouteReflector",
-			neighbor: &types.Neighbor{
-				Address: netip.MustParseAddr("10.0.0.1"),
-				RouteReflector: &types.NeighborRouteReflector{
-					Client:    true,
-					ClusterID: "255.0.0.1",
-				},
-			},
-			expected: &gobgp.Peer{
-				Conf: &gobgp.PeerConf{
-					NeighborAddress: "10.0.0.1",
-				},
-				RouteReflector: &gobgp.RouteReflector{
-					RouteReflectorClient:    true,
-					RouteReflectorClusterId: "255.0.0.1",
-				},
-				AfiSafis: defaultSafiAfi,
+				AfiSafis: defaultAfiSafi,
 			},
 		},
 		{
@@ -186,7 +170,7 @@ func TestToGoBGPPeer(t *testing.T) {
 						IdleHoldTimeAfterReset: idleHoldTimeAfterResetSeconds,
 					},
 				},
-				AfiSafis: defaultSafiAfi,
+				AfiSafis: defaultAfiSafi,
 			},
 		},
 		{
@@ -208,7 +192,7 @@ func TestToGoBGPPeer(t *testing.T) {
 					LocalPort:    1179,
 					RemotePort:   1179,
 				},
-				AfiSafis: defaultSafiAfi,
+				AfiSafis: defaultAfiSafi,
 			},
 		},
 		{

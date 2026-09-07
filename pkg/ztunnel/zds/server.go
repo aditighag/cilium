@@ -27,6 +27,11 @@ import (
 	"github.com/cilium/cilium/pkg/ztunnel/pb"
 )
 
+const (
+	// defaultZDSUnixAddress is the default Unix socket address for the ZDS server.
+	defaultZDSUnixAddress = "/var/run/cilium/ztunnel.sock"
+)
+
 type ztunnelConn struct {
 	conn *net.UnixConn
 }
@@ -135,8 +140,14 @@ type serverParams struct {
 	Lifecycle cell.Lifecycle
 	Logger    *slog.Logger
 	Config    config.Config
+	Metrics   *Metrics
 
 	EndpointManager endpointmanager.EndpointManager
+
+	// ZDSUnixAddr overrides the default ZDS unix socket address.
+	// If empty, config.DefaultZtunnelUnixAddress is used.
+	// This field is intended for testing purposes only.
+	ZDSUnixAddr string `optional:"true"`
 }
 
 type serverOut struct {
@@ -163,6 +174,7 @@ type Server struct {
 
 	updates               chan zdsUpdate // updates to send to ztunnel
 	initialSnapshotSeeded chan struct{}
+	metrics               *Metrics
 }
 
 type zdsUpdate struct {
@@ -178,28 +190,38 @@ func newZDSServer(p serverParams) serverOut {
 	if !p.Config.EnableZTunnel {
 		return serverOut{}
 	}
+	if p.Metrics == nil {
+		p.Metrics = NewMetrics()
+	}
+	p.Metrics.Enable()
 	server := &Server{
 		logger:                p.Logger,
 		updates:               make(chan zdsUpdate, 100),
 		endpointCache:         make(map[uint16]*endpoint.Endpoint),
 		initialSnapshotSeeded: make(chan struct{}),
+		metrics:               p.Metrics,
+	}
+
+	zdsUnixAddr := defaultZDSUnixAddress
+	if p.ZDSUnixAddr != "" {
+		zdsUnixAddr = p.ZDSUnixAddr
 	}
 
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(context.Background())
 	p.Lifecycle.Append(cell.Hook{
 		OnStart: func(hc cell.HookContext) error {
-			err := os.RemoveAll(p.Config.ZDSUnixAddr)
+			err := os.RemoveAll(zdsUnixAddr)
 			if err != nil {
 				return err
 			}
 
-			// if we need to create the basedir for the ZDSUnixAddr, do it
-			if err := os.MkdirAll(path.Dir(p.Config.ZDSUnixAddr), 0755); err != nil {
+			// if we need to create the basedir for the zdsUnixAddr, do it
+			if err := os.MkdirAll(path.Dir(zdsUnixAddr), 0755); err != nil {
 				return fmt.Errorf("failed to create ztunnel unix addr directory: %w", err)
 			}
 
-			resolvedAddr, err := net.ResolveUnixAddr("unixpacket", p.Config.ZDSUnixAddr)
+			resolvedAddr, err := net.ResolveUnixAddr("unixpacket", zdsUnixAddr)
 			if err != nil {
 				return fmt.Errorf("failed to resolve ztunnel unix addr: %w", err)
 			}
@@ -209,11 +231,9 @@ func newZDSServer(p serverParams) serverOut {
 				return fmt.Errorf("failed to listen on ztunnel unix addr: %w", err)
 			}
 
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				server.Serve(ctx)
-			}()
+			})
 
 			return nil
 		},
@@ -267,18 +287,18 @@ func (s *Server) Serve(ctx context.Context) {
 		connCtx, cancel := context.WithCancel(ctx)
 		cancelPrevConn = cancel
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			if err := s.handleConn(connCtx, zc); err != nil {
 				s.logger.Error("failed to handle connection", logfields.Error, err)
 			}
-		}()
+		})
 	}
 }
 
 func (s *Server) handleConn(ctx context.Context, zc *ztunnelConn) error {
 	defer zc.Close()
+	s.metrics.ConnectionActive.Inc()
+	defer s.metrics.ConnectionActive.Dec()
 
 	s.logger.Info("new ztunnel connection")
 
@@ -320,6 +340,7 @@ func (s *Server) handleConn(ctx context.Context, zc *ztunnelConn) error {
 
 func (s *Server) EnrollEndpoint(ep *endpoint.Endpoint) error {
 	s.logger.Info("enrolling endpoint to ztunnel", logfields.EndpointID, ep.GetID16())
+	s.metrics.EnrollmentTotal.Inc()
 
 	// Check if endpoint is already enrolled
 	s.endpointCacheMutex.Lock()
@@ -332,6 +353,7 @@ func (s *Server) EnrollEndpoint(ep *endpoint.Endpoint) error {
 
 	ns, err := netns.OpenPinned(ep.GetContainerNetnsPath())
 	if err != nil {
+		s.metrics.EnrollmentFailures.WithLabelValues("netns_failed").Inc()
 		s.logger.Error("failed to open netns file",
 			logfields.EndpointID, ep.GetID16(),
 			logfields.Error, err,
@@ -343,11 +365,13 @@ func (s *Server) EnrollEndpoint(ep *endpoint.Endpoint) error {
 	if err = ns.Do(func() error {
 		return iptables.CreateInPodRules(s.logger, option.Config.EnableIPv4, option.Config.EnableIPv6)
 	}); err != nil {
+		s.metrics.EnrollmentFailures.WithLabelValues("iptables_failed").Inc()
 		return fmt.Errorf("unable to setup iptable rules for ztunnel inpod mode: %w", err)
 	}
 
 	workload, err := endpointToWorkload(ep)
 	if err != nil {
+		s.metrics.EnrollmentFailures.WithLabelValues("conversion_failed").Inc()
 		s.logger.Error("failed to convert endpoint to workload",
 			logfields.EndpointID, ep.GetID16(),
 			logfields.Error, err,
@@ -369,6 +393,7 @@ func (s *Server) EnrollEndpoint(ep *endpoint.Endpoint) error {
 
 	s.updates <- update
 	if err := <-update.errCh; err != nil {
+		s.metrics.EnrollmentFailures.WithLabelValues("send_failed").Inc()
 		return fmt.Errorf("sending update failed: %w", err)
 	}
 

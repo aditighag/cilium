@@ -210,7 +210,7 @@ func runTool() {
 
 	// Check if there is a non-empty user supplied configuration
 	if config, _ := loadConfigFile(configPath); config != nil && len(config.Commands) > 0 {
-		// All of of the commands run are from the configuration file
+		// All of the commands run are from the configuration file
 		commands = config.Commands
 	}
 
@@ -252,6 +252,8 @@ func runTool() {
 
 		defer printDisclaimer()
 		runAll(commands, cmdDir)
+
+		removeSensitiveFiles(cmdDir)
 
 		if excludeObjectFiles {
 			removeObjectFiles(cmdDir)
@@ -392,6 +394,17 @@ func removeObjectFiles(cmdDir string) {
 	rmFunc(path)
 }
 
+// removeSensitiveFiles removes sensitive files (e.g. WireGuard private key files) from
+// the copied state directory.
+func removeSensitiveFiles(cmdDir string) {
+	matches, _ := filepath.Glob(filepath.Join(cmdDir, defaults.StateDir, "*.key"))
+	for _, m := range matches {
+		if err := os.Remove(m); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to remove sensitive file: %s\n", err)
+		}
+	}
+}
+
 func execCommand(prompt string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), execTimeout)
 	defer cancel()
@@ -421,7 +434,7 @@ func writeCmdToFile(cmdDir, prompt string, enableMarkdown bool, postProcess func
 	}
 	defer f.Close()
 
-	cmd := strings.Split(prompt, " ")[0]
+	cmd, _, _ := strings.Cut(prompt, " ")
 
 	// The command does not exist, abort.
 	if _, err := exec.LookPath(cmd); err != nil {

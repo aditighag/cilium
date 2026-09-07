@@ -28,7 +28,7 @@ var (
 		`%`:      NewLabel(`%`, `%ed`, LabelSourceUnspec),
 	}
 
-	DefaultLabelSourceKeyPrefix = LabelSourceAny + "."
+	DefaultLabelSourceKeyPrefix = LabelSourceAny + SourceDelimiter
 )
 
 func TestNewFrom(t *testing.T) {
@@ -275,35 +275,6 @@ func TestLabelCompare(t *testing.T) {
 	require.False(t, b1.Equals(&c1))
 }
 
-func TestLabelParseKey(t *testing.T) {
-	tests := []struct {
-		str string
-		out string
-	}{
-		{"source0:key0=value1", "source0.key0"},
-		{"source3:key1", "source3.key1"},
-		{"source4:key1==value1", "source4.key1"},
-		{"source::key1=value1", "source.:key1"},
-		{"4blah=:foo=", "4blah=.foo"},
-		{"5blah::foo=", "5blah.:foo"},
-		{"source2.key1=value1", DefaultLabelSourceKeyPrefix + "source2.key1"},
-		{"1foo", DefaultLabelSourceKeyPrefix + "1foo"},
-		{":2foo", DefaultLabelSourceKeyPrefix + "2foo"},
-		{":3foo=", DefaultLabelSourceKeyPrefix + "3foo"},
-		{"6foo==", DefaultLabelSourceKeyPrefix + "6foo"},
-		{"7foo=bar", DefaultLabelSourceKeyPrefix + "7foo"},
-		{"cilium.key1=value1", DefaultLabelSourceKeyPrefix + "cilium.key1"},
-		{"key1=value1", DefaultLabelSourceKeyPrefix + "key1"},
-		{"value1", DefaultLabelSourceKeyPrefix + "value1"},
-		{"$world=value1", LabelSourceReservedKeyPrefix + "world"},
-		{"k8s:foo=bar:", LabelSourceK8sKeyPrefix + "foo"},
-	}
-	for _, test := range tests {
-		lbl := GetExtendedKeyFrom(test.str)
-		require.Equal(t, test.out, lbl)
-	}
-}
-
 func TestLabelsCompare(t *testing.T) {
 	la11 := NewLabel("a", "1", "src1")
 	la12 := NewLabel("a", "1", "src2")
@@ -331,24 +302,24 @@ func TestLabelsCompare(t *testing.T) {
 func TestLabelsK8sStringMap(t *testing.T) {
 	laKa1 := NewLabel("a", "1", LabelSourceK8s)
 	laUa1 := NewLabel("a", "1", LabelSourceUnspec)
-	laCa2 := NewLabel("a", "2", LabelSourceContainer)
+	laGa2 := NewLabel("a", "2", LabelSourceGenerated)
 	laNa3 := NewLabel("a", "3", LabelSourceCNI)
 	lbAb2 := NewLabel("b", "2", LabelSourceAny)
 	lbRb2 := NewLabel("b", "2", LabelSourceReserved)
 
 	lblsKa1 := Labels{laKa1.Key: laKa1}
 	lblsUa1 := Labels{laUa1.Key: laUa1}
-	lblsCa2 := Labels{laCa2.Key: laCa2}
+	lblsGa2 := Labels{laGa2.Key: laGa2}
 	lblsNa3 := Labels{laNa3.Key: laNa3}
 	lblsAb2 := Labels{lbAb2.Key: lbAb2}
 	lblsRb2 := Labels{lbRb2.Key: lbRb2}
 	lblsOverlap := Labels{laKa1.Key: laKa1, laUa1.Key: laUa1}
-	lblsAll := Labels{laKa1.Key: laKa1, laUa1.Key: laUa1, laCa2.Key: laCa2, lbAb2.Key: lbAb2, lbRb2.Key: lbRb2}
-	lblsFewer := Labels{laKa1.Key: laKa1, laCa2.Key: laCa2, lbAb2.Key: lbAb2, lbRb2.Key: lbRb2}
+	lblsAll := Labels{laKa1.Key: laKa1, laUa1.Key: laUa1, laGa2.Key: laGa2, lbAb2.Key: lbAb2, lbRb2.Key: lbRb2}
+	lblsFewer := Labels{laKa1.Key: laKa1, laGa2.Key: laGa2, lbAb2.Key: lbAb2, lbRb2.Key: lbRb2}
 
 	require.Equal(t, map[string]string{"a": "1"}, lblsKa1.K8sStringMap())
 	require.Equal(t, map[string]string{"a": "1"}, lblsUa1.K8sStringMap())
-	require.Equal(t, map[string]string{"container.a": "2"}, lblsCa2.K8sStringMap())
+	require.Equal(t, map[string]string{"gen.a": "2"}, lblsGa2.K8sStringMap())
 	require.Equal(t, map[string]string{"cni.a": "3"}, lblsNa3.K8sStringMap())
 	require.Equal(t, map[string]string{"b": "2"}, lblsAb2.K8sStringMap())
 	require.Equal(t, map[string]string{"reserved.b": "2"}, lblsRb2.K8sStringMap())
@@ -360,10 +331,10 @@ func TestLabelsK8sStringMap(t *testing.T) {
 	// makes the last entry with the same key, but maybe from
 	// different source, overwrite the previous value with the
 	// same key. This makes the Labels contents dependent on the
-	// label insertion order. In this example, "a" from container
+	// label insertion order. In this example, "a" from generated
 	// overwrites "a" from K8s and "a" from Unspec, and "b" from
 	// reserved overwrites "b" from any.
-	require.Equal(t, map[string]string{"container.a": "2", "reserved.b": "2"}, lblsAll.K8sStringMap())
+	require.Equal(t, map[string]string{"gen.a": "2", "reserved.b": "2"}, lblsAll.K8sStringMap())
 }
 
 func TestLabels_Has(t *testing.T) {

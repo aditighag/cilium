@@ -7,6 +7,7 @@
 #include <bpf/api.h>
 
 #include "common.h"
+#include "network_device.h"
 #include "neigh.h"
 #include "l3.h"
 
@@ -20,9 +21,9 @@ neigh_resolver_without_nh_available()
 }
 
 static __always_inline int
-add_l2_hdr(struct __ctx_buff *ctx __maybe_unused)
+add_l2_hdr(struct __ctx_buff *ctx)
 {
-	__u16 proto = ctx_get_protocol(ctx);
+	__be16 proto = ctx_get_protocol(ctx);
 
 	if (ctx_change_head(ctx, __ETH_HLEN, 0))
 		return DROP_INVALID;
@@ -33,11 +34,9 @@ add_l2_hdr(struct __ctx_buff *ctx __maybe_unused)
 }
 
 static __always_inline int
-maybe_add_l2_hdr(struct __ctx_buff *ctx __maybe_unused,
-		 __u32 ifindex __maybe_unused,
-		 bool *l2_hdr_required __maybe_unused)
+maybe_add_l2_hdr(struct __ctx_buff *ctx, __u32 ifindex, bool *l2_hdr_required)
 {
-	if (IS_L3_DEV(ifindex)) {
+	if (device_is_l3(ifindex)) {
 		/* The packet is going to be redirected to L3 dev, so
 		 * skip L2 addr settings.
 		 */
@@ -126,7 +125,7 @@ fib_do_redirect(struct __ctx_buff *ctx, const bool needs_l2_check,
 		if (eth_store_saddr(ctx, fib_params->l.smac, 0) < 0)
 			return DROP_WRITE_ERROR;
 	} else {
-		union macaddr smac = NATIVE_DEV_MAC_BY_IFINDEX(oif);
+		const union macaddr *smac = device_mac(oif);
 		const union macaddr *dmac = NULL;
 
 		if (allow_neigh_map) {
@@ -145,7 +144,7 @@ fib_do_redirect(struct __ctx_buff *ctx, const bool needs_l2_check,
 		}
 		if (eth_store_daddr_aligned(ctx, dmac->addr, 0) < 0)
 			return DROP_WRITE_ERROR;
-		if (eth_store_saddr_aligned(ctx, smac.addr, 0) < 0)
+		if (eth_store_saddr_aligned(ctx, smac->addr, 0) < 0)
 			return DROP_WRITE_ERROR;
 	}
 out_send:
@@ -162,8 +161,8 @@ fib_lookup_skip_neigh() {
 
 static __always_inline int
 fib_redirect(struct __ctx_buff *ctx, const bool needs_l2_check,
-	     struct bpf_fib_lookup_padded *fib_params __maybe_unused,
-	     bool use_neigh_map, __s8 *ext_err __maybe_unused, int *oif)
+	     struct bpf_fib_lookup_padded *fib_params, bool use_neigh_map,
+	     __s8 *ext_err, int *oif)
 {
 	int ret;
 
@@ -209,16 +208,52 @@ fib_lookup_v6(struct __ctx_buff *ctx, struct bpf_fib_lookup_padded *fib_params,
 	return (int)fib_lookup(ctx, &fib_params->l, sizeof(fib_params->l), flags);
 };
 
+/* fib_lookup_src_v6 will perform a source IP resolution for the given
+ * destination address.
+ * @ ctx - context buffer
+ * @ src - output parameter to store the resolved source address
+ * @ dst - destination address to resolve the source for
+ *
+ * If the result is any value other than BPF_FIB_LKUP_RET_SUCCESS the provided
+ * src parameter will be unmodified.
+ */
+static __always_inline int
+fib_lookup_src_v6(struct __ctx_buff *ctx, struct in6_addr *src,
+		  const struct in6_addr *dst)
+{
+	struct bpf_fib_lookup_padded fib_params = {0};
+	struct in6_addr zero = {0};
+	int fib_result = 0;
+
+	if (!CONFIG(supports_fib_lookup_src))
+		return BPF_FIB_LKUP_RET_FWD_DISABLED;
+
+	fib_result = fib_lookup_v6(ctx, &fib_params, &zero, dst,
+				   BPF_FIB_LOOKUP_SRC);
+
+	if (fib_result == BPF_FIB_LKUP_RET_SUCCESS) {
+		ipv6_addr_copy((union v6addr *)src,
+			       (union v6addr *)&fib_params.l.ipv6_src);
+	}
+	return fib_result;
+}
+
 static __always_inline int
 fib_redirect_v6(struct __ctx_buff *ctx, int l3_off,
 		struct ipv6hdr *ip6, const bool needs_l2_check,
-		bool allow_neigh_map, __s8 *ext_err __maybe_unused, int *oif)
+		bool allow_neigh_map, __s8 *ext_err, int *oif, __u32 tbid)
 {
 	int ret;
 	struct bpf_fib_lookup_padded fib_params = {0};
 	int fib_result;
+	int flags = 0;
 
-	fib_result = fib_lookup_v6(ctx, &fib_params, &ip6->saddr, &ip6->daddr, 0);
+	if (tbid) {
+		fib_params.l.tbid = tbid;
+		flags = (BPF_FIB_LOOKUP_DIRECT | BPF_FIB_LOOKUP_TBID);
+	}
+
+	fib_result = fib_lookup_v6(ctx, &fib_params, &ip6->saddr, &ip6->daddr, flags);
 	switch (fib_result) {
 	case BPF_FIB_LKUP_RET_SUCCESS:
 	case BPF_FIB_LKUP_RET_NO_NEIGH:
@@ -259,16 +294,48 @@ fib_lookup_v4(struct __ctx_buff *ctx, struct bpf_fib_lookup_padded *fib_params,
 	return (int)fib_lookup(ctx, &fib_params->l, sizeof(fib_params->l), flags);
 }
 
+/* fib_lookup_src_v4 will perform a source IP resolution for the given
+ * destination address.
+ * @ ctx - context buffer
+ * @ src - output parameter to store the resolved source address
+ * @ dst - destination address to resolve the source for
+ *
+ * If the result is any value other than BPF_FIB_LKUP_RET_SUCCESS the provided
+ * src parameter will be unmodified.
+ */
+static __always_inline int
+fib_lookup_src_v4(struct __ctx_buff *ctx, __be32 *src, const __be32 dst)
+{
+	struct bpf_fib_lookup_padded fib_params = {0};
+	int fib_result = 0;
+
+	if (!CONFIG(supports_fib_lookup_src))
+		return BPF_FIB_LKUP_RET_FWD_DISABLED;
+
+	fib_result = fib_lookup_v4(ctx, &fib_params, 0, dst, BPF_FIB_LOOKUP_SRC);
+
+	if (fib_result == BPF_FIB_LKUP_RET_SUCCESS)
+		*src = fib_params.l.ipv4_src;
+
+	return fib_result;
+}
+
 static __always_inline int
 fib_redirect_v4(struct __ctx_buff *ctx, int l3_off,
 		struct iphdr *ip4, const bool needs_l2_check,
-		bool allow_neigh_map, __s8 *ext_err __maybe_unused, int *oif)
+		bool allow_neigh_map, __s8 *ext_err, int *oif, __u32 tbid)
 {
 	int ret;
 	struct bpf_fib_lookup_padded fib_params = {0};
 	int fib_result;
+	int flags = 0;
 
-	fib_result = fib_lookup_v4(ctx, &fib_params, ip4->saddr, ip4->daddr, 0);
+	if (tbid) {
+		fib_params.l.tbid = tbid;
+		flags = (BPF_FIB_LOOKUP_DIRECT | BPF_FIB_LOOKUP_TBID);
+	}
+
+	fib_result = fib_lookup_v4(ctx, &fib_params, ip4->saddr, ip4->daddr, flags);
 	switch (fib_result) {
 	case BPF_FIB_LKUP_RET_SUCCESS:
 	case BPF_FIB_LKUP_RET_NO_NEIGH:

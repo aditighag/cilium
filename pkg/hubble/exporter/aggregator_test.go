@@ -251,6 +251,168 @@ func TestAggregateAdd(t *testing.T) {
 		assert.Equal(t, 0, value.UnknownDirectionFlowCount)
 		assert.NotNil(t, value.ProcessedFlow)
 	})
+
+	t.Run("oneof field mask with mixed protocols", func(t *testing.T) {
+		// Test that field mask correctly handles oneof variants (e.g., TCP vs UDP, HTTP vs DNS),
+		// when multiple variants are specified in the field mask.
+		fieldMask, err := fieldmaskpb.New(&flowpb.Flow{},
+			"source.namespace",
+			"l4.TCP.destination_port",
+			"l4.UDP.destination_port", // Both TCP and UDP specified.
+			"l7.http.code",
+			"l7.dns.rcode", // Both HTTP and DNS specified.
+		)
+		require.NoError(t, err)
+
+		fieldAgg, err := fieldaggregate.New(fieldMask)
+		require.NoError(t, err)
+
+		aggregator := NewAggregatorWithFields(fieldAgg, hivetest.Logger(t))
+
+		// Create 2 identical TCP+HTTP flows.
+		flow1 := &flowpb.Flow{
+			Source: &flowpb.Endpoint{Namespace: "default"},
+			L4: &flowpb.Layer4{
+				Protocol: &flowpb.Layer4_TCP{
+					TCP: &flowpb.TCP{
+						SourcePort:      33001,
+						DestinationPort: 443,
+					},
+				},
+			},
+			L7: &flowpb.Layer7{
+				Type: flowpb.L7FlowType_RESPONSE,
+				Record: &flowpb.Layer7_Http{
+					Http: &flowpb.HTTP{
+						Code: 200,
+					},
+				},
+			},
+			TrafficDirection: flowpb.TrafficDirection_INGRESS,
+		}
+
+		flow2 := &flowpb.Flow{
+			Source: &flowpb.Endpoint{Namespace: "default"},
+			L4: &flowpb.Layer4{
+				Protocol: &flowpb.Layer4_TCP{
+					TCP: &flowpb.TCP{
+						SourcePort:      33002, // Different source port (not in mask).
+						DestinationPort: 443,
+					},
+				},
+			},
+			L7: &flowpb.Layer7{
+				Type: flowpb.L7FlowType_RESPONSE,
+				Record: &flowpb.Layer7_Http{
+					Http: &flowpb.HTTP{
+						Code: 200,
+					},
+				},
+			},
+			TrafficDirection: flowpb.TrafficDirection_INGRESS,
+		}
+
+		aggregator.Add(&v1.Event{Event: flow1})
+		aggregator.Add(&v1.Event{Event: flow2})
+
+		// Should have exactly 1 aggregation (both flows are identical after masking).
+		// Previously without the oneof fix, this would create 2 aggregations because
+		// the field mask would create spurious UDP and DNS structures.
+		assert.Len(t, aggregator.m, 1, "should have exactly 1 aggregation, not one per spurious oneof variant")
+
+		for _, value := range aggregator.m {
+			assert.Equal(t, 2, value.IngressFlowCount)
+			assert.Equal(t, 0, value.EgressFlowCount)
+		}
+	})
+
+	t.Run("different keys create separate aggregates", func(t *testing.T) {
+		// Test that flows with DIFFERENT aggregation keys create SEPARATE aggregates,
+		// not grouped together. This is the inverse case of all the tests above.
+		fieldMask, err := fieldmaskpb.New(&flowpb.Flow{}, "verdict")
+		require.NoError(t, err)
+
+		fieldAgg, err := fieldaggregate.New(fieldMask)
+		require.NoError(t, err)
+
+		aggregator := NewAggregatorWithFields(fieldAgg, hivetest.Logger(t))
+
+		// Add flows with DIFFERENT verdicts - should create 3 separate aggregates.
+		aggregator.Add(&v1.Event{
+			Event: &flowpb.Flow{
+				Verdict:          flowpb.Verdict_FORWARDED,
+				TrafficDirection: flowpb.TrafficDirection_INGRESS,
+			},
+		})
+		aggregator.Add(&v1.Event{
+			Event: &flowpb.Flow{
+				Verdict:          flowpb.Verdict_DROPPED,
+				TrafficDirection: flowpb.TrafficDirection_EGRESS,
+			},
+		})
+		aggregator.Add(&v1.Event{
+			Event: &flowpb.Flow{
+				Verdict:          flowpb.Verdict_ERROR,
+				TrafficDirection: flowpb.TrafficDirection_INGRESS,
+			},
+		})
+
+		// Add another FORWARDED flow - should add to existing FORWARDED aggregate.
+		aggregator.Add(&v1.Event{
+			Event: &flowpb.Flow{
+				Verdict:          flowpb.Verdict_FORWARDED,
+				TrafficDirection: flowpb.TrafficDirection_EGRESS,
+			},
+		})
+
+		// Should have 3 separate aggregates (FORWARDED, DROPPED, ERROR).
+		assert.Len(t, aggregator.m, 3, "different verdicts should create separate aggregates")
+
+		// Verify each aggregate has correct counts.
+		forwardedKey := generateAggregationKey(&flowpb.Flow{Verdict: flowpb.Verdict_FORWARDED})
+		forwardedValue, exists := aggregator.m[forwardedKey]
+		require.True(t, exists, "FORWARDED aggregate should exist")
+		assert.Equal(t, 1, forwardedValue.IngressFlowCount, "FORWARDED should have 1 ingress")
+		assert.Equal(t, 1, forwardedValue.EgressFlowCount, "FORWARDED should have 1 egress")
+
+		droppedKey := generateAggregationKey(&flowpb.Flow{Verdict: flowpb.Verdict_DROPPED})
+		droppedValue, exists := aggregator.m[droppedKey]
+		require.True(t, exists, "DROPPED aggregate should exist")
+		assert.Equal(t, 1, droppedValue.EgressFlowCount, "DROPPED should have 1 egress")
+
+		errorKey := generateAggregationKey(&flowpb.Flow{Verdict: flowpb.Verdict_ERROR})
+		errorValue, exists := aggregator.m[errorKey]
+		require.True(t, exists, "ERROR aggregate should exist")
+		assert.Equal(t, 1, errorValue.IngressFlowCount, "ERROR should have 1 ingress")
+	})
+}
+
+func TestAggregateTimeEnrichment(t *testing.T) {
+
+	t.Run("time enriched despite not in fieldmask", func(t *testing.T) {
+		// Field Aggregate excludes time, but the processed flow is enriched anyway.
+		fieldMask, err := fieldmaskpb.New(&flowpb.Flow{}, "verdict")
+		require.NoError(t, err)
+
+		fieldAgg, err := fieldaggregate.New(fieldMask)
+		require.NoError(t, err)
+
+		aggregator := NewAggregatorWithFields(fieldAgg, hivetest.Logger(t))
+		testTimestamp := &timestamp.Timestamp{Seconds: 1692369601, Nanos: 123456789}
+		aggregator.Add(&v1.Event{
+			Event: &flowpb.Flow{
+				Time:             testTimestamp,
+				Verdict:          flowpb.Verdict_FORWARDED,
+				TrafficDirection: flowpb.TrafficDirection_INGRESS,
+			},
+		})
+
+		require.Len(t, aggregator.m, 1)
+		// Verify time is populated even though not in field mask.
+		for _, value := range aggregator.m {
+			assert.Equal(t, testTimestamp, value.ProcessedFlow.Time)
+		}
+	})
 }
 
 func TestAggregatorRunFunction(t *testing.T) {

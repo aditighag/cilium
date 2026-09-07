@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"iter"
 	"log/slog"
+	"net/netip"
 	"os"
 	"slices"
 	"testing"
@@ -18,6 +19,7 @@ import (
 	"github.com/cilium/statedb/reconciler"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/ptr"
 
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
@@ -26,8 +28,10 @@ import (
 	"github.com/cilium/cilium/pkg/kpr"
 	"github.com/cilium/cilium/pkg/loadbalancer"
 	"github.com/cilium/cilium/pkg/node"
+	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/source"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 type testParams struct {
@@ -36,9 +40,13 @@ type testParams struct {
 	DB     *statedb.DB
 	Writer *Writer
 
-	ServiceTable  statedb.Table[*loadbalancer.Service]
-	FrontendTable statedb.Table[*loadbalancer.Frontend]
-	BackendTable  statedb.Table[*loadbalancer.Backend]
+	LocalNodeStore *node.LocalNodeStore
+
+	NodeAddressTable statedb.RWTable[tables.NodeAddress]
+	ServiceTable     statedb.Table[*loadbalancer.Service]
+	FrontendTable    statedb.Table[*loadbalancer.Frontend]
+	BackendTable     statedb.Table[*loadbalancer.Backend]
+	Nodes            statedb.Table[*node.LocalNode]
 }
 
 func fixture(t testing.TB) (p testParams) {
@@ -69,7 +77,7 @@ func fixture(t testing.TB) (p testParams) {
 func intToAddr(i int) cmtypes.AddrCluster {
 	var addr [4]byte
 	binary.BigEndian.PutUint32(addr[:], 0x0100_0000+uint32(i))
-	addrCluster, _ := cmtypes.AddrClusterFromIP(addr[:])
+	addrCluster := cmtypes.AddrClusterFrom(netip.AddrFrom4(addr), 0)
 	return addrCluster
 }
 
@@ -229,7 +237,8 @@ func TestWriter_Backend_UpsertDelete(t *testing.T) {
 			wtxn,
 			name1,
 			source.Kubernetes,
-			slices.Values([]loadbalancer.BackendParams{
+			LocalClusterID,
+			slices.Values([]loadbalancer.Backend{
 				{
 					Address: beAddr1,
 					State:   loadbalancer.BackendStateActive,
@@ -245,7 +254,8 @@ func TestWriter_Backend_UpsertDelete(t *testing.T) {
 			wtxn,
 			name2,
 			source.Kubernetes,
-			slices.Values([]loadbalancer.BackendParams{
+			LocalClusterID,
+			slices.Values([]loadbalancer.Backend{
 				{
 					Address: beAddr3,
 					State:   loadbalancer.BackendStateActive,
@@ -261,20 +271,24 @@ func TestWriter_Backend_UpsertDelete(t *testing.T) {
 
 		// By address
 		for _, addr := range []loadbalancer.L3n4Addr{beAddr1, beAddr2, beAddr3} {
-			be, _, found := p.BackendTable.Get(txn, loadbalancer.BackendByAddress(addr))
-			if assert.True(t, found, "Backend not found with address %s", addr) {
-				assert.Equal(t, addr, be.Address, "Backend address %s does not match %s", be.Address, addr)
+			bes := statedb.Collect(p.BackendTable.List(txn, loadbalancer.BackendByAddress(addr)))
+			if assert.NotEmpty(t, bes, "Backend not found with address %s", addr) {
+				for _, be := range bes {
+					assert.Equal(t, addr, be.Address, "Backend address %s does not match %s", be.Address, addr)
+				}
 			}
 		}
 
 		// By service
-		bes := statedb.Collect(p.BackendTable.List(txn, loadbalancer.BackendByServiceName(name1)))
+		seq, _ := loadbalancer.ListBackendsByServiceName(txn, p.BackendTable, name1)
+		bes := statedb.Collect(seq)
 		require.Len(t, bes, 2)
 		require.Equal(t, beAddr1, bes[0].Address)
 		require.Equal(t, beAddr2, bes[1].Address)
 
 		// Backends for [name2] can be found even though the service doesn't exist (yet).
-		bes = statedb.Collect(p.BackendTable.List(txn, loadbalancer.BackendByServiceName(name2)))
+		seq, _ = loadbalancer.ListBackendsByServiceName(txn, p.BackendTable, name2)
+		bes = statedb.Collect(seq)
 		require.Len(t, bes, 1)
 		require.Equal(t, beAddr3, bes[0].Address)
 	}
@@ -285,11 +299,60 @@ func TestWriter_Backend_UpsertDelete(t *testing.T) {
 
 		// Release the [name1] reference to [beAddr1].
 		require.Equal(t, 3, p.BackendTable.NumObjects(wtxn))
-		err := p.Writer.ReleaseBackends(wtxn, name1, slices.Values([]loadbalancer.L3n4Addr{beAddr1}))
+		err := p.Writer.DeleteBackendsByAddress(wtxn, name1, source.Kubernetes, LocalClusterID, slices.Values([]loadbalancer.L3n4Addr{beAddr1}))
 		require.NoError(t, err, "ReleaseBackend failed")
 
 		wtxn.Abort()
 	}
+}
+
+func TestWriter_UpdateBackendHealth_AllSources(t *testing.T) {
+	p := fixture(t)
+	name := loadbalancer.NewServiceName("test", "test-health")
+	feAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(100), 3000, loadbalancer.ScopeExternal)
+	beAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(101), 4000, loadbalancer.ScopeExternal)
+
+	wtxn := p.Writer.WriteTxn()
+	_, err := p.Writer.UpsertService(wtxn, &loadbalancer.Service{Name: name, Source: source.Kubernetes})
+	require.NoError(t, err)
+	_, err = p.Writer.UpsertFrontend(wtxn, loadbalancer.FrontendParams{ServiceName: name, Address: feAddr, Type: loadbalancer.SVCTypeClusterIP})
+	require.NoError(t, err)
+
+	for _, src := range []source.Source{source.Kubernetes, source.KubeAPIServer} {
+		err = p.Writer.UpsertBackends(
+			wtxn,
+			name,
+			src,
+			LocalClusterID,
+			slices.Values([]loadbalancer.Backend{{
+				Address: beAddr,
+				State:   loadbalancer.BackendStateActive,
+			}}),
+		)
+		require.NoError(t, err)
+	}
+
+	changed, err := p.Writer.UpdateBackendHealth(wtxn, name, beAddr, false)
+	require.NoError(t, err)
+	require.True(t, changed)
+	wtxn.Commit()
+
+	txn := p.DB.ReadTxn()
+	bes, _ := loadbalancer.ListBackendsByServiceNameAndAddress(txn, p.BackendTable, name, beAddr)
+	count := 0
+	for be := range bes {
+		count++
+		require.True(t, be.Unhealthy)
+		require.NotNil(t, be.UnhealthyUpdatedAt)
+	}
+	require.Equal(t, 2, count)
+
+	// Updating again returns false since nothing changed
+	wtxn = p.Writer.WriteTxn()
+	defer wtxn.Abort()
+	changed, err = p.Writer.UpdateBackendHealth(wtxn, name, beAddr, false)
+	require.NoError(t, err)
+	require.False(t, changed)
 }
 
 // TestWriter_Initializers checks that all tables managed by Writer are only initialized
@@ -353,6 +416,81 @@ func TestWriter_Initializers(t *testing.T) {
 	require.NotEmpty(t, p.ServiceTable.PendingInitializers(firstTxn), "expected services to be uninitialized")
 }
 
+func TestWriter_WildcardAddressReconciler(t *testing.T) {
+	p := fixture(t)
+
+	wildcardName := loadbalancer.NewServiceName("test", "wildcard")
+	otherName := loadbalancer.NewServiceName("test", "other")
+	wildcardAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(200), 2000, loadbalancer.ScopeExternal)
+	otherAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(201), 2001, loadbalancer.ScopeInternal)
+
+	// Add one wildcard-candidate frontend and one non-candidate frontend.
+	wtxn := p.Writer.WriteTxn()
+	require.NoError(t, p.Writer.UpsertServiceAndFrontends(
+		wtxn,
+		&loadbalancer.Service{Name: wildcardName, Source: source.Kubernetes},
+		loadbalancer.FrontendParams{
+			ServiceName: wildcardName,
+			Address:     wildcardAddr,
+			Type:        loadbalancer.SVCTypeClusterIP,
+			ServicePort: wildcardAddr.Port(),
+		},
+	))
+	require.NoError(t, p.Writer.UpsertServiceAndFrontends(
+		wtxn,
+		&loadbalancer.Service{Name: otherName, Source: source.Kubernetes},
+		loadbalancer.FrontendParams{
+			ServiceName: otherName,
+			Address:     otherAddr,
+			Type:        loadbalancer.SVCTypeClusterIP,
+			ServicePort: otherAddr.Port(),
+		},
+	))
+	wtxn.Commit()
+
+	// Mark both frontends as done so the reconciler has to push them back to pending.
+	wtxn = p.Writer.WriteTxn()
+	frontendTable, ok := any(p.FrontendTable).(statedb.RWTable[*loadbalancer.Frontend])
+	require.True(t, ok)
+	wildcardFE, _, found := p.FrontendTable.Get(wtxn, loadbalancer.FrontendByAddress(wildcardAddr))
+	require.True(t, found)
+	otherFE, _, found := p.FrontendTable.Get(wtxn, loadbalancer.FrontendByAddress(otherAddr))
+	require.True(t, found)
+
+	wildcardFE = wildcardFE.Clone()
+	wildcardFE.Status = reconciler.StatusDone()
+	_, _, err := frontendTable.Insert(wtxn, wildcardFE)
+	require.NoError(t, err)
+
+	otherFE = otherFE.Clone()
+	otherFE.Status = reconciler.StatusDone()
+	_, _, err = frontendTable.Insert(wtxn, otherFE)
+	require.NoError(t, err)
+	wtxn.Commit()
+
+	// Change the node-address set to trigger the wildcard address reconciler.
+	ntxn := p.DB.WriteTxn(p.NodeAddressTable)
+	_, _, err = p.NodeAddressTable.Insert(ntxn, tables.NodeAddress{
+		Addr:       intToAddr(250).Addr(),
+		Primary:    true,
+		DeviceName: "eth0",
+	})
+	require.NoError(t, err)
+	ntxn.Commit()
+
+	// Verify that only the wildcard candidate gets requeued to pending.
+	require.Eventually(t, func() bool {
+		txn := p.DB.ReadTxn()
+		wildcardFE, _, found := p.FrontendTable.Get(txn, loadbalancer.FrontendByAddress(wildcardAddr))
+		if !found || wildcardFE.Status.Kind != reconciler.StatusKindPending {
+			return false
+		}
+
+		otherFE, _, found := p.FrontendTable.Get(txn, loadbalancer.FrontendByAddress(otherAddr))
+		return found && otherFE.Status.Kind == reconciler.StatusKindDone
+	}, 5*time.Second, 100*time.Millisecond)
+}
+
 func TestWriter_SetBackends(t *testing.T) {
 	p := fixture(t)
 
@@ -366,13 +504,13 @@ func TestWriter_SetBackends(t *testing.T) {
 	beAddr2 := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(122), 4242, loadbalancer.ScopeExternal)
 	beAddr3 := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(123), 4243, loadbalancer.ScopeExternal)
 
-	backend1 := loadbalancer.BackendParams{Address: beAddr1}
-	backend2 := loadbalancer.BackendParams{Address: beAddr2}
-	backend3 := loadbalancer.BackendParams{Address: beAddr3}
+	backend1 := loadbalancer.Backend{Address: beAddr1}
+	backend2 := loadbalancer.Backend{Address: beAddr2}
+	backend3 := loadbalancer.Backend{Address: beAddr3}
 
-	backend1_cluster1 := loadbalancer.BackendParams{Address: beAddr1, ClusterID: 1}
-	backend2_cluster1 := loadbalancer.BackendParams{Address: beAddr2, ClusterID: 1}
-	backend3_cluster2 := loadbalancer.BackendParams{Address: beAddr3, ClusterID: 2}
+	backend1_cluster1 := loadbalancer.Backend{Address: beAddr1, ClusterID: 1}
+	backend2_cluster1 := loadbalancer.Backend{Address: beAddr2, ClusterID: 1}
+	backend3_cluster2 := loadbalancer.Backend{Address: beAddr3, ClusterID: 2}
 
 	type testCase struct {
 		desc   string
@@ -498,19 +636,31 @@ func TestWriter_SetBackends(t *testing.T) {
 					fe, _, ok := p.Writer.Frontends().Get(txn, loadbalancer.FrontendByServiceName(name)) // We assume only one frontend per service
 					require.True(t, ok)
 					if !present {
-						be, _, found := p.Writer.Backends().Get(txn, loadbalancer.BackendByAddress(addr))
-						if found { // Backend should not exist...
-							ptr := be.GetInstance(name)
-							require.Nil(t, ptr) // ...or not be associated with the service.
+						bes := statedb.Collect(p.Writer.Backends().List(txn, loadbalancer.BackendByAddress(addr)))
+						if len(bes) > 0 { // Backend should not exist...
+							foundForService := false
+							for _, be := range bes {
+								if be.ServiceName == name {
+									foundForService = true
+									break
+								}
+							}
+							require.False(t, foundForService) // ...or not be associated with the service.
 						}
 						for be := range fe.Backends {
 							require.NotEqual(t, addr, be.Address)
 						}
 					} else {
-						be, _, found := p.Writer.Backends().Get(txn, loadbalancer.BackendByAddress(addr))
-						require.True(t, found)
-						ptr := be.GetInstance(name)
-						require.NotNil(t, ptr)
+						bes := statedb.Collect(p.Writer.Backends().List(txn, loadbalancer.BackendByAddress(addr)))
+						require.NotEmpty(t, bes)
+						foundForService := false
+						for _, be := range bes {
+							if be.ServiceName == name {
+								foundForService = true
+								break
+							}
+						}
+						require.True(t, foundForService)
 						foundInFrontend := false
 						for be := range fe.Backends {
 							foundInFrontend = foundInFrontend || be.Address == addr
@@ -520,8 +670,8 @@ func TestWriter_SetBackends(t *testing.T) {
 				}
 			}
 			for addr, shouldExist := range tc.existence {
-				_, _, found := p.Writer.Backends().Get(txn, loadbalancer.BackendByAddress(addr))
-				require.Equal(t, shouldExist, found, "address: %s", addr.String())
+				bes := statedb.Collect(p.Writer.Backends().List(txn, loadbalancer.BackendByAddress(addr)))
+				require.Equal(t, shouldExist, len(bes) > 0, "address: %s", addr.String())
 			}
 		})
 	}
@@ -536,7 +686,7 @@ func TestWriter_WithConflictingSources(t *testing.T) {
 	feAddr1 := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(1234), 1234, loadbalancer.ScopeExternal)
 	feAddr2 := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(1235), 1235, loadbalancer.ScopeExternal)
 
-	backendTemplate := loadbalancer.BackendParams{Address: loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(123), 4242, loadbalancer.ScopeExternal)}
+	backendTemplate := loadbalancer.Backend{Address: loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(123), 4242, loadbalancer.ScopeExternal)}
 	backend10 := backendTemplate
 	backend10.Weight = 10
 	backend11 := backendTemplate
@@ -573,26 +723,26 @@ func TestWriter_WithConflictingSources(t *testing.T) {
 		{
 			desc: "add backends for two services",
 			action: func(t *testing.T, w *Writer, wtxn WriteTxn) {
-				require.NoError(t, w.UpsertBackends(wtxn, name1, source.Kubernetes,
-					slices.Values([]loadbalancer.BackendParams{backend10})))
-				require.NoError(t, w.UpsertBackends(wtxn, name2, source.KubeAPIServer,
-					slices.Values([]loadbalancer.BackendParams{backend20})))
+				require.NoError(t, w.UpsertBackends(wtxn, name1, source.Kubernetes, LocalClusterID,
+					slices.Values([]loadbalancer.Backend{backend10})))
+				require.NoError(t, w.UpsertBackends(wtxn, name2, source.KubeAPIServer, LocalClusterID,
+					slices.Values([]loadbalancer.Backend{backend20})))
 			},
 			want: map[loadbalancer.ServiceName]*weight{name1: ptr.To[weight](10), name2: ptr.To[weight](20)},
 		},
 		{
 			desc: "update backend from higher priority source",
 			action: func(t *testing.T, w *Writer, wtxn WriteTxn) {
-				require.NoError(t, w.UpsertBackends(wtxn, name1, source.KubeAPIServer,
-					slices.Values([]loadbalancer.BackendParams{backend11})))
+				require.NoError(t, w.UpsertBackends(wtxn, name1, source.KubeAPIServer, LocalClusterID,
+					slices.Values([]loadbalancer.Backend{backend11})))
 			},
 			want: map[loadbalancer.ServiceName]*weight{name1: ptr.To[weight](11), name2: ptr.To[weight](20)},
 		},
 		{
 			desc: "update backend from lower priority source",
 			action: func(t *testing.T, w *Writer, wtxn WriteTxn) {
-				require.NoError(t, w.UpsertBackends(wtxn, name1, source.Kubernetes,
-					slices.Values([]loadbalancer.BackendParams{backend12})))
+				require.NoError(t, w.UpsertBackends(wtxn, name1, source.Kubernetes, LocalClusterID,
+					slices.Values([]loadbalancer.Backend{backend12})))
 			},
 			want: map[loadbalancer.ServiceName]*weight{name1: ptr.To[weight](11), name2: ptr.To[weight](20)}, // no change here
 		},
@@ -607,10 +757,10 @@ func TestWriter_WithConflictingSources(t *testing.T) {
 		{
 			desc: "add deleted backends back",
 			action: func(t *testing.T, w *Writer, wtxn WriteTxn) {
-				require.NoError(t, w.UpsertBackends(wtxn, name1, source.KubeAPIServer,
-					slices.Values([]loadbalancer.BackendParams{backend11})))
-				require.NoError(t, w.UpsertBackends(wtxn, name2, source.KubeAPIServer,
-					slices.Values([]loadbalancer.BackendParams{backend20})))
+				require.NoError(t, w.UpsertBackends(wtxn, name1, source.KubeAPIServer, LocalClusterID,
+					slices.Values([]loadbalancer.Backend{backend11})))
+				require.NoError(t, w.UpsertBackends(wtxn, name2, source.KubeAPIServer, LocalClusterID,
+					slices.Values([]loadbalancer.Backend{backend20})))
 			},
 			want: map[loadbalancer.ServiceName]*weight{name1: ptr.To[weight](11), name2: ptr.To[weight](20)},
 		},
@@ -639,11 +789,14 @@ func TestWriter_WithConflictingSources(t *testing.T) {
 				fe, _, ok := p.Writer.Frontends().Get(txn, loadbalancer.FrontendByServiceName(name)) // We assume only one frontend per service
 				require.True(t, ok)
 				if weight == nil {
-					_, _, found := p.Writer.Backends().Get(txn, loadbalancer.BackendByServiceName(name))
-					require.False(t, found)
-					require.Empty(t, statedb.Collect(iter.Seq2[loadbalancer.BackendParams, statedb.Revision](fe.Backends)))
+					bes, _ := loadbalancer.ListBackendsByServiceName(txn, p.Writer.Backends(), name)
+					preferred := loadbalancer.PreferredBackendsByAddress(bes)
+					backendRows := statedb.Collect(preferred)
+					require.Empty(t, backendRows)
+					require.Empty(t, statedb.Collect(iter.Seq2[*loadbalancer.Backend, statedb.Revision](fe.Backends)))
 				} else {
-					backends := p.Writer.Backends().List(txn, loadbalancer.BackendByServiceName(name))
+					bes, _ := loadbalancer.ListBackendsByServiceName(txn, p.Writer.Backends(), name)
+					backends := loadbalancer.PreferredBackendsByAddress(bes)
 					count := 0
 					var backendFromTable *loadbalancer.Backend
 					for b := range backends {
@@ -651,9 +804,12 @@ func TestWriter_WithConflictingSources(t *testing.T) {
 						backendFromTable = b
 					}
 					require.Equal(t, 1, count)
-					actual := slices.Collect(statedb.ToSeq(iter.Seq2[loadbalancer.BackendParams, statedb.Revision](fe.Backends)))
+					actual := slices.Collect(statedb.ToSeq(iter.Seq2[*loadbalancer.Backend, statedb.Revision](fe.Backends)))
 					require.Len(t, actual, 1)
-					for desc, b := range map[string]loadbalancer.BackendParams{"from table": *backendFromTable.GetInstance(name), "from Frontend": actual[0]} {
+					backendFromTableParams := *backendFromTable
+					backendFromTableParams.ServiceName = loadbalancer.ServiceName{}
+					backendFromTableParams.SetSourcePriority(0)
+					for desc, b := range map[string]*loadbalancer.Backend{"from table": &backendFromTableParams, "from Frontend": actual[0]} {
 						require.NotNil(t, b, desc)
 						require.Equal(t, int(*weight), int(b.Weight), "backend %s", desc)
 					}
@@ -674,13 +830,13 @@ func TestWriter_SetSelectBackends(t *testing.T) {
 	var beAddr loadbalancer.L3n4Addr
 	beAddr.ParseFromString("2.0.0.1:80/TCP")
 
-	w.SetSelectBackendsFunc(func(_ statedb.ReadTxn, bes iter.Seq2[loadbalancer.BackendParams, statedb.Revision], svc *loadbalancer.Service, fe *loadbalancer.Frontend) iter.Seq2[loadbalancer.BackendParams, statedb.Revision] {
+	w.SetSelectBackendsFunc(func(_ statedb.ReadTxn, bes iter.Seq2[*loadbalancer.Backend, statedb.Revision], svc *loadbalancer.Service, fe *loadbalancer.Frontend) iter.Seq2[*loadbalancer.Backend, statedb.Revision] {
 		require.NotNil(t, bes)
 		require.NotNil(t, svc)
 		require.NotNil(t, fe)
 		require.Equal(t, feAddr.String(), fe.Address.String())
-		return func(yield func(loadbalancer.BackendParams, uint64) bool) {
-			yield(loadbalancer.BackendParams{
+		return func(yield func(*loadbalancer.Backend, uint64) bool) {
+			yield(&loadbalancer.Backend{
 				Address: beAddr,
 				Source:  "test",
 			}, 1)
@@ -696,7 +852,259 @@ func TestWriter_SetSelectBackends(t *testing.T) {
 
 	fe, _, found := w.Frontends().Get(txn, loadbalancer.FrontendByAddress(feAddr))
 	require.True(t, found)
-	bes := slices.Collect(statedb.ToSeq(iter.Seq2[loadbalancer.BackendParams, statedb.Revision](fe.Backends)))
+	bes := slices.Collect(statedb.ToSeq(iter.Seq2[*loadbalancer.Backend, statedb.Revision](fe.Backends)))
 	require.Len(t, bes, 1)
 	require.Equal(t, beAddr.String(), bes[0].Address.String())
+}
+
+func TestWriter_SelectBackends_PreferCloseFallsBackFromUnhealthySameZone(t *testing.T) {
+	p := fixture(t)
+	p.Writer.config.EnableServiceTopology = true
+	p.Writer.SetIsServiceHealthCheckedFunc(func(*loadbalancer.Service) bool { return true })
+	p.LocalNodeStore.Update(func(n *node.LocalNode) {
+		if n.Labels == nil {
+			n.Labels = map[string]string{}
+		}
+		n.Labels[corev1.LabelTopologyZone] = "zone-a"
+	})
+
+	svcName := loadbalancer.NewServiceName("test", "svc")
+	feAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(1), 80, loadbalancer.ScopeExternal)
+	localAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(2), 8080, loadbalancer.ScopeExternal)
+	remoteAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(3), 8080, loadbalancer.ScopeExternal)
+	now := time.Now()
+
+	svc := &loadbalancer.Service{
+		Name:                svcName,
+		Source:              source.Kubernetes,
+		TrafficDistribution: loadbalancer.TrafficDistributionPreferClose,
+	}
+	fe := &loadbalancer.Frontend{
+		FrontendParams: loadbalancer.FrontendParams{
+			ServiceName: svcName,
+			Address:     feAddr,
+			Type:        loadbalancer.SVCTypeClusterIP,
+			ServicePort: feAddr.Port(),
+		},
+		Service: svc,
+	}
+	backends := iter.Seq2[*loadbalancer.Backend, statedb.Revision](func(yield func(*loadbalancer.Backend, statedb.Revision) bool) {
+		for i, be := range []*loadbalancer.Backend{
+			{
+				Address:            localAddr,
+				State:              loadbalancer.BackendStateActive,
+				Unhealthy:          true,
+				UnhealthyUpdatedAt: &now,
+				Zone:               &loadbalancer.BackendZone{Zone: "zone-a", ForZones: []string{"zone-a"}},
+			},
+			{
+				Address:            remoteAddr,
+				State:              loadbalancer.BackendStateActive,
+				UnhealthyUpdatedAt: &now,
+				Zone:               &loadbalancer.BackendZone{Zone: "zone-b", ForZones: []string{"zone-b"}},
+			},
+		} {
+			if !yield(be, statedb.Revision(i+1)) {
+				return
+			}
+		}
+	})
+
+	selected := slices.Collect(statedb.ToSeq(p.Writer.SelectBackends(p.DB.ReadTxn(), backends, svc, fe)))
+	require.Len(t, selected, 2)
+	addresses := []loadbalancer.L3n4Addr{selected[0].Address, selected[1].Address}
+	assert.Contains(t, addresses, localAddr)
+	assert.Contains(t, addresses, remoteAddr)
+}
+
+// TestWriter_SelectBackends_PreferCloseIgnoresTerminatingForMissingHints verifies
+// that backends in BackendStateTerminating / BackendStateTerminatingNotServing are
+// excluded from the missing-hints safeguard. The EndpointSlice controller does not
+// compute zone hints for non-Ready endpoints, so without this exclusion a single
+// terminating Pod would disable topology-aware routing for the entire Service.
+func TestWriter_SelectBackends_PreferCloseIgnoresTerminatingForMissingHints(t *testing.T) {
+	p := fixture(t)
+	p.Writer.config.EnableServiceTopology = true
+	p.LocalNodeStore.Update(func(n *node.LocalNode) {
+		if n.Labels == nil {
+			n.Labels = map[string]string{}
+		}
+		n.Labels[corev1.LabelTopologyZone] = "zone-a"
+	})
+
+	svcName := loadbalancer.NewServiceName("test", "svc")
+	feAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(1), 80, loadbalancer.ScopeExternal)
+	activeLocalAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(2), 8080, loadbalancer.ScopeExternal)
+	activeRemoteAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(3), 8080, loadbalancer.ScopeExternal)
+	terminatingAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(4), 8080, loadbalancer.ScopeExternal)
+	terminatingNoZoneAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(5), 8080, loadbalancer.ScopeExternal)
+
+	svc := &loadbalancer.Service{
+		Name:                svcName,
+		Source:              source.Kubernetes,
+		TrafficDistribution: loadbalancer.TrafficDistributionPreferClose,
+	}
+	fe := &loadbalancer.Frontend{
+		FrontendParams: loadbalancer.FrontendParams{
+			ServiceName: svcName,
+			Address:     feAddr,
+			Type:        loadbalancer.SVCTypeClusterIP,
+			ServicePort: feAddr.Port(),
+		},
+		Service: svc,
+	}
+	backends := iter.Seq2[*loadbalancer.Backend, statedb.Revision](func(yield func(*loadbalancer.Backend, statedb.Revision) bool) {
+		for i, be := range []*loadbalancer.Backend{
+			{
+				Address: activeLocalAddr,
+				State:   loadbalancer.BackendStateActive,
+				Zone:    &loadbalancer.BackendZone{Zone: "zone-a", ForZones: []string{"zone-a"}},
+			},
+			{
+				Address: activeRemoteAddr,
+				State:   loadbalancer.BackendStateActive,
+				Zone:    &loadbalancer.BackendZone{Zone: "zone-b", ForZones: []string{"zone-b"}},
+			},
+			{
+				// Terminating Pod whose endpoint kept its zone label but has no
+				// ForZones hint. Pre-fix this would have set missingHints=true and
+				// disabled topology routing for the whole Service.
+				Address: terminatingAddr,
+				State:   loadbalancer.BackendStateTerminating,
+				Zone:    &loadbalancer.BackendZone{Zone: "zone-c"},
+			},
+			{
+				// Terminating Pod on a node without a zone label. Pre-fix the
+				// emit loop would have nil-dereferenced be.Zone.ForZones.
+				Address: terminatingNoZoneAddr,
+				State:   loadbalancer.BackendStateTerminatingNotServing,
+			},
+		} {
+			if !yield(be, statedb.Revision(i+1)) {
+				return
+			}
+		}
+	})
+
+	selected := slices.Collect(statedb.ToSeq(p.Writer.SelectBackends(p.DB.ReadTxn(), backends, svc, fe)))
+
+	// Topology safeguard must remain engaged: only the zone-a Active backend
+	// should be selected. Terminating backends are filtered from primary traffic
+	// because their (possibly empty / nil) ForZones cannot match the local zone.
+	require.Len(t, selected, 1)
+	assert.Equal(t, activeLocalAddr.String(), selected[0].Address.String())
+}
+
+// TestWriter_SelectBackends_PreferCloseFallsBackWhenOnlyTerminating verifies that
+// when every backend is terminating, the safeguard reports no candidates and we
+// fall back to the default behaviour (yield all backends), preserving graceful
+// drain semantics. The nil-Zone backend must not panic.
+func TestWriter_SelectBackends_PreferCloseFallsBackWhenOnlyTerminating(t *testing.T) {
+	p := fixture(t)
+	p.Writer.config.EnableServiceTopology = true
+	p.LocalNodeStore.Update(func(n *node.LocalNode) {
+		if n.Labels == nil {
+			n.Labels = map[string]string{}
+		}
+		n.Labels[corev1.LabelTopologyZone] = "zone-a"
+	})
+
+	svcName := loadbalancer.NewServiceName("test", "svc")
+	feAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(1), 80, loadbalancer.ScopeExternal)
+	terminatingAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(2), 8080, loadbalancer.ScopeExternal)
+	terminatingNoZoneAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(3), 8080, loadbalancer.ScopeExternal)
+
+	svc := &loadbalancer.Service{
+		Name:                svcName,
+		Source:              source.Kubernetes,
+		TrafficDistribution: loadbalancer.TrafficDistributionPreferClose,
+	}
+	fe := &loadbalancer.Frontend{
+		FrontendParams: loadbalancer.FrontendParams{
+			ServiceName: svcName,
+			Address:     feAddr,
+			Type:        loadbalancer.SVCTypeClusterIP,
+			ServicePort: feAddr.Port(),
+		},
+		Service: svc,
+	}
+	backends := iter.Seq2[*loadbalancer.Backend, statedb.Revision](func(yield func(*loadbalancer.Backend, statedb.Revision) bool) {
+		for i, be := range []*loadbalancer.Backend{
+			{
+				Address: terminatingAddr,
+				State:   loadbalancer.BackendStateTerminating,
+				Zone:    &loadbalancer.BackendZone{Zone: "zone-a"},
+			},
+			{
+				Address: terminatingNoZoneAddr,
+				State:   loadbalancer.BackendStateTerminating,
+			},
+		} {
+			if !yield(be, statedb.Revision(i+1)) {
+				return
+			}
+		}
+	})
+
+	selected := slices.Collect(statedb.ToSeq(p.Writer.SelectBackends(p.DB.ReadTxn(), backends, svc, fe)))
+	require.Len(t, selected, 2)
+	addresses := []loadbalancer.L3n4Addr{selected[0].Address, selected[1].Address}
+	assert.Contains(t, addresses, terminatingAddr)
+	assert.Contains(t, addresses, terminatingNoZoneAddr)
+}
+
+func TestWriter_SelectBackends_PreferSameNodeIgnoresTerminating(t *testing.T) {
+	oldName := nodeTypes.GetName()
+	nodeTypes.SetName("node-a")
+	t.Cleanup(func() {
+		nodeTypes.SetName(oldName)
+	})
+
+	p := fixture(t)
+	p.Writer.config.EnableServiceTopology = true
+
+	svcName := loadbalancer.NewServiceName("test", "svc")
+	feAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(1), 80, loadbalancer.ScopeExternal)
+	activeLocalAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(2), 8080, loadbalancer.ScopeExternal)
+	terminatingLocalAddr := loadbalancer.NewL3n4Addr(loadbalancer.TCP, intToAddr(3), 8080, loadbalancer.ScopeExternal)
+
+	svc := &loadbalancer.Service{
+		Name:                svcName,
+		Source:              source.Kubernetes,
+		TrafficDistribution: loadbalancer.TrafficDistributionPreferSameNode,
+	}
+	fe := &loadbalancer.Frontend{
+		FrontendParams: loadbalancer.FrontendParams{
+			ServiceName: svcName,
+			Address:     feAddr,
+			Type:        loadbalancer.SVCTypeClusterIP,
+			ServicePort: feAddr.Port(),
+		},
+		Service: svc,
+	}
+	backends := iter.Seq2[*loadbalancer.Backend, statedb.Revision](func(yield func(*loadbalancer.Backend, statedb.Revision) bool) {
+		for i, be := range []*loadbalancer.Backend{
+			{
+				Address:  activeLocalAddr,
+				State:    loadbalancer.BackendStateActive,
+				NodeName: "node-a",
+			},
+			{
+				Address:  terminatingLocalAddr,
+				State:    loadbalancer.BackendStateTerminating,
+				NodeName: "node-a",
+			},
+		} {
+			if !yield(be, statedb.Revision(i+1)) {
+				return
+			}
+		}
+	})
+
+	selected := slices.Collect(statedb.ToSeq(p.Writer.SelectBackends(p.DB.ReadTxn(), backends, svc, fe)))
+
+	// Only the active local backend should be selected.
+	// Terminating local backend must be filtered out.
+	require.Len(t, selected, 1)
+	assert.Equal(t, activeLocalAddr.String(), selected[0].Address.String())
 }

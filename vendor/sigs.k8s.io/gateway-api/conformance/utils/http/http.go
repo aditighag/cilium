@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package http
+package http //nolint:revive
 
 import (
 	"fmt"
@@ -78,6 +78,47 @@ type Request struct {
 	Protocol         string
 	Body             string
 	SNI              string
+	ClientCert       string
+}
+
+const requestIDQueryParam = "gateway-api-conformance-request-id"
+
+// AddRequestIDQueryParam adds a request ID to the request URI so that echo
+// server logs for this request can be matched unambiguously.
+// Returns a non-nil error if either Request.Path or ExpectedRequest.Path has an unparseable query.
+func (er *ExpectedResponse) AddRequestIDQueryParam(requestID string) error {
+	path, err := addQueryParam(er.Request.Path, requestIDQueryParam, requestID)
+	if err != nil {
+		return err
+	}
+	if er.ExpectedRequest != nil {
+		if er.ExpectedRequest.Path == "" {
+			er.ExpectedRequest.Path = path
+		} else {
+			er.ExpectedRequest.Path, err = addQueryParam(er.ExpectedRequest.Path, requestIDQueryParam, requestID)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	er.Request.Path = path
+	return nil
+}
+
+// addQueryParam adds 'name'='value' query parameter to the given 'rawURL' and returns it.
+// Returns an error if rawURL or its query cannot be parsed.
+func addQueryParam(rawURL, name, value string) (string, error) {
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		return "", err
+	}
+	query, err := url.ParseQuery(parsedURL.RawQuery)
+	if err != nil {
+		return "", err
+	}
+	query.Set(name, value)
+	parsedURL.RawQuery = query.Encode()
+	return parsedURL.String(), nil
 }
 
 // ExpectedRequest defines expected properties of a request that reaches a backend.
@@ -87,16 +128,24 @@ type ExpectedRequest struct {
 	// AbsentHeaders are names of headers that are expected
 	// *not* to be present on the request.
 	AbsentHeaders []string
+	// If set, CompareRoundTrip asserts the echoed httpPort equals this value.
+	HTTPPort string
 }
 
 // Response defines expected properties of a response from a backend.
 type Response struct {
 	// Deprecated: Use StatusCodes instead, which supports matching against multiple status codes.
-	StatusCode    int
-	StatusCodes   []int
-	Headers       map[string]string
-	AbsentHeaders []string
-	Protocol      string
+	StatusCode  int
+	StatusCodes []int
+	Headers     map[string]string
+	// ValidHeaderValues can be used to verify when a header may have
+	// different valid values
+	ValidHeaderValues map[string][]string
+	AbsentHeaders     []string
+	Protocol          string
+	// IgnoreWhitespace will cause whitespace to be ignored when comparing the response
+	// header values.
+	IgnoreWhitespace bool
 }
 
 type BackendRef struct {
@@ -141,7 +190,7 @@ func MakeRequest(t *testing.T, expected *ExpectedResponse, gwAddr, protocol, sch
 	}
 
 	// if the deprecated field StatusCode is set, append it to StatusCodes for backwards compatibility
-	if expected.Response.StatusCode != 0 {
+	if expected.Response.StatusCode != 0 && !slices.Contains(expected.Response.StatusCodes, expected.Response.StatusCode) {
 		expected.Response.StatusCodes = append(expected.Response.StatusCodes, expected.Response.StatusCode)
 	}
 
@@ -239,7 +288,7 @@ func AwaitConvergence(t *testing.T, threshold int, maxTimeToConsistency time.Dur
 		default:
 		}
 
-		completed := fn(time.Now().Sub(start))
+		completed := fn(time.Since(start))
 		attempts++
 		if completed {
 			successes++
@@ -307,10 +356,8 @@ func WaitForConsistentFailureResponse(t *testing.T, r roundtripper.RoundTripper,
 
 func CompareRoundTrip(t *testing.T, req *roundtripper.Request, cReq *roundtripper.CapturedRequest, cRes *roundtripper.CapturedResponse, expected ExpectedResponse) error {
 	if roundtripper.IsTimeoutError(cRes.StatusCode) {
-		for _, statusCode := range expected.Response.StatusCodes {
-			if roundtripper.IsTimeoutError(statusCode) {
-				return nil
-			}
+		if slices.ContainsFunc(expected.Response.StatusCodes, roundtripper.IsTimeoutError) {
+			return nil
 		}
 	}
 	if !slices.Contains(expected.Response.StatusCodes, cRes.StatusCode) {
@@ -320,7 +367,8 @@ func CompareRoundTrip(t *testing.T, req *roundtripper.Request, cReq *roundtrippe
 		return fmt.Errorf("expected protocol to be %s, got %s", expected.Response.Protocol, cRes.Protocol)
 	}
 
-	if cRes.StatusCode == 200 {
+	// 204 is a valid response for CORS requests.
+	if cRes.StatusCode == 200 || cRes.StatusCode == 204 {
 		// The request expected to arrive at the backend is
 		// the same as the request made, unless otherwise
 		// specified.
@@ -362,20 +410,52 @@ func CompareRoundTrip(t *testing.T, req *roundtripper.Request, cReq *roundtrippe
 			}
 		}
 
-		if expected.Response.Headers != nil {
+		if expected.ExpectedRequest.HTTPPort != "" && expected.ExpectedRequest.HTTPPort != cReq.HTTPPort {
+			return fmt.Errorf("expected httpPort %q, got %q", expected.ExpectedRequest.HTTPPort, cReq.HTTPPort)
+		}
+
+		if len(expected.Response.Headers) > 0 || len(expected.Response.ValidHeaderValues) > 0 {
 			if cRes.Headers == nil {
-				return fmt.Errorf("no headers captured, expected %v", len(expected.ExpectedRequest.Headers))
+				if len(expected.Response.Headers) > 0 {
+					return fmt.Errorf("no headers captured, expected %d single-value headers", len(expected.Response.Headers))
+				}
+				if len(expected.Response.ValidHeaderValues) > 0 {
+					return fmt.Errorf("no headers captured, expected %d multi-value headers", len(expected.Response.ValidHeaderValues))
+				}
 			}
 			for name, val := range cRes.Headers {
 				cRes.Headers[strings.ToLower(name)] = val
+			}
+
+			for name, expectedVals := range expected.Response.ValidHeaderValues {
+				actualVal, ok := cRes.Headers[strings.ToLower(name)]
+				if !ok {
+					return fmt.Errorf("expected %s header to be set, actual headers: %v", name, cRes.Headers)
+				}
+				actualValStr := strings.Join(actualVal, ",")
+				if expected.Response.IgnoreWhitespace {
+					actualValStr = strings.ReplaceAll(actualValStr, " ", "")
+					for i := range expectedVals {
+						expectedVals[i] = strings.ReplaceAll(expectedVals[i], " ", "")
+					}
+				}
+				if !slices.Contains(expectedVals, actualValStr) {
+					return fmt.Errorf("expected %s header to be set to one of %v, got %s", name, expectedVals, actualValStr)
+				}
 			}
 
 			for name, expectedVal := range expected.Response.Headers {
 				actualVal, ok := cRes.Headers[strings.ToLower(name)]
 				if !ok {
 					return fmt.Errorf("expected %s header to be set, actual headers: %v", name, cRes.Headers)
-				} else if strings.Join(actualVal, ",") != expectedVal {
-					return fmt.Errorf("expected %s header to be set to %s, got %s", name, expectedVal, strings.Join(actualVal, ","))
+				}
+				actualValStr := strings.Join(actualVal, ",")
+				if expected.Response.IgnoreWhitespace {
+					actualValStr = strings.ReplaceAll(actualValStr, " ", "")
+					expectedVal = strings.ReplaceAll(expectedVal, " ", "")
+				}
+				if actualValStr != expectedVal {
+					return fmt.Errorf("expected %s header to be set to %s, got %s", name, expectedVal, actualValStr)
 				}
 			}
 		}
@@ -414,6 +494,12 @@ func CompareRoundTrip(t *testing.T, req *roundtripper.Request, cReq *roundtrippe
 
 		if expected.ExpectedRequest.SNI != "" && expected.ExpectedRequest.SNI != cReq.TLS.ServerName {
 			return fmt.Errorf("expected SNI %q to be equal to %q", cReq.TLS.ServerName, expected.ExpectedRequest.SNI)
+		}
+
+		if expected.ExpectedRequest.ClientCert != "" {
+			if !slices.Contains(cReq.TLS.PeerCertificates, expected.ExpectedRequest.ClientCert) {
+				return fmt.Errorf("expected client certiifcate was not captured")
+			}
 		}
 	} else if roundtripper.IsRedirect(cRes.StatusCode) {
 		if expected.RedirectRequest == nil {

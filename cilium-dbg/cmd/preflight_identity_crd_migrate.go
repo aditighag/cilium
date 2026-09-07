@@ -6,7 +6,6 @@ package cmd
 import (
 	"context"
 	"errors"
-	"path"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,14 +15,16 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"github.com/cilium/cilium/pkg/allocator"
+	bgpConfig "github.com/cilium/cilium/pkg/bgp/config"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/identity/cache"
 	cacheKey "github.com/cilium/cilium/pkg/identity/key"
 	"github.com/cilium/cilium/pkg/idpool"
 	ciliumClient "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/client"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/k8s/identitybackend"
+	"github.com/cilium/cilium/pkg/kvstore"
 	kvstoreallocator "github.com/cilium/cilium/pkg/kvstore/allocator"
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -35,7 +36,6 @@ import (
 const opTimeout = 30 * time.Second
 
 func migrateIdentityCmd() *cobra.Command {
-
 	cmd := &cobra.Command{
 		Use:   "migrate-identity",
 		Short: "Migrate KVStore-backed identities to kubernetes CRD-backed identities",
@@ -51,10 +51,18 @@ func migrateIdentityCmd() *cobra.Command {
 
 	hive := hive.New(
 		k8sClient.Cell,
-		cell.Invoke(func(lc cell.Lifecycle, clientset k8sClient.Clientset, shutdowner hive.Shutdowner) {
+		cmtypes.ClusterInfoCell,
+		cell.Config(bgpConfig.DefaultConfig),
+		cell.Invoke(func(
+			lc cell.Lifecycle,
+			clientset k8sClient.Clientset,
+			shutdowner hive.Shutdowner,
+			bgpCfg bgpConfig.BGPConfig,
+			cinfo cmtypes.ClusterInfo,
+		) {
 			lc.Append(cell.Hook{
 				OnStart: func(ctx cell.HookContext) error {
-					return migrateIdentities(ctx, clientset, shutdowner)
+					return migrateIdentities(ctx, clientset, shutdowner, bgpCfg, cinfo)
 				},
 			})
 		}),
@@ -89,7 +97,13 @@ func migrateIdentityCmd() *cobra.Command {
 //
 // NOTE: It is assumed that the migration is from k8s to k8s installations. The
 // key labels different when running in non-k8s mode.
-func migrateIdentities(ctx cell.HookContext, clientset k8sClient.Clientset, shutdowner hive.Shutdowner) error {
+func migrateIdentities(
+	ctx cell.HookContext,
+	clientset k8sClient.Clientset,
+	shutdowner hive.Shutdowner,
+	bgpCfg bgpConfig.BGPConfig,
+	cinfo cmtypes.ClusterInfo,
+) error {
 	defer shutdowner.Shutdown()
 
 	// This allows us to initialize a CRD allocator
@@ -99,7 +113,7 @@ func migrateIdentities(ctx cell.HookContext, clientset k8sClient.Clientset, shut
 	initCtx, initCancel := context.WithTimeout(ctx, opTimeout)
 	kvstoreBackend := initKVStore(ctx, initCtx)
 
-	crdBackend, crdAllocator := initK8s(initCtx, clientset)
+	crdBackend, crdAllocator := initK8s(initCtx, clientset, bgpCfg, cinfo)
 	initCancel()
 
 	log.Info("Listing identities in kvstore")
@@ -165,7 +179,7 @@ func migrateIdentities(ctx cell.HookContext, clientset k8sClient.Clientset, shut
 		// nil returns mean the key doesn't exist. This shouldn't happen, but treat
 		// it like a mismatch and allocate it. The allocator will find it if it has
 		// been re-allocated via master key protection.
-		case upstreamKey == nil && err == nil:
+		case upstreamKey == nil:
 			// fallthrough
 
 		case key.GetKey() == upstreamKey.GetKey():
@@ -207,11 +221,16 @@ func migrateIdentities(ctx cell.HookContext, clientset k8sClient.Clientset, shut
 
 // initK8s connects to k8s with a allocator.Backend and an initialized
 // allocator.Allocator, using the k8s config passed into the command.
-func initK8s(ctx context.Context, clientset k8sClient.Clientset) (crdBackend allocator.Backend, crdAllocator *allocator.Allocator) {
+func initK8s(
+	ctx context.Context,
+	clientset k8sClient.Clientset,
+	bgpCfg bgpConfig.BGPConfig,
+	cinfo cmtypes.ClusterInfo,
+) (crdBackend allocator.Backend, crdAllocator *allocator.Allocator) {
 	log.Info("Setting up kubernetes client")
 
 	// Update CRDs to ensure ciliumIdentity is present
-	ciliumClient.RegisterCRDs(log, clientset)
+	ciliumClient.CreateCustomResourceDefinitions(ctx, log, clientset, bgpCfg)
 
 	// Create a CRD Backend
 	crdBackend, err := identitybackend.NewCRDBackend(log, identitybackend.CRDBackendConfiguration{
@@ -226,11 +245,8 @@ func initK8s(ctx context.Context, clientset k8sClient.Clientset) (crdBackend all
 
 	// Create a real allocator with CRD as the backend. This mimics the setup in
 	// pkg/allocator/cache
-	//
-	// FIXME: add options to handle clustermesh with this constructor parameter:
-	//    allocator.WithPrefixMask(idpool.ID(option.Config.ClusterID<<identity.ClusterIDShift)))
-	minID := idpool.ID(identity.GetMinimalAllocationIdentity(option.Config.ClusterID))
-	maxID := idpool.ID(identity.GetMaximumAllocationIdentity(option.Config.ClusterID))
+	minID := idpool.ID(cinfo.MinimalAllocationIdentity())
+	maxID := idpool.ID(cinfo.MaximumAllocationIdentity())
 	crdAllocator, err = allocator.NewAllocator(log, &cacheKey.GlobalIdentity{}, crdBackend, allocator.WithMax(maxID), allocator.WithMin(minID))
 	if err != nil {
 		logging.Fatal(log, "Unable to initialize Identity Allocator with CRD backend to allocate identities with already allocated IDs", logfields.Error, err)
@@ -250,7 +266,7 @@ func initKVStore(ctx, wctx context.Context) (kvstoreBackend allocator.Backend) {
 	log.Info("Setting up kvstore client")
 	client := setupKvstore(ctx, log)
 
-	idPath := path.Join(cache.IdentitiesPath, "id")
+	idPath := kvstore.JoinKey(cache.IdentitiesPath, "id")
 	kvstoreBackend, err := kvstoreallocator.NewKVStoreBackend(log, kvstoreallocator.KVStoreBackendConfiguration{BasePath: cache.IdentitiesPath, Suffix: idPath, Typ: &cacheKey.GlobalIdentity{}, Backend: client})
 	if err != nil {
 		logging.Fatal(log, "Cannot create kvstore identity backend", logfields.Error, err)

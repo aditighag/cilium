@@ -5,15 +5,15 @@ package gobgp
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
+	"strings"
 
-	gobgp "github.com/osrg/gobgp/v3/api"
-	"github.com/osrg/gobgp/v3/pkg/apiutil"
-	"github.com/osrg/gobgp/v3/pkg/packet/bgp"
-	"google.golang.org/protobuf/types/known/anypb"
-	"google.golang.org/protobuf/types/known/timestamppb"
+	gobgp "github.com/osrg/gobgp/v4/api"
+	"github.com/osrg/gobgp/v4/pkg/apiutil"
+	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/bgp/types"
@@ -21,73 +21,40 @@ import (
 )
 
 // ToGoBGPPath converts the Agent Path type to the GoBGP Path type
-func ToGoBGPPath(p *types.Path) (*gobgp.Path, error) {
-	nlri, err := apiutil.MarshalNLRI(p.NLRI)
-	if err != nil {
-		return nil, fmt.Errorf("failed to convert NLRI: %w", err)
+func ToGoBGPPath(p *types.Path) (*apiutil.Path, error) {
+	createdAt := p.CreatedAt
+	if createdAt.IsZero() {
+		// GoBGP's Age field is a Unix creation timestamp in seconds;
+		// zero would mean 1970-01-01, not an unset timestamp.
+		createdAt = time.Now()
 	}
-
-	pattrs, err := apiutil.MarshalPathAttributes(p.PathAttributes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to convert PathAttribute: %w", err)
-	}
-
-	// ageTimestamp is Path's creation time stamp.
-	// It is calculated by subtraction of the AgeNanoseconds from the current timestamp.
-	ageTimestamp := timestamppb.New(time.Now().Add(time.Duration(-1 * p.AgeNanoseconds)))
-
-	family := toGoBGPFamily(p.Family)
-
-	// infer family from NLRI if not provided
-	if family.Afi == gobgp.Family_AFI_UNKNOWN {
-		family = &gobgp.Family{
-			Afi:  gobgp.Family_Afi(p.NLRI.AFI()),
-			Safi: gobgp.Family_Safi(p.NLRI.SAFI()),
-		}
-	}
-
-	return &gobgp.Path{
-		Nlri:      nlri,
-		Pattrs:    pattrs,
-		Age:       ageTimestamp,
-		Best:      p.Best,
-		Family:    family,
-		Uuid:      p.UUID,
-		SourceAsn: p.SourceASN,
+	return &apiutil.Path{
+		Family:  bgp.NewFamily(uint16(p.Family.Afi), uint8(p.Family.Safi)),
+		Nlri:    p.NLRI,
+		Attrs:   p.PathAttributes,
+		Age:     createdAt.Unix(),
+		Best:    p.Best,
+		PeerASN: p.SourceASN,
 	}, nil
 }
 
 // ToAgentPath converts the GoBGP Path type to the Agent Path type
-func ToAgentPath(p *gobgp.Path) (*types.Path, error) {
-	family := bgp.AfiSafiToRouteFamily(uint16(p.Family.Afi), uint8(p.Family.Safi))
-
-	nlri, err := apiutil.UnmarshalNLRI(family, p.Nlri)
-	if err != nil {
-		return nil, fmt.Errorf("failed to convert Nlri: %w", err)
-	}
-
-	pattrs, err := apiutil.UnmarshalPathAttributes(p.Pattrs)
-	if err != nil {
-		return nil, fmt.Errorf("failed to convert Pattrs: %w", err)
-	}
-
-	// ageNano is time since the Path was created in nanoseconds.
-	// It is calculated by difference in time from age timestamp till now.
-	ageNano := int64(time.Since(p.Age.AsTime()))
-
+func ToAgentPath(p *apiutil.Path) (*types.Path, error) {
 	return &types.Path{
-		NLRI:           nlri,
-		Family:         toAgentFamily(p.Family),
-		PathAttributes: pattrs,
-		AgeNanoseconds: ageNano,
+		Family: types.Family{
+			Afi:  types.Afi(p.Family.Afi()),
+			Safi: types.Safi(p.Family.Safi()),
+		},
+		NLRI:           p.Nlri,
+		PathAttributes: p.Attrs,
+		CreatedAt:      time.Unix(p.Age, 0), // GoBGP's Age field is a Unix creation timestamp in seconds.
 		Best:           p.Best,
-		UUID:           p.Uuid,
-		SourceASN:      p.SourceAsn,
+		SourceASN:      p.PeerASN,
 	}, nil
 }
 
 // ToAgentPaths converts slice of the GoBGP Path type to slice of the Agent Path type
-func ToAgentPaths(paths []*gobgp.Path) ([]*types.Path, error) {
+func ToAgentPaths(paths []*apiutil.Path) ([]*types.Path, error) {
 	errs := []error{}
 	ps := []*types.Path{}
 
@@ -117,7 +84,7 @@ func toGoBGPFamily(family types.Family) *gobgp.Family {
 func toGoBGPAfi(a types.Afi) gobgp.Family_Afi {
 	switch a {
 	case types.AfiUnknown:
-		return gobgp.Family_AFI_UNKNOWN
+		return gobgp.Family_AFI_UNSPECIFIED
 	case types.AfiIPv4:
 		return gobgp.Family_AFI_IP
 	case types.AfiIPv6:
@@ -129,14 +96,14 @@ func toGoBGPAfi(a types.Afi) gobgp.Family_Afi {
 	case types.AfiOpaque:
 		return gobgp.Family_AFI_OPAQUE
 	default:
-		return gobgp.Family_AFI_UNKNOWN
+		return gobgp.Family_AFI_UNSPECIFIED
 	}
 }
 
 func toGoBGPSafi(s types.Safi) gobgp.Family_Safi {
 	switch s {
 	case types.SafiUnknown:
-		return gobgp.Family_SAFI_UNKNOWN
+		return gobgp.Family_SAFI_UNSPECIFIED
 	case types.SafiUnicast:
 		return gobgp.Family_SAFI_UNICAST
 	case types.SafiMulticast:
@@ -168,7 +135,7 @@ func toGoBGPSafi(s types.Safi) gobgp.Family_Safi {
 	case types.SafiKeyValue:
 		return gobgp.Family_SAFI_KEY_VALUE
 	default:
-		return gobgp.Family_SAFI_UNKNOWN
+		return gobgp.Family_SAFI_UNSPECIFIED
 	}
 }
 
@@ -179,7 +146,13 @@ func toGoBGPPolicy(apiPolicy *types.RoutePolicy) (*gobgp.Policy, []*gobgp.Define
 		Name: apiPolicy.Name,
 	}
 	for i, stmt := range apiPolicy.Statements {
-		statement, dSets := toGoBGPPolicyStatement(stmt, policyStatementName(apiPolicy.Name, i))
+		name := stmt.Name
+		if name == "" {
+			// use statement index as the default name
+			name = fmt.Sprintf("stmt%d", i)
+		}
+		name = scopedPolicyStatementName(apiPolicy.Name, name)
+		statement, dSets := toGoBGPPolicyStatement(stmt, name)
 		policy.Statements = append(policy.Statements, statement)
 		definedSets = append(definedSets, dSets...)
 	}
@@ -193,7 +166,9 @@ func toAgentPolicy(p *gobgp.Policy, definedSets map[string]*gobgp.DefinedSet, as
 		Type: toAgentPolicyType(assignment.Direction),
 	}
 	for _, s := range p.Statements {
-		policy.Statements = append(policy.Statements, toAgentPolicyStatement(s, definedSets))
+		statement := toAgentPolicyStatement(s, definedSets)
+		statement.Name = unscopedPolicyStatementName(p.Name, statement.Name)
+		policy.Statements = append(policy.Statements, statement)
 	}
 	return policy
 }
@@ -216,7 +191,7 @@ func toGoBGPPolicyStatement(apiStatement *types.RoutePolicyStatement, name strin
 			neighbors = append(neighbors, netip.PrefixFrom(addr, addr.BitLen()).String())
 		}
 		ds := &gobgp.DefinedSet{
-			DefinedType: gobgp.DefinedType_NEIGHBOR,
+			DefinedType: gobgp.DefinedType_DEFINED_TYPE_NEIGHBOR,
 			Name:        policyNeighborDefinedSetName(name),
 			List:        neighbors,
 		}
@@ -230,7 +205,7 @@ func toGoBGPPolicyStatement(apiStatement *types.RoutePolicyStatement, name strin
 	// defined set to match prefixes
 	if apiStatement.Conditions.MatchPrefixes != nil && len(apiStatement.Conditions.MatchPrefixes.Prefixes) > 0 {
 		ds := &gobgp.DefinedSet{
-			DefinedType: gobgp.DefinedType_PREFIX,
+			DefinedType: gobgp.DefinedType_DEFINED_TYPE_PREFIX,
 			Name:        policyPrefixDefinedSetName(name),
 		}
 		for _, prefix := range apiStatement.Conditions.MatchPrefixes.Prefixes {
@@ -258,13 +233,13 @@ func toGoBGPPolicyStatement(apiStatement *types.RoutePolicyStatement, name strin
 	// community actions
 	if len(apiStatement.Actions.AddCommunities) > 0 {
 		s.Actions.Community = &gobgp.CommunityAction{
-			Type:        gobgp.CommunityAction_ADD,
+			Type:        gobgp.CommunityAction_TYPE_ADD,
 			Communities: apiStatement.Actions.AddCommunities,
 		}
 	}
 	if len(apiStatement.Actions.AddLargeCommunities) > 0 {
 		s.Actions.LargeCommunity = &gobgp.CommunityAction{
-			Type:        gobgp.CommunityAction_ADD,
+			Type:        gobgp.CommunityAction_TYPE_ADD,
 			Communities: apiStatement.Actions.AddLargeCommunities,
 		}
 	}
@@ -289,7 +264,9 @@ func toGoBGPPolicyStatement(apiStatement *types.RoutePolicyStatement, name strin
 }
 
 func toAgentPolicyStatement(s *gobgp.Statement, definedSets map[string]*gobgp.DefinedSet) *types.RoutePolicyStatement {
-	stmt := &types.RoutePolicyStatement{}
+	stmt := &types.RoutePolicyStatement{
+		Name: s.Name,
+	}
 
 	if s.Conditions != nil {
 		if s.Conditions.NeighborSet != nil && definedSets[s.Conditions.NeighborSet.Name] != nil {
@@ -349,8 +326,14 @@ func toAgentPolicyStatement(s *gobgp.Statement, definedSets map[string]*gobgp.De
 	return stmt
 }
 
-func policyStatementName(policyName string, cnt int) string {
-	return fmt.Sprintf("%s-%d", policyName, cnt)
+// GoBGP stores statement names globally, so scope the caller's policy-local statement name with the policy name at the GoBGP adapter boundary.
+func scopedPolicyStatementName(policyName, statementName string) string {
+	return policyName + "_" + statementName
+}
+
+// Remove prefix added by GoBGP adapter (scopedPolicyStatementName) to restore policy-local statement name.
+func unscopedPolicyStatementName(policyName, statementName string) string {
+	return strings.TrimPrefix(statementName, policyName+"_")
 }
 
 func policyNeighborDefinedSetName(policyStatementName string) string {
@@ -364,18 +347,18 @@ func policyPrefixDefinedSetName(policyStatementName string) string {
 func toGoBGPRouteAction(a types.RoutePolicyAction) gobgp.RouteAction {
 	switch a {
 	case types.RoutePolicyActionAccept:
-		return gobgp.RouteAction_ACCEPT
+		return gobgp.RouteAction_ROUTE_ACTION_ACCEPT
 	case types.RoutePolicyActionReject:
-		return gobgp.RouteAction_REJECT
+		return gobgp.RouteAction_ROUTE_ACTION_REJECT
 	}
-	return gobgp.RouteAction_NONE
+	return gobgp.RouteAction_ROUTE_ACTION_UNSPECIFIED
 }
 
 func toAgentRouteAction(a gobgp.RouteAction) types.RoutePolicyAction {
 	switch a {
-	case gobgp.RouteAction_ACCEPT:
+	case gobgp.RouteAction_ROUTE_ACTION_ACCEPT:
 		return types.RoutePolicyActionAccept
-	case gobgp.RouteAction_REJECT:
+	case gobgp.RouteAction_ROUTE_ACTION_REJECT:
 		return types.RoutePolicyActionReject
 	}
 	return types.RoutePolicyActionNone
@@ -384,15 +367,15 @@ func toAgentRouteAction(a gobgp.RouteAction) types.RoutePolicyAction {
 func toGoBGPPolicyDirection(policyType types.RoutePolicyType) gobgp.PolicyDirection {
 	switch policyType {
 	case types.RoutePolicyTypeExport:
-		return gobgp.PolicyDirection_EXPORT
+		return gobgp.PolicyDirection_POLICY_DIRECTION_EXPORT
 	case types.RoutePolicyTypeImport:
-		return gobgp.PolicyDirection_IMPORT
+		return gobgp.PolicyDirection_POLICY_DIRECTION_IMPORT
 	}
-	return gobgp.PolicyDirection_UNKNOWN
+	return gobgp.PolicyDirection_POLICY_DIRECTION_UNSPECIFIED
 }
 
 func toAgentPolicyType(d gobgp.PolicyDirection) types.RoutePolicyType {
-	if d == gobgp.PolicyDirection_IMPORT {
+	if d == gobgp.PolicyDirection_POLICY_DIRECTION_IMPORT {
 		return types.RoutePolicyTypeImport
 	}
 	return types.RoutePolicyTypeExport
@@ -401,60 +384,69 @@ func toAgentPolicyType(d gobgp.PolicyDirection) types.RoutePolicyType {
 func toGoBGPPolicyMatchType(apiType types.RoutePolicyMatchType) gobgp.MatchSet_Type {
 	switch apiType {
 	case types.RoutePolicyMatchAny:
-		return gobgp.MatchSet_ANY
+		return gobgp.MatchSet_TYPE_ANY
 	case types.RoutePolicyMatchAll:
-		return gobgp.MatchSet_ALL
+		return gobgp.MatchSet_TYPE_ALL
 	case types.RoutePolicyMatchInvert:
-		return gobgp.MatchSet_INVERT
+		return gobgp.MatchSet_TYPE_INVERT
 	}
-	return gobgp.MatchSet_ANY
+	return gobgp.MatchSet_TYPE_ANY
 }
 
 func toAgentPolicyMatchType(t gobgp.MatchSet_Type) types.RoutePolicyMatchType {
 	switch t {
-	case gobgp.MatchSet_ANY:
+	case gobgp.MatchSet_TYPE_ANY:
 		return types.RoutePolicyMatchAny
-	case gobgp.MatchSet_ALL:
+	case gobgp.MatchSet_TYPE_ALL:
 		return types.RoutePolicyMatchAll
-	case gobgp.MatchSet_INVERT:
+	case gobgp.MatchSet_TYPE_INVERT:
 		return types.RoutePolicyMatchInvert
 	}
 	return types.RoutePolicyMatchAny
 }
 
-func toGoBGPSoftResetDirection(direction types.SoftResetDirection) gobgp.ResetPeerRequest_SoftResetDirection {
+func toGoBGPSoftResetDirection(direction types.SoftResetDirection) gobgp.ResetPeerRequest_Direction {
 	switch direction {
 	case types.SoftResetDirectionIn:
-		return gobgp.ResetPeerRequest_IN
+		return gobgp.ResetPeerRequest_DIRECTION_IN
 	case types.SoftResetDirectionOut:
-		return gobgp.ResetPeerRequest_OUT
+		return gobgp.ResetPeerRequest_DIRECTION_OUT
 	}
-	return gobgp.ResetPeerRequest_BOTH
+	return gobgp.ResetPeerRequest_DIRECTION_BOTH
 }
 
 // toAgentSessionState translates gobgp session state to cilium bgp session state.
 func toAgentSessionState(s gobgp.PeerState_SessionState) types.SessionState {
 	switch s {
-	case gobgp.PeerState_UNKNOWN:
+	case gobgp.PeerState_SESSION_STATE_UNSPECIFIED:
 		return types.SessionUnknown
-	case gobgp.PeerState_IDLE:
+	case gobgp.PeerState_SESSION_STATE_IDLE:
 		return types.SessionIdle
-	case gobgp.PeerState_CONNECT:
+	case gobgp.PeerState_SESSION_STATE_CONNECT:
 		return types.SessionConnect
-	case gobgp.PeerState_ACTIVE:
+	case gobgp.PeerState_SESSION_STATE_ACTIVE:
 		return types.SessionActive
-	case gobgp.PeerState_OPENSENT:
+	case gobgp.PeerState_SESSION_STATE_OPENSENT:
 		return types.SessionOpenSent
-	case gobgp.PeerState_OPENCONFIRM:
+	case gobgp.PeerState_SESSION_STATE_OPENCONFIRM:
 		return types.SessionOpenConfirm
-	case gobgp.PeerState_ESTABLISHED:
+	case gobgp.PeerState_SESSION_STATE_ESTABLISHED:
 		return types.SessionEstablished
 	default:
 		return types.SessionUnknown
 	}
 }
 
-func toAgentCap(s []*anypb.Any) []*models.BgpCapabilities {
+func toAgentCap(s []*gobgp.Capability) []bgp.ParameterCapabilityInterface {
+	caps, err := apiutil.UnmarshalCapabilities(s)
+	if err != nil {
+		return nil
+	}
+
+	return caps
+}
+
+func toAgentCapLegacy(s []*gobgp.Capability) []*models.BgpCapabilities {
 	caps, err := apiutil.UnmarshalCapabilities(s)
 	if err != nil {
 		return nil
@@ -487,7 +479,7 @@ func toAgentFamily(family *gobgp.Family) types.Family {
 // toAgentAfi translates gobgp AFI to cilium bgp AFI.
 func toAgentAfi(a gobgp.Family_Afi) types.Afi {
 	switch a {
-	case gobgp.Family_AFI_UNKNOWN:
+	case gobgp.Family_AFI_UNSPECIFIED:
 		return types.AfiUnknown
 	case gobgp.Family_AFI_IP:
 		return types.AfiIPv4
@@ -506,7 +498,7 @@ func toAgentAfi(a gobgp.Family_Afi) types.Afi {
 
 func toAgentSafi(s gobgp.Family_Safi) types.Safi {
 	switch s {
-	case gobgp.Family_SAFI_UNKNOWN:
+	case gobgp.Family_SAFI_UNSPECIFIED:
 		return types.SafiUnknown
 	case gobgp.Family_SAFI_UNICAST:
 		return types.SafiUnicast
@@ -546,13 +538,13 @@ func toAgentSafi(s gobgp.Family_Safi) types.Safi {
 func toGoBGPTableType(t types.TableType) (gobgp.TableType, error) {
 	switch t {
 	case types.TableTypeLocRIB:
-		return gobgp.TableType_LOCAL, nil
+		return gobgp.TableType_TABLE_TYPE_LOCAL, nil
 	case types.TableTypeAdjRIBIn:
-		return gobgp.TableType_ADJ_IN, nil
+		return gobgp.TableType_TABLE_TYPE_ADJ_IN, nil
 	case types.TableTypeAdjRIBOut:
-		return gobgp.TableType_ADJ_OUT, nil
+		return gobgp.TableType_TABLE_TYPE_ADJ_OUT, nil
 	default:
-		return gobgp.TableType_LOCAL, fmt.Errorf("unknown table type %d", t)
+		return gobgp.TableType_TABLE_TYPE_LOCAL, fmt.Errorf("unknown table type %d", t)
 	}
 }
 
@@ -561,7 +553,6 @@ func ToGoBGPPeer(n *types.Neighbor, oldPeer *gobgp.Peer, v4 bool) *gobgp.Peer {
 
 	newPeer.Conf = toGoBGPPeerConf(n, oldPeer)
 	newPeer.EbgpMultihop = toGoBGPEbgpMultihop(n.EbgpMultihop)
-	newPeer.RouteReflector = toGoBGPRouteReflector(n.RouteReflector)
 	newPeer.Timers = toGoBGPTimers(n.Timers)
 	newPeer.Transport = toGoBGPTransport(n.Transport, oldPeer, v4)
 	newPeer.GracefulRestart = toGoBGPGracefulRestart(n.GracefulRestart)
@@ -570,12 +561,32 @@ func ToGoBGPPeer(n *types.Neighbor, oldPeer *gobgp.Peer, v4 bool) *gobgp.Peer {
 	return newPeer
 }
 
+type peerDescription struct {
+	Name string `json:"name"`
+}
+
 func toGoBGPPeerConf(n *types.Neighbor, oldPeer *gobgp.Peer) *gobgp.PeerConf {
 	conf := &gobgp.PeerConf{}
 
 	// Inherit the default values from existing peer configuration
 	if oldPeer != nil && oldPeer.Conf != nil {
 		conf = oldPeer.Conf
+	}
+
+	// Encode neighbor name (inherited from the CRD) into the description
+	// field as JSON (for future extensibility). This is useful for the
+	// discovered peers where we cannot obtain IP address from the CRD.
+	if n.Name != "" {
+		pd := peerDescription{
+			Name: n.Name,
+		}
+		desc, err := json.Marshal(pd)
+		if err == nil {
+			// We ignore error here because this field is not
+			// critical for operation. Caller should handle the
+			// case when description is not set.
+			conf.Description = string(desc)
+		}
 	}
 
 	if n.Address.IsValid() {
@@ -599,16 +610,6 @@ func toGoBGPEbgpMultihop(n *types.NeighborEbgpMultihop) *gobgp.EbgpMultihop {
 	return &gobgp.EbgpMultihop{
 		Enabled:     true,
 		MultihopTtl: n.TTL,
-	}
-}
-
-func toGoBGPRouteReflector(n *types.NeighborRouteReflector) *gobgp.RouteReflector {
-	if n == nil {
-		return nil
-	}
-	return &gobgp.RouteReflector{
-		RouteReflectorClient:    n.Client,
-		RouteReflectorClusterId: n.ClusterID,
 	}
 }
 
@@ -677,7 +678,18 @@ func toGoBGPGracefulRestart(n *types.NeighborGracefulRestart) *gobgp.GracefulRes
 
 func toGoBGPAfiSafi(fams []*types.Family, gr *gobgp.GracefulRestart) []*gobgp.AfiSafi {
 	if len(fams) == 0 {
-		return defaultSafiAfi
+		res := make([]*gobgp.AfiSafi, len(defaultAfiSafi))
+		for i, v := range defaultAfiSafi {
+			res[i] = &gobgp.AfiSafi{
+				Config: &gobgp.AfiSafiConfig{
+					Family: &gobgp.Family{
+						Afi:  gobgp.Family_Afi(v.Config.Family.Afi),
+						Safi: gobgp.Family_Safi(v.Config.Family.Safi),
+					},
+				},
+			}
+		}
+		return res
 	}
 	afisafis := make([]*gobgp.AfiSafi, 0, len(fams))
 	for _, fam := range fams {

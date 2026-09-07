@@ -9,13 +9,15 @@ metadata:
     {{- toYaml . | nindent 4 }}
     {{- end }}
     {{- if and .Values.hubble.relay.prometheus.enabled (not .Values.hubble.relay.prometheus.serviceMonitor.enabled) }}
-    prometheus.io/scrape: "true"
-    prometheus.io/port: {{ .Values.hubble.relay.prometheus.port | quote }}
+    {{- with include "cilium.prometheusAnnotations" (list .Values.hubble.relay.prometheus.port .Values.hubble.relay.annotations) }}
+    {{- . | nindent 4 }}
+    {{- end }}
     {{- end }}
   labels:
     k8s-app: hubble-relay
     app.kubernetes.io/name: hubble-relay
     app.kubernetes.io/part-of: cilium
+    helm.sh/chart: {{ include "cilium.chart" . }}
     {{- with .Values.commonLabels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

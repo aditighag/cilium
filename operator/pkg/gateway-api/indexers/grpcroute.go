@@ -35,6 +35,25 @@ func IndexGRPCRouteByGateway(rawObj client.Object) []string {
 	return gateways
 }
 
+// IndexGRPCRouteByListenerSet indexes GRPCRoutes by all ListenerSet parents
+// referenced in the object, returning ListenerSet full names (`namespace/name`).
+func IndexGRPCRouteByListenerSet(rawObj client.Object) []string {
+	route := rawObj.(*gatewayv1.GRPCRoute)
+	var listenerSets []string
+	for _, parent := range route.Spec.ParentRefs {
+		if !helpers.IsListenerSet(parent) {
+			continue
+		}
+		listenerSets = append(listenerSets,
+			types.NamespacedName{
+				Namespace: helpers.NamespaceDerefOr(parent.Namespace, route.Namespace),
+				Name:      string(parent.Name),
+			}.String(),
+		)
+	}
+	return listenerSets
+}
+
 // IndexGRPCRouteByGammaService is a client.IndexerFunc that takes a single GRPCRoute and returns all
 // referenced Service object full names (`namespace/name`) to add to the relevant index.
 func IndexGRPCRouteByGammaService(rawObj client.Object) []string {
@@ -59,7 +78,7 @@ func IndexGRPCRouteByGammaService(rawObj client.Object) []string {
 
 // GenerateIndexerGRPCRoutebyBackendService takes a single GRPCRoute and  returns all referenced backend service full names (`namespace/name`)
 // to add to the relevant index.
-func GenerateIndexerGRPCRoutebyBackendService(c client.Client, logger *slog.Logger) client.IndexerFunc {
+func GenerateIndexerGRPCRoutebyBackendService(c helpers.ClientReader, logger *slog.Logger) client.IndexerFunc {
 	return func(rawObj client.Object) []string {
 		route := rawObj.(*gatewayv1.GRPCRoute)
 		var backendServices []string
@@ -82,8 +101,64 @@ func GenerateIndexerGRPCRoutebyBackendService(c client.Client, logger *slog.Logg
 					}.String(),
 				)
 			}
+			for _, f := range rule.Filters {
+				if f.Type != gatewayv1.GRPCRouteFilterRequestMirror || f.RequestMirror == nil {
+					continue
+				}
+				namespace := helpers.NamespaceDerefOr(f.RequestMirror.BackendRef.Namespace, route.Namespace)
+				backendServiceName, err := helpers.GetBackendServiceName(c, namespace, f.RequestMirror.BackendRef)
+				if err != nil {
+					logger.Error("Failed to get request mirror backend service name",
+						logfields.LogSubsys, logfields.GRPCRoute,
+						logfields.Resource, client.ObjectKeyFromObject(rawObj),
+						logfields.Error, err)
+					continue
+				}
+				backendServices = append(backendServices,
+					types.NamespacedName{
+						Namespace: namespace,
+						Name:      backendServiceName,
+					}.String(),
+				)
+			}
 		}
 
 		return backendServices
 	}
+}
+
+// IndexGRPCRouteByBackendServiceImport is a client.IndexerFunc that takes a single GRPCRoute and
+// returns all referenced backend ServiceImport full names (`namespace/name`) to add to the relevant index.
+func IndexGRPCRouteByBackendServiceImport(rawObj client.Object) []string {
+	route, ok := rawObj.(*gatewayv1.GRPCRoute)
+	if !ok {
+		return nil
+	}
+	var backendServiceImports []string
+
+	for _, rule := range route.Spec.Rules {
+		for _, backend := range rule.BackendRefs {
+			if !helpers.IsServiceImport(backend.BackendObjectReference) {
+				continue
+			}
+			backendServiceImports = append(backendServiceImports,
+				types.NamespacedName{
+					Namespace: helpers.NamespaceDerefOr(backend.Namespace, route.Namespace),
+					Name:      string(backend.Name),
+				}.String(),
+			)
+		}
+		for _, f := range rule.Filters {
+			if f.Type != gatewayv1.GRPCRouteFilterRequestMirror || f.RequestMirror == nil || !helpers.IsServiceImport(f.RequestMirror.BackendRef) {
+				continue
+			}
+			backendServiceImports = append(backendServiceImports,
+				types.NamespacedName{
+					Namespace: helpers.NamespaceDerefOr(f.RequestMirror.BackendRef.Namespace, route.Namespace),
+					Name:      string(f.RequestMirror.BackendRef.Name),
+				}.String(),
+			)
+		}
+	}
+	return backendServiceImports
 }

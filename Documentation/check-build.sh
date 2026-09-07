@@ -157,20 +157,22 @@ run_linter() {
     ignored_messages="${ignored_messages}bpf/.*\.rst:.*: \(INFO/1\) Enumerated list start value not ordinal"
     ignored_messages="${ignored_messages}|Hyperlink target .*is not referenced\."
     ignored_messages="${ignored_messages}|Duplicate implicit target name:"
-    ignored_messages="${ignored_messages}|\(ERROR/3\) Indirect hyperlink target \".*\"  refers to target \"${CONF_PY_TARGET_NAMES}\", which does not exist."
+    ignored_messages="${ignored_messages}|\(ERROR/3\) Indirect hyperlink target \".*\".*refers to target \"${CONF_PY_TARGET_NAMES}\", which does not exist."
     ignored_messages="${ignored_messages}|\(ERROR/3\) Unknown target name: \"${CONF_PY_TARGET_NAMES}\"."
+    ignored_messages="${ignored_messages}|.*expected a single document in the stream.*"
     ignored_messages="${ignored_messages})"
     # Filter out the AttributeError reports that are due to a bug in rstcheck,
     # see https://github.com/rstcheck/rstcheck-core/issues/3.
     rstcheck \
+        --sphinx-source-dir "${script_dir}" \
         --report-level info \
         --ignore-languages "bash,c" \
         --ignore-messages "${ignored_messages}" \
-        --ignore-directives "tabs,openapi" \
+        --ignore-directives "tabs,openapi,cilium-helm-install,cilium-helm-upgrade,cilium-helm-template" \
         --ignore-roles "${CONF_PY_ROLES},spelling:ignore,spelling:word" \
         --ignore-substitutions "${CONF_PY_SUBSTITUTIONS}" \
        -r . ../README.rst 2>&1 | \
-       grep -v 'WARNING:rstcheck_core.checker:An `AttributeError` error occurred. This is most probably due to a code block directive (code/code-block/sourcecode) without a specified language.'
+       grep -v 'WARNING:rstcheck_core.checker:An `AttributeError` error .* This is most probably due to a code block directive (code/code-block/sourcecode) without a specified language.'
 }
 
 read_all_opt=""
@@ -219,7 +221,7 @@ fi
 
 echo "Building documentation (${target})..."
 sphinx-build -M "${target}" "${script_dir}" "${build_dir}" $@ \
-    ${read_all_opt} -n --color -w "${warnings}" 2>/dev/null
+    ${read_all_opt} -n --color -w "${warnings}"
 
 # We can have warnings but no errors here, or sphinx-build would return non-0
 # and we would have exited because of "set -o errexit".

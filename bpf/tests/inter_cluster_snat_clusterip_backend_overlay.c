@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 /* Copyright Authors of Cilium */
 
-
 #include <bpf/ctx/skb.h>
 #include "common.h"
 #include "pktgen.h"
@@ -29,22 +28,11 @@
 /* Inter-cluster SNAT is mandatory for overlapping PodCIDR support for now */
 #define ENABLE_INTER_CLUSTER_SNAT
 
-/* Import map definitions and some default values */
-#include <bpf/config/node.h>
-
-/* Overwrite the default port range defined in node_config.h
- * to have deterministic source port selection.
+/* Import map definitions and some default values and set port ranges to have
+ * deterministic source port selection
  */
-#undef NODEPORT_PORT_MAX
-#undef NODEPORT_PORT_MIN_NAT
-#undef NODEPORT_PORT_MAX_NAT
-#define NODEPORT_PORT_MAX 32767
-#define NODEPORT_PORT_MIN_NAT (NODEPORT_PORT_MAX + 1)
-#define NODEPORT_PORT_MAX_NAT (NODEPORT_PORT_MIN_NAT)
-
-/* Overwrite (local) CLUSTER_ID defined in node_config.h */
-#undef CLUSTER_ID
-#define CLUSTER_ID 1
+#define NODEPORT_PORT_MAX_NAT 32768
+#include "nodeport_defaults.h"
 
 /*
  * Test configurations
@@ -59,9 +47,6 @@
 #define BACKEND_PORT		tcp_svc_one
 #define CLIENT_CLUSTER_ID	1
 #define CLIENT_IDENTITY		(0x00000000 | (CLIENT_CLUSTER_ID << 16) | 0xff01)
-
-#undef IPV4_INTER_CLUSTER_SNAT
-#define IPV4_INTER_CLUSTER_SNAT BACKEND_NODE_IP
 
 /* SNAT should always select NODEPORT_PORT_MIN_NAT as a source */
 #define CLIENT_INTER_CLUSTER_SNAT_PORT __bpf_htons(NODEPORT_PORT_MIN_NAT)
@@ -99,6 +84,11 @@ int mock_send_drop_notify(__u8 file __maybe_unused, __u16 line __maybe_unused,
 
 /* Include an actual datapath code */
 #include "lib/bpf_overlay.h"
+
+ASSIGN_CONFIG(union v4addr, ipv4_inter_cluster_snat, { .be32 = BACKEND_NODE_IP })
+
+/* Overwrite (local) cluster_id defined in clustermesh.h */
+ASSIGN_CONFIG(__u32, cluster_id, 1)
 
 #include "lib/endpoint.h"
 
@@ -164,7 +154,7 @@ pktgen_from_overlay(struct __ctx_buff *ctx, bool syn, bool ack)
 	return 0;
 }
 
-PKTGEN("tc", "01_from_overlay_syn")
+PKTGEN(PROG_TYPE, "01_from_overlay_syn")
 int from_overlay_syn_pktgen(struct __ctx_buff *ctx)
 {
 	/* Emulate input from bpf_lxc */
@@ -173,7 +163,7 @@ int from_overlay_syn_pktgen(struct __ctx_buff *ctx)
 	return pktgen_from_overlay(ctx, true, false);
 }
 
-SETUP("tc", "01_from_overlay_syn")
+SETUP(PROG_TYPE, "01_from_overlay_syn")
 int from_overlay_syn_setup(struct __ctx_buff *ctx)
 {
 	endpoint_v4_add_entry(BACKEND_IP, BACKEND_IFINDEX, 0, 0, 0, 0,
@@ -183,7 +173,7 @@ int from_overlay_syn_setup(struct __ctx_buff *ctx)
 	return TEST_ERROR;
 }
 
-CHECK("tc", "01_from_overlay_syn")
+CHECK(PROG_TYPE, "01_from_overlay_syn")
 int from_overlay_syn_check(struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -194,6 +184,8 @@ int from_overlay_syn_check(struct __ctx_buff *ctx)
 	__u32 meta;
 
 	test_init();
+
+	endpoint_v4_del_entry(BACKEND_IP);
 
 	data = (void *)(long)ctx_data(ctx);
 	data_end = (void *)(long)ctx->data_end;
@@ -242,24 +234,20 @@ int from_overlay_syn_check(struct __ctx_buff *ctx)
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst port has changed");
 
-	if (l4->check != bpf_htons(0x777f))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+	if (l4->check != bpf_htons(0xd71f))
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_htons(0xd71f));
 
-	meta = ctx_load_meta(ctx, CB_DELIVERY_REDIRECT);
-	if (meta != 1)
-		test_fatal("skb->cb[CB_DELIVERY_REDIRECT] should be 1, got %d", meta);
+	meta = ctx_load_meta(ctx, CB_DELIVERY_FLAGS);
+	if (!(meta & CB_DELIVERY_FLAGS_REDIRECT))
+		test_fatal("skb->cb[CB_DELIVERY_FLAGS] should have CB_DELIVERY_FLAGS_REDIRECT");
+	if (meta & CB_DELIVERY_FLAGS_FROM_HOST)
+		test_fatal("skb->cb[CB_DELIVERY_FLAGS] has CB_DELIVERY_FLAGS_FROM_HOST");
+	if (!(meta & CB_DELIVERY_FLAGS_FROM_TUNNEL))
+		test_fatal("skb->cb[CB_DELIVERY_FLAGS] should have CB_DELIVERY_FLAGS_FROM_TUNNEL");
 
 	meta = ctx_load_meta(ctx, CB_SRC_LABEL);
 	if (meta != CLIENT_IDENTITY)
 		test_fatal("skb->cb[CB_SRC_LABEL] should be %d, got %d", CLIENT_IDENTITY, meta);
-
-	meta = ctx_load_meta(ctx, CB_FROM_TUNNEL);
-	if (meta != 1)
-		test_fatal("skb->cb[CB_FROM_TUNNEL] should be 1, got %d", meta);
-
-	meta = ctx_load_meta(ctx, CB_FROM_HOST);
-	if (meta != 0)
-		test_fatal("skb->cb[CB_FROM_HOST] should be 0, got %d", meta);
 
 	meta = ctx_load_meta(ctx, CB_CLUSTER_ID_INGRESS);
 	if (meta != 0)
@@ -268,19 +256,19 @@ int from_overlay_syn_check(struct __ctx_buff *ctx)
 	test_finish();
 }
 
-PKTGEN("tc", "02_to_overlay_synack")
+PKTGEN(PROG_TYPE, "02_to_overlay_synack")
 int to_overlay_synack_pktgen(struct __ctx_buff *ctx)
 {
 	return pktgen_to_overlay(ctx, true, true);
 }
 
-SETUP("tc", "02_to_overlay_synack")
+SETUP(PROG_TYPE, "02_to_overlay_synack")
 int to_overlay_synack_setup(struct __ctx_buff *ctx)
 {
 	return overlay_send_packet(ctx);
 }
 
-CHECK("tc", "02_to_overlay_synack")
+CHECK(PROG_TYPE, "02_to_overlay_synack")
 int to_overlay_synack_check(struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -335,25 +323,28 @@ int to_overlay_synack_check(struct __ctx_buff *ctx)
 	if (l4->dest != CLIENT_INTER_CLUSTER_SNAT_PORT)
 		test_fatal("dst port has changed");
 
-	if (l4->check != bpf_htons(0x776f))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+	if (l4->check != bpf_htons(0xd70f))
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_htons(0xd70f));
 
 	test_finish();
 }
 
-PKTGEN("tc", "03_from_overlay_ack")
+PKTGEN(PROG_TYPE, "03_from_overlay_ack")
 int from_overlay_ack_pktgen(struct __ctx_buff *ctx)
 {
 	return pktgen_from_overlay(ctx, false, true);
 }
 
-SETUP("tc", "03_from_overlay_ack")
+SETUP(PROG_TYPE, "03_from_overlay_ack")
 int from_overlay_ack_setup(struct __ctx_buff *ctx)
 {
+	endpoint_v4_add_entry(BACKEND_IP, BACKEND_IFINDEX, 0, 0, 0, 0,
+			      (__u8 *)BACKEND_MAC, (__u8 *)BACKEND_ROUTER_MAC);
+
 	return overlay_receive_packet(ctx);
 }
 
-CHECK("tc", "03_from_overlay_ack")
+CHECK(PROG_TYPE, "03_from_overlay_ack")
 int from_overlay_ack_check(struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -364,6 +355,8 @@ int from_overlay_ack_check(struct __ctx_buff *ctx)
 	__u32 meta;
 
 	test_init();
+
+	endpoint_v4_del_entry(BACKEND_IP);
 
 	data = (void *)(long)ctx_data(ctx);
 	data_end = (void *)(long)ctx->data_end;
@@ -409,24 +402,20 @@ int from_overlay_ack_check(struct __ctx_buff *ctx)
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst port has changed");
 
-	if (l4->check != bpf_htons(0x7771))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+	if (l4->check != bpf_htons(0xd711))
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_htons(0xd711));
 
-	meta = ctx_load_meta(ctx, CB_DELIVERY_REDIRECT);
-	if (meta != 1)
-		test_fatal("skb->cb[CB_DELIVERY_REDIRECT] should be 1, got %d", meta);
+	meta = ctx_load_meta(ctx, CB_DELIVERY_FLAGS);
+	if (!(meta & CB_DELIVERY_FLAGS_REDIRECT))
+		test_fatal("skb->cb[CB_DELIVERY_FLAGS] should have CB_DELIVERY_FLAGS_REDIRECT");
+	if (meta & CB_DELIVERY_FLAGS_FROM_HOST)
+		test_fatal("skb->cb[CB_DELIVERY_FLAGS] has CB_DELIVERY_FLAGS_FROM_HOST");
+	if (!(meta & CB_DELIVERY_FLAGS_FROM_TUNNEL))
+		test_fatal("skb->cb[CB_DELIVERY_FLAGS] should have CB_DELIVERY_FLAGS_FROM_TUNNEL");
 
 	meta = ctx_load_meta(ctx, CB_SRC_LABEL);
 	if (meta != CLIENT_IDENTITY)
 		test_fatal("skb->cb[CB_SRC_LABEL] should be %d, got %d", CLIENT_IDENTITY, meta);
-
-	meta = ctx_load_meta(ctx, CB_FROM_TUNNEL);
-	if (meta != 1)
-		test_fatal("skb->cb[CB_FROM_TUNNEL] should be 1, got %d", meta);
-
-	meta = ctx_load_meta(ctx, CB_FROM_HOST);
-	if (meta != 0)
-		test_fatal("skb->cb[CB_FROM_HOST] should be 0, got %d", meta);
 
 	meta = ctx_load_meta(ctx, CB_CLUSTER_ID_INGRESS);
 	if (meta != 0)

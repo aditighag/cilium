@@ -215,26 +215,36 @@ var nodeAddressTests = []struct {
 	},
 
 	{
-		name: "node IP preferred",
+		// Test that K8s Node IP is prioritized within its category (public/private)
+		// but doesn't override the public/private preference itself.
+		// - testNodeIPv4 (172.16.0.1) is private, should be prioritized among private IPs
+		// - testNodeIPv6 (2222::1) is public, should be prioritized among public IPs
+		name: "k8s node IP prioritized within category",
 		addrs: []DeviceAddress{
+			// IPv4: multiple private IPs + one public
 			{
-				Addr:  netip.MustParseAddr("10.0.0.1"),
+				Addr:  netip.MustParseAddr("10.0.0.1"), // private, but not K8s IP
 				Scope: RT_SCOPE_UNIVERSE,
 			},
 			{
-				Addr:  netip.MustParseAddr("1.1.1.1"),
+				Addr:  netip.MustParseAddr("1.1.1.1"), // public
 				Scope: RT_SCOPE_UNIVERSE,
 			},
 			{
-				Addr:  testNodeIPv4,
+				Addr:  testNodeIPv4, // private K8s Node IP (172.16.0.1)
+				Scope: RT_SCOPE_UNIVERSE,
+			},
+			// IPv6: multiple public IPs + one private
+			{
+				Addr:  netip.MustParseAddr("2001:db8::1"), // private (documentation prefix)
 				Scope: RT_SCOPE_UNIVERSE,
 			},
 			{
-				Addr:  netip.MustParseAddr("2001:db8::1"),
+				Addr:  netip.MustParseAddr("2600:beef::1"), // public, but not K8s IP
 				Scope: RT_SCOPE_UNIVERSE,
 			},
 			{
-				Addr:  testNodeIPv6,
+				Addr:  testNodeIPv6, // public K8s Node IP (2222::1)
 				Scope: RT_SCOPE_UNIVERSE,
 			},
 		},
@@ -244,20 +254,50 @@ var nodeAddressTests = []struct {
 			ciliumHostIPLinkScoped,
 			netip.MustParseAddr("10.0.0.1"),
 			netip.MustParseAddr("1.1.1.1"),
-			netip.MustParseAddr("2001:db8::1"),
 			testNodeIPv4,
+			netip.MustParseAddr("2001:db8::1"),
+			netip.MustParseAddr("2600:beef::1"),
 			testNodeIPv6,
 		},
 
+		// Primary prefers public; among public IPs, K8s Node IP is prioritized
 		wantPrimary: []netip.Addr{
 			ciliumHostIP,
-			testNodeIPv4,
-			testNodeIPv6,
+			netip.MustParseAddr("1.1.1.1"), // IPv4: only public IP
+			testNodeIPv6,                   // IPv6: K8s Node IP prioritized among public
 		},
 
+		// NodePort prefers private; among private IPs, K8s Node IP is prioritized
 		wantNodePort: []netip.Addr{
-			testNodeIPv4,
-			testNodeIPv6,
+			testNodeIPv4,                       // IPv4: K8s Node IP prioritized among private
+			netip.MustParseAddr("2001:db8::1"), // IPv6: only private IP
+		},
+	},
+
+	{
+		name: "ipv6 skip link-local",
+		addrs: []DeviceAddress{
+			{
+				Addr:  netip.MustParseAddr("2600:beef::1"), // public
+				Scope: RT_SCOPE_UNIVERSE,
+			},
+			{
+				Addr:  netip.MustParseAddr("fe80::1"), // link-local (should be skipped)
+				Scope: RT_SCOPE_LINK,
+			},
+		},
+		wantAddrs: []netip.Addr{
+			ciliumHostIP,
+			ciliumHostIPLinkScoped,
+			netip.MustParseAddr("2600:beef::1"),
+			netip.MustParseAddr("fe80::1"),
+		},
+		wantPrimary: []netip.Addr{
+			ciliumHostIP,
+			netip.MustParseAddr("2600:beef::1"),
+		},
+		wantNodePort: []netip.Addr{
+			netip.MustParseAddr("2600:beef::1"),
 		},
 	},
 }
@@ -302,7 +342,6 @@ func TestNodeAddress(t *testing.T) {
 
 	for _, tt := range nodeAddressTests {
 		t.Run(tt.name, func(t *testing.T) {
-
 			txn := db.WriteTxn(devices)
 			_, watch := nodeAddrs.AllWatch(txn)
 
@@ -340,7 +379,6 @@ func TestNodeAddress(t *testing.T) {
 			assert.ElementsMatch(t, nodePort, tt.wantNodePort, "NodePort addresses do not match")
 			assert.ElementsMatch(t, primary, tt.wantPrimary, "Primary addresses do not match")
 			assertOnePrimaryPerDevice(t, addrs)
-
 		})
 	}
 
@@ -728,7 +766,7 @@ func TestNodeAddressNodeIPChange(t *testing.T) {
 	txn.Commit()
 	<-watch // wait for propagation
 
-	iter, watch := nodeAddrs.ListWatch(db.ReadTxn(), NodeAddressNodePortIndex.Query(true))
+	iter, watch := nodeAddrs.ListWatch(db.ReadTxn(), NodeAddressesByNodePort(true))
 	addrs := statedb.Collect(iter)
 	if assert.Len(t, addrs, 1) {
 		assert.Equal(t, testNodeIPv4, addrs[0].Addr)
@@ -742,7 +780,7 @@ func TestNodeAddressNodeIPChange(t *testing.T) {
 	<-watch
 
 	// The new node IP should now be preferred for NodePort.
-	iter = nodeAddrs.List(db.ReadTxn(), NodeAddressNodePortIndex.Query(true))
+	iter = nodeAddrs.List(db.ReadTxn(), NodeAddressesByNodePort(true))
 	addrs = statedb.Collect(iter)
 	if assert.Len(t, addrs, 1) {
 		assert.Equal(t, "10.0.0.1", addrs[0].Addr.String())
@@ -796,8 +834,7 @@ func fixture(t *testing.T, addressScopeMax int, beforeStart func(*hive.Hive)) (*
 	return db, devices, nodeAddrs, localNodeStore
 }
 
-type testLocalNodeSync struct {
-}
+type testLocalNodeSync struct{}
 
 // InitLocalNode implements node.LocalNodeSynchronizer.
 func (t testLocalNodeSync) InitLocalNode(_ context.Context, n *node.LocalNode) error {
@@ -808,6 +845,11 @@ func (t testLocalNodeSync) InitLocalNode(_ context.Context, n *node.LocalNode) e
 
 // SyncLocalNode implements node.LocalNodeSynchronizer.
 func (t testLocalNodeSync) SyncLocalNode(context.Context, *node.LocalNodeStore) {
+}
+
+// WaitForNodeInformation implements [node.LocalNodeSynchronizer].
+func (t testLocalNodeSync) WaitForNodeInformation(context.Context, *node.LocalNodeStore) error {
+	return nil
 }
 
 var _ node.LocalNodeSynchronizer = testLocalNodeSync{}
@@ -904,7 +946,117 @@ func TestSortedAddresses(t *testing.T) {
 		actual = SortedAddresses(shuffleSlice(slices.Clone(expected)))
 		assert.Equal(t, expected, actual)
 	}
+}
 
+func TestPreferredIPv6Address(t *testing.T) {
+	tests := []struct {
+		name  string
+		addrs []DeviceAddress
+		want  netip.Addr
+	}{
+		{
+			name: "link_local_only",
+			addrs: []DeviceAddress{
+				{Addr: netip.MustParseAddr("fe80::4001:aff:fe35:a805")},
+			},
+			want: netip.MustParseAddr("fe80::4001:aff:fe35:a805"),
+		},
+		{
+			name: "global_only",
+			addrs: []DeviceAddress{
+				{Addr: netip.MustParseAddr("2600:1900:4001:2a1:0:2::")},
+			},
+			want: netip.MustParseAddr("2600:1900:4001:2a1:0:2::"),
+		},
+		{
+			name: "local_first",
+			addrs: []DeviceAddress{
+				{Addr: netip.MustParseAddr("fe80::4001:aff:fe35:a805")},
+				{Addr: netip.MustParseAddr("2600:1900:4001:2a1:0:2::")},
+			},
+			want: netip.MustParseAddr("2600:1900:4001:2a1:0:2::"),
+		},
+		{
+			name: "global_first",
+			addrs: []DeviceAddress{
+				{Addr: netip.MustParseAddr("2600:1900:4001:2a1:0:2::")},
+				{Addr: netip.MustParseAddr("fe80::4001:aff:fe35:a805")},
+			},
+			want: netip.MustParseAddr("2600:1900:4001:2a1:0:2::"),
+		},
+		{
+			name: "select_first_global",
+			addrs: []DeviceAddress{
+				{Addr: netip.MustParseAddr("2600:1900:4001:2a1:0:2::")},
+				{Addr: netip.MustParseAddr("2600:1900:4001:2a1:0:3::")},
+			},
+			want: netip.MustParseAddr("2600:1900:4001:2a1:0:2::"),
+		},
+		{
+			name: "link_local_fallback",
+			addrs: []DeviceAddress{
+				{Addr: netip.MustParseAddr("fe80::1")},
+				{Addr: netip.MustParseAddr("::")},
+			},
+			want: netip.MustParseAddr("fe80::1"),
+		},
+		{
+			name: "ignore_unspecified_address",
+			addrs: []DeviceAddress{
+				{Addr: netip.MustParseAddr("fe80::1")},
+				{Addr: netip.MustParseAddr("::")},
+				{Addr: netip.MustParseAddr("2600:1900:4001:2a1:0:2::")},
+			},
+			want: netip.MustParseAddr("2600:1900:4001:2a1:0:2::"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, PreferredIPv6Address(tt.addrs))
+		})
+	}
+}
+
+func TestPreferredIPv4Address(t *testing.T) {
+	tests := []struct {
+		name  string
+		addrs []DeviceAddress
+		want  netip.Addr
+	}{
+		{
+			name: "prefer primary IPv4",
+			addrs: []DeviceAddress{
+				{Addr: netip.MustParseAddr("1.1.1.1"), Secondary: true},
+				{Addr: netip.MustParseAddr("2.2.2.2")},
+			},
+			want: netip.MustParseAddr("2.2.2.2"),
+		},
+		{
+			name: "skip preferred IPv6",
+			addrs: []DeviceAddress{
+				{Addr: netip.MustParseAddr("2001:db8::1"), Scope: RT_SCOPE_UNIVERSE},
+				{Addr: netip.MustParseAddr("10.0.0.1"), Scope: RT_SCOPE_SITE},
+			},
+			want: netip.MustParseAddr("10.0.0.1"),
+		},
+		{
+			name:  "no IPv4 address",
+			addrs: []DeviceAddress{{Addr: netip.MustParseAddr("2001:db8::1")}},
+			want:  netip.Addr{},
+		},
+		{
+			name:  "skip unspecified IPv4 address",
+			addrs: []DeviceAddress{{Addr: netip.MustParseAddr("0.0.0.0")}},
+			want:  netip.Addr{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, PreferredIPv4Address(tt.addrs))
+		})
+	}
 }
 
 func TestFallbackAddresses(t *testing.T) {
@@ -988,11 +1140,13 @@ func TestNodeAddressFromRoute(t *testing.T) {
 
 	// Define our test scenarios.
 	testCases := []struct {
-		name               string
-		nodePortAddrs      []string
-		ipAlreadyOnDevice  bool // To test duplicate avoidance
-		customizeRoute     func(*Route)
-		expectNodePortFlag bool
+		name                string
+		nodePortAddrs       []string
+		ipAlreadyOnDevice   bool // To test duplicate avoidance
+		differentIPOnDevice bool // To test primary selection with existing device IP
+		customizeRoute      func(*Route)
+		expectNodePortFlag  bool
+		expectSecondary     bool // Expect Primary to be false
 	}{
 		{
 			name:               "no-nodeport-whitelist",
@@ -1032,6 +1186,21 @@ func TestNodeAddressFromRoute(t *testing.T) {
 			name:               "ipv6-route-no-nodeport-match",
 			nodePortAddrs:      []string{"2001:db9::/64"},
 			expectNodePortFlag: false,
+		},
+		{
+			name:                "device-has-different-primary-ip",
+			differentIPOnDevice: true,
+			expectSecondary:     true,
+		},
+		{
+			name:                "ipv6-route-device-has-different-primary-ip",
+			differentIPOnDevice: true,
+			expectSecondary:     true,
+		},
+		{
+			name:                "ipv6-route-cross-family-device-has-different-primary-ip",
+			differentIPOnDevice: true,
+			expectSecondary:     false,
 		},
 	}
 
@@ -1099,9 +1268,30 @@ func TestNodeAddressFromRoute(t *testing.T) {
 			txn := db.WriteTxn(devices, routes)
 			_, watch := nodeAddrs.AllWatch(txn)
 
+			var differentIP netip.Addr
+			if tc.differentIPOnDevice {
+				if strings.Contains(tc.name, "cross-family") {
+					if strings.Contains(tc.name, "ipv6") {
+						differentIP = netip.MustParseAddr("10.0.0.1")
+					} else {
+						differentIP = netip.MustParseAddr("2001:db8::99")
+					}
+				} else {
+					if strings.Contains(tc.name, "ipv6") {
+						differentIP = netip.MustParseAddr("2001:db8::99")
+					} else {
+						differentIP = netip.MustParseAddr("10.0.0.1")
+					}
+				}
+			}
+
 			if tc.ipAlreadyOnDevice {
 				testDeviceWithAddr := *testDevice // clone
 				testDeviceWithAddr.Addrs = []DeviceAddress{{Addr: routeBasedIP, Scope: RT_SCOPE_UNIVERSE}}
+				devices.Insert(txn, &testDeviceWithAddr)
+			} else if tc.differentIPOnDevice {
+				testDeviceWithAddr := *testDevice // clone
+				testDeviceWithAddr.Addrs = []DeviceAddress{{Addr: differentIP, Scope: RT_SCOPE_UNIVERSE}}
 				devices.Insert(txn, &testDeviceWithAddr)
 			} else {
 				devices.Insert(txn, testDevice)
@@ -1168,7 +1358,7 @@ func TestNodeAddressFromRoute(t *testing.T) {
 
 			require.NotNil(t, foundAddr, "Expected address %s to be discovered from route, but it was not", routeBasedIP)
 			assert.Equal(t, "eth0", foundAddr.DeviceName, "Address should be associated with correct device")
-			assert.True(t, foundAddr.Primary, "Address discovered from a route should be considered Primary")
+			assert.Equal(t, !tc.expectSecondary, foundAddr.Primary, "Address discovered from a route Primary flag was not as expected")
 			assert.Equal(t, tc.expectNodePortFlag, foundAddr.NodePort, "NodePort flag for address %s was not as expected", routeBasedIP)
 
 			// Test route deletion

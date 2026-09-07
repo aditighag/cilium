@@ -18,7 +18,7 @@ import (
 	jsoniter "github.com/json-iterator/go"
 	"github.com/spf13/pflag"
 
-	datapath "github.com/cilium/cilium/pkg/datapath/types"
+	"github.com/cilium/cilium/pkg/datapath/iptables"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/option"
@@ -120,7 +120,7 @@ type ProxyPorts struct {
 func NewProxyPorts(
 	logger *slog.Logger,
 	config ProxyPortsConfig,
-	datapathUpdater datapath.IptablesManager,
+	datapathUpdater iptables.Manager,
 ) *ProxyPorts {
 	return &ProxyPorts{
 		logger:                       logger,
@@ -168,17 +168,17 @@ func defaultProxyPortMap() proxyPortsMap {
 			ProxyType: types.ProxyTypeHTTP,
 			Ingress:   true,
 		},
+		"cilium-tls-egress": {
+			ProxyType: types.ProxyTypeTLS,
+			Ingress:   false,
+		},
+		"cilium-tls-ingress": {
+			ProxyType: types.ProxyTypeTLS,
+			Ingress:   true,
+		},
 		types.DNSProxyName: {
 			ProxyType: types.ProxyTypeDNS,
 			Ingress:   false,
-		},
-		"cilium-proxylib-egress": {
-			ProxyType: types.ProxyTypeAny,
-			Ingress:   false,
-		},
-		"cilium-proxylib-ingress": {
-			ProxyType: types.ProxyTypeAny,
-			Ingress:   true,
 		},
 	}
 }
@@ -267,7 +267,6 @@ func (p *ProxyPorts) AllocatePort(pp *ProxyPort, retry bool) (err error) {
 // Each call has to be paired with AckProxyPort(name) to update the datapath rules accordingly.
 // Each allocated port must be eventually freed with ReleaseProxyPort().
 func (p *ProxyPorts) AllocateCRDProxyPort(name string) (uint16, error) {
-	// Accessing pp.proxyPort requires the lock
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
@@ -298,6 +297,42 @@ func (p *ProxyPorts) AllocateCRDProxyPort(name string) (uint16, error) {
 	pp.configured = true
 
 	p.logger.Debug("AllocateProxyPort: allocated proxy port",
+		fieldProxyRedirectID, name,
+		logfields.ProxyPort, pp.ProxyPort,
+	)
+
+	return pp.ProxyPort, nil
+}
+
+// ReallocateCRDProxyPort() reallocates a new port for listener 'name'.
+// This will force reallocation of a new port even if one was already allocated.
+func (p *ProxyPorts) ReallocateCRDProxyPort(name string) (uint16, error) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	pp := p.proxyPorts[name]
+	if pp == nil || pp.Ingress {
+		pp = &ProxyPort{ProxyType: types.ProxyTypeCRD, Ingress: false}
+	}
+
+	if pp.ProxyPort != 0 {
+		p.reset(pp)
+		pp.rulesPort = 0
+	}
+
+	// Allocate a new port
+	var err error
+	pp.ProxyPort, err = p.allocatePort(0, p.rangeMin, p.rangeMax)
+	if err != nil {
+		return 0, err
+	}
+	p.proxyPorts[name] = pp
+	// marks port as reserved
+	p.allocatedPorts[pp.ProxyPort] = true
+	// mark proxy port as configured
+	pp.configured = true
+
+	p.logger.Debug("ReallocateProxyPort: reallocated proxy port",
 		fieldProxyRedirectID, name,
 		logfields.ProxyPort, pp.ProxyPort,
 	)
@@ -496,14 +531,8 @@ func (p *ProxyPorts) FindByTypeWithReference(l7Type types.ProxyType, listener st
 			logfields.ProxyPort, p.proxyPorts,
 		)
 		return "", nil
-	case types.ProxyTypeDNS, types.ProxyTypeHTTP:
+	case types.ProxyTypeDNS, types.ProxyTypeHTTP, types.ProxyTypeTLS:
 		// Look up by the given type
-	default:
-		// "Unknown" parsers are assumed to be Proxylib (TCP) parsers, which
-		// is registered with an empty string.
-		// This works also for explicit TCP and TLS parser types, which are backed by the
-		// TCP Proxy filter chain.
-		portType = types.ProxyTypeAny
 	}
 	// proxyPorts is small enough to not bother indexing it.
 	for name, pp := range p.proxyPorts {

@@ -1,5 +1,5 @@
 ---
-apiVersion: gateway.networking.k8s.io/v1alpha2
+apiVersion: gateway.networking.k8s.io/v1
 kind: TLSRoute
 metadata:
   name: gateway-conformance-infra-test
@@ -18,7 +18,7 @@ status:
   parents:
     - conditions:
         - lastTransitionTime: "2025-08-15T00:36:04Z"
-          message: Accepted HTTPRoute
+          message: Accepted TLSRoute
           reason: Accepted
           status: "True"
           type: Accepted

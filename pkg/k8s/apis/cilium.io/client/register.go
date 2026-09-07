@@ -4,6 +4,7 @@
 package client
 
 import (
+	"context"
 	_ "embed"
 	"fmt"
 	"log/slog"
@@ -13,11 +14,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 
+	bgpConfig "github.com/cilium/cilium/pkg/bgp/config"
 	k8sconst "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
 	k8sconstv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	k8sconstv2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/k8s/apis/crdhelpers"
-	"github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/k8s/synced"
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -76,10 +77,6 @@ const (
 	// LBIPPoolCRDName is the full name of the BGPPool CRD.
 	LBIPPoolCRDName = k8sconstv2.PoolKindDefinition + "/" + k8sconstv2.CustomResourceDefinitionVersion
 
-	// CNCCRDNameAlpha is the full name of the CiliumNodeConfig CRD.
-	// TODO remove me when CNC CRD v2alpha1 will be deprecated.
-	CNCCRDNameAlpha = k8sconstv2alpha1.CNCKindDefinition + "/" + k8sconstv2alpha1.CustomResourceDefinitionVersion
-
 	// CCGCRDName is the full name of the CiliumCIDRGroup CRD.
 	CCGCRDName = k8sconstv2.CCGKindDefinition + "/" + k8sconstv2.CustomResourceDefinitionVersion
 
@@ -90,6 +87,18 @@ const (
 	CPIPCRDName = k8sconstv2alpha1.CPIPKindDefinition + "/" + k8sconstv2alpha1.CustomResourceDefinitionVersion
 	// CGCCCRDName is the full name of the CiliumGatewayClassConfig CRD.
 	CGCCCRDName = k8sconstv2alpha1.CGCCKindDefinition + "/" + k8sconstv2alpha1.CustomResourceDefinitionVersion
+
+	// CDPPCRDName is the full name of the CDPP CRD.
+	CDPPCRDName = k8sconstv2alpha1.CDPPKindDefinition + "/" + k8sconstv2alpha1.CustomResourceDefinitionVersion
+
+	// CiliumNetworkDriverClusterConfigCRDName is the full name of the CiliumNetworkDriverClusterConfig CRD.
+	CiliumNetworkDriverClusterConfigCRDName = k8sconstv2alpha1.CiliumNetworkDriverClusterConfigKindDefinition + "/" + k8sconstv2alpha1.CustomResourceDefinitionVersion
+
+	// CiliumNetworkDriverNodeConfigCRDName is the full name of the CiliumNetworkDriverNodeConfig CRD.
+	CiliumNetworkDriverNodeConfigCRDName = k8sconstv2alpha1.CiliumNetworkDriverNodeConfigKindDefinition + "/" + k8sconstv2alpha1.CustomResourceDefinitionVersion
+
+	// CRIPCRDName is the full name of the CiliumResourceIPPool CRD.
+	CRIPCRDName = k8sconstv2alpha1.CRIPKindDefinition + "/" + k8sconstv2alpha1.CustomResourceDefinitionVersion
 )
 
 type CRDList struct {
@@ -184,25 +193,45 @@ func CustomResourceDefinitionList() map[string]*CRDList {
 			Name:     CGCCCRDName,
 			FullName: k8sconstv2alpha1.CGCCName,
 		},
+		synced.CRDResourceName(k8sconstv2alpha1.CDPPName): {
+			Name:     CDPPCRDName,
+			FullName: k8sconstv2alpha1.CDPPName,
+		},
+		synced.CRDResourceName(k8sconstv2alpha1.CiliumNetworkDriverClusterConfigName): {
+			Name:     CiliumNetworkDriverClusterConfigCRDName,
+			FullName: k8sconstv2alpha1.CiliumNetworkDriverClusterConfigName,
+		},
+		synced.CRDResourceName(k8sconstv2alpha1.CiliumNetworkDriverNodeConfigName): {
+			Name:     CiliumNetworkDriverNodeConfigCRDName,
+			FullName: k8sconstv2alpha1.CiliumNetworkDriverNodeConfigName,
+		},
+		synced.CRDResourceName(k8sconstv2alpha1.CRIPName): {
+			Name:     CRIPCRDName,
+			FullName: k8sconstv2alpha1.CRIPName,
+		},
 	}
 }
 
 // CreateCustomResourceDefinitions creates our CRD objects in the Kubernetes
 // cluster.
-func CreateCustomResourceDefinitions(logger *slog.Logger, clientset apiextensionsclient.Interface) error {
+func CreateCustomResourceDefinitions(ctx context.Context, logger *slog.Logger, clientset apiextensionsclient.Interface, bgpCfg bgpConfig.BGPConfig) (
+	needsMigration []*apiextensionsv1.CustomResourceDefinition, err error) {
 	crds := CustomResourceDefinitionList()
 
-	for _, r := range synced.AllCiliumCRDResourceNames() {
+	for _, r := range synced.AllCiliumCRDResourceNames(bgpCfg) {
 		if crd, ok := crds[r]; ok {
-			if err := createCRD(logger, clientset, crd.Name, crd.FullName); err != nil {
-				return err
+			obj, err := createCRD(ctx, logger, clientset, crd.Name, crd.FullName)
+			if err != nil {
+				return nil, fmt.Errorf("Unable to create custom resource definition %s: %w", crd.FullName, err)
+			}
+			if crdhelpers.CRDNeedsMigration(obj) {
+				needsMigration = append(needsMigration, obj)
 			}
 		} else {
 			logging.Fatal(logger, fmt.Sprintf("Unknown resource %s. Please update pkg/k8s/apis/cilium.io/client to understand this type.", r))
 		}
 	}
-
-	return nil
+	return
 }
 
 var (
@@ -268,6 +297,18 @@ var (
 
 	//go:embed crds/v2alpha1/ciliumgatewayclassconfigs.yaml
 	crdsv2Alpha1CiliumGatewayClassConfigs []byte
+
+	//go:embed crds/v2alpha1/ciliumdatapathplugins.yaml
+	crdsv2Alpha1CiliumDatapathPlugins []byte
+
+	//go:embed crds/v2alpha1/ciliumnetworkdriverclusterconfigs.yaml
+	crdsv2Alpha1CiliumNetworkDriverClusterConfigs []byte
+
+	//go:embed crds/v2alpha1/ciliumnetworkdrivernodeconfigs.yaml
+	crdsv2Alpha1CiliumNetworkDriverNodeConfigs []byte
+
+	//go:embed crds/v2alpha1/ciliumresourceippools.yaml
+	crdsv2Alpha1CiliumResourceIPPools []byte
 )
 
 // GetPregeneratedCRD returns the pregenerated CRD based on the requested CRD
@@ -324,6 +365,14 @@ func GetPregeneratedCRD(logger *slog.Logger, crdName string) apiextensionsv1.Cus
 		crdBytes = crdsv2Alpha1CiliumPodIPPools
 	case CGCCCRDName:
 		crdBytes = crdsv2Alpha1CiliumGatewayClassConfigs
+	case CDPPCRDName:
+		crdBytes = crdsv2Alpha1CiliumDatapathPlugins
+	case CiliumNetworkDriverClusterConfigCRDName:
+		crdBytes = crdsv2Alpha1CiliumNetworkDriverClusterConfigs
+	case CiliumNetworkDriverNodeConfigCRDName:
+		crdBytes = crdsv2Alpha1CiliumNetworkDriverNodeConfigs
+	case CRIPCRDName:
+		crdBytes = crdsv2Alpha1CiliumResourceIPPools
 	default:
 		logging.Fatal(logger, "Pregenerated CRD does not exist", logfields.CRDName, crdName)
 	}
@@ -344,10 +393,11 @@ func GetPregeneratedCRD(logger *slog.Logger, crdName string) apiextensionsv1.Cus
 
 // createCRD creates and updates a CRD.
 // It should be called on agent startup but is idempotent and safe to call again.
-func createCRD(logger *slog.Logger, clientset apiextensionsclient.Interface, crdVersionedName string, crdMetaName string) error {
+func createCRD(ctx context.Context, logger *slog.Logger, clientset apiextensionsclient.Interface, crdVersionedName string, crdMetaName string) (*apiextensionsv1.CustomResourceDefinition, error) {
 	ciliumCRD := GetPregeneratedCRD(logger, crdVersionedName)
 
 	return crdhelpers.CreateUpdateCRD(
+		ctx,
 		logger,
 		clientset,
 		constructV1CRD(crdMetaName, ciliumCRD),
@@ -384,13 +434,4 @@ func constructV1CRD(
 			Conversion: template.Spec.Conversion, // conversion strategy is needed to support several versions of a same CRD
 		},
 	}
-}
-
-// RegisterCRDs registers all CRDs with the K8s apiserver.
-func RegisterCRDs(logger *slog.Logger, clientset client.Clientset) error {
-	if err := CreateCustomResourceDefinitions(logger, clientset); err != nil {
-		return fmt.Errorf("Unable to create custom resource definition: %w", err)
-	}
-
-	return nil
 }

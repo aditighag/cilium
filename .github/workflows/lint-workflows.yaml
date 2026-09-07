@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           # hard-code the path instead of using ${{ github.repository }} to make sure it works for forked repo as well
@@ -28,7 +28,7 @@ jobs:
 
       # Load Ginkgo build from GitHub
       - name: Load ginkgo linter from GH cache
-        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cache
         with:
           path: /tmp/.ginkgo-build/
@@ -36,11 +36,11 @@ jobs:
 
       - name: Install Go
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
-        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           cache-dependency-path: "src/github.com/cilium/cilium/*.sum"
           # renovate: datasource=golang-version depName=go
-          go-version: 1.25.5
+          go-version: 1.27.1
 
       - name: Build Ginkgo
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
@@ -89,10 +89,6 @@ jobs:
           sed -e 's/^[[:space:]]\+# //g' | \
           sort -u > /tmp/ginkgo-workflow-comments.txt
 
-          grep '# Runtime' .github/workflows/conformance-runtime.yaml | \
-          sed -e 's/^[[:space:]]\+# //g' | \
-          sort -u > /tmp/runtime-workflow-comments.txt
-
       - name: Getting test runs output
         shell: bash
         run: |
@@ -100,15 +96,8 @@ jobs:
 
           ./test.test -ginkgo.failFast -ginkgo.dryRun -- --cilium.testScope=K8s | \
           grep TestRun | \
-          grep -v 'TestRun\[Top Level\] Runtime' | \
           sed 's/TestRun\[Top Level\]\ //g' | \
           sort -u > /tmp/ginkgo-tests.txt
-
-          ./test.test -ginkgo.failFast -ginkgo.dryRun -- --cilium.testScope=Runtime | \
-          grep TestRun | \
-          grep -v 'TestRun\[Top Level\] K8s' | \
-          sed 's/TestRun\[Top Level\]\ //g' | \
-          sort -u > /tmp/runtime-tests.txt
 
       - name: Checking diff Ginkgo Workflow
         shell: bash
@@ -122,30 +111,18 @@ jobs:
             exit 1
           fi
 
-      - name: Checking diff Runtime Workflow
-        shell: bash
-        run: |
-          if ! diff /tmp/runtime-workflow-comments.txt /tmp/runtime-tests.txt --suppress-common-lines; then
-            echo ""
-            echo "Ginkgo tests out of sync with comments from GH workflow:"
-            echo "$diff"
-            echo ""
-            echo "Please fix the comments from .github/workflows/conformance-runtime.yaml accordingly"
-            exit 1
-          fi
-
   ginkgo-schema-validation:
     name: Validate Ginkgo Schema
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.10'
       - name: Install yamela
         run: pip install yamale
       - name: Checkout code
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           # hard-code the path instead of using ${{ github.repository }} to make sure it works for forked repo as well
@@ -164,13 +141,13 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.10'
       - name: Install yamela
         run: pip install yamale
       - name: Checkout code
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           # hard-code the path instead of using ${{ github.repository }} to make sure it works for forked repo as well
@@ -196,7 +173,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           # hard-code the path instead of using ${{ github.repository }} to make sure it works for forked repo as well
@@ -283,12 +260,12 @@ jobs:
     name: actionlint
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         name: checkout
       - name: Setup actionlint matcher
         run: echo "::add-matcher::.github/actionlint-matcher.json"
       - name: Check workflow files
-        uses: docker://rhysd/actionlint:1.7.9@sha256:a0383f60d92601e2694e24b24d37df7b6a40bed7cedbc447611c50009bf02d94
+        uses: docker://docker.io/rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
         env:
           SHELLCHECK_OPTS: --exclude=SC2086,SC2129,SC2185,SC2162,SC2090,SC2089,SC2001,SC2002
         with:

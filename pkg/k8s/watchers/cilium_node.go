@@ -16,7 +16,7 @@ import (
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	agentK8s "github.com/cilium/cilium/daemon/k8s"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/k8s"
 	cilium_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
@@ -24,7 +24,6 @@ import (
 	k8sSynced "github.com/cilium/cilium/pkg/k8s/synced"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	nm "github.com/cilium/cilium/pkg/node/manager"
-	"github.com/cilium/cilium/pkg/node/types"
 )
 
 type k8sCiliumNodeWatcherParams struct {
@@ -33,11 +32,12 @@ type k8sCiliumNodeWatcherParams struct {
 	Logger *slog.Logger
 
 	Clientset         k8sClient.Clientset
-	Resources         agentK8s.Resources
+	CiliumNode        resource.Resource[*cilium_v2.CiliumNode]
 	K8sResourceSynced *k8sSynced.Resources
 	K8sAPIGroups      *k8sSynced.APIGroups
 
 	NodeManager nm.NodeManager
+	ClusterInfo cmtypes.ClusterInfo
 }
 
 func newK8sCiliumNodeWatcher(params k8sCiliumNodeWatcherParams) *K8sCiliumNodeWatcher {
@@ -46,8 +46,9 @@ func newK8sCiliumNodeWatcher(params k8sCiliumNodeWatcherParams) *K8sCiliumNodeWa
 		clientset:         params.Clientset,
 		k8sResourceSynced: params.K8sResourceSynced,
 		k8sAPIGroups:      params.K8sAPIGroups,
-		resources:         params.Resources,
+		ciliumNode:        params.CiliumNode,
 		nodeManager:       params.NodeManager,
+		clusterInfo:       params.ClusterInfo,
 	}
 }
 
@@ -63,9 +64,10 @@ type K8sCiliumNodeWatcher struct {
 	// k8sAPIGroups is a set of k8s API in use. They are setup in watchers,
 	// and may be disabled while the agent runs.
 	k8sAPIGroups *k8sSynced.APIGroups
-	resources    agentK8s.Resources
+	ciliumNode   resource.Resource[*cilium_v2.CiliumNode]
 
 	nodeManager nodeManager
+	clusterInfo cmtypes.ClusterInfo
 
 	ciliumNodeStore atomic.Pointer[resource.Store[*cilium_v2.CiliumNode]]
 }
@@ -82,7 +84,7 @@ func (k *K8sCiliumNodeWatcher) ciliumNodeInit(ctx context.Context) {
 	k.k8sAPIGroups.AddAPI(k8sAPIGroupCiliumNodeV2)
 
 	go func() {
-		events := k.resources.CiliumNode.Events(ctx)
+		events := k.ciliumNode.Events(ctx)
 		cache := make(map[resource.Key]*cilium_v2.CiliumNode)
 		for event := range events {
 			switch event.Kind {
@@ -91,7 +93,7 @@ func (k *K8sCiliumNodeWatcher) ciliumNodeInit(ctx context.Context) {
 				k.nodeManager.NodeSync()
 
 				// The informer just synchronized, so the Store call will not block.
-				store, err := k.resources.CiliumNode.Store(ctx)
+				store, err := k.ciliumNode.Store(ctx)
 				if err != nil {
 					if !errors.Is(err, context.Canceled) {
 						k.logger.Warn("unable to retrieve CiliumNode local store, going to query kube-apiserver directly", logfields.Error, err)
@@ -124,7 +126,7 @@ func (k *K8sCiliumNodeWatcher) onCiliumNodeInsert(ciliumNode *cilium_v2.CiliumNo
 	if k8s.IsLocalCiliumNode(ciliumNode) {
 		return false
 	}
-	n := types.ParseCiliumNode(ciliumNode)
+	n := k8s.ParseCiliumNode(ciliumNode, k.clusterInfo)
 	k.nodeManager.NodeUpdated(n)
 	return true
 }
@@ -143,7 +145,7 @@ func (k *K8sCiliumNodeWatcher) onCiliumNodeDelete(ciliumNode *cilium_v2.CiliumNo
 	if k8s.IsLocalCiliumNode(ciliumNode) {
 		return
 	}
-	n := types.ParseCiliumNode(ciliumNode)
+	n := k8s.ParseCiliumNode(ciliumNode, k.clusterInfo)
 	k.nodeManager.NodeDeleted(n)
 }
 

@@ -44,8 +44,11 @@ type ingressReconciler struct {
 	enforcedHTTPS           bool
 	defaultRequestTimeout   time.Duration
 
-	hostNetworkEnabled    bool
-	hostNetworkSharedPort uint32
+	hostNetworkEnabled            bool
+	hostNetworkSharedPort         uint32
+	hostNetworkHTTPPort           uint32
+	hostNetworkHTTPSPort          uint32
+	hostNetworkTLSPassthroughPort uint32
 
 	cecTranslator       translation.CECTranslator
 	dedicatedTranslator translation.Translator
@@ -66,6 +69,9 @@ func newIngressReconciler(
 	defaultRequestTimeout time.Duration,
 	hostNetworkEnabled bool,
 	hostNetworkSharedPort uint32,
+	hostNetworkHTTPPort uint32,
+	hostNetworkHTTPSPort uint32,
+	hostNetworkTLSPassthroughPort uint32,
 ) *ingressReconciler {
 	return &ingressReconciler{
 		logger: logger,
@@ -83,8 +89,11 @@ func newIngressReconciler(
 		enforcedHTTPS:           enforcedHTTPS,
 		defaultRequestTimeout:   defaultRequestTimeout,
 
-		hostNetworkEnabled:    hostNetworkEnabled,
-		hostNetworkSharedPort: hostNetworkSharedPort,
+		hostNetworkEnabled:            hostNetworkEnabled,
+		hostNetworkSharedPort:         hostNetworkSharedPort,
+		hostNetworkHTTPPort:           hostNetworkHTTPPort,
+		hostNetworkHTTPSPort:          hostNetworkHTTPSPort,
+		hostNetworkTLSPassthroughPort: hostNetworkTLSPassthroughPort,
 	}
 }
 

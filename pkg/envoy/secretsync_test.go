@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/cilium/hive/hivetest"
-	cilium "github.com/cilium/proxy/go/cilium/api"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -20,6 +19,7 @@ import (
 	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
 	"github.com/cilium/cilium/pkg/policy"
 	"github.com/cilium/cilium/pkg/proxy/endpoint"
+	"github.com/cilium/cilium/pkg/revert"
 )
 
 func Test_k8sSecretToEnvoySecretTlsCertificate(t *testing.T) {
@@ -408,7 +408,7 @@ func (r *fakeXdsServer) Reset() {
 	r.nrOfDeletions = 0
 }
 
-func (r *fakeXdsServer) UpdateEnvoyResources(ctx context.Context, old Resources, new Resources) error {
+func (r *fakeXdsServer) UpdateEnvoyResources(ctx context.Context, old xds.Resources, new xds.Resources, wg *completion.WaitGroup) error {
 	if r.returnError {
 		return errors.New("failed to update envoy resources")
 	}
@@ -417,7 +417,7 @@ func (r *fakeXdsServer) UpdateEnvoyResources(ctx context.Context, old Resources,
 	return nil
 }
 
-func (r *fakeXdsServer) DeleteEnvoyResources(ctx context.Context, resources Resources) error {
+func (r *fakeXdsServer) DeleteEnvoyResources(ctx context.Context, resources xds.Resources, wg *completion.WaitGroup) error {
 	if r.returnError {
 		return errors.New("failed to delete envoy resources")
 	}
@@ -426,7 +426,7 @@ func (r *fakeXdsServer) DeleteEnvoyResources(ctx context.Context, resources Reso
 	return nil
 }
 
-func (r *fakeXdsServer) UpsertEnvoyResources(ctx context.Context, resources Resources) error {
+func (r *fakeXdsServer) UpsertEnvoyResources(ctx context.Context, resources xds.Resources, wg *completion.WaitGroup) error {
 	if r.returnError {
 		return errors.New("failed to upsert envoy resources")
 	}
@@ -435,19 +435,15 @@ func (r *fakeXdsServer) UpsertEnvoyResources(ctx context.Context, resources Reso
 	return nil
 }
 
-func (*fakeXdsServer) AddListener(name string, kind policy.L7ParserType, port uint16, isIngress bool, mayUseOriginalSourceAddr bool, wg *completion.WaitGroup, cb func(err error)) error {
+func (*fakeXdsServer) AddListener(ctx context.Context, name string, kind policy.L7ParserType, port uint16, isIngress bool, mayUseOriginalSourceAddr bool, wg *completion.WaitGroup, cb func(err error)) error {
 	panic("unimplemented")
 }
 
-func (*fakeXdsServer) AddAdminListener(port uint16, wg *completion.WaitGroup) {
+func (*fakeXdsServer) AddAdminListener(ctx context.Context, port uint16, wg *completion.WaitGroup) {
 	panic("unimplemented")
 }
 
-func (*fakeXdsServer) AddMetricsListener(port uint16, wg *completion.WaitGroup) {
-	panic("unimplemented")
-}
-
-func (*fakeXdsServer) GetNetworkPolicies(resourceNames []string) (map[string]*cilium.NetworkPolicy, error) {
+func (*fakeXdsServer) AddMetricsListener(ctx context.Context, port uint16, wg *completion.WaitGroup) {
 	panic("unimplemented")
 }
 
@@ -455,19 +451,15 @@ func (*fakeXdsServer) RemoveAllNetworkPolicies() {
 	panic("unimplemented")
 }
 
-func (*fakeXdsServer) RemoveListener(name string, wg *completion.WaitGroup) xds.AckingResourceMutatorRevertFunc {
+func (*fakeXdsServer) RemoveListener(ctx context.Context, name string, wg *completion.WaitGroup) xds.AckingResourceMutatorRevertFunc {
 	panic("unimplemented")
 }
 
-func (*fakeXdsServer) RemoveNetworkPolicy(ep endpoint.EndpointInfoSource) {
+func (*fakeXdsServer) RemoveNetworkPolicy(ctx context.Context, ep endpoint.EndpointInfoSource) {
 	panic("unimplemented")
 }
 
-func (*fakeXdsServer) UpdateNetworkPolicy(ep endpoint.EndpointUpdater, policy *policy.EndpointPolicy, wg *completion.WaitGroup) (error, func() error) {
-	panic("unimplemented")
-}
-
-func (*fakeXdsServer) UseCurrentNetworkPolicy(ep endpoint.EndpointUpdater, policy *policy.EndpointPolicy, wg *completion.WaitGroup) {
+func (*fakeXdsServer) UpdateNetworkPolicy(ctx context.Context, ep endpoint.EndpointUpdater, policy *policy.EndpointPolicy, wg *completion.WaitGroup) (error, revert.RevertFunc, revert.FinalizeFunc) {
 	panic("unimplemented")
 }
 

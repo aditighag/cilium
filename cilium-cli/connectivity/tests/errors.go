@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/blang/semver/v4"
 	corev1 "k8s.io/api/core/v1"
@@ -44,35 +45,104 @@ func (r regexMatcher) IsMatch(log string) bool {
 	return r.MatchString(log)
 }
 
+// thresholdException tolerates a bad log message while it affects no more than
+// maxDistinct distinct values of the distinguishingField log field, used to
+// tell otherwise-equal message lines apart, and fails beyond that. seen tracks
+// the distinct values observed so far within a single pod's log stream.
+type thresholdException struct {
+	matcher             logMatcher
+	distinguishingField string
+	maxDistinct         int
+	seen                map[string]struct{}
+}
+
+// thresholdExceptions is the set of threshold exceptions in effect, carrying
+// their per-pod state. Create a fresh copy per pod with newTracker.
+type thresholdExceptions []thresholdException
+
+// newTracker returns a copy of the exceptions with empty per-pod state, ready
+// to record the messages of a single pod's log stream.
+func (tes thresholdExceptions) newTracker() thresholdExceptions {
+	tracker := make(thresholdExceptions, len(tes))
+	for i, te := range tes {
+		te.seen = make(map[string]struct{})
+		tracker[i] = te
+	}
+	return tracker
+}
+
+// recordFailure records an occurrence of a bad log message and reports whether
+// it should count as a failure. A message not governed by any threshold
+// exception always counts; a governed one counts only once it has been seen for
+// more than maxDistinct distinct values of its field.
+func (tes thresholdExceptions) recordFailure(justMsg, line string) bool {
+	for i := range tes {
+		te := &tes[i]
+		if !te.matcher.IsMatch(line) {
+			continue
+		}
+		value := extractValueFromLog(line, te.distinguishingField)
+		if value == "" {
+			// Missing field: key on the whole line so it can't collapse into one.
+			value = line
+		}
+		te.seen[value] = struct{}{}
+		return len(te.seen) > te.maxDistinct
+	}
+	return true
+}
+
 // NoErrorsInLogs checks whether there are no error messages in cilium-agent
 // logs. The error messages are defined in badLogMsgsWithExceptions, which key
 // is an error message, while values is a list of ignored messages.
-func NoErrorsInLogs(ciliumVersion semver.Version, checkLevels []string, externalTarget string, externalOtherTarget string) check.Scenario {
+func NoErrorsInLogs(ciliumVersion semver.Version, checkLevels []string, extraExceptions []string, externalTarget string, externalOtherTarget string, startTime time.Time) check.Scenario {
 	// Exceptions for level=error should only be added as a last resort, if the
 	// error cannot be fixed in Cilium or in the test.
 	errorLogExceptions := []logMatcher{
 		stringMatcher("Error in delegate stream, restarting"),
-		failedToUpdateLock, failedToReleaseLock,
-		failedToListCRDs, knownIssueWireguardCollision, nilDetailsForService}
+		failedToUpdateLock, failedToReleaseLock, failedToRetrieveLock, leaderElectionReadTimeout,
+		failedToListCRDs, knownIssueWireguardCollision, nilDetailsForService, gobgpFailedCloseTCP,
+		vendoredLeaderElectionLeaseLockError}
 
 	envoyExternalTargetTLSWarning := regexMatcher{regexp.MustCompile(fmt.Sprintf(envoyTLSWarningTemplate, externalTarget))}
 	envoyExternalOtherTargetTLSWarning := regexMatcher{regexp.MustCompile(fmt.Sprintf(envoyTLSWarningTemplate, externalOtherTarget))}
-	warningLogExceptions := []logMatcher{cantEnableJIT, delMissingService, podCIDRUnavailable,
+	warningLogExceptions := []logMatcher{cantEnableJIT, podCIDRUnavailable,
 		unableGetNode, sessionAffinitySocketLB, objectHasBeenModified, noBackendResponse,
-		legacyBGPFeature, etcdTimeout, endpointRestoreFailed, unableRestoreRouterIP,
+		legacyBGPFeature, etcdTimeout, unableRestoreRouterIP,
 		routerIPReallocated, cantFindIdentityInCache, keyAllocFailedFoundMaster,
 		cantRecreateMasterKey, cantUpdateCRDIdentity, cantDeleteFromPolicyMap, failedToListCRDs,
-		hubbleQueueFull, reflectPanic, svcNotFound, gobgpWarnings,
-		endpointMapDeleteFailed, etcdReconnection, epRestoreMissingState, mutationDetectorKlog,
+		hubbleQueueFull, reflectPanic, svcNotFound, gobgpv3Warnings, gobgpNotification, gobgpNoMatchingWithdrawPath,
+		gobgpReceivedNotification, gobgpFailedToSend,
+		endpointMapDeleteFailed, etcdReconnection, failedToRetrieveRemoteClusterCfg, epRestoreMissingState, mutationDetectorKlog,
 		hubbleFailedCreatePeer, fqdnDpUpdatesTimeout, longNetpolUpdate, failedToGetEpLabels,
 		failedCreategRPCClient, unableReallocateIngressIP, fqdnMaxIPPerHostname, failedGetMetricsAPI,
-		envoyExternalTargetTLSWarning, envoyExternalOtherTargetTLSWarning, ciliumNodeConfigDeprecation,
+		envoyExternalTargetTLSWarning, envoyExternalOtherTargetTLSWarning,
 		hubbleUIEnvVarFallback, k8sClientNetworkStatusError, bgpAlphaResourceDeprecation, ccgAlphaResourceDeprecation,
-		k8sEndpointDeprecatedWarn, proxylibDeprecatedWarn, certloaderInitialLoadWarn}
+		k8sEndpointDeprecatedWarn, proxylibDeprecatedWarn, certloaderInitialLoadWarn, localKeyAlreadyAllocated,
+		getSecurityGroupsForVpcUnauthorized, eniIPv6BetaWarn, lbMapCannotAllocateMemory}
+
+	warningThresholdExceptions := thresholdExceptions{
+		// Benign for one node at ENI capacity, a real IP-starvation signal for
+		// several. cf. https://github.com/cilium/cilium/issues/42092
+		{matcher: instanceOutOfInterfaces, distinguishingField: "name", maxDistinct: 1},
+	}
 
 	if ciliumVersion.LT(semver.MustParse("1.18.0")) {
-		errorLogExceptions = append(errorLogExceptions, linkNotFound)
-		warningLogExceptions = append(warningLogExceptions, linkNotFound)
+		errorLogExceptions = append(errorLogExceptions, linkNotFound, removeInexistentID)
+		warningLogExceptions = append(warningLogExceptions, linkNotFound, removeInexistentID)
+	}
+
+	if ciliumVersion.LT(semver.MustParse("1.19.0")) {
+		warningLogExceptions = append(warningLogExceptions, kvstoreNodesGCWarn, kvstoreNodesGCWarn2, kvstoreNodesGCWarn3)
+	}
+
+	if ciliumVersion.LT(semver.MustParse("1.21.0")) {
+		warningLogExceptions = append(warningLogExceptions, endpointRestoreFailed)
+	}
+
+	for _, exception := range extraExceptions {
+		errorLogExceptions = append(errorLogExceptions, stringMatcher(exception))
+		warningLogExceptions = append(warningLogExceptions, stringMatcher(exception))
 	}
 
 	// The list is adopted from cilium/cilium/test/helper/utils.go
@@ -102,8 +172,10 @@ func NoErrorsInLogs(ciliumVersion semver.Version, checkLevels []string, external
 	}
 	return &noErrorsInLogs{
 		errorMsgsWithExceptions: errorMsgsWithExceptions,
+		thresholdExceptions:     warningThresholdExceptions,
 		ScenarioBase:            check.NewScenarioBase(),
 		ciliumVersion:           ciliumVersion,
+		startTime:               startTime,
 	}
 }
 
@@ -111,9 +183,11 @@ type noErrorsInLogs struct {
 	check.ScenarioBase
 
 	errorMsgsWithExceptions map[string][]logMatcher
+	thresholdExceptions     thresholdExceptions
 	ciliumVersion           semver.Version
 	mostCommonFailureLog    string
 	mostCommonFailureCount  int
+	startTime               time.Time
 }
 
 func (n *noErrorsInLogs) FilePath() string {
@@ -149,7 +223,16 @@ func (n *noErrorsInLogs) Run(ctx context.Context, t *check.Test) {
 		t.Fatalf("Error retrieving Cilium pods: %s", err)
 	}
 
+	// The "config" init-container restart exception below is only accepted on
+	// GKE, where it has been observed on freshly-created clusters; we do not
+	// want to blindly ignore restarts on other platforms.
+	flavor, _ := t.Context().Feature(features.Flavor)
+	isGKE := flavor.Enabled && flavor.Mode == "gke"
+
 	opts := corev1.PodLogOptions{LimitBytes: ptr.To[int64](sysdump.DefaultLogsLimitBytes)}
+	st := metav1.NewTime(n.startTime)
+	t.Infof("Start time for the check: %s", st.UTC().String())
+	opts.SinceTime = &st
 	prevOpts := opts
 	prevOpts.Previous = true
 	for pod, info := range pods {
@@ -173,6 +256,32 @@ func (n *noErrorsInLogs) Run(ctx context.Context, t *check.Test) {
 				// the startup probe, let's just accept one possible restart here.
 				ignore = ignore || (restarts == 1 && container == "hubble-relay")
 
+				// The "config" init container (cilium-dbg build-config) queries
+				// the kube-apiserver during pod startup. On freshly-created GKE
+				// clusters, whose control plane may still be warming up, it can
+				// restart once before the API server is reachable. Accept one
+				// such restart, but only on GKE where it has been observed.
+				ignore = ignore || (isGKE && restarts == 1 && container == "config")
+
+				// Each pod is associated with a single /etc/hosts file that is
+				// mounted inside each container of the pod, and the kubelet
+				// enforces its content again every time that a container is
+				// started, through [os.WriteFile] [1]. However, this leaves a
+				// tiny race condition window in which an already started
+				// container may observe a truncated version of the hosts file.
+				// No race condition is small enough to escape our CI, and we
+				// witnessed the etcd container fail to resolve the localhost
+				// hostname when configuring the peer listeners, and exit [2],
+				// eventually tripping this restart check. Ideally, we'd not
+				// rely on a hostname there, but that's easier said than done,
+				// because a direct use of either 127.0.0.1 or [::1] would not
+				// work if the corresponding IP family is disabled. For the
+				// moment, let's tolerate a possible restart of this container.
+				//
+				// [1]: https://github.com/kubernetes/kubernetes/blob/65bca7cd12f0/pkg/kubelet/kubelet_pods.go#L491-L515
+				// [2]: [...] "msg":"creating peer listener failed","error":"listen tcp: lookup localhost on 10.245.0.10:53: no such host"
+				ignore = ignore || (restarts == 1 && container == "etcd")
+
 				var logs bytes.Buffer
 				err := client.GetLogs(ctx, pod.Namespace, pod.Name, container, opts, &logs)
 				if err != nil {
@@ -187,6 +296,12 @@ func (n *noErrorsInLogs) Run(ctx context.Context, t *check.Test) {
 					err := client.GetLogs(ctx, pod.Namespace, pod.Name, container, prevOpts, &logs)
 					if err == nil {
 						n.checkErrorsInLogs(id, logs.Bytes(), a, &prevOpts)
+					} else if strings.Contains(err.Error(), "previous terminated container") && strings.Contains(err.Error(), "not found") {
+						// The previous container's logs may already have been
+						// garbage-collected by the kubelet, in which case there
+						// is nothing to inspect. Don't turn this race into a
+						// hard failure.
+						a.Infof("Previous container logs unavailable (already garbage-collected): %s", err)
 					} else {
 						a.Failf("Error reading Cilium logs: %s", err)
 					}
@@ -311,6 +426,8 @@ func (n *noErrorsInLogs) podContainers(pod *corev1.Pod) podContainers {
 func (n *noErrorsInLogs) findUniqueFailures(logs []byte) (map[string]int, map[string]string) {
 	uniqueFailures := make(map[string]int)
 	exampleLogLine := make(map[string]string)
+	// Per-pod threshold state, reset for each pod's log stream.
+	thresholdExceptions := n.thresholdExceptions.newTracker()
 	for chunk := range bytes.SplitSeq(logs, []byte("\n")) {
 		msg := string(chunk)
 		for fail, ignoreMsgs := range n.errorMsgsWithExceptions {
@@ -328,8 +445,10 @@ func (n *noErrorsInLogs) findUniqueFailures(logs []byte) (map[string]int, map[st
 						// Matching didn't work, fallback to previous behaviour
 						justMsg = msg
 					}
-					count := uniqueFailures[justMsg]
-					uniqueFailures[justMsg] = count + 1
+					if !thresholdExceptions.recordFailure(justMsg, msg) {
+						continue
+					}
+					uniqueFailures[justMsg]++
 					exampleLogLine[justMsg] = msg
 				}
 			}
@@ -422,47 +541,63 @@ const (
 	failedToListCRDs     stringMatcher = "the server could not find the requested resource" // cf. https://github.com/cilium/cilium/issues/16425
 	failedToUpdateLock   stringMatcher = "Failed to update lock:"
 	failedToReleaseLock  stringMatcher = "Failed to release lock:"
-	nilDetailsForService stringMatcher = "retrieved nil details for Service" // from: https://github.com/cilium/cilium/issues/35595
+	failedToRetrieveLock stringMatcher = "Error retrieving lease lock"                          // cf. https://github.com/cilium/cilium/issues/45426
+	nilDetailsForService stringMatcher = "retrieved nil details for Service"                    // from: https://github.com/cilium/cilium/issues/35595
+	removeInexistentID   stringMatcher = "removing identity not added to the identity manager!" // from https://github.com/cilium/cilium/issues/16419
+	gobgpFailedCloseTCP  stringMatcher = "failed to close existing tcp connection"              // Benign error during BGP peer teardown in ACTIVE state
 
 	// warnings
-	cantEnableJIT               stringMatcher = "bpf_jit_enable: no such file or directory"                              // Because we run tests in Kind.
-	delMissingService           stringMatcher = "Deleting no longer present service"                                     // cf. https://github.com/cilium/cilium/issues/29679
-	podCIDRUnavailable          stringMatcher = " PodCIDR not available"                                                 // cf. https://github.com/cilium/cilium/issues/29680
-	unableGetNode               stringMatcher = "Unable to get node resource"                                            // cf. https://github.com/cilium/cilium/issues/29710
-	sessionAffinitySocketLB     stringMatcher = "Session affinity for host reachable services needs kernel"              // cf. https://github.com/cilium/cilium/issues/29736
-	objectHasBeenModified       stringMatcher = "the object has been modified; please apply your changes"                // cf. https://github.com/cilium/cilium/issues/29712
-	noBackendResponse           stringMatcher = "The kernel does not support --service-no-backend-response=reject"       // cf. https://github.com/cilium/cilium/issues/29733
-	legacyBGPFeature            stringMatcher = "You are using the legacy BGP feature"                                   // Expected when testing the legacy BGP feature.
-	etcdTimeout                 stringMatcher = "etcd client timeout exceeded"                                           // cf. https://github.com/cilium/cilium/issues/29714
-	endpointRestoreFailed       stringMatcher = "Unable to restore endpoint, ignoring"                                   // cf. https://github.com/cilium/cilium/issues/29716
-	unableRestoreRouterIP       stringMatcher = "Unable to restore router IP from filesystem"                            // cf. https://github.com/cilium/cilium/issues/29715
-	routerIPReallocated         stringMatcher = "Router IP could not be re-allocated"                                    // cf. https://github.com/cilium/cilium/issues/29715
-	cantFindIdentityInCache     stringMatcher = "unable to release identity: unable to find key in local cache"          // cf. https://github.com/cilium/cilium/issues/29732
-	keyAllocFailedFoundMaster   stringMatcher = "Found master key after proceeding with new allocation"                  // cf. https://github.com/cilium/cilium/issues/29738
-	cantRecreateMasterKey       stringMatcher = "unable to re-create missing master key"                                 // cf. https://github.com/cilium/cilium/issues/29738
-	cantUpdateCRDIdentity       stringMatcher = "Unable update CRD identity information with a reference for this node"  // cf. https://github.com/cilium/cilium/issues/29739
-	cantDeleteFromPolicyMap     stringMatcher = "cilium_call_policy: delete: key does not exist"                         // cf. https://github.com/cilium/cilium/issues/29754
-	hubbleQueueFull             stringMatcher = "hubble events queue is full"                                            // Because we run without monitor aggregation
-	reflectPanic                stringMatcher = "reflect.Value.SetUint using value obtained using unexported field"      // cf. https://github.com/cilium/cilium/issues/33766
-	svcNotFound                 stringMatcher = "service not found"                                                      // cf. https://github.com/cilium/cilium/issues/35768
-	gobgpWarnings               stringMatcher = "component=gobgp.BgpServerInstance"                                      // cf. https://github.com/cilium/cilium/issues/35799
-	etcdReconnection            stringMatcher = "Error observed on etcd connection, reconnecting etcd"                   // cf. https://github.com/cilium/cilium/issues/35865
-	epRestoreMissingState       stringMatcher = "Couldn't find state, ignoring endpoint"                                 // cf. https://github.com/cilium/cilium/issues/35869
-	mutationDetectorKlog        stringMatcher = "Mutation detector is enabled, this will result in memory leakage."      // cf. https://github.com/cilium/cilium/issues/35929
-	hubbleFailedCreatePeer      stringMatcher = "Failed to create peer client for peers synchronization"                 // cf. https://github.com/cilium/cilium/issues/35930
-	fqdnDpUpdatesTimeout        stringMatcher = "Timed out waiting for datapath updates of FQDN IP information"          // cf. https://github.com/cilium/cilium/issues/35931
-	longNetpolUpdate            stringMatcher = "onConfigUpdate(): Worker threads took longer than"                      // cf. https://github.com/cilium/cilium/issues/36067
-	failedToGetEpLabels         stringMatcher = "Failed to get identity labels for endpoint"                             // cf. https://github.com/cilium/cilium/issues/36068
-	failedCreategRPCClient      stringMatcher = "Failed to create gRPC client"                                           // cf. https://github.com/cilium/cilium/issues/36070
-	unableReallocateIngressIP   stringMatcher = "unable to re-allocate ingress IPv6"                                     // cf. https://github.com/cilium/cilium/issues/36072
-	fqdnMaxIPPerHostname        stringMatcher = "Raise tofqdns-endpoint-max-ip-per-hostname to mitigate this"            // cf. https://github.com/cilium/cilium/issues/36073
-	failedGetMetricsAPI         stringMatcher = "retrieve the complete list of server APIs: metrics.k8s.io/v1beta1"      // cf. https://github.com/cilium/cilium/issues/36085
-	ciliumNodeConfigDeprecation stringMatcher = "cilium.io/v2alpha1 CiliumNodeConfig will be deprecated in cilium v1.16" // cf. https://github.com/cilium/cilium/issues/37249
-	hubbleUIEnvVarFallback      stringMatcher = "using fallback value for env var"                                       // cf. https://github.com/cilium/hubble-ui/pull/940
-	k8sClientNetworkStatusError stringMatcher = "Network status error received, restarting client connections"           // cf. https://github.com/cilium/cilium/issues/37712
+	cantEnableJIT                    stringMatcher = "bpf_jit_enable: no such file or directory"                               // Because we run tests in Kind.
+	podCIDRUnavailable               stringMatcher = " PodCIDR not available"                                                  // cf. https://github.com/cilium/cilium/issues/29680
+	unableGetNode                    stringMatcher = "Unable to get node resource"                                             // cf. https://github.com/cilium/cilium/issues/29710
+	sessionAffinitySocketLB          stringMatcher = "Session affinity for host reachable services needs kernel"               // cf. https://github.com/cilium/cilium/issues/29736
+	objectHasBeenModified            stringMatcher = "the object has been modified; please apply your changes"                 // cf. https://github.com/cilium/cilium/issues/29712
+	noBackendResponse                stringMatcher = "The kernel does not support --service-no-backend-response=reject"        // cf. https://github.com/cilium/cilium/issues/29733
+	legacyBGPFeature                 stringMatcher = "You are using the legacy BGP feature"                                    // Expected when testing the legacy BGP feature.
+	etcdTimeout                      stringMatcher = "etcd client timeout exceeded"                                            // cf. https://github.com/cilium/cilium/issues/29714
+	endpointRestoreFailed            stringMatcher = "Unable to restore endpoint, ignoring"                                    // cf. https://github.com/cilium/cilium/issues/29716
+	unableRestoreRouterIP            stringMatcher = "Unable to restore router IP from filesystem"                             // cf. https://github.com/cilium/cilium/issues/29715
+	routerIPReallocated              stringMatcher = "Router IP could not be re-allocated"                                     // cf. https://github.com/cilium/cilium/issues/29715
+	cantFindIdentityInCache          stringMatcher = "unable to find key in local cache"                                       // cf. https://github.com/cilium/cilium/issues/29732
+	keyAllocFailedFoundMaster        stringMatcher = "Found master key after proceeding with new allocation"                   // cf. https://github.com/cilium/cilium/issues/29738
+	cantRecreateMasterKey            stringMatcher = "unable to re-create missing master key"                                  // cf. https://github.com/cilium/cilium/issues/29738
+	cantUpdateCRDIdentity            stringMatcher = "Unable update CRD identity information with a reference for this node"   // cf. https://github.com/cilium/cilium/issues/29739
+	cantDeleteFromPolicyMap          stringMatcher = "cilium_call_policy: delete: key does not exist"                          // cf. https://github.com/cilium/cilium/issues/29754
+	hubbleQueueFull                  stringMatcher = "hubble events queue is full"                                             // Because we run without monitor aggregation
+	reflectPanic                     stringMatcher = "reflect.Value.SetUint using value obtained using unexported field"       // cf. https://github.com/cilium/cilium/issues/33766
+	svcNotFound                      stringMatcher = "service not found"                                                       // cf. https://github.com/cilium/cilium/issues/35768
+	gobgpv3Warnings                  stringMatcher = "component=gobgp.BgpServerInstance"                                       // cf. https://github.com/cilium/cilium/issues/35799
+	gobgpNotification                stringMatcher = "sent notification"                                                       // cf. https://github.com/cilium/cilium/issues/35799
+	gobgpNoMatchingWithdrawPath      stringMatcher = "No matching path for withdraw found"                                     // cf. https://github.com/cilium/cilium/issues/35799
+	gobgpReceivedNotification        stringMatcher = "received notification"                                                   // cf. https://github.com/cilium/cilium/issues/35799
+	etcdReconnection                 stringMatcher = "Error observed on etcd connection, reconnecting etcd"                    // cf. https://github.com/cilium/cilium/issues/35865
+	failedToRetrieveRemoteClusterCfg stringMatcher = "failed to retrieve cluster configuration: not found"                     // Possible race condition in KVStoreMesh mode
+	epRestoreMissingState            stringMatcher = "Couldn't find state, ignoring endpoint"                                  // cf. https://github.com/cilium/cilium/issues/35869
+	mutationDetectorKlog             stringMatcher = "Mutation detector is enabled, this will result in memory leakage."       // cf. https://github.com/cilium/cilium/issues/35929
+	hubbleFailedCreatePeer           stringMatcher = "Failed to create peer client for peers synchronization"                  // cf. https://github.com/cilium/cilium/issues/35930
+	fqdnDpUpdatesTimeout             stringMatcher = "Timed out waiting for datapath updates of FQDN IP information"           // cf. https://github.com/cilium/cilium/issues/35931
+	longNetpolUpdate                 stringMatcher = "onConfigUpdate(): Worker threads took longer than"                       // cf. https://github.com/cilium/cilium/issues/36067
+	failedToGetEpLabels              stringMatcher = "Failed to get identity labels for endpoint"                              // cf. https://github.com/cilium/cilium/issues/36068
+	failedCreategRPCClient           stringMatcher = "Failed to create gRPC client"                                            // cf. https://github.com/cilium/cilium/issues/36070
+	unableReallocateIngressIP        stringMatcher = "unable to re-allocate ingress IPv6"                                      // cf. https://github.com/cilium/cilium/issues/36072
+	fqdnMaxIPPerHostname             stringMatcher = "Raise tofqdns-endpoint-max-ip-per-hostname to mitigate this"             // cf. https://github.com/cilium/cilium/issues/36073
+	failedGetMetricsAPI              stringMatcher = "retrieve the complete list of server APIs: metrics.k8s.io/v1beta1"       // cf. https://github.com/cilium/cilium/issues/36085
+	hubbleUIEnvVarFallback           stringMatcher = "using fallback value for env var"                                        // cf. https://github.com/cilium/hubble-ui/pull/940
+	k8sClientNetworkStatusError      stringMatcher = "Network status error received, restarting client connections"            // cf. https://github.com/cilium/cilium/issues/37712
+	localKeyAlreadyAllocated         stringMatcher = "local key already allocated with different value"                        // cf. https://github.com/cilium/cilium/issues/41280
+	eniIPv6BetaWarn                  stringMatcher = "(ipam.mode=eni, ipv6.enabled=true) is a beta feature"                    // Expected when running with IPv6 enabled in ENI IPAM mode.
+	kvstoreNodesGCWarn               stringMatcher = "Preventing GC of nodes in the KVStore due the nonexistence of"           // Fixed in v1.19 and later by https://github.com/cilium/cilium/pull/41712
+	kvstoreNodesGCWarn2              stringMatcher = "Received delete event for key which re-appeared within delay time"       // Fixed in v1.19 and later by https://github.com/cilium/cilium/pull/41712
+	kvstoreNodesGCWarn3              stringMatcher = "Received delete event for local key. Re-creating the key in the kvstore" // Fixed in v1.19 and later by https://github.com/cilium/cilium/pull/41712
 
 	k8sEndpointDeprecatedWarn stringMatcher = "v1 Endpoints is deprecated in v1.33+; use discovery.k8s.io/v1 EndpointSlice" // cf. https://github.com/cilium/cilium/issues/39105
 	proxylibDeprecatedWarn    stringMatcher = "The support for Envoy Go Extensions (proxylib) has been deprecated"          // cf. https://github.com/cilium/cilium/issues/38224
+	instanceOutOfInterfaces   stringMatcher = "Instance is out of interfaces"                                               // AWS ENI-at-capacity; benign for one node, fails if several nodes hit it. cf. https://github.com/cilium/cilium/issues/42092
+	// Expected when the operator lacks the ec2:GetSecurityGroupsForVpc
+	// privilege, as is the case for the default eksctl node role used by CI: the
+	// fallback to DescribeSecurityGroups is a supported configuration, and the
+	// warning is emitted at most once per operator process.
+	getSecurityGroupsForVpcUnauthorized stringMatcher = "Not authorized to use the EC2 GetSecurityGroupsForVpc API, falling back to DescribeSecurityGroups"
 
 	certloaderInitialLoadWarn stringMatcher = certloader.InitialLoadWarn // Expected when certificates are not yet mounted.
 
@@ -477,6 +612,8 @@ var (
 	// while we fix this issue.
 	// TODO: Remove this after: #31535 has been fixed.
 	knownIssueWireguardCollision = regexMatcher{regexp.MustCompile("Cannot forward proxied DNS lookup.*:51871.*bind: address already in use")} // from: https://github.com/cilium/cilium/issues/30901
+	// This error originates from vendored client-go code and is retried by its leader election loop.
+	vendoredLeaderElectionLeaseLockError = regexMatcher{regexp.MustCompile(`vendor/k8s\.io/client-go/tools/leaderelection/leaderelection\.go:\d+.*msg="Error retrieving lease lock"`)}
 	// Cf. https://github.com/cilium/cilium/issues/35803
 	endpointMapDeleteFailed = regexMatcher{regexp.MustCompile(`Ignoring error while deleting endpoint.*from map cilium_\w+: delete: key does not exist`)}
 	// envoyTLSWarningTemplate is the legitimate warning log for negative TLS SNI test case
@@ -486,6 +623,13 @@ var (
 	bgpAlphaResourceDeprecation = regexMatcher{regexp.MustCompile(`cilium.io/v2alpha1 CiliumBGP\w+ is deprecated`)}
 	// ccgAlphaResourceDeprecation is the same as bgpAlphaResourceDeprecation but for the CiliumCIDRGroup.
 	ccgAlphaResourceDeprecation = regexMatcher{regexp.MustCompile(`cilium.io/v2alpha1 CiliumCIDRGroup is deprecated`)}
+	// gobgpFailedToSend ignores GoBGPv4's "failed to send" warning, but only when the write
+	// failed because the peer connection was torn down (closed connection or broken pipe);
+	gobgpFailedToSend = regexMatcher{regexp.MustCompile(`osrg/gobgp/v4/pkg/server.*msg="failed to send".*(use of closed network connection|broken pipe)`)}
 	// For https://github.com/cilium/cilium/issues/39370: Fixed only in cilium version >= 1.18
 	linkNotFound = regexMatcher{regexp.MustCompile(`retrieving device .+\: Link not found`)}
+	// Client-go counterpart of failedToRetrieveLock, scoped to the cancelled read. cf. https://github.com/cilium/cilium/issues/45426
+	leaderElectionReadTimeout = regexMatcher{regexp.MustCompile(`Unexpected error when reading response body.*(request canceled|context deadline exceeded) \(Client\.Timeout or context cancellation while reading body\)`)}
+	// it can happen under memory pressure if the Kernel cannot allocate a new chunk of memory at that point in time, and it is automatically retried.
+	lbMapCannotAllocateMemory = regexMatcher{regexp.MustCompile(`Updating frontend failed.*update: cannot allocate memory`)}
 )

@@ -42,7 +42,7 @@ func TestMapState_AccumulateMapChanges_Ordered(t *testing.T) {
 		redirect bool
 		deny     bool
 		authReq  AuthRequirement
-		level    uint32
+		level    types.Priority
 	}
 	tests := []struct {
 		name  string
@@ -153,6 +153,7 @@ func TestMapState_AccumulateMapChanges_Ordered(t *testing.T) {
 		policyMapState := emptyMapState(logger)
 		epPolicy.policyMapState = policyMapState
 
+		features := precedenceFeatures
 		for _, x := range tt.args {
 			dir := trafficdirection.Egress
 			if x.ingress {
@@ -165,11 +166,19 @@ func TestMapState_AccumulateMapChanges_Ordered(t *testing.T) {
 			if x.redirect {
 				proxyPort = 1
 			}
-			value := newMapStateEntry(x.level, NilRuleOrigin, proxyPort, 0, x.deny, x.authReq)
-			policyMaps.AccumulateMapChanges(adds, deletes, []Key{key}, value)
+			verdict := types.Allow
+			if x.deny {
+				verdict = types.Deny
+			}
+			// pass verdict not used in this test
+			if x.authReq != NoAuthRequirement {
+				features |= authRules
+			}
+			value := newMapStateEntry(x.level, types.HighestPriority, types.LowestPriority, NilRuleOrigin, proxyPort, 0, verdict, x.authReq)
+			policyMaps.AccumulateMapChanges(0, 0, adds, deletes, key, value)
 		}
 		policyMaps.SyncMapChanges(types.MockSelectorSnapshot())
-		policyMaps.consumeMapChanges(epPolicy, allFeatures)
+		policyMaps.consumeMapChanges(epPolicy, features)
 		policyMapState.validatePortProto(t)
 		require.True(t, policyMapState.Equal(&tt.state), "%s (MapState):\n%s", tt.name, policyMapState.diff(&tt.state))
 	}
@@ -220,6 +229,7 @@ func TestOrderedPolicyValidation(t *testing.T) {
 	identityWorld := identity.ReservedIdentityWorld
 	identityWorldIPv4 := identity.ReservedIdentityWorldIPv4
 	identityWorldIPv6 := identity.ReservedIdentityWorldIPv6
+	identityAggregateWorld := identity.ReservedIdentityAggregateWorld
 	labelsWorld := labels.LabelWorld.LabelArray()
 
 	identity1111 := localIdentity(1111)
@@ -239,13 +249,16 @@ func TestOrderedPolicyValidation(t *testing.T) {
 	DenyEntry := types.DenyEntry()
 	denyEntry := NewMapStateEntry(DenyEntry).withLabels(labels.LabelArrayList{nil})
 
+	prioNormal := types.Priority(perTierRoundUp)
+
 	identityCache := identity.IdentityMap{
-		identityFoo:       labelsFoo,
-		identityWorld:     labelsWorld,
-		identityWorldIPv4: labels.LabelWorldIPv4.LabelArray(),
-		identityWorldIPv6: labels.LabelWorldIPv6.LabelArray(),
-		identity1111:      labels1111,
-		identity1100:      labels1100,
+		identityFoo:                             labelsFoo,
+		identityWorld:                           labelsWorld,
+		identityWorldIPv4:                       labels.LabelWorldIPv4.LabelArray(),
+		identityWorldIPv6:                       labels.LabelWorldIPv6.LabelArray(),
+		identity.ReservedIdentityAggregateWorld: labels.LabelsAggregateWorld.LabelArray(),
+		identity1111:                            labels1111,
+		identity1100:                            labels1100,
 	}
 	selectorCache := testNewSelectorCache(t, logger, identityCache)
 	identity := identity.NewIdentityFromLabelArray(identityFoo, labelsFoo)
@@ -257,12 +270,264 @@ func TestOrderedPolicyValidation(t *testing.T) {
 	}
 
 	tests := []struct {
-		name     string                // test name
-		entries  types.PolicyEntries   // starts at level 1, level increments for each rule
-		expected map[Key]mapStateEntry // expected MapState, optional
-		probes   []probe               // probes to test the policy, optional
+		name            string                // test name
+		skipDefaultDeny bool                  // skip setting DefaultDeny on 'entries'
+		entries         types.PolicyEntries   // starts at level 1, level increments for each rule
+		expected        map[Key]mapStateEntry // expected MapState, optional
+		probes          []probe               // probes to test the policy, optional
 	}{
 		{
+			name: "allow all",
+			entries: types.PolicyEntries{
+				&types.PolicyEntry{
+					L3:      types.ToSelectors(api.WildcardEndpointSelector),
+					Verdict: types.Allow,
+				},
+			},
+			expected: mapStateMap{
+				// default allow ingress
+				ingressKey(0, 0, 0, 0): newAllowEntryWithLabels(LabelsAllowAnyIngress),
+				egressKey(0, 0, 0, 0):  allowEntry.withLevel(0),
+			},
+			probes: []probe{
+				{key: egressKey(identityWorld, 6, 82, 16), found: true, entry: AllowEntry},
+			},
+		}, {
+			name: "allow TCP 80",
+			entries: types.PolicyEntries{
+				&types.PolicyEntry{
+					L3:      types.Selectors{},
+					L4:      port80,
+					Verdict: types.Allow,
+				},
+			},
+			expected: mapStateMap{
+				// default allow ingress
+				ingressKey(0, 0, 0, 0): newAllowEntryWithLabels(LabelsAllowAnyIngress),
+				egressKey(0, 6, 80, 0): allowEntry.withLevel(0),
+			},
+			probes: []probe{
+				{key: egressKey(identityWorld, 6, 80, 16), found: true, entry: AllowEntry},
+			},
+		}, {
+			name: "allow 1.1.1.1 deny port 80",
+			entries: types.PolicyEntries{
+				&types.PolicyEntry{
+					Tier:     0,
+					Priority: 0,
+					L3:       types.Selectors{},
+					L4:       port80,
+					Verdict:  types.Deny,
+				},
+				&types.PolicyEntry{
+					Tier:     1,
+					Priority: 0,
+					L3:       selectors1111,
+					L4:       port80_81,
+					Verdict:  types.Allow,
+				},
+				&types.PolicyEntry{
+					Tier:     1,
+					Priority: 1,
+					L3:       types.ToSelectors(api.WildcardEndpointSelector),
+					Verdict:  types.Allow,
+				},
+			},
+			expected: mapStateMap{
+				// default allow ingress
+				ingressKey(0, 0, 0, 0): newAllowEntryWithLabels(LabelsAllowAnyIngress),
+
+				egressKey(0, 6, 80, 0):             denyEntry.withLevel(0),
+				egressKey(identity1111, 6, 81, 15): allowEntry.withLevel(prioNormal),
+				egressKey(0, 0, 0, 0):              allowEntry.withLevel(prioNormal + 1),
+			},
+			probes: []probe{
+				{key: egressKey(identityWorld, 6, 80, 16), found: true, entry: DenyEntry},
+				{key: egressKey(identity1111, 6, 80, 16), found: true, entry: DenyEntry},
+				{key: egressKey(identity1111, 6, 81, 16), found: true, entry: AllowEntry},
+				{key: egressKey(identity1111, 6, 82, 16), found: true, entry: AllowEntry},
+				{key: egressKey(identityWorld, 6, 82, 16), found: true, entry: AllowEntry},
+			},
+		}, {
+			name: "PASS 1.1.1.1 over deny, allow shadowing PASS",
+			entries: types.PolicyEntries{
+				&types.PolicyEntry{
+					Tier:     0,
+					Priority: 0,
+					L3:       selectors1111,
+					Verdict:  types.Pass,
+				},
+				&types.PolicyEntry{
+					Tier:     0,
+					Priority: 1,
+					L3:       types.ToSelectors(api.WildcardEndpointSelector),
+					Verdict:  types.Deny,
+				},
+				&types.PolicyEntry{
+					Tier:     1,
+					Priority: 1,
+					L3:       selectors1111,
+					Verdict:  types.Allow,
+				},
+			},
+			expected: mapStateMap{
+				// default allow ingress
+				ingressKey(0, 0, 0, 0): newAllowEntryWithLabels(LabelsAllowAnyIngress),
+
+				egressKey(0, 0, 0, 0):            denyEntry.withLevel(2*prioNormal + 1),
+				egressKey(identity1111, 0, 0, 0): allowEntry.withLevel(1).withPassPriority(0, 0, 3*prioNormal),
+			},
+			probes: []probe{
+				{key: egressKey(identityWorld, 6, 80, 16), found: true, entry: DenyEntry},
+				{key: egressKey(identity1111, 6, 80, 16), found: true, entry: AllowEntry},
+				{key: egressKey(identity1111, 6, 81, 16), found: true, entry: AllowEntry},
+				{key: egressKey(identity1111, 6, 82, 16), found: true, entry: AllowEntry},
+				{key: egressKey(identityWorld, 6, 82, 16), found: true, entry: AllowEntry},
+			},
+		}, {
+			name: "PASS 1.1.1.1 over deny, allows shadowing PASS",
+			entries: types.PolicyEntries{
+				&types.PolicyEntry{
+					Tier:     0,
+					Priority: 0,
+					L3:       selectors1100,
+					Verdict:  types.Pass,
+				},
+				&types.PolicyEntry{
+					Tier:     0,
+					Priority: 1,
+					L3:       types.Selectors{},
+					L4:       port80,
+					Verdict:  types.Deny,
+				},
+				&types.PolicyEntry{
+					Tier:     1, // -> 1000, but covered by PASS -> 0
+					Priority: 0,
+					L3:       selectors1111,
+					Verdict:  types.Allow,
+				},
+				&types.PolicyEntry{
+					Tier:     1, // 1001, but covered by both PASS and allow
+					Priority: 1,
+					L3:       selectors1100,
+					Verdict:  types.Deny,
+				},
+				&types.PolicyEntry{
+					Tier:     2, // -> 2000
+					Priority: 0,
+					L3:       types.ToSelectors(api.WildcardEndpointSelector),
+					Verdict:  types.Deny,
+				},
+			},
+			expected: mapStateMap{
+				// default allow ingress
+				ingressKey(0, 0, 0, 0):           newAllowEntryWithLabels(LabelsAllowAnyIngress),
+				egressKey(0, 6, 80, 0):           denyEntry.withLevel(3*prioNormal + 1),
+				egressKey(identity1111, 0, 0, 0): allowEntry.withLevel(1).withPassPriority(0, 0, 4*prioNormal),
+				egressKey(identity1100, 0, 0, 0): denyEntry.withLevel(2).withPassPriority(0, 0, 4*prioNormal),
+				egressKey(0, 0, 0, 0):            denyEntry.withLevel(5 * prioNormal),
+			},
+			probes: []probe{
+				{key: egressKey(identityWorld, 6, 80, 16), found: true, entry: DenyEntry},
+				{key: egressKey(identity1111, 6, 80, 16), found: true, entry: AllowEntry},
+				{key: egressKey(identity1111, 6, 81, 16), found: true, entry: AllowEntry},
+				{key: egressKey(identity1111, 6, 82, 16), found: true, entry: AllowEntry},
+				{key: egressKey(identityWorld, 6, 82, 16), found: true, entry: AllowEntry},
+			},
+		}, {
+			name: "PASS 1.1.1.1 over deny",
+			entries: types.PolicyEntries{
+				&types.PolicyEntry{
+					Tier:     0,
+					Priority: 0,
+					L3:       selectors1111,
+					Verdict:  types.Pass,
+				},
+				&types.PolicyEntry{
+					Tier:     0,
+					Priority: 1,
+					L3:       selectors1111,
+					Verdict:  types.Deny,
+				},
+				&types.PolicyEntry{
+					Tier:     1,
+					Priority: 0,
+					L3:       selectors1111,
+					L4:       port80,
+					Verdict:  types.Allow,
+				},
+			},
+			expected: mapStateMap{
+				// default allow ingress
+				ingressKey(0, 0, 0, 0): newAllowEntryWithLabels(LabelsAllowAnyIngress),
+
+				// default deny egress
+				egressKey(0, 0, 0, 0): newDenyEntryWithLabels(LabelsDenyAnyEgress).withLevel(4 * prioNormal),
+
+				egressKey(identity1111, 0, 0, 0):  newDenyEntryWithLabels(LabelsDenyAnyEgress).withLevel(1*prioNormal+1).withPassPriority(0, 0, 3*prioNormal),
+				egressKey(identity1111, 6, 80, 0): allowEntry.withLevel(1),
+			},
+			probes: []probe{},
+		}, {
+			name:            "PASS 1.1.1.1 over deny with default allow",
+			skipDefaultDeny: true,
+			entries: types.PolicyEntries{
+				&types.PolicyEntry{
+					Tier:     0,
+					Priority: 0,
+					L3:       selectors1111,
+					Verdict:  types.Pass,
+				},
+				&types.PolicyEntry{
+					Tier:     0,
+					Priority: 1,
+					L3:       selectors1111,
+					Verdict:  types.Deny,
+				},
+				&types.PolicyEntry{
+					Tier:     1,
+					Priority: 0,
+					L3:       selectors1111,
+					L4:       port80,
+					Verdict:  types.Allow,
+				},
+			},
+			expected: mapStateMap{
+				// default allow ingress
+				ingressKey(0, 0, 0, 0):            newAllowEntryWithLabels(LabelsAllowAnyIngress),
+				egressKey(identity1111, 0, 0, 0):  newAllowEntryWithLabels(LabelsAllowAnyEgress).withLevel(1*prioNormal+1).withPassPriority(0, 0, 3*prioNormal),
+				egressKey(identity1111, 6, 80, 0): allowEntry.withLevel(1),
+				// default allow egress
+				egressKey(0, 0, 0, 0): newAllowEntryWithLabels(LabelsAllowAnyEgress).withLevel(4 * prioNormal),
+			},
+			probes: []probe{},
+		}, {
+			name:            "PASS 1.1.1.1 to lower-tier deny with non-consecutive tiers",
+			skipDefaultDeny: true,
+			entries: types.PolicyEntries{
+				&types.PolicyEntry{
+					Tier:     0,
+					Priority: 10,
+					L3:       selectors1111,
+					Verdict:  types.Pass,
+				},
+				&types.PolicyEntry{
+					Tier:     2,
+					Priority: 10,
+					L3:       selectors1111,
+					Verdict:  types.Deny,
+				},
+			},
+			expected: mapStateMap{
+				// default allow ingress
+				ingressKey(0, 0, 0, 0): newAllowEntryWithLabels(LabelsAllowAnyIngress),
+
+				egressKey(identity1111, 0, 0, 0): denyEntry.withLevel(1).withPassPriority(0, 0, 3*prioNormal),
+				// default allow egress
+				egressKey(0, 0, 0, 0): newAllowEntryWithLabels(LabelsAllowAnyEgress).withLevel(4 * prioNormal),
+			},
+			probes: []probe{},
+		}, {
 			name: "allow 1.1.1.1, deny 1.1.1.1",
 			// 0: allow 1.1.1.1
 			// 0: deny 1.1.1.1
@@ -270,11 +535,12 @@ func TestOrderedPolicyValidation(t *testing.T) {
 				&types.PolicyEntry{
 					L3:       selectors1111,
 					Priority: 0,
+					Verdict:  types.Allow,
 				},
 				&types.PolicyEntry{
 					L3:       selectors1111,
 					Priority: 0,
-					Deny:     true,
+					Verdict:  types.Deny,
 				},
 			},
 			expected: map[Key]mapStateEntry{
@@ -289,9 +555,7 @@ func TestOrderedPolicyValidation(t *testing.T) {
 				{key: egressKey(identity1111, 6, 81, 16), found: true, entry: DenyEntry},
 				{key: egressKey(identity1111, 6, 82, 16), found: true, entry: DenyEntry},
 			},
-		},
-
-		{
+		}, {
 			name: "allow 1.1.1.1, deny 1.1.1.1 (override)",
 			// -1. allow 1.1.1.1
 			// 1. deny 1.1.1.1
@@ -301,11 +565,12 @@ func TestOrderedPolicyValidation(t *testing.T) {
 				&types.PolicyEntry{
 					L3:       selectors1111,
 					Priority: -1,
+					Verdict:  types.Allow,
 				},
 				&types.PolicyEntry{
 					L3:       selectors1111,
 					Priority: 1,
-					Deny:     true,
+					Verdict:  types.Deny,
 				},
 			},
 			expected: map[Key]mapStateEntry{
@@ -329,11 +594,12 @@ func TestOrderedPolicyValidation(t *testing.T) {
 					L3:       selectors1111,
 					L4:       port80,
 					Priority: 0,
+					Verdict:  types.Allow,
 				},
 				&types.PolicyEntry{
 					L3:       selectors1111,
 					Priority: 1,
-					Deny:     true,
+					Verdict:  types.Deny,
 				},
 			},
 			expected: map[Key]mapStateEntry{
@@ -356,12 +622,13 @@ func TestOrderedPolicyValidation(t *testing.T) {
 				&types.PolicyEntry{
 					L3:       selectors1111,
 					Priority: 0,
+					Verdict:  types.Allow,
 				},
 				&types.PolicyEntry{
 					L3:       types.Selectors{},
 					L4:       port80,
 					Priority: 1,
-					Deny:     true,
+					Verdict:  types.Deny,
 				},
 			},
 			expected: map[Key]mapStateEntry{
@@ -389,16 +656,18 @@ func TestOrderedPolicyValidation(t *testing.T) {
 					L3:       selectors1111,
 					L4:       port80,
 					Priority: -1,
+					Verdict:  types.Allow,
 				},
 				&types.PolicyEntry{
 					L3:       types.Selectors{},
 					L4:       port80_81,
 					Priority: 0,
-					Deny:     true,
+					Verdict:  types.Deny,
 				},
 				&types.PolicyEntry{
 					L3:       selectors1111,
 					Priority: 0,
+					Verdict:  types.Allow,
 				},
 			},
 			expected: map[Key]mapStateEntry{
@@ -427,16 +696,18 @@ func TestOrderedPolicyValidation(t *testing.T) {
 					L3:       selectors1111,
 					L4:       port80_81,
 					Priority: 1,
+					Verdict:  types.Allow,
 				},
 				&types.PolicyEntry{
 					L3:       types.Selectors{},
 					L4:       port80,
 					Priority: 2,
-					Deny:     true,
+					Verdict:  types.Deny,
 				},
 				&types.PolicyEntry{
 					L3:       selectors1111,
 					Priority: 3,
+					Verdict:  types.Allow,
 				},
 			},
 			expected: map[Key]mapStateEntry{
@@ -465,16 +736,18 @@ func TestOrderedPolicyValidation(t *testing.T) {
 					L3:       selectors1111,
 					L4:       port80_81,
 					Priority: 1,
+					Verdict:  types.Allow,
 				},
 				&types.PolicyEntry{
 					L3:       types.Selectors{},
 					L4:       port80_90,
 					Priority: 2,
-					Deny:     true,
+					Verdict:  types.Deny,
 				},
 				&types.PolicyEntry{
 					L3:       selectors1111,
 					Priority: 3,
+					Verdict:  types.Allow,
 				},
 			},
 			expected: map[Key]mapStateEntry{
@@ -508,16 +781,18 @@ func TestOrderedPolicyValidation(t *testing.T) {
 					L3:       selectors1111,
 					L4:       port80_81,
 					Priority: 1,
+					Verdict:  types.Allow,
 				},
 				&types.PolicyEntry{
 					L3:       types.Selectors{},
 					L4:       port80_81,
 					Priority: 2,
-					Deny:     true,
+					Verdict:  types.Deny,
 				},
 				&types.PolicyEntry{
 					L3:       selectors1111,
 					Priority: 3,
+					Verdict:  types.Allow,
 				},
 			},
 			expected: map[Key]mapStateEntry{
@@ -547,16 +822,18 @@ func TestOrderedPolicyValidation(t *testing.T) {
 					L3:       selectors1111,
 					L4:       port80,
 					Priority: 1,
+					Verdict:  types.Allow,
 				},
 				&types.PolicyEntry{
 					L3:       types.Selectors{},
 					L4:       port80_81,
 					Priority: 2,
-					Deny:     true,
+					Verdict:  types.Deny,
 				},
 				&types.PolicyEntry{
 					L3:       selectors1100,
 					Priority: 3,
+					Verdict:  types.Allow,
 				},
 			},
 			expected: map[Key]mapStateEntry{
@@ -591,13 +868,14 @@ func TestOrderedPolicyValidation(t *testing.T) {
 					L4:       port80_81,
 					Ingress:  true,
 					Priority: 1,
+					Verdict:  types.Allow,
 				},
 				&types.PolicyEntry{
 					L3:       types.Selectors{},
 					L4:       port80,
 					Priority: 2,
 					Ingress:  true,
-					Deny:     true,
+					Verdict:  types.Deny,
 				},
 			},
 			expected: map[Key]mapStateEntry{
@@ -628,13 +906,14 @@ func TestOrderedPolicyValidation(t *testing.T) {
 					L3:       types.ToSelectors(types.APISelector(selectFoo_)),
 					Ingress:  true,
 					Priority: 1,
+					Verdict:  types.Allow,
 				},
 				&types.PolicyEntry{
 					L3:       types.Selectors{},
 					L4:       port80,
 					Priority: 2,
 					Ingress:  true,
-					Deny:     true,
+					Verdict:  types.Deny,
 				},
 			},
 			expected: map[Key]mapStateEntry{
@@ -659,13 +938,14 @@ func TestOrderedPolicyValidation(t *testing.T) {
 					L3:       types.ToSelectors(types.APISelector(selectFoo_)),
 					Ingress:  true,
 					Priority: 1,
-					Deny:     true,
+					Verdict:  types.Deny,
 				},
 				&types.PolicyEntry{
 					L3:       types.Selectors{},
 					L4:       portTCPAll,
 					Priority: 2,
 					Ingress:  true,
+					Verdict:  types.Allow,
 				},
 			},
 			expected: map[Key]mapStateEntry{
@@ -685,7 +965,7 @@ func TestOrderedPolicyValidation(t *testing.T) {
 			name: "ordered test-3a: CIDR deny with an earlier order allow hole",
 			// 42: allow 1.1.1.1:u53
 			// 43: deny 1.1.0.0/16
-			// 43: deny world
+			// 43: deny entity world
 			// 99: deny everything
 			// 100: deny everything
 			entries: types.PolicyEntries{
@@ -693,38 +973,38 @@ func TestOrderedPolicyValidation(t *testing.T) {
 					L3:       selectors1111,
 					L4:       portUDP53,
 					Priority: 42,
+					Verdict:  types.Allow,
 				},
 				&types.PolicyEntry{
 					L3:       types.ToSelectors(api.EntitySelectorMapping[api.EntityWorld]...),
-					Deny:     true,
+					Verdict:  types.Deny,
 					Priority: 43,
 				},
 				&types.PolicyEntry{
 					L3:       selectors1100,
-					Deny:     true,
+					Verdict:  types.Deny,
 					Priority: 43,
 				},
 				&types.PolicyEntry{
 					L3:       types.Selectors{},
-					Deny:     true,
+					Verdict:  types.Deny,
 					Priority: 99,
 				},
 				&types.PolicyEntry{
 					L3:       types.Selectors{},
-					Deny:     true,
+					Verdict:  types.Deny,
 					Priority: 100,
 				},
 			},
 
 			expected: map[Key]mapStateEntry{
 				// default allow ingress
-				ingressKey(0, 0, 0, 0):              newAllowEntryWithLabels(LabelsAllowAnyIngress),
-				egressKey(identity1111, 17, 53, 16): allowEntry.withLevel(0),
-				egressL3OnlyKey(identityWorld):      denyEntry.withLevel(1),
-				egressL3OnlyKey(identityWorldIPv4):  denyEntry.withLevel(1),
-				egressL3OnlyKey(identityWorldIPv6):  denyEntry.withLevel(1),
-				egressL3OnlyKey(identity1111):       denyEntry.withLevel(1),
-				egressL3OnlyKey(identity1100):       denyEntry.withLevel(1),
+				ingressKey(0, 0, 0, 0):                  newAllowEntryWithLabels(LabelsAllowAnyIngress),
+				egressKey(identity1111, 17, 53, 16):     allowEntry.withLevel(0),
+				egressL3OnlyKey(identityWorld):          denyEntry.withLevel(1),
+				egressL3OnlyKey(identityWorldIPv4):      denyEntry.withLevel(1),
+				egressL3OnlyKey(identityWorldIPv6):      denyEntry.withLevel(1),
+				egressL3OnlyKey(identityAggregateWorld): denyEntry.withLevel(1), // this prevents the CIDR entries from being inserted
 			},
 			probes: []probe{
 				{key: egressKey(identity1111, 6, 53, 16), found: true, entry: DenyEntry},
@@ -751,13 +1031,14 @@ func TestOrderedPolicyValidation(t *testing.T) {
 			repo := newPolicyDistillery(t, selectorCache)
 			for _, entry := range tt.entries {
 				entry.Subject = wildcardSubject
-				entry.DefaultDeny = true
+				if !tt.skipDefaultDeny {
+					entry.DefaultDeny = true
+				}
 			}
 			repo.MustAddPolicyEntries(tt.entries)
 			expected := testMapState(t, tt.expected)
 			logBuffer := new(bytes.Buffer)
 			repo = repo.WithLogBuffer(logBuffer)
-			repo.policyCache.insert(identity)
 			epp, err := repo.distillEndpointPolicy(logger, DummyOwner{}, identity)
 			require.NoError(t, err)
 			epp.Ready()

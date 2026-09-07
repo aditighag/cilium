@@ -279,8 +279,9 @@ at any given time – when updating the version used by a Cilium branch, you sho
 choose the older of the two supported versions.
 
 To update the minor version of Golang used by a release, you will first need to
-update the Renovate configuration found in ``.github/renovate.json5``. For each
-minor release, there will be a section that looks like this:
+update the Renovate configuration found in ``.github/renovate.json5``. Each minor
+release has a bucket of two adjacent entries there. The first holds the Golang
+ceiling for that branch:
 
 .. code-block:: json
 
@@ -289,19 +290,37 @@ minor release, there will be a section that looks like this:
         "docker.io/library/golang",
         "go"
       ],
-      "allowedVersions": "<1.21",
+      "allowedVersions": "<1.27",
       "matchBaseBranches": [
-        "v1.14"
+        "v1.20"
+      ]
+    }
+
+The second holds its ``golangci-lint`` ceiling:
+
+.. code-block:: json
+
+    {
+      "matchPackageNames": [
+        "golangci/golangci-lint"
+      ],
+      "allowedVersions": "<2.14",
+      "matchBaseBranches": [
+        "v1.20"
       ]
     }
 
 To allow Renovate to create a pull request that updates the minor Golang version,
-bump the ``allowedVersions`` constraint to include the desired minor version. Once
-this change has been merged, Renovate will create a pull request that updates the
-Golang version. Minor version updates may require further changes to ensure that
-all Cilium features are working correctly – use the CI to identify any issues that
-require further changes, and bring them to the attention of the Cilium maintainers
-in the pull request.
+bump the ``allowedVersions`` constraint of both entries to include the desired
+versions. Once this change has been merged, Renovate will create a pull request
+that updates the Golang version. Minor version updates may require further changes
+to ensure that all Cilium features are working correctly – use the CI to identify
+any issues that require further changes, and bring them to the attention of the
+Cilium maintainers in the pull request.
+
+Raise both ceilings in the same change. ``golangci-lint`` is compiled with the Go
+toolchain the branch installs, so it must not move ahead of the branch's Golang
+version.
 
 Once the CI is passing, the PR will be merged as part of the standard version
 upgrade process.
@@ -472,10 +491,8 @@ Minor version
    the target k8s versions in the GitHub action workflows.
 
 #. Once CI is green and PR has been merged, ping the CI team again so that they
-   update the `Cilium CI matrix`_, ``.github/maintainers-little-helper.yaml``,
-   and GitHub required PR checks accordingly.
-
-.. _Cilium CI matrix: https://docs.google.com/spreadsheets/d/1TThkqvVZxaqLR-Ela4ZrcJ0lrTJByCqrbdCjnI32_X0
+   update the ``.github/maintainers-little-helper.yaml`` and GitHub required PR
+   checks accordingly.
 
 Patch version
 ~~~~~~~~~~~~~
@@ -516,55 +533,6 @@ At last you might want to check the chart using the ``lint`` target:
 
    $ make -C install/kubernetes lint
 
-
-Optional: Docker and IPv6
--------------------------
-
-Note that these instructions are useful to you if you care about having IPv6
-addresses for your Docker containers.
-
-If you'd like IPv6 addresses, you will need to follow these steps:
-
-1) Edit ``/etc/docker/daemon.json`` and set the ``ipv6`` key to ``true``.
-
-   .. code-block:: json
-
-      {
-        "ipv6": true
-      }
-
-
-   If that doesn't work alone, try assigning a fixed range. Many people have
-   reported trouble with IPv6 and Docker. `Source here.
-   <https://github.com/moby/moby/issues/29443#issuecomment-495808871>`_
-
-   .. code-block:: json
-
-      {
-        "ipv6": true,
-        "fixed-cidr-v6": "2001:db8:1::/64"
-      }
-
-
-   And then:
-
-   .. code-block:: shell-session
-
-    ip -6 route add 2001:db8:1::/64 dev docker0
-    sysctl net.ipv6.conf.default.forwarding=1
-    sysctl net.ipv6.conf.all.forwarding=1
-
-
-2) Restart the docker daemon to pick up the new configuration.
-
-3) The new command for creating a network managed by Cilium:
-
-   .. code-block:: shell-session
-
-      $ docker network create --ipv6 --driver cilium --ipam-driver cilium cilium-net
-
-
-Now new containers will have an IPv6 address assigned to them.
 
 Debugging
 ---------
@@ -672,8 +640,8 @@ endpoints appearing in the "not-ready" state and never switching out of it:
     $ cilium-dbg endpoint list
     ENDPOINT   POLICY        IDENTITY   LABELS (source:key[=value])   IPv6                     IPv4            STATUS
                ENFORCEMENT
-    48896      Disabled      266        container:id.server           fd02::c0a8:210b:0:bf00   10.11.13.37     not-ready
-    60670      Disabled      267        container:id.client           fd02::c0a8:210b:0:ecfe   10.11.167.158   not-ready
+    48896      Disabled      266        k8s:id=server                 fd02::c0a8:210b:0:bf00   10.11.13.37     not-ready
+    60670      Disabled      267        k8s:id=client                 fd02::c0a8:210b:0:ecfe   10.11.167.158   not-ready
 
 Running ``cilium-dbg endpoint get`` for one of the endpoints will provide a
 description of known state about it, which includes eBPF verification logs.
@@ -690,21 +658,19 @@ for debugging what is going on inside them, for example:
 .. code-block:: shell-session
 
     # ls /sys/fs/bpf/tc/globals/
-    cilium_calls_15124  cilium_calls_48896        cilium_ct4_global       cilium_lb4_rr_seq       cilium_lb6_services  cilium_policy_v2_25729     cilium_policy_v2_60670       cilium_tunnel_map
-    cilium_calls_25729  cilium_calls_60670        cilium_ct6_global       cilium_lb4_services     cilium_lxc           cilium_policy_v2_3978      cilium_policy_v2_reserved_1
-    cilium_calls_3978   cilium_calls_netdev_ns_1  cilium_events           cilium_lb6_reverse_nat  cilium_policy        cilium_policy_v2_4314      cilium_policy_v2_reserved_2
-    cilium_calls_4314   cilium_calls_overlay_2    cilium_lb4_reverse_nat  cilium_lb6_rr_seq       cilium_policy_v2_15124  cilium_policy_v2_48896  cilium_reserved_policy
-    # bpf-map info /sys/fs/bpf/tc/globals/cilium_policy_v2_15124
+    cilium_calls_15124  cilium_calls_48896        cilium_ct4_global       cilium_lb4_rr_seq       cilium_lb6_services  cilium_policy_v3_25729     cilium_policy_v3_60670       cilium_tunnel_map
+    cilium_calls_25729  cilium_calls_60670        cilium_ct6_global       cilium_lb4_services     cilium_lxc           cilium_policy_v3_3978      cilium_policy_v3_reserved_1
+    cilium_calls_3978   cilium_calls_netdev_ns_1  cilium_events           cilium_lb6_reverse_nat  cilium_policy        cilium_policy_v3_4314      cilium_policy_v3_reserved_2
+    cilium_calls_4314   cilium_calls_overlay_2    cilium_lb4_reverse_nat  cilium_lb6_rr_seq       cilium_policy_v3_15124  cilium_policy_v3_48896  cilium_reserved_policy
+    # bpf-map info /sys/fs/bpf/tc/globals/cilium_policy_v3_15124
     Type:           Hash
     Key size:       8
     Value size:     24
     Max entries:    1024
     Flags:          0x0
-    # bpf-map dump /sys/fs/bpf/tc/globals/cilium_policy_v2_15124
+    # bpf-map dump /sys/fs/bpf/tc/globals/cilium_policy_v3_15124
     Key:
     00000000  6a 01 00 00 82 23 06 00                           |j....#..|
     Value:
     00000000  01 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
     00000010  00 00 00 00 00 00 00 00                           |........|
-
-

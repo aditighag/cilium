@@ -14,6 +14,7 @@ metadata:
     k8s-app: cilium
     app.kubernetes.io/name: cilium-agent
     app.kubernetes.io/part-of: cilium
+    helm.sh/chart: {{ include "cilium.chart" . }}
     {{- with .Values.commonLabels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -40,12 +41,17 @@ metadata:
   name: cilium-agent
   namespace: {{ include "cilium.namespace" . }}
   annotations:
-    prometheus.io/scrape: "true"
-    prometheus.io/port: {{ .Values.envoy.prometheus.port | quote }}
+    {{- with include "cilium.prometheusAnnotations" (list .Values.envoy.prometheus.port .Values.annotations) }}
+    {{- . | nindent 4 }}
+    {{- end }}
+    {{- with .Values.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
   labels:
     k8s-app: cilium
     app.kubernetes.io/name: cilium-agent
     app.kubernetes.io/part-of: cilium
+    helm.sh/chart: {{ include "cilium.chart" . }}
     {{- with .Values.commonLabels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

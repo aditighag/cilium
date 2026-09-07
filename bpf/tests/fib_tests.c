@@ -64,7 +64,7 @@ long mock_fib_lookup(void *ctx __maybe_unused,
 
 ASSIGN_CONFIG(bool, supports_fib_lookup_skip_neigh, true)
 
-CHECK("tc", "fib_do_redirect_happy_path")
+CHECK(PROG_TYPE, "fib_do_redirect_happy_path")
 int test1_check(struct __ctx_buff *ctx)
 {
 	test_init();
@@ -178,7 +178,7 @@ int test1_check(struct __ctx_buff *ctx)
 	test_finish();
 }
 
-CHECK("tc", "fib_redirect*_fib_lookup_flags")
+CHECK(PROG_TYPE, "fib_redirect*_fib_lookup_flags")
 int test2_check(struct __ctx_buff *ctx)
 {
 	test_init();
@@ -209,7 +209,7 @@ int test2_check(struct __ctx_buff *ctx)
 		if (!neigh_resolver_available())
 			test_fatal("expected neigh_resolver_available true");
 
-		fib_redirect_v4(ctx, 0, &hdr, true, true, &ext_err, &oif);
+		fib_redirect_v4(ctx, 0, &hdr, true, true, &ext_err, &oif, 0);
 
 		if (fib_lookup_recorder.flags != BPF_FIB_LOOKUP_SKIP_NEIGH)
 			test_fatal("expected flags %x, got %d",
@@ -227,7 +227,7 @@ int test2_check(struct __ctx_buff *ctx)
 		if (!neigh_resolver_available())
 			test_fatal("expected neigh_resolver_available true");
 
-		fib_redirect_v6(ctx, 0, &hdr6, true, true, &ext_err, &oif);
+		fib_redirect_v6(ctx, 0, &hdr6, true, true, &ext_err, &oif, 0);
 
 		if (fib_lookup_recorder.flags != BPF_FIB_LOOKUP_SKIP_NEIGH)
 			test_fatal("expected flags %x, got %d",

@@ -10,17 +10,21 @@ debug: export NOOPT=1 ## Builds Cilium by disabling inlining, compiler optimizat
 debug: export NOSTRIP=1
 debug: all
 
+# using $(MAKE) in mac-os for commands wrapped in a
+# linux container propagate a non existing path.
+# if mac-os, fall back to simply using `make`
+MAKE_CONTAINER=$(MAKE)
+ifeq ($(shell uname -s),Darwin)
+	MAKE_CONTAINER="make"
+endif
+
 include Makefile.defs
 
-SUBDIRS_CILIUM_CONTAINER := cilium-dbg daemon cilium-health bugtool hubble tools/mount tools/sysctlfix plugins/cilium-cni
+SUBDIRS_CILIUM_CONTAINER := cilium-dbg daemon cilium-health bugtool hubble tools/mount tools/sysctlfix tools/envoy-bootstrap-locality plugins/cilium-cni
 SUBDIR_OPERATOR_CONTAINER := operator
 SUBDIR_RELAY_CONTAINER := hubble-relay
 SUBDIR_CLUSTERMESH_APISERVER_CONTAINER := clustermesh-apiserver
 SUBDIR_STANDALONE_DNS_PROXY_CONTAINER := standalone-dns-proxy
-
-ifdef LIBNETWORK_PLUGIN
-SUBDIRS_CILIUM_CONTAINER += plugins/cilium-docker
-endif
 
 # Add the ability to override variables
 -include Makefile.override
@@ -38,7 +42,6 @@ SUBDIRS := $(filter-out $(foreach dir,$(SUBDIRS),$(dir)/%),$(SUBDIRS))
 # Because is treated as a Go package pattern, the special '...' sequence is supported,
 # meaning 'all subpackages of the given package'.
 TESTPKGS ?= ./...
-UNPARALLELTESTPKGS ?= ./pkg/datapath/linux/... ./pkg/datapath/loader/... ./pkg/datapath/neighbor/test/...
 
 GOTEST_BASE := -timeout 720s
 GOTEST_COVER_OPTS += -coverprofile=coverage.out
@@ -46,9 +49,9 @@ BENCH_EVAL := "."
 BENCH ?= $(BENCH_EVAL)
 BENCHFLAGS_EVAL := -bench=$(BENCH) -run=^$$ -benchtime=10s
 BENCHFLAGS ?= $(BENCHFLAGS_EVAL)
-SKIP_KVSTORES ?= "false"
-SKIP_K8S_CODE_GEN_CHECK ?= "true"
-SKIP_CUSTOMVET_CHECK ?= "false"
+SKIP_KVSTORES ?= false
+SKIP_K8S_CODE_GEN_CHECK ?= true
+SKIP_CUSTOMVET_CHECK ?= false
 
 JOB_BASE_NAME ?= cilium_test
 
@@ -81,7 +84,7 @@ build-container-hubble-relay:
 
 build-container-clustermesh-apiserver: ## Builds components required for the clustermesh-apiserver container.
 	$(MAKE) $(SUBMAKEOPTS) -C $(SUBDIR_CLUSTERMESH_APISERVER_CONTAINER) all
- 
+
 build-container-standalone-dns-proxy: ## Builds components required for standalone dns proxy container.
 	$(MAKE) $(SUBMAKEOPTS) -C $(SUBDIR_STANDALONE_DNS_PROXY_CONTAINER) all
 
@@ -89,37 +92,19 @@ $(SUBDIRS): force ## Execute default make target(make all) for the provided subd
 	@ $(MAKE) $(SUBMAKEOPTS) -C $@ all
 
 tests-privileged-only: ## Run Go only the unit tests that require elevated privileges.
-	@$(ECHO_CHECK) running privileged tests...
-	## We split tests into two parts: one that can be run in parallel
-	## and tests that cannot be run in parallel with other packages
-	## One drawback of this approach is that
-	## if first set of tests fails, second one is not run
-	{ PRIVILEGED_TESTS=true PATH=$(PATH):$(ROOT_DIR)/bpf $(GO_TEST) $(TEST_LDFLAGS) \
-		$(TESTPKGS) $(GOTEST_BASE) -run "TestPrivileged.*" $(GOTEST_COVER_OPTS) \
-	&& PRIVILEGED_TESTS=true PATH=$(PATH):$(ROOT_DIR)/bpf $(GO_TEST) $(TEST_LDFLAGS) \
-		$(UNPARALLELTESTPKGS) $(GOTEST_BASE) -run "TestPrivileged.*" \
-		-json -covermode=count -coverprofile=coverage2.out -p 1 --tags=unparallel; } | $(GOTEST_FORMATTER)
-	tail -n+2 coverage2.out >> coverage.out
-	rm coverage2.out
+	@$(ECHO_CHECK) running only privileged tests...
+	PRIVILEGED_TESTS=true PATH=$(PATH):$(ROOT_DIR)/bpf $(GO_TEST) $(TEST_LDFLAGS) \
+		$(TESTPKGS) $(GOTEST_BASE) -run "TestPrivileged.*" $(GOTEST_COVER_OPTS) | $(GOTEST_FORMATTER)
 	$(MAKE) generate-cov
 
 tests-privileged: ## Run Go tests including ones that require elevated privileges.
 	@$(ECHO_CHECK) running privileged tests...
-	## We split tests into two parts: one that can be run in parallel
-	## and tests that cannot be run in parallel with other packages
-	## One drawback of this approach is that
-	## if first set of tests fails, second one is not run
-	{ PRIVILEGED_TESTS=true PATH=$(PATH):$(ROOT_DIR)/bpf $(GO_TEST) $(TEST_LDFLAGS) \
-		$(TESTPKGS) $(GOTEST_BASE) $(GOTEST_COVER_OPTS) \
-	&& PRIVILEGED_TESTS=true PATH=$(PATH):$(ROOT_DIR)/bpf $(GO_TEST) $(TEST_LDFLAGS) \
-		$(UNPARALLELTESTPKGS) $(GOTEST_BASE) \
-		-json -covermode=count -coverprofile=coverage2.out -p 1 --tags=unparallel; } | $(GOTEST_FORMATTER)
-	tail -n+2 coverage2.out >> coverage.out
-	rm coverage2.out
+	PRIVILEGED_TESTS=true PATH=$(PATH):$(ROOT_DIR)/bpf $(GO_TEST) $(TEST_LDFLAGS) \
+		$(TESTPKGS) $(GOTEST_BASE) $(GOTEST_COVER_OPTS) | $(GOTEST_FORMATTER)
 	$(MAKE) generate-cov
 
 start-kvstores: ## Start running kvstores (etcd container) for integration tests.
-ifeq ($(SKIP_KVSTORES),"false")
+ifeq ($(SKIP_KVSTORES),false)
 	@echo Starting key-value store container...
 	-$(QUIET)$(CONTAINER_ENGINE) rm -f "cilium-etcd-test-container" 2> /dev/null
 	$(QUIET)$(CONTAINER_ENGINE) run -d \
@@ -136,7 +121,7 @@ ifeq ($(SKIP_KVSTORES),"false")
 endif
 
 stop-kvstores: ## Forcefully removes running kvstore components (etcd container) for integration tests.
-ifeq ($(SKIP_KVSTORES),"false")
+ifeq ($(SKIP_KVSTORES),false)
 	$(QUIET)$(CONTAINER_ENGINE) rm -f "cilium-etcd-test-container"
 endif
 
@@ -262,7 +247,7 @@ manifests: ## Generate K8s manifests e.g. CRD, RBAC etc.
 	contrib/scripts/k8s-manifests-gen.sh
 
 .PHONY: generate-apis
-generate-apis: generate-api generate-health-api generate-hubble-api generate-operator-api generate-kvstoremesh-api generate-sdp-api
+generate-apis: generate-api generate-health-api generate-hubble-api generate-operator-api generate-kvstoremesh-api generate-sdp-api generate-datapathplugins-api generate-clustermesh-api
 
 generate-api: api/v1/openapi.yaml ## Generate cilium-agent client, model and server code from openapi spec.
 	@$(ECHO_GEN)api/v1/openapi.yaml
@@ -277,6 +262,11 @@ generate-api: api/v1/openapi.yaml ## Generate cilium-agent client, model and ser
 		-f api/v1/openapi.yaml \
 		-C api/v1/cilium-client.yml \
 		-r hack/spdx-copyright-header.txt
+	@# go-swagger always emits omitempty, which is a no-op on the struct types
+	@# iputil.Addr and iputil.Prefix and on the array type mac.MAC: a zero value
+	@# would be marshalled as "" or "00:00:00:00:00:00" instead of being omitted.
+	@# omitzero is the appropriate annotation for those.
+	$(QUIET)$(SED) -i -E '/[[:space:]]\*?(iputil\.(Addr|Prefix)|mac\.MAC)[[:space:]]+`json:/s/,omitempty"`$$/,omitzero"`/' ./api/v1/models/*.go
 	@# sort goimports automatically
 	$(QUIET)$(GO) tool golang.org/x/tools/cmd/goimports -w ./api/v1/client ./api/v1/models ./api/v1/server
 
@@ -295,6 +285,8 @@ generate-health-api: api/v1/health/openapi.yaml ## Generate cilium-health client
 		-f api/v1/health/openapi.yaml \
 		-C api/v1/cilium-client.yml \
 		-r hack/spdx-copyright-header.txt
+	@# rewrite omitempty to omitzero on iputil and mac fields, see generate-api
+	$(QUIET)$(SED) -i -E '/[[:space:]]\*?(iputil\.(Addr|Prefix)|mac\.MAC)[[:space:]]+`json:/s/,omitempty"`$$/,omitzero"`/' ./api/v1/health/models/*.go
 	@# sort goimports automatically
 	$(QUIET)$(GO) tool golang.org/x/tools/cmd/goimports -w ./api/v1/health
 
@@ -313,6 +305,8 @@ generate-operator-api: api/v1/operator/openapi.yaml ## Generate cilium-operator 
 		-f api/v1/operator/openapi.yaml \
 		-C api/v1/cilium-client.yml \
 		-r hack/spdx-copyright-header.txt
+	@# rewrite omitempty to omitzero on iputil and mac fields, see generate-api
+	$(QUIET)$(SED) -i -E '/[[:space:]]\*?(iputil\.(Addr|Prefix)|mac\.MAC)[[:space:]]+`json:/s/,omitempty"`$$/,omitzero"`/' ./api/v1/operator/models/*.go
 	@# sort goimports automatically
 	$(QUIET)$(GO) tool golang.org/x/tools/cmd/goimports -w ./api/v1/operator
 
@@ -331,6 +325,8 @@ generate-kvstoremesh-api: api/v1/kvstoremesh/openapi.yaml ## Generate kvstoremes
 		-f api/v1/kvstoremesh/openapi.yaml \
 		-C api/v1/cilium-client.yml \
 		-r hack/spdx-copyright-header.txt
+	@# rewrite omitempty to omitzero on iputil and mac fields, see generate-api
+	$(QUIET)$(SED) -i -E '/[[:space:]]\*?(iputil\.(Addr|Prefix)|mac\.MAC)[[:space:]]+`json:/s/,omitempty"`$$/,omitzero"`/' ./api/v1/kvstoremesh/models/*.go
 	@# sort goimports automatically
 	$(QUIET)$(GO) tool golang.org/x/tools/cmd/goimports -w ./api/v1/kvstoremesh
 
@@ -341,6 +337,9 @@ generate-ztunnel-api: pkg/ztunnel/pb/ca_ztunnel.proto pkg/ztunnel/pb/workload_zt
 	$(QUIET) $(MAKE) $(SUBMAKEOPTS) -C pkg/ztunnel/pb
 
 generate-sdp-api: api/v1/standalone-dns-proxy/standalone-dns-proxy.proto
+	$(QUIET) $(MAKE) $(SUBMAKEOPTS) -C api/v1
+
+generate-datapathplugins-api:
 	$(QUIET) $(MAKE) $(SUBMAKEOPTS) -C api/v1
 
 define generate_k8s_protobuf
@@ -366,11 +365,30 @@ define K8S_PROTO_PACKAGES
 github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1
 github.com/cilium/cilium/pkg/k8s/slim/k8s/api/discovery/v1
 github.com/cilium/cilium/pkg/k8s/slim/k8s/api/networking/v1
-github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/apiextensions/v1
 github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1
 github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1beta1
 github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/util/intstr
 endef
+
+define CLUSTERMESH_PROTO_PACKAGES
+-github.com/cilium/cilium/pkg/k8s/slim/k8s/api/discovery/v1
+github.com/cilium/cilium/pkg/clustermesh/types/endpointslice/internal
+endef
+
+.PHONY: generate-clustermesh-api-local
+generate-clustermesh-api-local:
+	$(ASSERT_CILIUM_MODULE)
+
+	$(eval TMPDIR := $(shell mktemp -d -t cilium.tmpXXXXXXXX))
+
+	$(QUIET) $(call generate_k8s_protobuf,${CLUSTERMESH_PROTO_PACKAGES},"$(TMPDIR)")
+
+	$(QUIET) rm -rf "$(TMPDIR)"
+
+.PHONY: generate-clustermesh-api
+generate-clustermesh-api:
+	contrib/scripts/builder.sh \
+		$(MAKE_CONTAINER) -C /go/src/github.com/cilium/cilium/ generate-clustermesh-api-local
 
 .PHONY: generate-k8s-api-local
 generate-k8s-api-local:
@@ -385,22 +403,28 @@ generate-k8s-api-local:
 
 .PHONY: generate-k8s-api
 generate-k8s-api: ## Generate Cilium k8s API client, deepcopy and deepequal Go sources.
+	@$(ECHO_DOCKER)
 	contrib/scripts/builder.sh \
-		$(MAKE) -C /go/src/github.com/cilium/cilium/ generate-k8s-api-local
+		$(MAKE_CONTAINER) -C /go/src/github.com/cilium/cilium/ generate-k8s-api-local V=$(V)
 
 .PHONY: generate-bpf
 generate-bpf: ## Generate config structs from BPF objects using dpgen and Go skeletons with bpf2go
+	@$(ECHO_DOCKER)
 	contrib/scripts/builder.sh \
-		$(MAKE) -C /go/src/github.com/cilium/cilium/bpf generate
+		$(MAKE_CONTAINER) -C /go/src/github.com/cilium/cilium/bpf generate V=$(V)
+	contrib/scripts/builder.sh \
+		$(MAKE_CONTAINER) -C /go/src/github.com/cilium/cilium/examples/datapath-plugin generate V=$(V)
+	@$(ECHO_CHECK) bpf-skel
+	$(QUIET)git status bpf/ pkg/ --porcelain
 
 check-k8s-clusterrole: ## Ensures there is no diff between preflight's clusterrole and runtime's clusterrole.
 	./contrib/scripts/check-preflight-clusterrole.sh
 
 ##@ Development
-reload: ## Reload cilium-agent and cilium-docker systemd service after installing built binaries.
-	sudo systemctl stop cilium cilium-docker
+reload: ## Reload cilium-agent and systemd service after installing built binaries.
+	sudo systemctl stop cilium
 	sudo $(MAKE) install
-	sudo systemctl start cilium cilium-docker
+	sudo systemctl start cilium
 	sleep 6
 	cilium status
 
@@ -414,18 +438,32 @@ govet: ## Run govet on Go source files in the repository.
 	@$(ECHO_CHECK) vetting all packages...
 	$(QUIET) $(GO_VET) ./...
 
-.PHONY: custom-lint
-custom-lint: ## Run extra local linters
+.PHONY: custom-lint metrics-lint cloud-dep-check statedb-lint
+custom-lint: metrics-lint statedb-lint cloud-dep-check ## Run extra local linters
+
+metrics-lint:
 	$(ECHO_CHECK) metricslint
 	$(QUIET)$(MAKE) -C tools/metricslint
 	$(QUIET)tools/metricslint/metricslint ./...
 
+cloud-dep-check:
+	$(ECHO_CHECK) cloud-dep-check
+	$(QUIET)$(MAKE) -C tools/cloud-dep-check
+	$(QUIET)tools/cloud-dep-check/cilium-cloud-dep-check -root .
+
+statedb-lint:
+	$(ECHO_CHECK) statedblint
+	$(QUIET)$(MAKE) -C tools/statedblint
+	$(QUIET)tools/statedblint/statedblint ./...
+
 golangci-lint: ## Run golangci-lint
 ifneq (,$(findstring $(GOLANGCILINT_WANT_VERSION:v%=%),$(GOLANGCILINT_VERSION)))
 	@$(ECHO_CHECK) golangci-lint $(GOLANGCI_LINT_ARGS)
-	$(QUIET) GOLANGCI_LINT_ARGS="$(GOLANGCI_LINT_ARGS)" ./contrib/scripts/golangci-lint.sh
+	$(QUIET) ./contrib/scripts/golangci-lint.sh $(GOLANGCI_LINT_ARGS)
 else
-	$(QUIET) $(CONTAINER_ENGINE) run --rm -v `pwd`:/app -w /app -e GOLANGCI_LINT_ARGS="$(GOLANGCI_LINT_ARGS)" docker.io/golangci/golangci-lint:$(GOLANGCILINT_WANT_VERSION)@$(GOLANGCILINT_IMAGE_SHA) ./contrib/scripts/golangci-lint.sh
+	$(QUIET) $(CONTAINER_ENGINE) run --rm -ti -v `pwd`:/app -w /app \
+	docker.io/golangci/golangci-lint:$(GOLANGCILINT_WANT_VERSION)@$(GOLANGCILINT_IMAGE_SHA) \
+	./contrib/scripts/golangci-lint.sh $(GOLANGCI_LINT_ARGS)
 endif
 
 golangci-lint-fix: ## Run golangci-lint to automatically fix warnings
@@ -475,7 +513,7 @@ fuzz: check-fuzz # Run fuzzer tests briefly for FUZZ_TIME seconds
 	./test/fuzzing/go-fuzz.sh | $(GOTEST_FORMATTER)
 
 precheck: ## Peform build precheck for the source code.
-ifeq ($(SKIP_K8S_CODE_GEN_CHECK),"false")
+ifeq ($(SKIP_K8S_CODE_GEN_CHECK),false)
 	@$(ECHO_CHECK) contrib/scripts/check-k8s-code-gen.sh
 	$(QUIET) contrib/scripts/check-k8s-code-gen.sh
 endif
@@ -483,32 +521,24 @@ endif
 	$(QUIET) contrib/scripts/check-fmt.sh
 	@$(ECHO_CHECK) contrib/scripts/check-log-newlines.sh
 	$(QUIET) contrib/scripts/check-log-newlines.sh
-	@$(ECHO_CHECK) contrib/scripts/check-test-tags.sh
-	$(QUIET) contrib/scripts/check-test-tags.sh
-	@$(ECHO_CHECK) contrib/scripts/lock-check.sh
-	$(QUIET) contrib/scripts/lock-check.sh
 	@$(ECHO_CHECK) contrib/scripts/check-viper.sh
 	$(QUIET) contrib/scripts/check-viper.sh
-ifeq ($(SKIP_CUSTOMVET_CHECK),"false")
+ifeq ($(SKIP_CUSTOMVET_CHECK),false)
 	@$(ECHO_CHECK) contrib/scripts/custom-vet-check.sh
 	$(QUIET) contrib/scripts/custom-vet-check.sh
 endif
-	@$(ECHO_CHECK) contrib/scripts/check-time.sh
-	$(QUIET) contrib/scripts/check-time.sh
 	@$(ECHO_CHECK) contrib/scripts/check-go-testdata.sh
 	$(QUIET) contrib/scripts/check-go-testdata.sh
+	@$(ECHO_CHECK) contrib/scripts/check-go-test-tags.sh
+	$(QUIET) contrib/scripts/check-go-test-tags.sh
 	@$(ECHO_CHECK) contrib/scripts/check-source-info.sh
 	$(QUIET) contrib/scripts/check-source-info.sh
-	@$(ECHO_CHECK) contrib/scripts/check-xfrmstate.sh
-	$(QUIET) contrib/scripts/check-xfrmstate.sh
 	@$(ECHO_CHECK) contrib/scripts/check-legacy-header-guard.sh
 	$(QUIET) contrib/scripts/check-legacy-header-guard.sh
 	@$(ECHO_CHECK) contrib/scripts/check-datapathconfig.sh
 	$(QUIET) contrib/scripts/check-datapathconfig.sh
 	@$(ECHO_CHECK) $(GO) run ./tools/slogloggercheck .
 	$(QUIET)$(GO) run ./tools/slogloggercheck .
-	@$(ECHO_CHECK) contrib/scripts/check-fipsonly.sh
-	$(QUIET) contrib/scripts/check-fipsonly.sh
 	$(MAKE) check-fuzz
 
 pprof-heap: ## Get Go pprof heap profile.
@@ -569,7 +599,6 @@ help: ## Display help for the Makefile, from https://www.thapaliya.com/en/writin
 	$(call print_help_line,"docker-cilium-image","Build cilium-agent docker image")
 	$(call print_help_line,"dev-docker-image","Build cilium-agent development docker image")
 	$(call print_help_line,"dev-docker-image-debug","Build cilium-agent development docker debug image")
-	$(call print_help_line,"docker-plugin-image","Build cilium-docker plugin image")
 	$(call print_help_line,"docker-hubble-relay-image","Build hubble-relay docker image")
 	$(call print_help_line,"docker-clustermesh-apiserver-image","Build docker image for Cilium clustermesh APIServer")
 	$(call print_help_line,"docker-operator-image","Build cilium-operator docker image")
@@ -577,33 +606,98 @@ help: ## Display help for the Makefile, from https://www.thapaliya.com/en/writin
 	$(call print_help_line,"dev-docker-operator-*-image-debug","Build platform specific cilium-operator debug images(alibabacloud, aws, azure, generic)")
 	$(call print_help_line,"docker-*-image-unstripped","Build unstripped version of above docker images(cilium, hubble-relay, operator etc.)")
 	$(call print_help_line,"docker-standalone-dns-proxy-image","Build standalone DNS proxy docker image")
-	
-.PHONY: help clean clean-container dev-doctor force generate-api generate-health-api generate-operator-api generate-kvstoremesh-api generate-hubble-api generate-sdp-api install licenses-all veryclean run_bpf_tests run-builder gateway-api-conformance
+
+.PHONY: help clean clean-container dev-doctor force generate-api generate-health-api generate-operator-api generate-kvstoremesh-api generate-hubble-api generate-sdp-api install licenses-all veryclean run_bpf_tests run-builder gateway-api-conformance mcs-api-conformance
 force :;
 
+KIND_NET_CIDR ?= $(shell docker network inspect kind-cilium -f '{{json .IPAM.Config}}' | jq -r '.[] | select(.Subnet | test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+")) | .Subnet')
+GATEWAY_API_CONFORMANCE_USABLE_NETWORK_ADDRESSES?=$(shell echo ${KIND_NET_CIDR} | sed "s@0.0/16@255.206@")
+GATEWAY_API_CONFORMANCE_UNUSABLE_NETWORK_ADDRESSES?=$(shell echo ${KIND_NET_CIDR} | sed "s@0.0/16@255.216@")
+GATEWAY_API_CONFORMANCE_TEST_NAME ?= TestConformance
+GATEWAY_API_DIR ?=
 gateway-api-conformance: ## Run Gateway API conformance tests.
 	@$(ECHO_CHECK) running Gateway API conformance tests...
+	$(QUIET)set -e; \
+	modfile_flags=; \
+	if [ -n "$(GATEWAY_API_DIR)" ]; then \
+		if [ ! -f "$(GATEWAY_API_DIR)/go.mod" ] || [ ! -f "$(GATEWAY_API_DIR)/conformance/go.mod" ]; then \
+			echo "GATEWAY_API_DIR must contain go.mod and conformance/go.mod" >&2; \
+			exit 1; \
+		fi; \
+		gateway_api_dir="$$(cd "$(GATEWAY_API_DIR)" && pwd)"; \
+		tmpdir="$$(mktemp -d)"; \
+		trap 'rm -rf "$$tmpdir"' EXIT; \
+		cp "$(CURDIR)/go.mod" "$$tmpdir/cilium.mod"; \
+		cp "$(CURDIR)/go.sum" "$$tmpdir/cilium.sum"; \
+		$(GO) mod edit -modfile="$$tmpdir/cilium.mod" \
+			-replace=sigs.k8s.io/gateway-api="$$gateway_api_dir" \
+			-replace=sigs.k8s.io/gateway-api/conformance="$$gateway_api_dir/conformance"; \
+		modfile_flags="-mod=mod -modfile=$$tmpdir/cilium.mod"; \
+	fi; \
 	GATEWAY_API_CONFORMANCE_TESTS=1 \
-	GATEWAY_API_CONFORMANCE_USABLE_NETWORK_ADDRESSES=$${GATEWAY_API_CONFORMANCE_USABLE_NETWORK_ADDRESSES} \
-	GATEWAY_API_CONFORMANCE_UNUSABLE_NETWORK_ADDRESSES=$${GATEWAY_API_CONFORMANCE_UNUSABLE_NETWORK_ADDRESSES} \
-	$(GO_TEST) $(GO_TEST_FLAGS) -p 4 -v ./operator/pkg/gateway-api \
+	$(GO_TEST) $(GO_TEST_FLAGS) $$modfile_flags -p 4 -v ./operator/pkg/gateway-api \
 		$(GATEWAY_TEST_FLAGS) \
-		-test.run "TestConformance" \
+		-test.run $(GATEWAY_API_CONFORMANCE_TEST_NAME) \
 		-test.timeout=29m \
+		--gateway-class cilium \
+		--all-features \
+		--allow-crds-mismatch\
+		--cleanup-base-resources=false \
 	| $(GOTEST_FORMATTER)
 
-BPF_TEST ?= ""
-BPF_TEST_DUMP_CTX ?= ""
-BPF_TEST_VERBOSE ?= 0
+CILIUM_VERSION ?= $(shell git describe --tags --exact-match 2>/dev/null || echo "v.0.0.0-`git --no-pager log -1 --pretty='format:%cd-%h' --date='format:%Y%m%d%H%M%S'`" )
+gateway-api-conformance-report: ## Run Gateway API conformance tests with a conformance report.
+	@$(ECHO_CHECK) running Gateway API conformance tests with conformance report...
+	GATEWAY_API_CONFORMANCE_TESTS=1 \
+	GATEWAY_API_CONFORMANCE_USABLE_NETWORK_ADDRESSES=$(GATEWAY_API_CONFORMANCE_USABLE_NETWORK_ADDRESSES) \
+	GATEWAY_API_CONFORMANCE_UNUSABLE_NETWORK_ADDRESSES=$(GATEWAY_API_CONFORMANCE_UNUSABLE_NETWORK_ADDRESSES) \
+	$(GO_TEST) $(GO_TEST_FLAGS) -p 4 -v ./operator/pkg/gateway-api \
+		$(GATEWAY_TEST_FLAGS) \
+		-test.run $(GATEWAY_API_CONFORMANCE_TEST_NAME) \
+		-test.timeout=29m \
+		--gateway-class cilium \
+		--all-features \
+		--allow-crds-mismatch\
+		--cleanup-base-resources=true \
+		--organization cilium \
+		--project cilium \
+		--url github.com/cilium/cilium \
+		--version $(CILIUM_VERSION) \
+		--contact https://github.com/cilium/community/blob/main/roles/Maintainers.md \
+		--conformance-profiles GATEWAY-HTTP,GATEWAY-TLS,GATEWAY-GRPC,GATEWAY-TCP,GATEWAY-UDP,MESH-HTTP,MESH-GRPC \
+		--report-output=$(CURDIR)/gateway-api-conformance-report.yaml \
+	| $(GOTEST_FORMATTER)
+
+MCS_API_CONFORMANCE_TEST_NAME ?= TestConformance
+mcs-api-conformance: ## Run MCS-API conformance tests.
+	@$(ECHO_CHECK) running MCS-API conformance tests...
+	MCS_API_CONFORMANCE_TESTS=1 \
+	$(GO_TEST) $(GO_TEST_FLAGS) -p 4 -v ./pkg/clustermesh/mcsapi/conformance \
+		-organization Cilium -project Cilium -url 'https://cilium.io/' \
+		-version "$(VERSION)"  \
+		$(MCS_API_TEST_FLAGS) \
+		-test.run $(MCS_API_CONFORMANCE_TEST_NAME) \
+	| $(GOTEST_FORMATTER)
+
+BPF_TEST ?=
+BPF_TEST_DUMP_CTX ?=
+BPF_TEST_FLAGS ?=
+SUDO ?= sudo -E
 
 run_bpf_tests: ## Build and run the BPF unit tests using the cilium-builder container image.
-	DOCKER_ARGS="--privileged -v /sys:/sys" RUN_AS_ROOT=1 contrib/scripts/builder.sh \
-		$(MAKE) $(SUBMAKEOPTS) -j$(shell nproc) -C bpf/tests/ run \
-			"BPF_TEST=$(BPF_TEST)" \
-			"BPF_TEST_DUMP_CTX=$(BPF_TEST_DUMP_CTX)" \
-			"LOG_CODEOWNERS=$(LOG_CODEOWNERS)" \
-			"JUNIT_PATH=$(JUNIT_PATH)" \
-			"V=$(BPF_TEST_VERBOSE)"
+	contrib/scripts/builder.sh \
+		env MAKEFLAGS="$(filter-out --jobserver-auth=%,$(MAKEFLAGS))" \
+		make $(SUBMAKEOPTS) -C bpf/tests/ all
+	$(GO) test ./bpf/tests/bpftest \
+		-bpf-test-path $(ROOT_DIR)/bpf/tests \
+		-exec "$(SUDO)" \
+		$(GO_TEST_FLAGS) \
+		$(and $(filter 1,$(V)),-test.v) \
+		$(and $(RUN),-run $(RUN)) \
+		$(and $(BPF_TEST_DUMP_CTX),-dump-ctx) \
+		$(and $(BPF_TEST),-test $(BPF_TEST)) \
+		$(BPF_TEST_FLAGS) \
+	| $(GOTEST_FORMATTER)
 
 run-builder: ## Drop into a shell inside a container running the cilium-builder image.
 	DOCKER_ARGS="-it" contrib/scripts/builder.sh bash
@@ -616,5 +710,5 @@ renovate-local: ## Run a local linter for the renovate configuration
 		-e GITHUB_COM_TOKEN="$(RENOVATE_GITHUB_COM_TOKEN)" \
 		-v /tmp:/tmp \
 		-v $(ROOT_DIR):/usr/src/app \
-		docker.io/renovate/renovate:slim \
+		docker.io/renovate/renovate:latest \
 			renovate --platform=local

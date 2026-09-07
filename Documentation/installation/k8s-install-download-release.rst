@@ -4,20 +4,20 @@
     Please use the official rendered version released here:
     https://docs.cilium.io
 
-.. only:: stable
+Setup Helm repository:
 
-   Setup Helm repository:
+.. tabs::
 
-   .. code-block:: shell-session
+   .. group-tab:: Helm Repository
 
-      helm repo add cilium https://helm.cilium.io/
+      .. code-block:: shell-session
 
-.. only:: not stable
+         helm repo add cilium https://helm.cilium.io/
 
-   Download the Cilium release tarball and change to the kubernetes install directory:
+   .. group-tab:: OCI Registry
 
-   .. parsed-literal::
+      Cilium charts are also available via OCI registries (Quay.io and Docker Hub).
+      No setup required - you can install directly using ``oci://`` URLs.
 
-      curl -LO |SCM_ARCHIVE_LINK|
-      tar xzf |SCM_ARCHIVE_FILENAME|
-      cd |SCM_ARCHIVE_NAME|/install/kubernetes
+      See the :ref:`OCI Registry section <k8s_install_helm>` for more information,
+      including chart signing verification and digest-based installations.

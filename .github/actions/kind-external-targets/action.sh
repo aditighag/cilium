@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+set -euo pipefail
+
 LVH="$1"
 KINDNETWORK="$2"
 IP4TARGET="$3"
@@ -15,11 +17,26 @@ lvh_wrapper() {
 	fi
 }
 
+# Run the given command, retrying up to 5 times on failure.
+retry() {
+	local attempt
+	for attempt in $(seq 1 5); do
+		if "$@"; then
+			return 0
+		fi
+		echo "Attempt ${attempt}/5 of '$*' failed, retrying in 5s..." >&2
+		sleep 5
+	done
+	echo "::error::Command '$*' failed after 5 attempts" >&2
+	return 1
+}
+
 TARGETNAME=fake.external.service.cilium
 OTHERTARGETNAME=fake.external.service.other.cilium
 
-echo "external_target_name=$TARGETNAME" >> $GITHUB_OUTPUT
-echo "other_external_target_name=$OTHERTARGETNAME" >> $GITHUB_OUTPUT
+# Publish FQDNs, so that pod resolvers don't walk their ndots:5 search list.
+echo "external_target_name=$TARGETNAME." >> $GITHUB_OUTPUT
+echo "other_external_target_name=$OTHERTARGETNAME." >> $GITHUB_OUTPUT
 
 # Create a private key for the self signed CA
 openssl genrsa 2048 > ca-key.pem
@@ -113,20 +130,29 @@ http {
 EOF
 
 # Start our first external target
-CONTAINERID=$(lvh_wrapper docker run -d --name webserver --network $KINDNETWORK \
+retry lvh_wrapper docker run -d --name webserver --network $KINDNETWORK \
     --ip $IP4TARGET --ip6 $IP6TARGET \
     -v ./nginx.conf:/etc/nginx/nginx.conf:ro \
     -v ./external-service.cilium.crt:/etc/ssl/external-service.cilium.crt:ro \
     -v ./external-service.cilium.key:/etc/ssl/external-service.cilium.key:ro \
-    nginx)
+    nginx
 
 # Start the second external target
-CONTAINERID=$(lvh_wrapper docker run -d --name other-webserver --network $KINDNETWORK \
+retry lvh_wrapper docker run -d --name other-webserver --network $KINDNETWORK \
     --ip $IP4OTHERTARGET --ip6 $IP6OTHERTARGET \
     -v ./nginx.conf:/etc/nginx/nginx.conf:ro \
     -v ./external-service.cilium.crt:/etc/ssl/external-service.cilium.crt:ro \
     -v ./external-service.cilium.key:/etc/ssl/external-service.cilium.key:ro \
-    nginx)
+    nginx
+
+# Fail fast if either target did not actually come up.
+for container in webserver other-webserver; do
+	running=$(lvh_wrapper docker inspect -f '{{.State.Running}}' "$container")
+	if [ "$running" != "true" ]; then
+		echo "::error::External target container '$container' is not running (State.Running=$running)" >&2
+		exit 1
+	fi
+done
 
 # Get the current CoreDNS config file
 kubectl -n kube-system get configmap/coredns -o json | jq ".data.Corefile" -r  > Corefile

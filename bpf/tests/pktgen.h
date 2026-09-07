@@ -78,6 +78,15 @@ volatile const __u8 mac_host[] = host_mac_addr;
 
 #define v4_pod_cidr_size		24
 
+/* Node-specific PodCIDR (IPv6) */
+#define v6_pod_one_on_node_two_addr	{0xfd, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1}
+#define v6_pod_cidr_on_node_two_addr	{0xfd, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0}
+
+volatile const __u8 v6_pod_one_on_node_two[] = v6_pod_one_on_node_two_addr;
+volatile const __u8 v6_pod_cidr_on_node_two[] = v6_pod_cidr_on_node_two_addr;
+
+#define v6_pod_cidr_size		112
+
 #define v4_svc_loopback	IPV4(10, 245, 255, 31)
 #define v6_svc_loopback {0xfd, 0x05, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
 
@@ -101,15 +110,30 @@ volatile const __u8 v6_pod_three[] = v6_pod_three_addr;
 #define v6_node_three_addr {0xfd, 0x05, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3}
 
 #define v6_ext_node_one_addr {0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+#define v6_ext_node_two_addr {0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}
 
 volatile const __u8 v6_ext_node_one[] = v6_ext_node_one_addr;
+volatile const __u8 v6_ext_node_two[] = v6_ext_node_two_addr;
 
 volatile const __u8 v6_node_one[] = v6_node_one_addr;
 volatile const __u8 v6_node_two[] = v6_node_two_addr;
 volatile const __u8 v6_node_three[] = v6_node_three_addr;
 
+/* Link-local address of a node's native device, and the Neighbor Discovery
+ * multicast destinations.
+ */
+#define v6_node_one_ll_addr {0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+#define v6_all_nodes_mcast_addr {0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+#define v6_all_routers_mcast_addr {0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}
+
+volatile const __u8 v6_node_one_ll[] = v6_node_one_ll_addr;
+volatile const __u8 v6_all_nodes_mcast[] = v6_all_nodes_mcast_addr;
+volatile const __u8 v6_all_routers_mcast[] = v6_all_routers_mcast_addr;
+
 /* IPv6 addresses for services in the cluster */
 #define v6_svc_one_addr {0xfd, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+#define v6_svc_two_addr {0xfd, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}
+#define v6_svc_three_addr {0xfd, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3}
 
 volatile const __u8 v6_svc_one[] = v6_svc_one_addr;
 
@@ -453,8 +477,8 @@ struct tcphdr *pktgen__push_default_tcphdr(struct pktgen *builder)
 		return 0;
 
 	hdr->syn = 1;
-	hdr->seq = 123456;
-	hdr->window = 65535;
+	hdr->seq = bpf_htonl(123456);
+	hdr->window = bpf_htons(65535);
 
 	/* In most cases the doff is 5, so a good default if we can't
 	 * calc the actual offset

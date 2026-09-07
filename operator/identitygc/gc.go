@@ -62,10 +62,7 @@ type GC struct {
 	clusterInfo    cmtypes.ClusterInfo
 	allocationMode string
 
-	gcInterval       time.Duration
-	heartbeatTimeout time.Duration
-	gcRateInterval   time.Duration
-	gcRateLimit      int64
+	gcInterval time.Duration
 
 	wp             *workerpool.WorkerPool
 	heartbeatStore *heartbeatStore
@@ -105,9 +102,6 @@ func registerGC(p params) {
 		clusterInfo:         p.ClusterInfo,
 		allocationMode:      p.SharedCfg.IdentityAllocationMode,
 		gcInterval:          p.Cfg.Interval,
-		heartbeatTimeout:    p.Cfg.HeartbeatTimeout,
-		gcRateInterval:      p.Cfg.RateInterval,
-		gcRateLimit:         p.Cfg.RateLimit,
 		heartbeatStore: newHeartbeatStore(
 			p.Cfg.HeartbeatTimeout,
 			p.Logger,
@@ -147,7 +141,9 @@ func registerGC(p params) {
 				gc.allocationMode == option.IdentityAllocationModeDoubleWriteReadCRD ||
 				gc.allocationMode == option.IdentityAllocationModeDoubleWriteReadKVstore {
 				// CRD mode GC runs in an additional goroutine
-				gc.mgr.RemoveAllAndWait()
+				if gc.mgr != nil {
+					gc.mgr.RemoveAllAndWait()
+				}
 			}
 			// Close the worker pool first to ensure all goroutines complete
 			// before stopping the rate limiter they depend on

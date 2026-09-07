@@ -6,7 +6,6 @@ package connector
 import (
 	"fmt"
 	"log/slog"
-	"net"
 
 	"github.com/vishvananda/netlink"
 
@@ -16,26 +15,10 @@ import (
 	"github.com/cilium/cilium/pkg/mac"
 )
 
-// SetupNetkit sets up the net interface, the temporary interface and fills up some
-// endpoint fields such as mac, NodeMac, ifIndex and ifName. Returns a pointer for the
-// created netkit, a pointer for the temporary link, the name of the temporary link
-// and error if something fails.
-func SetupNetkit(defaultLogger *slog.Logger, id string, cfg LinkConfig, l2Mode bool, sysctl sysctl.Sysctl) (*netlink.Netkit, netlink.Link, string, error) {
-	if id == "" {
-		return nil, nil, "", fmt.Errorf("invalid: empty ID")
-	}
-
-	lxcIfName := Endpoint2IfName(id)
-	tmpIfName := Endpoint2TempIfName(id)
-
-	netkit, peer, err := SetupNetkitWithNames(defaultLogger, lxcIfName, tmpIfName, cfg, l2Mode, sysctl)
-	return netkit, peer, tmpIfName, err
-}
-
-// SetupNetkitWithNames sets up the net interface, the peer interface and fills up some
-// endpoint fields such as mac, NodeMac, ifIndex and ifName. Returns a pointer for the
-// created netkit, a pointer for the peer link and error if something fails.
-func SetupNetkitWithNames(defaultLogger *slog.Logger, lxcIfName, peerIfName string, cfg LinkConfig, l2Mode bool, sysctl sysctl.Sysctl) (*netlink.Netkit, netlink.Link, error) {
+// setupNetkitPair sets up the host-facing interface, the peer interface and fills
+// up some endpoint fields such as mac, NodeMac, ifIndex and ifName. Returns a pointer
+// for the created netkit, a pointer for the peer link and error if something fails.
+func setupNetkitPair(defaultLogger *slog.Logger, cfg LinkConfig, l2Mode bool, sysctl sysctl.Sysctl) (*netlink.Netkit, netlink.Link, error) {
 	logger := defaultLogger.With(logfields.LogSubsys, "endpoint-connector")
 	var epHostMAC, epLXCMAC mac.MAC
 	var err error
@@ -64,9 +47,9 @@ func SetupNetkitWithNames(defaultLogger *slog.Logger, lxcIfName, peerIfName stri
 	}
 	netkit := &netlink.Netkit{
 		LinkAttrs: netlink.LinkAttrs{
-			Name:         lxcIfName,
+			Name:         cfg.HostIfName,
 			TxQLen:       1000,
-			HardwareAddr: net.HardwareAddr(epHostMAC),
+			HardwareAddr: epHostMAC.HardwareAddr(),
 		},
 		Mode:       mode,
 		Policy:     netlink.NETKIT_POLICY_FORWARD,
@@ -84,8 +67,8 @@ func SetupNetkitWithNames(defaultLogger *slog.Logger, lxcIfName, peerIfName stri
 		DesiredTailroom: uint16(cfg.DeviceTailroom),
 	}
 	peerAttr := &netlink.LinkAttrs{
-		Name:         peerIfName,
-		HardwareAddr: net.HardwareAddr(epLXCMAC),
+		Name:         cfg.PeerIfName,
+		HardwareAddr: epLXCMAC.HardwareAddr(),
 	}
 	netkit.SetPeerAttrs(peerAttr)
 
@@ -105,7 +88,7 @@ func SetupNetkitWithNames(defaultLogger *slog.Logger, lxcIfName, peerIfName stri
 	}()
 
 	logger.Debug("Created netkit pair",
-		logfields.NetkitPair, []string{peerIfName, lxcIfName},
+		logfields.NetkitPair, []string{cfg.HostIfName, cfg.PeerIfName},
 		logfields.DeviceHeadroom, netkit.DesiredHeadroom,
 		logfields.DeviceTailroom, netkit.DesiredTailroom,
 	)
@@ -113,19 +96,14 @@ func SetupNetkitWithNames(defaultLogger *slog.Logger, lxcIfName, peerIfName stri
 	// Disable reverse path filter on the host side netkit peer to allow
 	// container addresses to be used as source address when the linux
 	// stack performs routing.
-	err = DisableRpFilter(sysctl, lxcIfName)
+	err = DisableRpFilter(sysctl, cfg.HostIfName)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	peer, err := validateNetkitPair(logger, lxcIfName, peerIfName, cfg)
+	peer, err := validateNetkitPair(logger, cfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("netkit validation failed: %w", err)
-	}
-
-	err = configurePair(netkit, peer, cfg)
-	if err != nil {
-		return nil, nil, err
 	}
 
 	return netkit, peer, nil
@@ -133,10 +111,10 @@ func SetupNetkitWithNames(defaultLogger *slog.Logger, lxcIfName, peerIfName stri
 
 // validateNetkitPair queries the kernel for a copy of the underlying device attributes
 // for both the lxc host interface and the peer interface.
-func validateNetkitPair(logger *slog.Logger, lxcIfName string, peerIfName string, cfg LinkConfig) (netlink.Link, error) {
+func validateNetkitPair(logger *slog.Logger, cfg LinkConfig) (netlink.Link, error) {
 	// Query the kernel for the host link attributes, so we can verify the kernel
 	// has applied the configuration we expected.
-	hostLink, err := safenetlink.LinkByName(lxcIfName)
+	hostLink, err := safenetlink.LinkByName(cfg.HostIfName)
 	if err != nil {
 		return nil, fmt.Errorf("unable to lookup netkit host link: %w", err)
 	}
@@ -146,7 +124,7 @@ func validateNetkitPair(logger *slog.Logger, lxcIfName string, peerIfName string
 		return nil, fmt.Errorf("host link does not appear to be a Netkit device")
 	}
 
-	peerLink, err := safenetlink.LinkByName(peerIfName)
+	peerLink, err := safenetlink.LinkByName(cfg.PeerIfName)
 	if err != nil {
 		return nil, fmt.Errorf("unable to lookup netkit peer link: %w", err)
 	}
@@ -156,24 +134,18 @@ func validateNetkitPair(logger *slog.Logger, lxcIfName string, peerIfName string
 		return nil, fmt.Errorf("peer link does not appear to be a Netkit device")
 	}
 
-	// Validate the kernel supports Scrub functionality.
-	if !hostDevice.SupportsScrub() || !peerDevice.SupportsScrub() {
-		logger.Warn("kernel does not support IFLA_NETKIT_SCRUB, some features may not work with netkit",
-			logfields.NetkitPair, []string{hostDevice.Name, peerDevice.Name})
-	}
-
 	// Verify we have the correct buffer margins configured. We accept a margin that
 	// is greater than what we requested, just in case it's ever rounded or aligned
 	// within the kernel.
 	if hostDevice.Headroom < cfg.DeviceHeadroom || hostDevice.Tailroom < cfg.DeviceTailroom {
 		logger.Warn("unexpected buffer margins on host link",
-			logfields.Device, lxcIfName,
+			logfields.Device, cfg.HostIfName,
 			logfields.DeviceHeadroom, hostDevice.Headroom,
 			logfields.DeviceTailroom, hostDevice.Tailroom)
 	}
 	if peerDevice.Headroom != hostDevice.Headroom || peerDevice.Tailroom != hostDevice.Tailroom {
 		return nil, fmt.Errorf("mismatched buffer margins on peer link %s (%s:%d %s:%d)",
-			peerIfName,
+			cfg.PeerIfName,
 			logfields.DeviceHeadroom, peerDevice.Headroom,
 			logfields.DeviceTailroom, peerDevice.Tailroom)
 	}

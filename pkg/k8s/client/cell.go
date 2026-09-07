@@ -18,21 +18,22 @@ import (
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/connrotation"
 	mcsapi_clientset "sigs.k8s.io/mcs-api/pkg/client/clientset/versioned"
+	mcsapi_v1alpha1 "sigs.k8s.io/mcs-api/pkg/client/clientset/versioned/typed/apis/v1alpha1"
+	mcsapi_v1beta1 "sigs.k8s.io/mcs-api/pkg/client/clientset/versioned/typed/apis/v1beta1"
+	policy_clientset "sigs.k8s.io/network-policy-api/pkg/client/clientset/versioned"
+	policy_v1alpha1 "sigs.k8s.io/network-policy-api/pkg/client/clientset/versioned/typed/apis/v1alpha1"
+	policy_v1alpha2 "sigs.k8s.io/network-policy-api/pkg/client/clientset/versioned/typed/apis/v1alpha2"
 
 	"github.com/cilium/cilium/pkg/controller"
 	cilium_clientset "github.com/cilium/cilium/pkg/k8s/client/clientset/versioned"
 	k8smetrics "github.com/cilium/cilium/pkg/k8s/metrics"
-	slim_apiextclientsetscheme "github.com/cilium/cilium/pkg/k8s/slim/k8s/apiextensions-client/clientset/versioned/scheme"
-	slim_apiext_clientset "github.com/cilium/cilium/pkg/k8s/slim/k8s/apiextensions-clientset"
-	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
-	slim_metav1beta1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1beta1"
 	slim_clientset "github.com/cilium/cilium/pkg/k8s/slim/k8s/client/clientset/versioned"
 	k8sversion "github.com/cilium/cilium/pkg/k8s/version"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -74,16 +75,40 @@ type (
 	MCSAPIClientset     = mcsapi_clientset.Clientset
 	KubernetesClientset = kubernetes.Clientset
 	SlimClientset       = slim_clientset.Clientset
-	APIExtClientset     = slim_apiext_clientset.Clientset
+	APIExtClientset     = apiext_clientset.Clientset
 	CiliumClientset     = cilium_clientset.Clientset
+	PolicyClientset     = policy_clientset.Clientset
+)
+
+// mcsAPIInterface and policyInterface mirror the upstream clientset interfaces
+// without their Discovery() method. The mcs-api and network-policy-api clientsets
+// are generated in their own repositories and vendored pre-generated, and their
+// code-generator predates the change that widened Discovery() to return a
+// discovery.DiscoveryInterfaces: they still return a discovery.DiscoveryInterface,
+// while the clientsets generated from this repository do not. Embedding the
+// upstream interfaces as-is would therefore declare Discovery() twice with
+// conflicting signatures. Drop these mirrors once both projects regenerate their
+// clientsets.
+type (
+	mcsAPIInterface interface {
+		MulticlusterV1alpha1() mcsapi_v1alpha1.MulticlusterV1alpha1Interface
+		MulticlusterV1beta1() mcsapi_v1beta1.MulticlusterV1beta1Interface
+	}
+
+	policyInterface interface {
+		PolicyV1alpha1() policy_v1alpha1.PolicyV1alpha1Interface
+		PolicyV1alpha2() policy_v1alpha2.PolicyV1alpha2Interface
+	}
 )
 
 // Clientset is a composition of the different client sets used by Cilium.
 type Clientset interface {
-	mcsapi_clientset.Interface
+	mcsAPIInterface
 	kubernetes.Interface
 	apiext_clientset.Interface
 	cilium_clientset.Interface
+	policyInterface
+	dynamic.Interface
 	Getters
 
 	// Slim returns the slim client, which contains some of the same APIs as the
@@ -108,6 +133,8 @@ type compositeClientset struct {
 	*KubernetesClientset
 	*APIExtClientset
 	*CiliumClientset
+	*PolicyClientset
+	*dynamic.DynamicClient
 	ClientsetGetters
 
 	controller        *controller.Manager
@@ -117,6 +144,8 @@ type compositeClientset struct {
 	closeAllConns     func()
 	restConfigManager *restConfigManager
 }
+
+var _ Clientset = (*compositeClientset)(nil)
 
 // ConfigureK8sClientsetDialer provides an optional extension point
 // to configure the dialer used by the clientset.
@@ -173,6 +202,8 @@ func newClientsetForUserAgent(params compositeClientsetParams, name string) (Cli
 		}
 	}
 
+	client.ClientsetGetters = ClientsetGetters{Client: &client}
+
 	// Slim and K8s clients use protobuf marshalling.
 	rc.ContentConfig.ContentType = `application/vnd.kubernetes.protobuf`
 
@@ -181,7 +212,12 @@ func newClientsetForUserAgent(params compositeClientsetParams, name string) (Cli
 		return nil, nil, fmt.Errorf("unable to create slim k8s client: %w", err)
 	}
 
-	client.APIExtClientset, err = slim_apiext_clientset.NewForConfigAndClient(rc, httpClient)
+	client.DynamicClient, err = dynamic.NewForConfigAndClient(rc, httpClient)
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to create k8s dynamic client: %w", err)
+	}
+
+	client.APIExtClientset, err = apiext_clientset.NewForConfigAndClient(rc, httpClient)
 	if err != nil {
 		return nil, nil, fmt.Errorf("unable to create apiext k8s client: %w", err)
 	}
@@ -196,7 +232,10 @@ func newClientsetForUserAgent(params compositeClientsetParams, name string) (Cli
 		return nil, nil, fmt.Errorf("unable to create k8s client: %w", err)
 	}
 
-	client.ClientsetGetters = ClientsetGetters{&client}
+	client.PolicyClientset, err = policy_clientset.NewForConfigAndClient(rc, httpClient)
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to create policy k8s client: %w", err)
+	}
 
 	// The cilium client uses JSON marshalling.
 	rc.ContentConfig.ContentType = `application/json`
@@ -217,7 +256,7 @@ func (c *compositeClientset) Slim() slim_clientset.Interface {
 	return c.slim
 }
 
-func (c *compositeClientset) Discovery() discovery.DiscoveryInterface {
+func (c *compositeClientset) Discovery() discovery.DiscoveryInterfaces {
 	return c.KubernetesClientset.Discovery()
 }
 
@@ -427,11 +466,4 @@ func NewClientBuilder(params compositeClientsetParams) ClientBuilderFunc {
 		}
 		return c, nil
 	}
-}
-
-func init() {
-	// Register the metav1.Table and metav1.PartialObjectMetadata for the
-	// apiextclientset.
-	utilruntime.Must(slim_metav1.AddMetaToScheme(slim_apiextclientsetscheme.Scheme))
-	utilruntime.Must(slim_metav1beta1.AddMetaToScheme(slim_apiextclientsetscheme.Scheme))
 }

@@ -22,6 +22,7 @@ import (
 	restapi "github.com/cilium/cilium/api/v1/server/restapi/bgp"
 	"github.com/cilium/cilium/pkg/bgp/agent"
 	"github.com/cilium/cilium/pkg/bgp/api"
+	"github.com/cilium/cilium/pkg/bgp/config"
 	"github.com/cilium/cilium/pkg/bgp/manager/instance"
 	"github.com/cilium/cilium/pkg/bgp/manager/reconciler"
 	"github.com/cilium/cilium/pkg/bgp/manager/tables"
@@ -31,7 +32,6 @@ import (
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
-	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/time"
 )
 
@@ -44,7 +44,7 @@ type bgpRouterManagerParams struct {
 	Logger              *slog.Logger
 	Lifecycle           cell.Lifecycle
 	JobGroup            job.Group
-	DaemonConfig        *option.DaemonConfig
+	BGPConfig           config.BGPConfig
 	Metrics             *BGPManagerMetrics
 	DB                  *statedb.DB
 	ReconcileErrorTable statedb.RWTable[*tables.BGPReconcileError]
@@ -121,6 +121,8 @@ type BGPRouterManager struct {
 	DB                  *statedb.DB
 	ReconcileErrorTable statedb.RWTable[*tables.BGPReconcileError]
 
+	BGPConfig config.BGPConfig
+
 	// running is set when the manager is running, and unset when it is stopped.
 	running bool
 
@@ -137,7 +139,7 @@ type BGPRouterManager struct {
 
 // NewBGPRouterManager constructs a new BGPRouterManager.
 func NewBGPRouterManager(params bgpRouterManagerParams) agent.BGPRouterManager {
-	if !params.DaemonConfig.BGPControlPlaneEnabled() {
+	if !params.BGPConfig.BGPControlPlaneEnabled() {
 		return &BGPRouterManager{}
 	}
 
@@ -154,6 +156,8 @@ func NewBGPRouterManager(params bgpRouterManagerParams) agent.BGPRouterManager {
 		// statedb
 		DB:                  params.DB,
 		ReconcileErrorTable: params.ReconcileErrorTable,
+
+		BGPConfig: params.BGPConfig,
 
 		// By default, do not destroy the GobGP router on Stop() as that causes sending Cease notification to peers,
 		// which terminates Graceful Restart progress. We set this to true only for tests, where GR is not needed
@@ -214,8 +218,31 @@ func (m *BGPRouterManager) reconcileStateWithRetry(ctx context.Context) error {
 	return wait.ExponentialBackoffWithContext(ctx, bo, retryFn)
 }
 
-// GetPeers gets peering state from previously initialized bgp instances.
-func (m *BGPRouterManager) GetPeers(ctx context.Context) ([]*models.BgpPeer, error) {
+func (m *BGPRouterManager) GetPeers(ctx context.Context, req *agent.GetPeersRequest) (*agent.GetPeersResponse, error) {
+	m.RLock()
+	defer m.RUnlock()
+
+	if !m.running {
+		return nil, fmt.Errorf("bgp router manager is not running")
+	}
+
+	var res agent.GetPeersResponse
+	for _, i := range m.BGPInstances {
+		r, err := i.Router.GetPeerState(ctx, &types.GetPeerStateRequest{})
+		if err != nil {
+			return nil, err
+		}
+		res.Instances = append(res.Instances, agent.InstancePeerStates{
+			Name:  i.Name,
+			Peers: r.Peers,
+		})
+	}
+
+	return &res, nil
+}
+
+// GetPeersLegacy gets peering state from previously initialized bgp instances.
+func (m *BGPRouterManager) GetPeersLegacy(ctx context.Context) ([]*models.BgpPeer, error) {
 	m.RLock()
 	defer m.RUnlock()
 
@@ -225,7 +252,7 @@ func (m *BGPRouterManager) GetPeers(ctx context.Context) ([]*models.BgpPeer, err
 
 	var res []*models.BgpPeer
 	for _, i := range m.BGPInstances {
-		getPeerResp, err := i.Router.GetPeerState(ctx)
+		getPeerResp, err := i.Router.GetPeerStateLegacy(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -234,8 +261,60 @@ func (m *BGPRouterManager) GetPeers(ctx context.Context) ([]*models.BgpPeer, err
 	return res, nil
 }
 
-// GetRoutes retrieves routes from the RIB of underlying router
-func (m *BGPRouterManager) GetRoutes(ctx context.Context, params restapi.GetBgpRoutesParams) ([]*models.BgpRoute, error) {
+// GetRoutes retrieves routes from the RIB of underlying routers.
+func (m *BGPRouterManager) GetRoutes(ctx context.Context, req *agent.GetRoutesRequest) (*agent.GetRoutesResponse, error) {
+	m.RLock()
+	defer m.RUnlock()
+
+	if !m.running {
+		return nil, fmt.Errorf("BGP router manager is not running")
+	}
+	if req == nil {
+		return nil, fmt.Errorf("get routes request is nil")
+	}
+
+	var res agent.GetRoutesResponse
+	for _, i := range m.BGPInstances {
+		switch req.TableType {
+		case types.TableTypeAdjRIBIn, types.TableTypeAdjRIBOut:
+			peerState, err := i.Router.GetPeerState(ctx, &types.GetPeerStateRequest{})
+			if err != nil {
+				return nil, err
+			}
+			for _, peer := range peerState.Peers {
+				rs, err := i.Router.GetRoutes(ctx, &types.GetRoutesRequest{
+					TableType: req.TableType,
+					Family:    req.Family,
+					Neighbor:  peer.Address,
+				})
+				if err != nil {
+					return nil, err
+				}
+				res.Instances = append(res.Instances, agent.InstanceRoutes{
+					InstanceName: i.Name,
+					NeighborName: peer.Name,
+					Routes:       rs.Routes,
+				})
+			}
+		default:
+			rs, err := i.Router.GetRoutes(ctx, &types.GetRoutesRequest{
+				TableType: req.TableType,
+				Family:    req.Family,
+			})
+			if err != nil {
+				return nil, err
+			}
+			res.Instances = append(res.Instances, agent.InstanceRoutes{
+				InstanceName: i.Name,
+				Routes:       rs.Routes,
+			})
+		}
+	}
+	return &res, nil
+}
+
+// GetRoutesLegacy retrieves routes from the RIB of underlying router
+func (m *BGPRouterManager) GetRoutesLegacy(ctx context.Context, params restapi.GetBgpRoutesParams) ([]*models.BgpRoute, error) {
 	m.RLock()
 	defer m.RUnlock()
 
@@ -266,13 +345,13 @@ func (m *BGPRouterManager) GetRoutes(ctx context.Context, params restapi.GetBgpR
 		}
 		if allPeers {
 			// get routes for each peer of the server
-			getPeerResp, err := i.Router.GetPeerState(ctx)
+			getPeerResp, err := i.Router.GetPeerStateLegacy(ctx)
 			if err != nil {
 				return nil, err
 			}
 			for _, peer := range getPeerResp.Peers {
 				params.Neighbor = &peer.PeerAddress
-				routes, err := m.getRoutesFromInstance(ctx, i, params)
+				routes, err := m.getRoutesFromInstanceLegacy(ctx, i, params)
 				if err != nil {
 					return nil, err
 				}
@@ -280,7 +359,7 @@ func (m *BGPRouterManager) GetRoutes(ctx context.Context, params restapi.GetBgpR
 			}
 		} else {
 			// get routes with provided params
-			routes, err := m.getRoutesFromInstance(ctx, i, params)
+			routes, err := m.getRoutesFromInstanceLegacy(ctx, i, params)
 			if err != nil {
 				return nil, err
 			}
@@ -290,8 +369,8 @@ func (m *BGPRouterManager) GetRoutes(ctx context.Context, params restapi.GetBgpR
 	return res, nil
 }
 
-// getRoutesFromInstance retrieves routes from the RIB of the specified BGP instance
-func (m *BGPRouterManager) getRoutesFromInstance(ctx context.Context, i *instance.BGPInstance, params restapi.GetBgpRoutesParams) ([]*models.BgpRoute, error) {
+// getRoutesFromInstanceLegacy retrieves routes from the RIB of the specified BGP instance
+func (m *BGPRouterManager) getRoutesFromInstanceLegacy(ctx context.Context, i *instance.BGPInstance, params restapi.GetBgpRoutesParams) ([]*models.BgpRoute, error) {
 	if i.Config.LocalASN == nil {
 		return nil, fmt.Errorf("local ASN not set for instance")
 	}
@@ -323,7 +402,33 @@ func (m *BGPRouterManager) asnExistsInInstances(asn int64) bool {
 }
 
 // GetRoutePolicies fetches BGP routing policies from underlying routing daemon.
-func (m *BGPRouterManager) GetRoutePolicies(ctx context.Context, params restapi.GetBgpRoutePoliciesParams) ([]*models.BgpRoutePolicy, error) {
+func (m *BGPRouterManager) GetRoutePolicies(ctx context.Context, params *agent.GetRoutePoliciesRequest) (*agent.GetRoutePoliciesResponse, error) {
+	m.RLock()
+	defer m.RUnlock()
+
+	if !m.running {
+		return nil, fmt.Errorf("bgp router manager is not running")
+	}
+
+	var res agent.GetRoutePoliciesResponse
+	for _, i := range m.BGPInstances {
+		if params.InstanceName != "" && i.Name != params.InstanceName {
+			continue // return policies matching provided instance name only
+		}
+		rs, err := i.Router.GetRoutePolicies(ctx)
+		if err != nil {
+			return nil, err
+		}
+		res.Instances = append(res.Instances, agent.InstanceRoutePolicies{
+			Name:          i.Name,
+			RoutePolicies: rs.Policies,
+		})
+	}
+	return &res, nil
+}
+
+// GetRoutePoliciesLegacy fetches BGP routing policies from underlying routing daemon.
+func (m *BGPRouterManager) GetRoutePoliciesLegacy(ctx context.Context, params restapi.GetBgpRoutePoliciesParams) ([]*models.BgpRoutePolicy, error) {
 	m.RLock()
 	defer m.RUnlock()
 
@@ -393,13 +498,14 @@ func (m *BGPRouterManager) DestroyRouterOnStop(destroy bool) {
 // reconciled.
 func (m *BGPRouterManager) ReconcileInstances(ctx context.Context,
 	nodeObj *v2.CiliumBGPNodeConfig,
-	ciliumNode *v2.CiliumNode) error {
+	ciliumNode *v2.CiliumNode,
+) error {
 	m.Lock()
 	defer m.Unlock()
 
 	// use a reconcileDiff to compute which BgpServers must be created, removed
 	// and reconciled.
-	rd := newReconcileDiff(ciliumNode)
+	rd := newReconcileDiff(ciliumNode, m.BGPConfig)
 
 	if nodeObj == nil {
 		m.withdrawAll(ctx, rd)
@@ -470,8 +576,8 @@ func (m *BGPRouterManager) register(ctx context.Context, rd *reconcileDiff) erro
 // BGPInstance
 func (m *BGPRouterManager) registerBGPInstance(ctx context.Context,
 	c *v2.CiliumBGPNodeInstance,
-	ciliumNode *v2.CiliumNode) error {
-
+	ciliumNode *v2.CiliumNode,
+) error {
 	l := m.logger.With(types.InstanceLogField, c.Name)
 
 	l.Info("Registering BGP instance")
@@ -484,7 +590,7 @@ func (m *BGPRouterManager) registerBGPInstance(ctx context.Context,
 	if err != nil {
 		return err
 	}
-	routerID, err := getRouterID(c, ciliumNode)
+	routerID, err := getRouterID(c, ciliumNode, m.BGPConfig)
 	if err != nil {
 		return err
 	}
@@ -525,7 +631,7 @@ func (m *BGPRouterManager) registerBGPInstance(ctx context.Context,
 		return fmt.Errorf("failed initial reconciliation of BGP instance: %w", err)
 	}
 
-	m.logger.Info(
+	l.Info(
 		"Successfully registered BGP instance",
 		types.LocalASNLogField, localASN,
 		types.ListenPortLogField, localPort,
@@ -543,8 +649,8 @@ func (m *BGPRouterManager) registerBGPInstance(ctx context.Context,
 func (m *BGPRouterManager) reconcileBGPConfig(ctx context.Context,
 	i *instance.BGPInstance,
 	newc *v2.CiliumBGPNodeInstance,
-	ciliumNode *v2.CiliumNode) error {
-
+	ciliumNode *v2.CiliumNode,
+) error {
 	reconcileStart := time.Now()
 
 	var reconcileErrs []error
@@ -625,7 +731,7 @@ func (m *BGPRouterManager) updateReconcilerErrors(instance string, newErrors []e
 func (m *BGPRouterManager) getErrorsFromTable(txn statedb.WriteTxn, instance string) []error {
 	// get existing errors for this instance from the table
 	var reconcileErrs []*tables.BGPReconcileError
-	iter := m.ReconcileErrorTable.List(txn, tables.BGPReconcileErrorInstance.Query(instance))
+	iter := m.ReconcileErrorTable.List(txn, tables.BGPReconcileErrorsByInstance(instance))
 	for instanceErr := range iter {
 		reconcileErrs = append(reconcileErrs, instanceErr.DeepCopy())
 	}
@@ -641,7 +747,7 @@ func (m *BGPRouterManager) getErrorsFromTable(txn statedb.WriteTxn, instance str
 }
 
 func (m *BGPRouterManager) deleteErrorsFromTable(txn statedb.WriteTxn, instance string) error {
-	iter := m.ReconcileErrorTable.List(txn, tables.BGPReconcileErrorInstance.Query(instance))
+	iter := m.ReconcileErrorTable.List(txn, tables.BGPReconcileErrorsByInstance(instance))
 	for instanceErr := range iter {
 		_, _, err := m.ReconcileErrorTable.Delete(txn, instanceErr)
 		if err != nil {
@@ -777,9 +883,9 @@ func (m *BGPRouterManager) reconcile(ctx context.Context, rd *reconcileDiff) err
 // getLocalASN returns the local ASN for the given BGP instance. If the local ASN is defined in the desired config, it
 // will be returned. Currently, we do not support auto-ASN assignment, so if the local ASN is not defined in the
 // desired config, an error will be returned.
-func getLocalASN(config *v2.CiliumBGPNodeInstance) (int64, error) {
-	if config.LocalASN != nil {
-		return *config.LocalASN, nil
+func getLocalASN(cfg *v2.CiliumBGPNodeInstance) (int64, error) {
+	if cfg.LocalASN != nil {
+		return *cfg.LocalASN, nil
 	}
 	// NOTE: for now we require a local ASN to be specified
 	// remove this check once we support auto-ASN assignment.
@@ -825,30 +931,30 @@ func calcRouterIDFromMacAddress() (string, error) {
 // be returned. Otherwise, the router ID will be resolved from the ciliumnode annotations. If the router ID is not
 // defined in the annotations, the node IP from cilium node will be returned. If the node IP is not available, the
 // router ID will be calculated from the MAC address.
-func getRouterID(config *v2.CiliumBGPNodeInstance, ciliumNode *v2.CiliumNode) (string, error) {
-	if config.RouterID != nil {
-		return *config.RouterID, nil
+func getRouterID(cfg *v2.CiliumBGPNodeInstance, ciliumNode *v2.CiliumNode, bgpCfg config.BGPConfig) (string, error) {
+	if cfg.RouterID != nil {
+		return *cfg.RouterID, nil
 	}
 
 	// If there are no annotations about router-id, router-id will be allocated based on the allocation mode
-	switch option.Config.BGPRouterIDAllocationMode {
-	case option.BGPRouterIDAllocationModeDefault:
+	switch bgpCfg.RouterIDAllocationMode {
+	case config.BGPRouterIDAllocationModeDefault:
 		if nodeIP := ciliumNode.GetIP(false); nodeIP != nil {
 			return nodeIP.String(), nil
 		} else {
 			return calcRouterIDFromMacAddress()
 		}
-	case option.BGPRouterIDAllocationModeIPPool:
-		if config.RouterID == nil {
+	case config.BGPRouterIDAllocationModeIPPool:
+		if cfg.RouterID == nil {
 			return "", fmt.Errorf("can't find the router-id in the CiliumBGPNodeInstance")
 		}
-		routerID := *config.RouterID
+		routerID := *cfg.RouterID
 		if net.ParseIP(routerID).To4() == nil {
 			return "", fmt.Errorf("the router-id %s is not a valid IPv4 address", routerID)
 		}
 		return routerID, nil
 	default:
-		return "", fmt.Errorf("invalid router-id allocation mode: %s (supported modes: %s, %s)", option.Config.BGPRouterIDAllocationMode, option.BGPRouterIDAllocationModeDefault, option.BGPRouterIDAllocationModeIPPool)
+		return "", fmt.Errorf("invalid router-id allocation mode: %s (supported modes: %s, %s)", bgpCfg.RouterIDAllocationMode, config.BGPRouterIDAllocationModeDefault, config.BGPRouterIDAllocationModeIPPool)
 	}
 }
 
@@ -857,9 +963,9 @@ func getRouterID(config *v2.CiliumBGPNodeInstance, ciliumNode *v2.CiliumNode) (s
 // defined in the annotations, -1 will be returned.
 //
 // In gobgp, with -1 as the local port, bgp instance will start in non-listening mode.
-func getLocalPort(config *v2.CiliumBGPNodeInstance) (int32, error) {
-	if config.LocalPort != nil {
-		return *config.LocalPort, nil
+func getLocalPort(cfg *v2.CiliumBGPNodeInstance) (int32, error) {
+	if cfg.LocalPort != nil {
+		return *cfg.LocalPort, nil
 	}
 	return int32(-1), nil
 }

@@ -13,13 +13,14 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/blang/semver/v4"
-	"helm.sh/helm/v3/pkg/action"
-	"helm.sh/helm/v3/pkg/cli/output"
+	"helm.sh/helm/v4/pkg/action"
+	"helm.sh/helm/v4/pkg/cli/output"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -143,8 +144,7 @@ func NewClient(contextName, kubeconfig, ciliumNamespace string, impersonateAs st
 	// Use the default Helm driver (Kubernetes secret).
 	helmDriver := ""
 	actionConfig := action.Configuration{}
-	logger := func(_ string, _ ...any) {}
-	if err := actionConfig.Init(&restClientGetter, ciliumNamespace, helmDriver, logger); err != nil {
+	if err := actionConfig.Init(&restClientGetter, ciliumNamespace, helmDriver); err != nil {
 		return nil, err
 	}
 
@@ -304,6 +304,10 @@ func (c *Client) CreateNamespace(ctx context.Context, namespace *corev1.Namespac
 	return c.Clientset.CoreV1().Namespaces().Create(ctx, namespace, opts)
 }
 
+func (c *Client) UpdateNamespace(ctx context.Context, namespace *corev1.Namespace, opts metav1.UpdateOptions) (*corev1.Namespace, error) {
+	return c.Clientset.CoreV1().Namespaces().Update(ctx, namespace, opts)
+}
+
 func (c *Client) GetNamespace(ctx context.Context, namespace string, options metav1.GetOptions) (*corev1.Namespace, error) {
 	return c.Clientset.CoreV1().Namespaces().Get(ctx, namespace, options)
 }
@@ -370,6 +374,39 @@ func (c *Client) ContainerLogs(ctx context.Context, namespace, pod, containerNam
 
 func (c *Client) ListServices(ctx context.Context, namespace string, options metav1.ListOptions) (*corev1.ServiceList, error) {
 	return c.Clientset.CoreV1().Services(namespace).List(ctx, options)
+}
+
+// transientExecErrorSubstrings are error message fragments that indicate a
+// transient failure of the Kubernetes API server -> kubelet exec proxy rather
+// than a genuine failure of the executed command, and are therefore worth
+// retrying. On managed clusters (seen on AKS) the proxy is occasionally
+// unreachable for tens of seconds at a time. They are intentionally specific to
+// the exec-proxy tunnel so that benign command stderr (e.g. cilium-operator
+// "level=debug" log lines) is not mistaken for a transient error and needlessly
+// retried.
+var transientExecErrorSubstrings = []string{
+	"i/o timeout", // e.g. "dial tcp <apiserver>:443: i/o timeout"
+	"error dialing backend",
+	"unable to upgrade connection",
+	"Bad Gateway",         // HTTP 502
+	"Service Unavailable", // HTTP 503
+	"Gateway Timeout",     // HTTP 504
+	"TLS handshake timeout",
+}
+
+// IsTransientExecError reports whether err looks like a transient failure of
+// the Kubernetes API server exec proxy, as opposed to a genuine failure of the
+// command that was executed in the pod. Callers that exec through the proxy in
+// a loop (e.g. waiting for a NodePort or collecting features) use this to retry
+// proxy blips without treating them as a real result.
+func IsTransientExecError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return slices.ContainsFunc(transientExecErrorSubstrings, func(substr string) bool {
+		return strings.Contains(msg, substr)
+	})
 }
 
 func (c *Client) ExecInPodWithStderr(ctx context.Context, namespace, pod, container string, command []string) (bytes.Buffer, bytes.Buffer, error) {
@@ -645,7 +682,7 @@ func (c *Client) AutodetectFlavor(ctx context.Context) Flavor {
 
 	if context, ok := c.RawConfig.Contexts[c.ContextName()]; ok {
 		if cluster, ok := c.RawConfig.Clusters[context.Cluster]; ok {
-			if strings.HasSuffix(cluster.Server, "eks.amazonaws.com") {
+			if strings.Contains(cluster.Server, ".eks-cluster.") || strings.Contains(cluster.Server, ".eks.") {
 				f.Kind = KindEKS
 				return f
 			} else if strings.HasSuffix(cluster.Server, "azmk8s.io:443") {
@@ -659,8 +696,16 @@ func (c *Client) AutodetectFlavor(ctx context.Context) Flavor {
 	if err != nil {
 		return f
 	}
-	// Assume k3s if the k8s master node runs k3s
 	for _, node := range nodeList.Items {
+		if _, ok := node.Labels["cloud.google.com/gke-nodepool"]; ok {
+			f.Kind = KindGKE
+			return f
+		}
+		if _, ok := node.Labels["cloud.google.com/gke-os-distribution"]; ok {
+			f.Kind = KindGKE
+			return f
+		}
+
 		isMaster := node.Labels["node-role.kubernetes.io/master"]
 		if isMaster != "true" {
 			continue
@@ -669,6 +714,7 @@ func (c *Client) AutodetectFlavor(ctx context.Context) Flavor {
 		if !ok {
 			instanceType = node.Labels[corev1.LabelInstanceType]
 		}
+		// Assume k3s if the k8s master node runs k3s
 		if instanceType == "k3s" {
 			f.Kind = KindK3s
 			return f
@@ -999,12 +1045,12 @@ func (c *Client) ListCiliumNodes(ctx context.Context) (*ciliumv2.CiliumNodeList,
 	return c.CiliumClientset.CiliumV2().CiliumNodes().List(ctx, metav1.ListOptions{})
 }
 
-func (c *Client) ListCiliumNodeConfigs(ctx context.Context, namespace string, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumNodeConfigList, error) {
-	return c.CiliumClientset.CiliumV2alpha1().CiliumNodeConfigs(namespace).List(ctx, opts)
+func (c *Client) ListCiliumNodeConfigs(ctx context.Context, namespace string, opts metav1.ListOptions) (*ciliumv2.CiliumNodeConfigList, error) {
+	return c.CiliumClientset.CiliumV2().CiliumNodeConfigs(namespace).List(ctx, opts)
 }
 
-func (c *Client) ListCiliumPodIPPools(ctx context.Context, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumPodIPPoolList, error) {
-	return c.CiliumClientset.CiliumV2alpha1().CiliumPodIPPools().List(ctx, opts)
+func (c *Client) ListCiliumL2AnnouncementPolicies(ctx context.Context, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumL2AnnouncementPolicyList, error) {
+	return c.CiliumClientset.CiliumV2alpha1().CiliumL2AnnouncementPolicies().List(ctx, opts)
 }
 
 func (c *Client) GetLogs(ctx context.Context, namespace, name, container string, opts corev1.PodLogOptions, out io.Writer) error {
@@ -1054,11 +1100,11 @@ func (c *Client) GetCiliumVersion(ctx context.Context, p *corev1.Pod) (*semver.V
 }
 
 func (c *Client) GetRunningCiliumVersion(ciliumHelmReleaseName string) (string, error) {
-	release, err := action.NewGet(c.HelmActionConfig).Run(ciliumHelmReleaseName)
+	m, err := action.NewGetMetadata(c.HelmActionConfig).Run(ciliumHelmReleaseName)
 	if err != nil {
 		return "", err
 	}
-	return release.Chart.Metadata.Version, nil
+	return m.Version, nil
 }
 
 func (c *Client) ListCiliumLocalRedirectPolicies(ctx context.Context, namespace string, opts metav1.ListOptions) (*ciliumv2.CiliumLocalRedirectPolicyList, error) {
@@ -1105,8 +1151,7 @@ func (c *Client) GetHelmValues(_ context.Context, releaseName string, namespace 
 	}
 	helmDriver := ""
 	actionConfig := action.Configuration{}
-	logger := func(_ string, _ ...any) {}
-	if err := actionConfig.Init(c.RESTClientGetter, namespace, helmDriver, logger); err != nil {
+	if err := actionConfig.Init(c.RESTClientGetter, namespace, helmDriver); err != nil {
 		return "", err
 	}
 	helmGetValsClient := action.NewGetValues(&actionConfig)
@@ -1129,8 +1174,7 @@ func (c *Client) GetHelmMetadata(_ context.Context, releaseName string, namespac
 	}
 	helmDriver := ""
 	actionConfig := action.Configuration{}
-	logger := func(_ string, _ ...any) {}
-	if err := actionConfig.Init(c.RESTClientGetter, namespace, helmDriver, logger); err != nil {
+	if err := actionConfig.Init(c.RESTClientGetter, namespace, helmDriver); err != nil {
 		return "", err
 	}
 

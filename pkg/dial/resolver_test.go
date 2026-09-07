@@ -20,7 +20,6 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	k8stest "k8s.io/client-go/testing"
 
-	daemonk8s "github.com/cilium/cilium/daemon/k8s"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/dial"
@@ -29,6 +28,7 @@ import (
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client/testutils"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
+	k8sTables "github.com/cilium/cilium/pkg/k8s/tables"
 	"github.com/cilium/cilium/pkg/kpr"
 	"github.com/cilium/cilium/pkg/loadbalancer"
 	lb "github.com/cilium/cilium/pkg/loadbalancer"
@@ -54,10 +54,11 @@ func TestLBServiceResolver(t *testing.T) {
 		dial.ServiceResolverCell,
 
 		// LB depends on these
-		daemonk8s.TablesCell,
+		k8sTables.TablesCell,
 		node.LocalNodeStoreTestCell,
 		source.Cell,
 		cell.Provide(
+			func() cmtypes.ClusterInfo { return cmtypes.DefaultClusterInfo },
 			func() loadbalancer.Config { return loadbalancer.DefaultConfig },
 			func() loadbalancer.ExternalConfig {
 				return loadbalancer.ExternalConfig{EnableIPv4: true, EnableIPv6: true}
@@ -250,8 +251,8 @@ func TestServiceBackendResolver(t *testing.T) {
 		return lb.NewL3n4Addr(proto, cmtypes.MustParseAddrCluster(addr), port, lb.ScopeExternal)
 	}
 
-	be := func(proto lb.L4Type, addr string, port uint16, portname string, state lb.BackendState) lb.BackendParams {
-		return lb.BackendParams{
+	be := func(proto lb.L4Type, addr string, port uint16, portname string, state lb.BackendState) lb.Backend {
+		return lb.Backend{
 			Address:   toAddr(proto, addr, port),
 			PortNames: []string{portname},
 			State:     state,
@@ -283,8 +284,8 @@ func TestServiceBackendResolver(t *testing.T) {
 		},
 	), "Unexpected UpsertServiceAndFrontends error")
 
-	require.NoError(t, wr.UpsertBackends(txn, svc.Name, source.Kubernetes,
-		slices.Values([]lb.BackendParams{
+	require.NoError(t, wr.UpsertBackends(txn, svc.Name, source.Kubernetes, writer.LocalClusterID,
+		slices.Values([]lb.Backend{
 			be(lb.TCP, "10.0.0.1", 9090, "alpha", lb.BackendStateActive),
 			be(lb.TCP, "10.0.0.2", 9090, "alpha", lb.BackendStateActive),
 			be(lb.TCP, "10.0.0.3", 9090, "alpha", lb.BackendStateActive),
@@ -345,7 +346,7 @@ func TestServiceBackendResolver(t *testing.T) {
 
 	// Remove the previously used backend
 	txn = wr.WriteTxn()
-	wr.ReleaseBackends(txn, svc.Name, slices.Values([]lb.L3n4Addr{toAddr(lb.TCP, host, 9090)}))
+	wr.DeleteBackendsByAddress(txn, svc.Name, source.Kubernetes, writer.LocalClusterID, slices.Values([]lb.L3n4Addr{toAddr(lb.TCP, host, 9090)}))
 	txn.Commit()
 
 	// Should switch to one of the remaining backends

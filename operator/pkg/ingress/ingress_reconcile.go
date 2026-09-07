@@ -27,6 +27,7 @@ import (
 	"github.com/cilium/cilium/operator/pkg/model/ingestion"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/shortener"
 )
 
 const (
@@ -174,9 +175,9 @@ func (r *ingressReconciler) createOrUpdateSharedResources(ctx context.Context) e
 
 func (r *ingressReconciler) tryCleanupDedicatedResources(ctx context.Context, ingressNamespacedName types.NamespacedName) error {
 	resources := map[client.Object]types.NamespacedName{
-		&corev1.Service{}:             {Namespace: ingressNamespacedName.Namespace, Name: fmt.Sprintf("%s-%s", ciliumIngressPrefix, ingressNamespacedName.Name)},
-		&discoveryv1.EndpointSlice{}:  {Namespace: ingressNamespacedName.Namespace, Name: fmt.Sprintf("%s-%s", ciliumIngressPrefix, ingressNamespacedName.Name)},
-		&ciliumv2.CiliumEnvoyConfig{}: {Namespace: ingressNamespacedName.Namespace, Name: fmt.Sprintf("%s-%s-%s", ciliumIngressPrefix, ingressNamespacedName.Namespace, ingressNamespacedName.Name)},
+		&corev1.Service{}:             {Namespace: ingressNamespacedName.Namespace, Name: shortener.ShortenK8sResourceName(fmt.Sprintf("%s-%s", ciliumIngressPrefix, ingressNamespacedName.Name))},
+		&discoveryv1.EndpointSlice{}:  {Namespace: ingressNamespacedName.Namespace, Name: shortener.ShortenK8sResourceName(fmt.Sprintf("%s-%s", ciliumIngressPrefix, ingressNamespacedName.Name))},
+		&ciliumv2.CiliumEnvoyConfig{}: {Namespace: ingressNamespacedName.Namespace, Name: shortener.ShortenK8sResourceName(fmt.Sprintf("%s-%s-%s", ciliumIngressPrefix, ingressNamespacedName.Namespace, ingressNamespacedName.Name))},
 	}
 
 	for k, v := range resources {
@@ -227,8 +228,11 @@ func (r *ingressReconciler) buildSharedResources(ctx context.Context) (*ciliumv2
 			m.HTTP = append(m.HTTP, ingestion.Ingress(r.logger, item, r.defaultSecretNamespace, r.defaultSecretName, r.enforcedHTTPS, insecureHTTPPort, secureHTTPPort, r.defaultRequestTimeout)...)
 		}
 	}
-
-	return r.cecTranslator.Translate(r.ciliumNamespace, r.sharedResourcesName, m)
+	cec, err := r.cecTranslator.Translate(r.ciliumNamespace, r.sharedResourcesName, m)
+	if len(cec.Spec.Services) > 0 {
+		cec.Spec.Services[0].Ports = append(cec.Spec.Services[0].Ports, 443)
+	}
+	return cec, err
 }
 
 func (r *ingressReconciler) getSharedListenerPorts() (uint32, uint32, uint32) {
@@ -236,11 +240,17 @@ func (r *ingressReconciler) getSharedListenerPorts() (uint32, uint32, uint32) {
 		return defaultPassthroughPort, defaultInsecureHTTPPort, defaultSecureHTTPPort
 	}
 
-	if r.hostNetworkSharedPort > 0 {
-		return r.hostNetworkSharedPort, r.hostNetworkSharedPort, r.hostNetworkSharedPort
-	}
+	return r.effectiveHostNetworkPort(r.hostNetworkTLSPassthroughPort), r.effectiveHostNetworkPort(r.hostNetworkHTTPPort), r.effectiveHostNetworkPort(r.hostNetworkHTTPSPort)
+}
 
-	return defaultHostNetworkListenerPort, defaultHostNetworkListenerPort, defaultHostNetworkListenerPort
+func (r *ingressReconciler) effectiveHostNetworkPort(port uint32) uint32 {
+	if port > 0 {
+		return port
+	}
+	if r.hostNetworkSharedPort > 0 {
+		return r.hostNetworkSharedPort
+	}
+	return defaultHostNetworkListenerPort
 }
 
 func (r *ingressReconciler) buildDedicatedResources(ctx context.Context, ingress *networkingv1.Ingress, scopedLog *slog.Logger) (*ciliumv2.CiliumEnvoyConfig, *corev1.Service, *discoveryv1.EndpointSlice, error) {
@@ -249,14 +259,20 @@ func (r *ingressReconciler) buildDedicatedResources(ctx context.Context, ingress
 	m := &model.Model{}
 
 	if annotations.GetAnnotationTLSPassthroughEnabled(ingress) {
-		m.TLSPassthrough = append(m.TLSPassthrough, ingestion.IngressPassthrough(nil, *ingress, passthroughPort)...)
+		m.TLSPassthrough = append(m.TLSPassthrough, ingestion.IngressPassthrough(scopedLog, *ingress, passthroughPort)...)
 	} else {
-		m.HTTP = append(m.HTTP, ingestion.Ingress(nil, *ingress, r.defaultSecretNamespace, r.defaultSecretName, r.enforcedHTTPS, insecureHTTPPort, secureHTTPPort, r.defaultRequestTimeout)...)
+		m.HTTP = append(m.HTTP, ingestion.Ingress(scopedLog, *ingress, r.defaultSecretNamespace, r.defaultSecretName, r.enforcedHTTPS, insecureHTTPPort, secureHTTPPort, r.defaultRequestTimeout)...)
 	}
 
-	cec, svc, ep, err := r.dedicatedTranslator.Translate(m)
+	cec, svc, eps, err := r.dedicatedTranslator.Translate(m)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to translate model into resources: %w", err)
+	}
+	// Ingress only ever produces a single dummy EndpointSlice; unwrap from the
+	// shared Translator interface that returns a list to support gateway-api L4.
+	var ep *discoveryv1.EndpointSlice
+	if len(eps) > 0 {
+		ep = eps[0]
 	}
 
 	r.propagateIngressAnnotationsAndLabels(ingress, &svc.ObjectMeta)
@@ -430,7 +446,7 @@ func (r *ingressReconciler) updateIngressLoadbalancerStatus(ctx context.Context,
 	serviceNamespacedName := types.NamespacedName{}
 	if r.isEffectiveLoadbalancerModeDedicated(ingress) {
 		serviceNamespacedName.Namespace = ingress.Namespace
-		serviceNamespacedName.Name = fmt.Sprintf("%s-%s", ciliumIngressPrefix, ingress.Name)
+		serviceNamespacedName.Name = shortener.ShortenK8sResourceName(fmt.Sprintf("%s-%s", ciliumIngressPrefix, ingress.Name))
 	} else {
 		serviceNamespacedName.Namespace = r.ciliumNamespace
 		serviceNamespacedName.Name = r.sharedResourcesName

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"testing"
 	"time"
 
@@ -172,14 +173,14 @@ func TestGetFlowRate(t *testing.T) {
 				c = tc.ringCap
 			}
 			ring := container.NewRing(c)
-			for i := len(tc.events) - 1; i >= 0; i-- {
-				ev := tc.events[i].event
+			for _, evWithOffset := range slices.Backward(tc.events) {
+				ev := evWithOffset.event
 				if ev == nil {
 					// Default is flow
 					ev = &flowpb.Flow{}
 				}
 				ring.Write(&hubv1.Event{
-					Timestamp: timestamppb.New(now.Add(-1 * time.Duration(tc.events[i].offset) * time.Millisecond)),
+					Timestamp: timestamppb.New(now.Add(-1 * time.Duration(evWithOffset.offset) * time.Millisecond)),
 					Event:     ev,
 				})
 			}
@@ -229,7 +230,7 @@ func TestLocalObserverServer_GetFlows(t *testing.T) {
 	for i := range numFlows {
 		tn := monitor.TraceNotify{Type: byte(monitorAPI.MessageTypeTrace)}
 		macOnly := func(s string) net.HardwareAddr {
-			return net.HardwareAddr(mac.MustParseMAC(s))
+			return mac.MustParseMAC(s).HardwareAddr()
 		}
 		data := testutils.MustCreateL3L4Payload(tn, &layers.Ethernet{
 			SrcMAC: macOnly(fake.MAC()),

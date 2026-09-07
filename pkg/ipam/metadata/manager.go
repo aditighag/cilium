@@ -16,14 +16,14 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/validation"
 
-	"github.com/cilium/cilium/daemon/k8s"
 	"github.com/cilium/cilium/pkg/annotation"
 	"github.com/cilium/cilium/pkg/ipam"
 	consts "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
-	cilium_v2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
+	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	slim_labels "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/labels"
 	slim_meta_v1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
+	k8sTables "github.com/cilium/cilium/pkg/k8s/tables"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 )
@@ -68,8 +68,8 @@ type Manager interface {
 type manager struct {
 	logger     *slog.Logger
 	db         *statedb.DB
-	pods       statedb.Table[k8s.LocalPod]
-	namespaces statedb.Table[k8s.Namespace]
+	pods       statedb.Table[k8sTables.LocalPod]
+	namespaces statedb.Table[k8sTables.Namespace]
 
 	// compiledPools is a map of pools and their selectors that have been compiled
 	// from CiliumPodIPPool resources. It is protected by a RWMutex.
@@ -142,7 +142,7 @@ func (m *manager) GetIPPoolForPod(owner string, family ipam.Family) (pool string
 	txn := m.db.ReadTxn()
 
 	// Check annotation on pod
-	pod, _, found := m.pods.Get(txn, k8s.PodByName(namespace, name))
+	pod, _, found := m.pods.Get(txn, k8sTables.PodByName(namespace, name))
 	if !found {
 		return "", &ResourceNotFound{Resource: "Pod", Namespace: namespace, Name: name}
 	} else if ippool, ok := determinePoolByAnnotations(pod.Annotations, family); ok {
@@ -156,7 +156,7 @@ func (m *manager) GetIPPoolForPod(owner string, family ipam.Family) (pool string
 	}
 
 	// Check annotation on namespace
-	podNamespace, _, found := m.namespaces.Get(txn, k8s.NamespaceIndex.Query(namespace))
+	podNamespace, _, found := m.namespaces.Get(txn, k8sTables.NamespaceIndex.Query(namespace))
 	if !found {
 		m.logger.Debug("pool selector: namespace not found",
 			logfields.Owner, owner,
@@ -237,7 +237,7 @@ func (m *manager) GetIPPoolForPod(owner string, family ipam.Family) (pool string
 }
 
 // handlePoolEvent handles individual CiliumPodIPPool events and maintains internal selector state.
-func (m *manager) handlePoolEvent(ctx context.Context, event resource.Event[*cilium_v2alpha1.CiliumPodIPPool]) error {
+func (m *manager) handlePoolEvent(ctx context.Context, event resource.Event[*v2.CiliumPodIPPool]) error {
 	defer func() {
 		event.Done(nil)
 	}()
@@ -259,7 +259,7 @@ func (m *manager) handlePoolEvent(ctx context.Context, event resource.Event[*cil
 	return nil
 }
 
-func (m *manager) compilePool(p *cilium_v2alpha1.CiliumPodIPPool) {
+func (m *manager) compilePool(p *v2.CiliumPodIPPool) {
 	// Compile selectors
 	var podSelector slim_labels.Selector
 	var namespaceSelector slim_labels.Selector

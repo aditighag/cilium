@@ -39,7 +39,7 @@ func TestIdentitiesGC(t *testing.T) {
 	var authIdentityClient authIdentity.Provider
 
 	hive := hive.New(
-		cell.Config(cmtypes.DefaultClusterInfo),
+		cmtypes.ClusterInfoCell,
 		metrics.Metric(NewMetrics),
 
 		// provide a fake clientset
@@ -140,6 +140,50 @@ func TestIdentitiesGC(t *testing.T) {
 
 	if authIdentities[0] != "99999" {
 		t.Fatalf("expected Cilium Auth identity \"99999\", got %q", authIdentities[0])
+	}
+
+	if err := hive.Stop(tlog, ctx); err != nil {
+		t.Fatalf("failed to stop: %s", err)
+	}
+}
+
+func TestIdentitiesGC_Disabled(t *testing.T) {
+	defer testutils.GoleakVerifyNone(
+		t,
+		testutils.GoleakIgnoreTopFunction("time.Sleep"),
+	)
+
+	hive := hive.New(
+		cmtypes.ClusterInfoCell,
+		metrics.Metric(NewMetrics),
+
+		k8sFakeClient.FakeClientCell(),
+		kvstore.Cell(kvstore.DisabledBackendName),
+		spire.FakeCellClient,
+		k8s.ResourcesCell,
+
+		cell.Provide(func() Config {
+			return Config{
+				Interval: 0,
+
+				RateInterval: time.Minute,
+				RateLimit:    2500,
+			}
+		}),
+		cell.Provide(func() SharedConfig {
+			return SharedConfig{
+				IdentityAllocationMode: option.IdentityAllocationModeCRD,
+			}
+		}),
+
+		cell.Invoke(registerGC),
+	)
+
+	ctx := t.Context()
+	tlog := hivetest.Logger(t)
+
+	if err := hive.Start(tlog, ctx); err != nil {
+		t.Fatalf("failed to start: %s", err)
 	}
 
 	if err := hive.Stop(tlog, ctx); err != nil {

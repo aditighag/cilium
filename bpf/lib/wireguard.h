@@ -7,10 +7,10 @@
 #include <bpf/api.h>
 
 #include "common.h"
+#include "encrypt.h"
 #include "overloadable.h"
 #include "identity.h"
 
-#include "lib/proxy.h"
 #include "lib/l4.h"
 
 #include "linux/icmpv6.h"
@@ -26,10 +26,11 @@ DECLARE_CONFIG(__u16, wg_port, "Port for the WireGuard interface.")
  * - ctx is a UDP packet;
  * - L4 dport == CONFIG(wg_port);
  * - L4 sport == dport;
- * - valid identity in cluster.
+ * - valid remote node identity.
  */
 static __always_inline bool
-ctx_is_wireguard(struct __ctx_buff *ctx, int l4_off, __u8 protocol, __u32 identity)
+ctx_is_wireguard(struct __ctx_buff *ctx, int l4_off, __u8 protocol, fraginfo_t fraginfo,
+		 __u32 identity)
 {
 	struct {
 		__be16 sport;
@@ -41,7 +42,8 @@ ctx_is_wireguard(struct __ctx_buff *ctx, int l4_off, __u8 protocol, __u32 identi
 		return false;
 
 	/* Unable to retrieve L4 ports. */
-	if (l4_load_ports(ctx, l4_off + UDP_SPORT_OFF, &l4.sport) < 0)
+	if (!ipfrag_has_l4_header(fraginfo) ||
+	    l4_load_ports(ctx, l4_off + UDP_SPORT_OFF, &l4.sport) < 0)
 		return false;
 
 	/* Packet is not for cilium@WireGuard.*/
@@ -52,8 +54,8 @@ ctx_is_wireguard(struct __ctx_buff *ctx, int l4_off, __u8 protocol, __u32 identi
 	if (l4.sport != l4.dport)
 		return false;
 
-	/* Identity not in cluster. */
-	if (!identity_is_cluster(identity))
+	/* Identity is not a remote node. */
+	if (!identity_is_remote_node(identity))
 		return false;
 
 	/* Cilium-related WireGuard packet to be traced as encrypted. */
@@ -148,35 +150,9 @@ wg_maybe_redirect_to_encrypt(struct __ctx_buff *ctx, __be16 proto,
 	if (magic == MARK_MAGIC_PROXY_INGRESS ||
 	    magic == MARK_MAGIC_SKIP_TPROXY)
 		goto maybe_encrypt;
-#if defined(TUNNEL_MODE)
-	/* In tunneling mode the mark might have been reset. Check TC index instead.
-	 * TODO: remove this in v1.20, once we can rely on MARK_MAGIC_SKIP_TPROXY.
-	 */
-	if (tc_index_from_ingress_proxy(ctx) || tc_index_from_egress_proxy(ctx))
-		goto maybe_encrypt;
-#endif /* TUNNEL_MODE */
-
-	/* Unless node encryption is enabled, we don't want to encrypt
-	 * traffic from the hostns (an exception - L7 proxy traffic).
-	 *
-	 * NB: if iptables has SNAT-ed the packet, its sec id is HOST_ID.
-	 * This means that the packet won't be encrypted. This is fine,
-	 * as with --encrypt-node=false we encrypt only pod-to-pod packets.
-	 */
-	if (src_sec_identity == HOST_ID)
-		goto out;
 #endif /* !ENABLE_NODE_ENCRYPTION */
 
-	/* We don't want to encrypt any traffic that originates from outside
-	 * the cluster. This check excludes DSR traffic from the LB node to a remote backend.
-	 */
-	if (!identity_is_cluster(src_sec_identity))
-		goto out;
-
-	/* If source is remote node we should treat it like outside traffic.
-	 * This is possible when connection is done from pod to load balancer with DSR enabled.
-	 */
-	if (identity_is_remote_node(src_sec_identity))
+	if (!encrypt_src_matches_policy(src_sec_identity))
 		goto out;
 
 maybe_encrypt: __maybe_unused

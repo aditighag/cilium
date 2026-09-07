@@ -85,7 +85,9 @@ The following options can be used to configure encapsulation:
 * ``tunnel-protocol``: Set the encapsulation protocol to ``vxlan`` or
   ``geneve``, defaults to ``vxlan``.
 * ``underlay-protocol``: Set the IP family for the underlay. Defaults to
-  ``ipv4``. The underlying network must support that protocol.
+  ``auto``: Cilium will automatically select the appropriate underlay protocol
+  based on the daemon configuration, prioritizing IPv4 if both IPv4 and IPv6
+  are enabled. The underlying network must support that protocol.
 * ``tunnel-port``: Set the port for the encapsulation protocol. Defaults
   to ``8472`` for ``vxlan`` and ``6081`` for ``geneve``.
 
@@ -135,8 +137,7 @@ Requirements on the network
      If all nodes share a single L2 network, then this can be taken care of by
      enabling the option ``auto-direct-node-routes: true``. Otherwise, an
      additional system component such as a BGP daemon must be run to distribute
-     the routes.  See the guide :ref:`kube-router` on how to achieve this using
-     the kube-router project.
+     the routes.
 
 Configuration
 -------------
@@ -243,7 +244,7 @@ Configuration
 
 The AWS ENI datapath is enabled by setting the following option:
 
-.. code-block: yaml
+.. code-block:: yaml
 
         ipam: eni
         enable-endpoint-routes: "true"
@@ -292,9 +293,8 @@ Addressing
    distribution.
 
 Masquerading
-   All traffic not staying with the ``ipv4-native-routing-cidr`` (defaults to
-   the Cluster CIDR) will be masqueraded to the node's IP address to become
-   publicly routable.
+   All traffic not staying with the ``ipv4-native-routing-cidr`` will be
+   masqueraded to the node's IP address to become publicly routable.
 
 Load-balancing
    ClusterIP load-balancing will be performed using eBPF for all version of GKE.

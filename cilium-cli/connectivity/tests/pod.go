@@ -7,8 +7,10 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"net"
 	"net/netip"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -145,7 +147,7 @@ func (s *podToPodWithEndpoints) Run(ctx context.Context, t *check.Test) {
 func (s *podToPodWithEndpoints) curlEndpoints(ctx context.Context, t *check.Test, name string,
 	client *check.Pod, echo check.TestPeer, ipFam features.IPFamily) {
 	ct := t.Context()
-	baseURL := fmt.Sprintf("%s://%s:%d", echo.Scheme(), echo.Address(ipFam), echo.Port())
+	baseURL := fmt.Sprintf("%s://%s", echo.Scheme(), net.JoinHostPort(echo.Address(ipFam), strconv.FormatUint(uint64(echo.Port()), 10)))
 	var curlOpts []string
 	if s.method != "" {
 		curlOpts = append(curlOpts, "-X", s.method)
@@ -163,8 +165,9 @@ func (s *podToPodWithEndpoints) curlEndpoints(ctx context.Context, t *check.Test
 		ep := check.HTTPEndpointWithLabels(epName, url, echo.Labels())
 
 		t.NewAction(s, epName, client, ep, ipFam).Run(func(a *check.Action) {
-			curlOpts = append(curlOpts, s.retryCondition.CurlOptions(ep, ipFam, *client, ct.Params())...)
-			a.ExecInPod(ctx, a.CurlCommand(ep, curlOpts...))
+			opts := slices.Clone(curlOpts)
+			opts = append(opts, s.retryCondition.CurlOptions(ep, ipFam, *client, ct.Params(), a.ExpectingSuccess())...)
+			a.ExecInPod(ctx, a.CurlCommand(ep, opts...))
 
 			a.ValidateFlows(ctx, client, a.GetEgressRequirements(check.FlowParameters{}))
 			a.ValidateFlows(ctx, ep, a.GetIngressRequirements(check.FlowParameters{}))
@@ -177,8 +180,8 @@ func (s *podToPodWithEndpoints) curlEndpoints(ctx context.Context, t *check.Test
 			labels["X-Very-Secret-Token"] = "42"
 			ep = check.HTTPEndpointWithLabels(epName, url, labels)
 			t.NewAction(s, epName, client, ep, ipFam).Run(func(a *check.Action) {
-				opts := make([]string, 0, len(curlOpts)+2)
-				opts = append(opts, curlOpts...)
+				opts := slices.Clone(curlOpts)
+				opts = append(opts, s.retryCondition.CurlOptions(ep, ipFam, *client, ct.Params(), a.ExpectingSuccess())...)
 				opts = append(opts, "-H", "X-Very-Secret-Token: 42")
 
 				a.ExecInPod(ctx, a.CurlCommand(ep, opts...))
@@ -385,7 +388,7 @@ func (s *podToPodMissingIPCache) Run(ctx context.Context, t *check.Test) {
 
 			t.ForEachIPFamily(func(ipFam features.IPFamily) {
 				if ipFam == features.IPFamilyV6 {
-					// encryption-strict-mode-cidr only accepts an IPv4 CIDR
+					// encryption-strict-egress-cidr only accepts an IPv4 CIDR
 					return
 				}
 				t.NewAction(s, fmt.Sprintf("curl-%s-%d", ipFam, i), &client, echo, ipFam).Run(func(a *check.Action) {

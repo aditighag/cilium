@@ -40,8 +40,7 @@ enum egressgw_test {
 	TEST_REDIRECT_EXCL_CIDR       = 5,
 	TEST_REDIRECT_SKIP_NO_GATEWAY = 6,
 	TEST_XDP_REPLY                = 7,
-	TEST_FIB                      = 8,
-	TEST_DROP_NO_EGRESS_IP        = 9,
+	TEST_DROP_NO_EGRESS_IP        = 8,
 };
 
 struct egressgw_test_ctx {
@@ -87,11 +86,10 @@ static __always_inline int egressgw_pktgen(struct __ctx_buff *ctx,
 
 	if (test_ctx.dir == CT_INGRESS) {
 		l3->saddr = EXTERNAL_SVC_IP;
-		if (test_ctx.tuple_collision) {
+		if (test_ctx.tuple_collision)
 			l3->daddr = EGRESS_IP3;
-		} else {
+		else
 			l3->daddr = EGRESS_IP;
-		}
 	} else { /* CT_EGRESS */
 		l3->saddr = CLIENT_IP;
 		l3->daddr = EXTERNAL_SVC_IP;
@@ -266,6 +264,7 @@ static __always_inline int create_ct_entry(struct __ctx_buff *ctx, __be16 client
 	struct ipv4_ct_tuple tuple = {};
 	struct ct_state ct_state = {};
 
+	tuple.flags = TUPLE_F_OUT;
 	tuple.nexthdr = IPPROTO_TCP;
 	tuple.daddr = EXTERNAL_SVC_IP;
 	tuple.sport = EXTERNAL_SVC_PORT;
@@ -478,6 +477,7 @@ static __always_inline int create_ct_entry_v6(struct __ctx_buff *ctx, __be16 cli
 	struct ipv6_ct_tuple __align_stack_8 tuple = {};
 	struct ct_state ct_state = {};
 
+	tuple.flags = TUPLE_F_OUT;
 	tuple.nexthdr = IPPROTO_TCP;
 	ipv6_addr_copy((union v6addr *)&tuple.daddr, &ext_svc_ip);
 	tuple.sport = EXTERNAL_SVC_PORT;

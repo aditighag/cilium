@@ -11,7 +11,10 @@ import (
 
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/hive/hivetest"
+	"github.com/cilium/statedb"
+	"github.com/cilium/statedb/reconciler"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/hive"
@@ -21,14 +24,18 @@ import (
 type testSynchronizer struct{ identity chan uint32 }
 
 func (testSynchronizer) InitLocalNode(ctx context.Context, n *LocalNode) error {
-	n.NodeIdentity = 1
+	n.ClusterID = 1
 	return nil
 }
 
 func (ts testSynchronizer) SyncLocalNode(ctx context.Context, lns *LocalNodeStore) {
 	id := <-ts.identity
-	lns.Update(func(n *LocalNode) { n.NodeIdentity = id })
+	lns.Update(func(n *LocalNode) { n.ClusterID = id })
 	<-ctx.Done()
+}
+
+func (ts testSynchronizer) WaitForNodeInformation(context.Context, *LocalNodeStore) error {
+	return nil
 }
 
 func TestLocalNodeStore(t *testing.T) {
@@ -45,9 +52,9 @@ func TestLocalNodeStore(t *testing.T) {
 	observe := func(store *LocalNodeStore) {
 		store.Observe(context.TODO(),
 			func(n LocalNode) {
-				observed = append(observed, n.NodeIdentity)
+				observed = append(observed, n.ClusterID)
 
-				if n.NodeIdentity == expected[len(expected)-1] {
+				if n.ClusterID == expected[len(expected)-1] {
 					waitObserve.Done()
 				}
 			},
@@ -68,7 +75,7 @@ func TestLocalNodeStore(t *testing.T) {
 					}
 
 					store.Update(func(n *LocalNode) {
-						n.NodeIdentity = i
+						n.ClusterID = i
 					})
 				}
 				return nil
@@ -109,6 +116,110 @@ func TestLocalNodeStore(t *testing.T) {
 	// states may get skipped.
 	assert.NotEmpty(t, observed)
 	assert.Subset(t, expected, observed)
+}
+
+func TestLocalNodeStoreUpdateMarksStatusesPending(t *testing.T) {
+	const requiredReconciler = "required"
+
+	var (
+		store *LocalNodeStore
+		db    *statedb.DB
+		nodes statedb.Table[*Node]
+	)
+	hive := hive.New(
+		LocalNodeStoreTestCell,
+		cell.Provide(func() cmtypes.ClusterInfo {
+			return cmtypes.ClusterInfo{Name: "test"}
+		}),
+		cell.Invoke(func(
+			s *LocalNodeStore,
+			d *statedb.DB,
+			ns statedb.Table[*Node],
+			writer *Writer,
+		) {
+			store, db, nodes = s, d, ns
+			writer.RegisterReconciler(requiredReconciler)
+		}),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	tlog := hivetest.Logger(t)
+	require.NoError(t, hive.Start(tlog, ctx))
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Minute)
+		defer stopCancel()
+		require.NoError(t, hive.Stop(tlog, stopCtx))
+	})
+
+	rwNodes := nodes.(statedb.RWTable[*Node])
+	txn := db.WriteTxn(rwNodes)
+	local, _, found := rwNodes.Get(txn, LocalNodeQuery)
+	require.True(t, found)
+	local = local.DeepCopy()
+	local.Statuses = local.Statuses.Set("test", reconciler.StatusDone())
+	local.Statuses = local.Statuses.Set(
+		requiredReconciler,
+		reconciler.StatusDone(),
+	)
+	_, _, err := rwNodes.Insert(txn, local)
+	require.NoError(t, err)
+	txn.Commit()
+
+	store.Update(func(*LocalNode) {})
+	local, _, found = nodes.Get(db.ReadTxn(), LocalNodeQuery)
+	require.True(t, found)
+	require.Equal(t, reconciler.StatusKindDone, local.Statuses.Get("test").Kind)
+	require.Equal(t,
+		reconciler.StatusKindDone,
+		local.Statuses.Get(requiredReconciler).Kind,
+	)
+
+	store.Update(func(n *LocalNode) { n.ClusterID++ })
+	local, _, found = nodes.Get(db.ReadTxn(), LocalNodeQuery)
+	require.True(t, found)
+	require.Equal(t, reconciler.StatusKindPending, local.Statuses.Get("test").Kind)
+	require.Equal(t,
+		reconciler.StatusKindPending,
+		local.Statuses.Get(requiredReconciler).Kind,
+	)
+}
+
+func TestWaitForLocalNodeInit(t *testing.T) {
+	db := statedb.New()
+	nodes, err := NewNodeTable(db)
+	require.NoError(t, err)
+
+	wtxn := db.WriteTxn(nodes)
+	localInitDone := nodes.RegisterInitializer(wtxn, LocalNodeTableInitializerName)
+	otherInitDone := nodes.RegisterInitializer(wtxn, "other")
+	wtxn.Commit()
+
+	pending := nodes.PendingInitializers(db.ReadTxn())
+	require.Contains(t, pending, LocalNodeTableInitializerName)
+	require.Contains(t, pending, "other")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err = WaitForLocalNodeInit(ctx, db, nodes)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+
+	wtxn = db.WriteTxn(nodes)
+	localInitDone(wtxn)
+	wtxn.Commit()
+
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	txn, err := WaitForLocalNodeInit(ctx, db, nodes)
+	require.NoError(t, err)
+
+	pending = nodes.PendingInitializers(txn)
+	require.NotContains(t, pending, LocalNodeTableInitializerName)
+	require.Contains(t, pending, "other")
+
+	wtxn = db.WriteTxn(nodes)
+	otherInitDone(wtxn)
+	wtxn.Commit()
 }
 
 func BenchmarkLocalNodeStoreGet(b *testing.B) {

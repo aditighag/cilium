@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"syscall"
 
 	"github.com/vishvananda/netlink"
@@ -115,7 +116,7 @@ type SocketDestroyer interface {
 }
 
 type SocketFilter struct {
-	DestIp   net.IP
+	DestIp   netip.Addr
 	DestPort uint16
 	Family   uint8
 	Protocol uint8
@@ -175,8 +176,9 @@ func (d *netlinkSocketDestroyer) Destroy(logger *slog.Logger, filter SocketFilte
 		// Note that socketlb placed the revnat entry into the IPv4-related
 		// map (not the IPv6 one!). The DestroyCB looks up the right revnat
 		// BPF map based on the filter.DestIp which in our case is an IPv4
-		// address. The filter.DestIp stores the IPv4 address internally
-		// as IPv4-mapped IPv6 form as per net.IP.
+		// address. So the filter must remain an IPv4 address even while
+		// matching IPv6 sockets. MatchSocket unmaps both sides so the
+		// v4-in-v6 form compares equal.
 		if family == syscall.AF_INET {
 			family = syscall.AF_INET6
 			goto redo
@@ -198,7 +200,11 @@ func (d *netlinkSocketDestroyer) Destroy(logger *slog.Logger, filter SocketFilte
 }
 
 func (f *SocketFilter) MatchSocket(socket netlink.SocketID) bool {
-	if socket.Destination.Equal(f.DestIp) && socket.DestinationPort == f.DestPort {
+	socketAddr, ok := netip.AddrFromSlice(socket.Destination)
+	if !ok {
+		return false
+	}
+	if socketAddr.Unmap() == f.DestIp.Unmap() && socket.DestinationPort == f.DestPort {
 		if f.DestroyCB == nil || f.DestroyCB(socket) {
 			return true
 		}
@@ -209,7 +215,11 @@ func (f *SocketFilter) MatchSocket(socket netlink.SocketID) bool {
 
 func filterAndDestroySockets(family, protocol uint8, states uint32, socketCB func(socket netlink.SocketID, err error)) error {
 	return iterateNetlinkSockets(protocol, family, states, func(sockInfo *Socket, err error) error {
-		socketCB(sockInfo.ID, err)
+		if err != nil {
+			socketCB(netlink.SocketID{}, err)
+			return nil
+		}
+		socketCB(sockInfo.ID, nil)
 		return nil
 	})
 }
@@ -236,7 +246,7 @@ func newBPFSocketDestroyer(logger *slog.Logger, sockRevNat4, sockRevNat6 *bpf.Ma
 // socket iterator and the cil_sock_udp_destroy program.
 //
 // Supported families in the filter: syscall.AF_INET, syscall.AF_INET6
-// Supported protocols in the filter: unix.IPPROTO_UDP
+// Supported protocols in the filter: unix.IPPROTO_UDP, unix.IPPROTO_TCP
 func (sd *bpfSocketDestroyer) Destroy(logger *slog.Logger, f SocketFilter) error {
 	if f.Family != syscall.AF_INET && f.Family != syscall.AF_INET6 {
 		return fmt.Errorf("unsupported family for socket destroy: %d", f.Family)
@@ -511,30 +521,40 @@ func iterateNetlinkSockets(proto uint8, family uint8, stateFilter uint32, fn fun
 		return fmt.Errorf("failed to send netlink list request: %w", err)
 	}
 
-loop:
+	// Preserve receive-side error notifications for existing callback users,
+	// but terminate the current dump because it cannot be guaranteed to resume correctly.
+	reportError := func(err error) error {
+		if callbackErr := fn(nil, err); callbackErr != nil {
+			return callbackErr
+		}
+		return err
+	}
+
 	for {
 		msgs, from, err := s.Receive()
 		if err != nil {
-			fn(nil, err)
-			continue loop
+			return reportError(err)
 		}
 		if from.Pid != nl.PidKernel {
-			fn(nil, fmt.Errorf("Wrong sender portid %d, expected %d", from.Pid, nl.PidKernel))
-			continue loop
+			return reportError(fmt.Errorf("Wrong sender portid %d, expected %d", from.Pid, nl.PidKernel))
 		}
 		if len(msgs) == 0 {
-			fn(nil, errors.New("no message nor error from netlink"))
-			continue loop
+			return reportError(errors.New("no message nor error from netlink"))
 		}
 
 		for _, m := range msgs {
 			switch m.Header.Type {
 			case unix.NLMSG_DONE:
-				break loop
+				return nil
 			case unix.NLMSG_ERROR:
-				error := int32(native.Uint32(m.Data[0:4]))
-				fn(nil, syscall.Errno(-error))
-				continue loop
+				if len(m.Data) < 4 {
+					return reportError(fmt.Errorf("short NLMSG_ERROR response: got %d bytes", len(m.Data)))
+				}
+				errno := int32(native.Uint32(m.Data[0:4]))
+				if errno == 0 {
+					return nil
+				}
+				return reportError(syscall.Errno(-errno))
 			}
 			sockInfo := &Socket{}
 			err := sockInfo.Deserialize(m.Data)
@@ -543,5 +563,4 @@ loop:
 			}
 		}
 	}
-	return nil
 }

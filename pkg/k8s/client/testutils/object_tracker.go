@@ -15,6 +15,7 @@ import (
 
 	"github.com/cilium/statedb"
 	"github.com/cilium/statedb/index"
+	"github.com/google/uuid"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,11 +32,12 @@ import (
 
 	"github.com/cilium/cilium/pkg/container"
 	"github.com/cilium/cilium/pkg/k8s/testutils"
+	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 )
 
 const (
-	logfieldGVR               = "gvr" //  GroupVersIonResource
+	logfieldGVR               = "gvr" //  GroupVersionResource
 	logfieldClientset         = "clientset"
 	logfieldResourceVersion   = "resourceVersion"
 	logfieldFieldSelector     = "fieldSelector"
@@ -51,12 +53,13 @@ const (
 //
 // https://pkg.go.dev/k8s.io/client-go/testing#ObjectTracker
 type statedbObjectTracker struct {
-	domain  string
-	log     *slog.Logger
-	db      *statedb.DB
-	scheme  *runtime.Scheme
-	decoder runtime.Decoder
-	tbl     statedb.RWTable[object]
+	domain   string
+	log      *slog.Logger
+	db       *statedb.DB
+	scheme   *runtime.Scheme
+	decoder  runtime.Decoder
+	tbl      statedb.RWTable[object]
+	registry *watchRegistry
 }
 
 func newStateDBObjectTracker(db *statedb.DB, log *slog.Logger) (*statedbObjectTracker, error) {
@@ -70,7 +73,72 @@ func newStateDBObjectTracker(db *statedb.DB, log *slog.Logger) (*statedbObjectTr
 		tbl:     tbl,
 		scheme:  testutils.Scheme,
 		decoder: testutils.Decoder(),
+		registry: &watchRegistry{
+			watches:     make(map[uint64]*statedbWatch),
+			watermarks:  make(map[watchKey]statedb.Revision),
+			generations: make(map[watchKey]uint64),
+		},
 	}, nil
+}
+
+type watchRegistry struct {
+	mu          lock.Mutex
+	nextID      uint64
+	nextGen     uint64
+	watches     map[uint64]*statedbWatch
+	watermarks  map[watchKey]statedb.Revision
+	generations map[watchKey]uint64
+}
+
+type watchKey struct {
+	gvr schema.GroupVersionResource
+	ns  string
+}
+
+func (r *watchRegistry) registerLocked(w *statedbWatch) uint64 {
+	r.nextID++
+	id := r.nextID
+	r.watches[id] = w
+	return id
+}
+
+func (r *watchRegistry) unregister(id uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.watches, id)
+}
+
+func watchOverlaps(resyncNS, watchNS string) bool {
+	if resyncNS == "" || watchNS == "" {
+		return true
+	}
+	return resyncNS == watchNS
+}
+
+func (r *watchRegistry) lowWatermarkLocked(gvr schema.GroupVersionResource, ns string) statedb.Revision {
+	var rev statedb.Revision
+	for key, watermark := range r.watermarks {
+		if key.gvr != gvr || !watchOverlaps(key.ns, ns) {
+			continue
+		}
+		if watermark > rev {
+			rev = watermark
+		}
+	}
+	return rev
+}
+
+func (r *watchRegistry) generationLocked(gvr schema.GroupVersionResource, ns string) uint64 {
+	var gen uint64
+	for key, candidate := range r.generations {
+		if key.gvr != gvr || !watchOverlaps(key.ns, ns) {
+			continue
+		}
+		if candidate > gen {
+			gen = candidate
+		}
+	}
+	return gen
 }
 
 type object struct {
@@ -169,6 +237,79 @@ func (s *statedbObjectTracker) For(domain string, scheme *runtime.Scheme, decode
 	return &o
 }
 
+func (s *statedbObjectTracker) Resync(gvr schema.GroupVersionResource, replacements []object) (int, statedb.Revision, error) {
+	s.registry.mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			s.registry.mu.Unlock()
+		}
+	}()
+
+	matches := make([]*statedbWatch, 0)
+	for _, w := range s.registry.watches {
+		if w.gvr != gvr {
+			continue
+		}
+		matches = append(matches, w)
+	}
+
+	wtxn := s.db.WriteTxn(s.tbl)
+	defer wtxn.Abort()
+
+	key := watchKey{gvr: gvr}
+	rev := s.tbl.Revision(wtxn) + 1
+
+	for obj := range s.tbl.All(wtxn) {
+		if obj.gvr != gvr || obj.deleted {
+			continue
+		}
+		obj.deleted = true
+		if _, _, err := s.tbl.Insert(wtxn, obj); err != nil {
+			return 0, 0, err
+		}
+	}
+
+	for _, replacement := range replacements {
+		if replacement.gvr != gvr {
+			return 0, 0, fmt.Errorf("replacement %s does not match %s", replacement.gvr, gvr)
+		}
+
+		insert := replacement.o.DeepCopyObject()
+		objMeta, err := meta.Accessor(insert)
+		if err != nil {
+			return 0, 0, err
+		}
+		rev = s.tbl.Revision(wtxn) + 1
+		objMeta.SetResourceVersion(strconv.FormatUint(uint64(rev), 10))
+		fillTypeMetaIfNeeded(insert, gvr.GroupVersion().WithKind(replacement.kind))
+
+		if _, _, err := s.tbl.Insert(wtxn, object{
+			objectId: newObjectId(replacement.domain, gvr, objMeta.GetNamespace(), objMeta.GetName()),
+			kind:     replacement.kind,
+			o:        insert,
+		}); err != nil {
+			return 0, 0, err
+		}
+	}
+
+	if len(replacements) == 0 {
+		rev = s.tbl.Revision(wtxn)
+	}
+	s.registry.nextGen++
+	s.registry.watermarks[key] = rev
+	s.registry.generations[key] = s.registry.nextGen
+
+	wtxn.Commit()
+	locked = false
+	s.registry.mu.Unlock()
+
+	for _, w := range matches {
+		w.injectExpired()
+	}
+	return len(matches), rev, nil
+}
+
 func (s *statedbObjectTracker) ObjectReaction() testing.ReactionFunc {
 	return testing.ObjectReaction(s)
 }
@@ -192,12 +333,10 @@ func (s *statedbObjectTracker) addList(obj runtime.Object) error {
 
 // fillTypeMetaIfNeeded sets the [metav1.TypeMeta] in the object if it's not already set based
 // on the GroupVersionKind found from the schema.
-func fillTypeMetaIfNeeded(obj runtime.Object, gvk schema.GroupVersionKind) runtime.Object {
+func fillTypeMetaIfNeeded(obj runtime.Object, gvk schema.GroupVersionKind) {
 	if obj.GetObjectKind().GroupVersionKind().Empty() {
-		obj = obj.DeepCopyObject()
 		obj.GetObjectKind().SetGroupVersionKind(gvk)
 	}
-	return obj
 }
 
 // Add adds an object to the tracker. If object being added
@@ -219,6 +358,9 @@ func (s *statedbObjectTracker) Add(obj runtime.Object) error {
 
 	version := s.tbl.Revision(wtxn) + 1
 	objMeta.SetResourceVersion(strconv.FormatUint(version, 10))
+	if objMeta.GetUID() == "" {
+		objMeta.SetUID(types.UID(uuid.NewString()))
+	}
 
 	gvks, _, err := s.scheme.ObjectKinds(obj)
 	if err != nil {
@@ -244,7 +386,7 @@ func (s *statedbObjectTracker) Add(obj runtime.Object) error {
 			gvr.Version = ""
 		}
 
-		obj = fillTypeMetaIfNeeded(obj, gvk)
+		fillTypeMetaIfNeeded(obj, gvk)
 
 		s.log.Debug(
 			"Add",
@@ -342,11 +484,15 @@ func (s *statedbObjectTracker) Create(gvr schema.GroupVersionResource, obj runti
 		newMeta.SetNamespace(ns)
 	}
 
-	obj = fillTypeMetaIfNeeded(obj, gvks[0])
+	fillTypeMetaIfNeeded(obj, gvks[0])
 
 	wtxn := s.db.WriteTxn(s.tbl)
 	version := s.tbl.Revision(wtxn) + 1
 	newMeta.SetResourceVersion(strconv.FormatUint(version, 10))
+	if newMeta.GetUID() == "" {
+		newMeta.SetUID(types.UID(uuid.NewString()))
+	}
+
 	old, found, _ := s.tbl.Insert(wtxn, object{
 		objectId: newObjectId(s.domain, gvr, ns, newMeta.GetName()),
 		o:        obj,
@@ -373,13 +519,12 @@ func (s *statedbObjectTracker) Delete(gvr schema.GroupVersionResource, ns string
 		logfields.K8sNamespace, ns,
 		logfields.Name, name)
 
-	obj := object{deleted: true, objectId: newObjectId(s.domain, gvr, ns, name)}
 	wtxn := s.db.WriteTxn(s.tbl)
-	_, found, _ := s.tbl.Modify(wtxn, obj, func(old, new object) object {
-		old.deleted = true
-		return old
-	})
-	if !found {
+	obj, _, found := s.tbl.Get(wtxn, objectIndex.Query(newObjectId(s.domain, gvr, ns, name)))
+	if found {
+		obj.deleted = true
+		s.tbl.Insert(wtxn, obj)
+	} else {
 		wtxn.Abort()
 		err := apierrors.NewNotFound(gvr.GroupResource(), name)
 		log.Debug("Delete", logfields.Error, err)
@@ -494,16 +639,17 @@ func (s *statedbObjectTracker) List(gvr schema.GroupVersionResource, gvk schema.
 // The reactor functions take care of actually processing the patch
 // (objectTrackerReact.Patch in client-go/testing/fixture.go).
 func (s *statedbObjectTracker) Patch(gvr schema.GroupVersionResource, obj runtime.Object, ns string, opts ...metav1.PatchOptions) error {
-	return s.updateOrPatch("Patch", gvr, obj, ns)
+	return s.updateOrPatch("Patch", gvr, obj, ns, false)
 }
 
 // Update updates an existing object in the tracker in the specified namespace.
-// If the object does not exist an error is returned.
+// If the object does not exist, or the resource version of the provided object
+// does not match the stored one, an error is returned.
 func (s *statedbObjectTracker) Update(gvr schema.GroupVersionResource, obj runtime.Object, ns string, opts ...metav1.UpdateOptions) error {
-	return s.updateOrPatch("Update", gvr, obj, ns)
+	return s.updateOrPatch("Update", gvr, obj, ns, true)
 }
 
-func (s *statedbObjectTracker) updateOrPatch(what string, gvr schema.GroupVersionResource, obj runtime.Object, ns string, opts ...metav1.UpdateOptions) error {
+func (s *statedbObjectTracker) updateOrPatch(what string, gvr schema.GroupVersionResource, obj runtime.Object, ns string, checkConflict bool) error {
 	gvks, _, err := s.scheme.ObjectKinds(obj)
 	if err != nil {
 		s.log.Debug(what, logfields.Error, err)
@@ -526,27 +672,46 @@ func (s *statedbObjectTracker) updateOrPatch(what string, gvr schema.GroupVersio
 		newMeta.SetNamespace(ns)
 	}
 
-	obj = fillTypeMetaIfNeeded(obj, gvks[0])
+	fillTypeMetaIfNeeded(obj, gvks[0])
 
 	wtxn := s.db.WriteTxn(s.tbl)
-	version := s.tbl.Revision(wtxn) + 1
-	newMeta.SetResourceVersion(strconv.FormatUint(version, 10))
+	defer wtxn.Abort()
 
+	version := s.tbl.Revision(wtxn) + 1
 	log := s.log.With(
 		logfieldClientset, s.domain,
 		logfields.Object, obj,
 		logfieldResourceVersion, version)
 
-	oldObj, found, _ := s.tbl.Insert(wtxn,
-		object{objectId: newObjectId(s.domain, gvr, ns, newMeta.GetName()), o: obj, kind: gvk.Kind},
-	)
+	var oid = newObjectId(s.domain, gvr, ns, newMeta.GetName())
+	oldObj, _, found := s.tbl.Get(wtxn, objectIndex.Query(oid))
 	if !found || oldObj.deleted {
-		wtxn.Abort()
 		gr := gvr.GroupResource()
 		err := apierrors.NewNotFound(gr, newMeta.GetName())
 		log.Debug(what, logfields.Error, err)
 		return err
 	}
+
+	oldMeta, err := meta.Accessor(oldObj.o)
+	if err != nil {
+		s.log.Debug(what, logfields.Error, err)
+		return err
+	}
+
+	oldRV := oldMeta.GetResourceVersion()
+	newRV := newMeta.GetResourceVersion()
+	if checkConflict && oldRV != newRV {
+		err = apierrors.NewConflict(gvr.GroupResource(), newMeta.GetName(),
+			fmt.Errorf("the object has been modified; resource version mismatch, current %q, got %q", oldRV, newRV),
+		)
+		s.log.Debug(what, logfields.Error, err)
+		return err
+	}
+
+	newMeta.SetResourceVersion(strconv.FormatUint(version, 10))
+	newMeta.SetUID(oldMeta.GetUID())
+	s.tbl.Insert(wtxn, object{objectId: oid, o: obj, kind: gvk.Kind})
+
 	wtxn.Commit()
 	log.Debug(what)
 	return nil
@@ -614,9 +779,21 @@ func (s *statedbObjectTracker) Watch(gvr schema.GroupVersionResource, ns string,
 		stop:              make(chan struct{}),
 		stopped:           make(chan struct{}),
 		events:            make(chan watch.Event, 1),
+		injectErr:         make(chan runtime.Object, 1),
 		fieldSelector:     fieldSelector,
 		sendInitialEvents: sendInitialEvents,
+		registry:          s.registry,
 	}
+	s.registry.mu.Lock()
+	if minRV := s.registry.lowWatermarkLocked(gvr, ns); version > 0 && version < uint64(minRV) {
+		s.registry.mu.Unlock()
+		return nil, apierrors.NewResourceExpired(
+			fmt.Sprintf("resourceVersion %d is older than the minimum allowed %d after resync", version, minRV),
+		)
+	}
+	w.generation = s.registry.generationLocked(gvr, ns)
+	w.id = s.registry.registerLocked(w)
+	s.registry.mu.Unlock()
 	go w.feed()
 
 	return w, nil
@@ -636,13 +813,26 @@ type statedbWatch struct {
 	stopOnce          sync.Once
 	stopped           chan struct{}
 	events            chan watch.Event
+	injectErr         chan runtime.Object
 	fieldSelector     fields.Selector
 	sendInitialEvents bool
+	registry          *watchRegistry
+	generation        uint64
+	id                uint64
 }
 
 // ResultChan implements watch.Interface.
 func (w *statedbWatch) ResultChan() <-chan watch.Event {
 	return w.events
+}
+
+func (w *statedbWatch) superseded() bool {
+	if w.registry == nil {
+		return false
+	}
+	w.registry.mu.Lock()
+	defer w.registry.mu.Unlock()
+	return w.generation != w.registry.generationLocked(w.gvr, w.ns)
 }
 
 func (w *statedbWatch) feed() {
@@ -651,12 +841,21 @@ func (w *statedbWatch) feed() {
 	seen := sets.New[string]()
 	lastRev := w.version
 
+	if w.superseded() {
+		w.emitExpired("synthetic resync")
+		return
+	}
+
 	// WatchList semantics: if sendInitialEvents is true, first send Added events
 	// for all existing objects, then send a Bookmark event to signal the end of
 	// initial events.
 	if w.sendInitialEvents {
 		txn := w.db.ReadTxn()
 		for obj := range w.tbl.All(txn) {
+			if w.superseded() {
+				w.emitExpired("synthetic resync")
+				return
+			}
 			if obj.deleted {
 				continue
 			}
@@ -703,6 +902,10 @@ func (w *statedbWatch) feed() {
 			Object: w.createBookmarkObject(lastRev),
 		}
 		w.log.Debug("SendingBookmark", logfieldResourceVersion, lastRev)
+		if w.superseded() {
+			w.emitExpired("synthetic resync")
+			return
+		}
 		select {
 		case w.events <- ev:
 		case <-w.stop:
@@ -711,8 +914,16 @@ func (w *statedbWatch) feed() {
 	}
 
 	for {
+		if w.superseded() {
+			w.emitExpired("synthetic resync")
+			return
+		}
 		objs, objsWatch := w.tbl.LowerBoundWatch(w.db.ReadTxn(), statedb.ByRevision[object](lastRev+1))
 		for obj, rev := range objs {
+			if w.superseded() {
+				w.emitExpired("synthetic resync")
+				return
+			}
 			lastRev = rev
 			if obj.domain != w.clientset {
 				continue
@@ -759,6 +970,12 @@ func (w *statedbWatch) feed() {
 		}
 		select {
 		case <-w.stop:
+			return
+		case errObj := <-w.injectErr:
+			select {
+			case w.events <- watch.Event{Type: watch.Error, Object: errObj}:
+			case <-w.stop:
+			}
 			return
 		case <-objsWatch:
 		}
@@ -839,6 +1056,29 @@ func (w *statedbWatch) Stop() {
 		close(w.stop)
 	})
 	<-w.stopped
+	if w.registry != nil {
+		w.registry.unregister(w.id)
+	}
+}
+
+func (w *statedbWatch) injectExpired() {
+	w.sendExpired("synthetic resync")
+}
+
+func (w *statedbWatch) emitExpired(message string) {
+	status := apierrors.NewResourceExpired(message).ErrStatus.DeepCopyObject()
+	select {
+	case w.events <- watch.Event{Type: watch.Error, Object: status}:
+	case <-w.stop:
+	}
+}
+
+func (w *statedbWatch) sendExpired(message string) {
+	status := apierrors.NewResourceExpired(message).ErrStatus.DeepCopyObject()
+	select {
+	case w.injectErr <- status:
+	case <-w.stopped:
+	}
 }
 
 var _ watch.Interface = &statedbWatch{}

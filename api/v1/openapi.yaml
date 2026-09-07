@@ -36,8 +36,8 @@ paths:
       summary: Get health of Cilium daemon
       description: |
         Returns health and status information of the Cilium daemon and related
-        components such as the local container runtime, connected datastore,
-        Kubernetes integration and Hubble.
+        components such as the connected datastore, Kubernetes integration and
+        Hubble.
       tags:
       - daemon
       parameters:
@@ -576,6 +576,16 @@ paths:
           description: Success
           schema:
             "$ref": "#/definitions/SelectorCache"
+  "/policy/subject-selectors":
+    get:
+      summary: See what subject selectors match which identities on the local node
+      tags:
+        - policy
+      responses:
+        '200':
+          description: Success
+          schema:
+            "$ref": "#/definitions/SelectorCache"
   "/lrp":
     get:
       summary: Retrieve list of all local redirect policies
@@ -867,6 +877,8 @@ paths:
         Retrieves current operational state of BGP peers created by
         Cilium BGP virtual router. This includes session state, uptime,
         information per address family, etc.
+        Deprecated: This will be removed in the future.
+      deprecated: true
       tags:
         - bgp
       responses:
@@ -888,7 +900,10 @@ paths:
   "/bgp/routes":
     get:
       summary: Lists BGP routes from BGP Control Plane RIB.
-      description: Retrieves routes from BGP Control Plane RIB filtered by parameters you specify
+      description: |
+        Retrieves routes from BGP Control Plane RIB filtered by parameters you specify.
+        Deprecated: This will be removed in the future.
+      deprecated: true
       tags:
         - bgp
       parameters:
@@ -916,7 +931,10 @@ paths:
   "/bgp/route-policies":
     get:
       summary: Lists BGP route policies configured in BGP Control Plane.
-      description: Retrieves route policies from BGP Control Plane.
+      description: |
+        Retrieves route policies from BGP Control Plane.
+        Deprecated: This will be removed in the future.
+      deprecated: true
       tags:
         - bgp
       parameters:
@@ -950,11 +968,7 @@ parameters:
         - cilium-local: Local Cilium endpoint UUID, e.g. cilium-local:3389595
         - cilium-global: Global Cilium endpoint UUID, e.g. cilium-global:cluster1:nodeX:452343
         - cni-attachment-id: CNI attachment ID, e.g. cni-attachment-id:22222:eth0
-        - container-id: Container runtime ID, e.g. container-id:22222 (deprecated, may not be unique)
-        - container-name: Container name, e.g. container-name:foobar (deprecated, may not be unique)
-        - pod-name: pod name for this container if K8s is enabled, e.g. pod-name:default:foobar (deprecated, may not be unique)
         - cep-name: cep name for this container if K8s is enabled, e.g. pod-name:default:foobar-net1
-        - docker-endpoint: Docker libnetwork endpoint ID, e.g. docker-endpoint:4444
     in: path
     required: true
     type: string
@@ -1166,21 +1180,12 @@ definitions:
       container-id:
         description: ID assigned by container runtime
         type: string
-      container-name:
-        description: Name assigned to container
-        type: string
       container-netns-path:
         description: Path of Container Netns
-        type: string
-      docker-endpoint-id:
-        description: Docker endpoint ID
         type: string
       labels:
         description: Labels describing the identity
         "$ref": "#/definitions/Labels"
-      docker-network-id:
-        description: Docker network ID
-        type: string
       interface-name:
         description: Name of network device in host netns
         type: string
@@ -1200,10 +1205,10 @@ definitions:
         "$ref": "#/definitions/EndpointState"
       mac:
         description: MAC address
-        type: string
+        "$ref": "#/definitions/MAC"
       host-mac:
         description: MAC address
-        type: string
+        "$ref": "#/definitions/MAC"
       addressing:
         "$ref": "#/definitions/AddressPair"
       k8s-pod-name:
@@ -1228,10 +1233,9 @@ definitions:
         description: |
           Whether to build an endpoint synchronously
         type: boolean
-      disable-legacy-identifiers:
+      is-secondary-interface:
         description: >-
-          Disables lookup using legacy endpoint identifiers (container name,
-          container id, pod name) for this endpoint
+          Whether this is a secondary pod interface
         type: boolean
       netns-cookie:
         description: Network namespace cookie
@@ -1652,18 +1656,18 @@ definitions:
     properties:
       ip:
         description: Allocated IP for endpoint
-        type: string
+        "$ref": "#/definitions/Address"
       gateway:
         description: IP of gateway
-        type: string
+        "$ref": "#/definitions/Address"
       cidrs:
         description: List of CIDRs out of which IPs are allocated
         type: array
         items:
-          type: string
+          "$ref": "#/definitions/CIDR"
       master-mac:
-        type: string
         description: MAC of master interface if address is a slave/secondary of a master interface
+        "$ref": "#/definitions/MAC"
       expiration-uuid:
         type: string
         description: |
@@ -1702,6 +1706,35 @@ definitions:
   Address:
     description: IP address
     type: string
+    x-go-type:
+      type: Addr
+      import:
+        package: "github.com/cilium/cilium/pkg/ip"
+        alias: iputil
+      hints:
+        kind: primitive
+        noValidation: true
+  CIDR:
+    description: IP address prefix (CIDR)
+    type: string
+    x-go-type:
+      type: Prefix
+      import:
+        package: "github.com/cilium/cilium/pkg/ip"
+        alias: iputil
+      hints:
+        kind: primitive
+        noValidation: true
+  MAC:
+    description: MAC address
+    type: string
+    x-go-type:
+      type: MAC
+      import:
+        package: "github.com/cilium/cilium/pkg/mac"
+      hints:
+        kind: primitive
+        noValidation: true
   ClusterNodesResponse:
     properties:
       self:
@@ -1748,10 +1781,10 @@ definitions:
         "$ref": "#/definitions/NodeAddressing"
       host-mac:
         description: MAC address
-        type: string
+        "$ref": "#/definitions/MAC"
       mac:
         description: MAC address
-        type: string
+        "$ref": "#/definitions/MAC"
       interface-name:
         description: Name of network device in host netns
         type: string
@@ -1771,6 +1804,11 @@ definitions:
       cni-attachment-id:
         description: ID assigned to this attachment by container runtime
         type: string
+      # The identifiers below are retained for backwards compatibility only.
+      # Nothing populates these anymore, but during an upgrade older agents may
+      # still set them on the CiliumEndpoint CRD. The fields must stay in the
+      # schema so the generated CRD keeps accepting those objects. Do not
+      # remove.
       container-id:
         description: ID assigned by container runtime (deprecated, may not be unique)
         type: string
@@ -1846,9 +1884,6 @@ definitions:
       cni-file:
         description: Status of the CNI configuration file
         "$ref": "#/definitions/Status"
-      container-runtime:
-        description: Status of local container runtime
-        "$ref": "#/definitions/Status"
       host-firewall:
         description: Status of the host firewall
         "$ref": "#/definitions/HostFirewall"
@@ -1862,8 +1897,11 @@ definitions:
         description: Status of Kubernetes integration
         "$ref": "#/definitions/K8sStatus"
       datapath-mode:
-        description: Status of datapath mode
+        description: Status of operational datapath mode
         "$ref": "#/definitions/DatapathMode"
+      configured-datapath-mode:
+        description: Status of configured datapath mode
+        "$ref": "#/definitions/ConfiguredDatapathMode"
       attach-mode:
         description: Status of core datapath attachment mode
         "$ref": "#/definitions/AttachMode"
@@ -2305,6 +2343,9 @@ definitions:
       num-shared-services:
         description: Number of services in the cluster
         type: integer
+      num-endpoint-slices:
+        description: Number of endpoint slices in the cluster
+        type: integer
       num-service-exports:
         description: Number of MCS-API service exports in the cluster
         type: integer
@@ -2339,6 +2380,10 @@ definitions:
       services:
         description: Services synchronization status
         type: boolean
+      endpoint-slices:
+        description: Endpoint slices synchronization status (null means that the component is not watching endpoint slices)
+        type: boolean
+        x-nullable: true
       service-exports:
         description: MCS-API service exports synchronization status (null means that the component is not watching service exports)
         type: boolean
@@ -2374,6 +2419,12 @@ definitions:
         description: Whether or not MCS-API ServiceExports is enabled by the cluster (null means unsupported).
         type: boolean
         x-nullable: true
+      endpoint-slices-export-mode:
+        description: EndpointSlices export mode advertised by the remote cluster
+        type: string
+        enum:
+        - services-and-endpointslices
+        - endpointslices-only
   MonitorStatus:
     description: Status of the node monitor
     properties:
@@ -2464,11 +2515,13 @@ definitions:
       enableRouteMTUForCNIChaining:
         description: Enable route MTU for pod netns when CNI chaining is used
         type: boolean
-      enablePacketizationLayerPMTUD:
-        description: Enable PLPMTUD probing on the pod netns
-        type: boolean
+      packetizationLayerPMTUDMode:
+        description: Specifies what mode PLPMTUD probing on the pod netns should be set to (if empty will do nothing).
+        type: string
       datapathMode:
         "$ref": "#/definitions/DatapathMode"
+      configuredDatapathMode:
+        "$ref": "#/definitions/ConfiguredDatapathMode"
       ipam-mode:
         description: Configured IPAM mode
         type: string
@@ -2518,9 +2571,17 @@ definitions:
         description: True if BBR is enabled only in the host network namespace
         type: boolean
   DatapathMode:
-    description: Datapath mode
+    description: Operational datapath mode
     type: string
     enum:
+      - veth
+      - netkit
+      - netkit-l2
+  ConfiguredDatapathMode:
+    description: Configured datapath mode
+    type: string
+    enum:
+      - auto
       - veth
       - netkit
       - netkit-l2
@@ -2673,8 +2734,8 @@ definitions:
         description: string form of selector
         type: string
       labels:
-        description: Labels are the metadata labels associated with the selector
-        "$ref": "#/definitions/LabelArray"
+        description: Labels is a list of labels of the policy rules currently using this selector
+        "$ref": "#/definitions/LabelArrayList"
       identities:
         description: identities mapping to this selector
         type: array
@@ -3129,18 +3190,18 @@ definitions:
       snat-exclusion-cidr:
         description: |-
           This field is obsolete, please use snat-exclusion-cidr-v4 or snat-exclusion-cidr-v6.
-        type: string
+        "$ref": "#/definitions/CIDR"
       snat-exclusion-cidr-v4:
         description: |-
           SnatExclusionCIDRv4 exempts SNAT from being performed on any packet sent to
           an IPv4 address that belongs to this CIDR.
-        type: string
+        "$ref": "#/definitions/CIDR"
       snat-exclusion-cidr-v6:
         description: |-
           SnatExclusionCIDRv6 exempts SNAT from being performed on any packet sent to
           an IPv6 address that belongs to this CIDR.
           For IPv6 we only do masquerading in iptables mode.
-        type: string
+        "$ref": "#/definitions/CIDR"
   ClockSource:
     description: |-
       Status of BPF clock source
@@ -3249,10 +3310,10 @@ definitions:
         type: string
         format: date-time
       key:
-        description: Map key on which the event occured
+        description: Map key on which the event occurred
         type: string
       value:
-        description: Map value on which the event occured
+        description: Map value on which the event occurred
         type: string
       action:
         description: Action type for event
@@ -3595,9 +3656,13 @@ definitions:
   BgpPeer:
     description: |-
       State of a BGP Peer
+      Deprecated: This will be removed in the future.
 
       +k8s:deepcopy-gen=true
     properties:
+      name:
+        description: Name of peer
+        type: string
       local-asn:
         description: Local AS Number
         type: integer
@@ -3704,7 +3769,9 @@ definitions:
           (RFC 4724 section 4.2)
         type: integer
   BgpRoute:
-    description: Single BGP route retrieved from the RIB of underlying router
+    description: |
+      Single BGP route retrieved from the RIB of underlying router
+      Deprecated: This will be removed in the future.
     properties:
       router-asn:
         description: Autonomous System Number (ASN) identifying a BGP virtual router instance
@@ -3765,7 +3832,9 @@ definitions:
         description: Base64-encoded BGP path attribute in the BGP UPDATE message format
         type: string
   BgpRoutePolicy:
-    description: Single BGP route policy retrieved from the underlying router
+    description: |
+      Single BGP route policy retrieved from the underlying router
+      Deprecated: This will be removed in the future.
     properties:
       router-asn:
         description: Autonomous System Number (ASN) identifying a BGP virtual router instance
@@ -3879,7 +3948,7 @@ definitions:
         type: string
 
   Label:
-    description: Label is the Cilium's representation of a container label
+    description: Label is Cilium's representation of a label
     type: object
     properties:
       key:
@@ -3887,10 +3956,15 @@ definitions:
       value:
         type: string
       source:
-        description: Source can be one of the above values (e.g. LabelSourceContainer)
+        description: Source can be one of the above values (e.g. LabelSourceK8s)
         type: string
   LabelArray:
     description: LabelArray is an array of labels forming a set
     type: array
     items:
       "$ref": "#/definitions/Label"
+  LabelArrayList:
+    description: LabelArrayList is an array of LabelArrays forming a set
+    type: array
+    items:
+      "$ref": "#/definitions/LabelArray"

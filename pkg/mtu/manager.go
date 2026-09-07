@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"net"
 	"slices"
 	"sync/atomic"
 
@@ -17,7 +16,6 @@ import (
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	"github.com/cilium/cilium/pkg/logging/logfields"
-	"github.com/cilium/cilium/pkg/node/addressing"
 
 	"github.com/cilium/hive/cell"
 )
@@ -57,10 +55,20 @@ func (m *MTUManager) Updater(ctx context.Context, health cell.Health) error {
 			baseMTU = min(baseMTU, dev.MTU)
 			deviceNames = append(deviceNames, dev.Name)
 		}
-		m.Log.Debug("Detected base MTU from devices",
-			logfields.Devices, deviceNames,
-			logfields.MTU, baseMTU,
-		)
+		if len(consideredDevices) == 0 {
+			// Without any device to detect the MTU from we would keep MaxMTU, which no
+			// real NIC can carry. Fall back to the safe Ethernet default instead, the MTU
+			// is re-evaluated whenever the devices or the local node change.
+			baseMTU = EthernetMTU
+			m.Log.Warn("No devices to detect the MTU from, falling back to the default MTU",
+				logfields.MTU, baseMTU,
+			)
+		} else {
+			m.Log.Debug("Detected base MTU from devices",
+				logfields.Devices, deviceNames,
+				logfields.MTU, baseMTU,
+			)
+		}
 
 		routeMTU := m.Config.Calculate(baseMTU)
 
@@ -69,7 +77,7 @@ func (m *MTUManager) Updater(ctx context.Context, health cell.Health) error {
 		changed := false
 
 		// Update the IPv4 default route MTU if it has changed
-		existing, _, found := m.MTUTable.Get(txn, MTURouteIndex.Query(DefaultPrefixV4))
+		existing, _, found := m.MTUTable.Get(txn, MTURouteByPrefix(DefaultPrefixV4))
 		if !found || existing.DeviceMTU != routeMTU.DeviceMTU {
 			routeMTU.Prefix = DefaultPrefixV4
 			_, _, err := m.MTUTable.Insert(txn, routeMTU)
@@ -81,7 +89,7 @@ func (m *MTUManager) Updater(ctx context.Context, health cell.Health) error {
 		}
 
 		// Update the IPv6 default route MTU if it has changed
-		existing, _, found = m.MTUTable.Get(txn, MTURouteIndex.Query(DefaultPrefixV6))
+		existing, _, found = m.MTUTable.Get(txn, MTURouteByPrefix(DefaultPrefixV6))
 		if !found || existing.DeviceMTU != routeMTU.DeviceMTU {
 			routeMTU.Prefix = DefaultPrefixV6
 			_, _, err := m.MTUTable.Insert(txn, routeMTU)
@@ -117,16 +125,9 @@ func (m *MTUManager) observeLocalCiliumNode(ctx context.Context, event resource.
 		return nil
 	}
 
-	// Ignore update events if the node local IPs is not yet know, which might not happen
-	// in the first event.
-	hasInternalIP := false
-	for _, addr := range event.Object.Spec.Addresses {
-		if addr.Type == addressing.NodeInternalIP {
-			hasInternalIP = true
-			break
-		}
-	}
-	if !hasInternalIP {
+	// Ignore update events until the ENIs of the node are known, which might not be the
+	// case in the first event.
+	if len(event.Object.Status.ENI.ENIs) == 0 {
 		event.Done(nil)
 		return nil
 	}
@@ -166,36 +167,22 @@ func (m *MTUManager) consideredDevices(devs []*tables.Device) []*tables.Device {
 			break
 		}
 
-		var internalIP string
-		for _, addr := range localNode.Spec.Addresses {
-			if addr.Type == addressing.NodeInternalIP {
-				internalIP = addr.IP
-				break
-			}
-		}
-		// If we don't have the internal IP yet, we cannot exclude any devices
-		if internalIP == "" {
-			break
-		}
-
 		for _, eni := range localNode.Status.ENI.ENIs {
-			// Use the primary IP of the node to tell which ENI is the primary
-			isPrimary := eni.IP == internalIP
-			if isPrimary {
+			// Skip primary ENI
+			if eni.Number == 0 {
 				continue
 			}
 
 			// Names of ENIs and actual device doesn't match, use MAC address to match
-			// secondary ENIs to the actual device
-			mac, err := net.ParseMAC(eni.MAC)
-			if err != nil {
-				m.Log.Error("Failed to parse MAC address", logfields.Error, err)
+			// secondary ENIs to the actual device. An ENI reported without a
+			// MAC cannot be matched to a device.
+			if !eni.MAC.IsValid() {
 				continue
 			}
 
 			// Remove the device with the MAC address of the secondary ENI
 			devs = slices.DeleteFunc(devs, func(dev *tables.Device) bool {
-				return bytes.Equal(dev.HardwareAddr, mac)
+				return bytes.Equal(dev.HardwareAddr, eni.MAC.HardwareAddr())
 			})
 		}
 	}

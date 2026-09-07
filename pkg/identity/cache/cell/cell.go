@@ -5,6 +5,7 @@ package identitycachecell
 
 import (
 	"cmp"
+	"context"
 	"log/slog"
 	"net"
 
@@ -14,6 +15,7 @@ import (
 
 	"github.com/cilium/cilium/pkg/allocator"
 	"github.com/cilium/cilium/pkg/clustermesh"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/identity/cache"
 	"github.com/cilium/cilium/pkg/k8s/client/clientset/versioned"
@@ -64,13 +66,15 @@ type CachingIdentityAllocator interface {
 type identityAllocatorParams struct {
 	cell.In
 
-	Log       *slog.Logger
-	Lifecycle cell.Lifecycle
-	IDUpdater policycell.IdentityUpdater
+	Log            *slog.Logger
+	Lifecycle      cell.Lifecycle
+	IDUpdater      policycell.IdentityUpdater
+	LocalNodeStore *node.LocalNodeStore
 
 	IdentityHandlers []identity.UpdateIdentities `group:"identity-handlers"`
 
-	Config config
+	ClusterInfo cmtypes.ClusterInfo
+	Config      config
 }
 
 type identityAllocatorOut struct {
@@ -106,6 +110,7 @@ func newIdentityAllocator(params identityAllocatorParams) identityAllocatorOut {
 	iao := &identityAllocatorOwner{
 		IdentityUpdater: params.IDUpdater,
 		logger:          params.Log,
+		localNodeStore:  params.LocalNodeStore,
 	}
 
 	var idAlloc CachingIdentityAllocator
@@ -117,6 +122,7 @@ func newIdentityAllocator(params identityAllocatorParams) identityAllocatorOut {
 		)
 
 		allocatorConfig := cache.AllocatorConfig{
+			ClusterInfo:              params.ClusterInfo,
 			EnableOperatorManageCIDs: isOperatorManageCIDsEnabled,
 			Timeout:                  params.Config.IdentityAllocationTimeout,
 			SyncInterval:             params.Config.IdentityAllocationSyncInterval,
@@ -156,7 +162,8 @@ func newIdentityAllocator(params identityAllocatorParams) identityAllocatorOut {
 
 type identityAllocatorOwner struct {
 	policycell.IdentityUpdater
-	logger *slog.Logger
+	logger         *slog.Logger
+	localNodeStore *node.LocalNodeStore
 }
 
 // GetNodeSuffix returns the suffix to be appended to kvstore keys of this
@@ -164,11 +171,16 @@ type identityAllocatorOwner struct {
 func (iao *identityAllocatorOwner) GetNodeSuffix() string {
 	var ip net.IP
 
+	ln, err := iao.localNodeStore.Get(context.Background())
+	if err != nil {
+		logging.Fatal(iao.logger, "Failed to retrieve local node")
+	}
+
 	switch {
 	case option.Config.EnableIPv4:
-		ip = node.GetIPv4(iao.logger)
+		ip = ln.GetNodeIP(false)
 	case option.Config.EnableIPv6:
-		ip = node.GetIPv6(iao.logger)
+		ip = ln.GetNodeIP(true)
 	}
 
 	if ip == nil {

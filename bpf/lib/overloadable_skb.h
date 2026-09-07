@@ -3,9 +3,8 @@
 
 #pragma once
 
-#include "lib/common.h"
-#include "linux/ip.h"
-
+#include <linux/ip.h>
+#include "identity.h"
 
 static __always_inline __maybe_unused void
 bpf_clear_meta(struct __sk_buff *ctx)
@@ -50,9 +49,15 @@ get_epid(const struct __sk_buff *ctx)
 }
 
 static __always_inline __maybe_unused void
-set_identity_meta(struct __sk_buff *ctx, __u32 identity)
+set_encrypt_identity_meta(struct __sk_buff *ctx, __u32 identity)
 {
 	ctx->cb[CB_ENCRYPT_IDENTITY] = identity;
+}
+
+static __always_inline __maybe_unused __u32
+get_encrypt_identity_meta(const struct __sk_buff *ctx)
+{
+	return ctx->cb[CB_ENCRYPT_IDENTITY];
 }
 
 static __always_inline __maybe_unused int
@@ -91,29 +96,13 @@ ctx_skip_nodeport(struct __sk_buff *ctx __maybe_unused)
 {
 #ifdef ENABLE_NODEPORT
 	volatile __u32 tc_index = ctx->tc_index;
+
 	ctx->tc_index &= ~TC_INDEX_F_SKIP_NODEPORT;
 	return tc_index & TC_INDEX_F_SKIP_NODEPORT;
 #else
 	return true;
 #endif
 }
-
-#ifdef ENABLE_HOST_FIREWALL
-static __always_inline void
-ctx_skip_host_fw_set(struct __sk_buff *ctx)
-{
-	ctx->tc_index |= TC_INDEX_F_SKIP_HOST_FIREWALL;
-}
-
-static __always_inline bool
-ctx_skip_host_fw(struct __sk_buff *ctx)
-{
-	volatile __u32 tc_index = ctx->tc_index;
-
-	ctx->tc_index &= ~TC_INDEX_F_SKIP_HOST_FIREWALL;
-	return tc_index & TC_INDEX_F_SKIP_HOST_FIREWALL;
-}
-#endif /* ENABLE_HOST_FIREWALL */
 
 static __always_inline __maybe_unused __u32 ctx_get_xfer(struct __sk_buff *ctx,
 							 __u32 off)
@@ -186,30 +175,14 @@ static __always_inline bool ctx_egw_done(const struct __sk_buff *ctx)
 
 #ifdef HAVE_ENCAP
 static __always_inline __maybe_unused int
-ctx_set_encap_info4(struct __sk_buff *ctx, __u32 src_ip,
-		    __be16 src_port __maybe_unused, __u32 tunnel_endpoint,
-		    __u32 seclabel, __u32 vni __maybe_unused,
-		    void *opt, __u32 opt_len)
+ctx_set_encap_info(struct __sk_buff *ctx, struct bpf_tunnel_key *key,
+		   __u32 key_size, void *opt, __u32 opt_len, __u32 flags)
 {
-	struct bpf_tunnel_key key = {};
-	__u32 key_size = TUNNEL_KEY_WITHOUT_SRC_IP;
 	int ret;
 
-#ifdef ENABLE_VTEP
-	if (vni != NOT_VTEP_DST)
-		key.tunnel_id = get_tunnel_id(vni);
-	else
-#endif /* ENABLE_VTEP */
-		key.tunnel_id = get_tunnel_id(seclabel);
+	key->tunnel_ttl = IPDEFTTL;
 
-	if (src_ip != 0) {
-		key.local_ipv4 = bpf_ntohl(src_ip);
-		key_size = sizeof(key);
-	}
-	key.remote_ipv4 = bpf_ntohl(tunnel_endpoint);
-	key.tunnel_ttl = IPDEFTTL;
-
-	ret = ctx_set_tunnel_key(ctx, &key, key_size, BPF_F_ZERO_CSUM_TX);
+	ret = ctx_set_tunnel_key(ctx, key, key_size, flags);
 	if (unlikely(ret < 0))
 		return DROP_WRITE_ERROR;
 
@@ -223,30 +196,45 @@ ctx_set_encap_info4(struct __sk_buff *ctx, __u32 src_ip,
 }
 
 static __always_inline __maybe_unused int
+ctx_set_encap_info4(struct __sk_buff *ctx, __u32 src_ip,
+		    __be16 src_port __maybe_unused, __u32 tunnel_endpoint,
+		    __u32 seclabel, __u32 vni __maybe_unused,
+		    void *opt, __u32 opt_len)
+{
+	struct bpf_tunnel_key key = {};
+	__u32 key_size = TUNNEL_KEY_WITHOUT_SRC_IP;
+
+#ifdef ENABLE_VTEP
+	if (vni != NOT_VTEP_DST)
+		key.tunnel_id = get_tunnel_id(vni);
+	else
+#endif /* ENABLE_VTEP */
+		key.tunnel_id = get_tunnel_id(seclabel);
+
+	if (src_ip != 0) {
+		key.local_ipv4 = bpf_ntohl(src_ip);
+		key_size = sizeof(key);
+	}
+	key.remote_ipv4 = bpf_ntohl(tunnel_endpoint);
+
+	return ctx_set_encap_info(ctx, &key, key_size, opt, opt_len,
+				  BPF_F_ZERO_CSUM_TX);
+}
+
+static __always_inline __maybe_unused int
 ctx_set_encap_info6(struct __sk_buff *ctx, const union v6addr *tunnel_endpoint,
 		    __u32 seclabel, void *opt, __u32 opt_len)
 {
 	struct bpf_tunnel_key key = {};
 	__u32 key_size = TUNNEL_KEY_WITHOUT_SRC_IP;
-	int ret;
 
 	key.tunnel_id = get_tunnel_id(seclabel);
 	key.remote_ipv6[0] = tunnel_endpoint->p1;
 	key.remote_ipv6[1] = tunnel_endpoint->p2;
 	key.remote_ipv6[2] = tunnel_endpoint->p3;
 	key.remote_ipv6[3] = tunnel_endpoint->p4;
-	key.tunnel_ttl = IPDEFTTL;
 
-	ret = ctx_set_tunnel_key(ctx, &key, key_size, BPF_F_TUNINFO_IPV6);
-	if (unlikely(ret < 0))
-		return DROP_WRITE_ERROR;
-
-	if (opt && opt_len > 0) {
-		ret = ctx_set_tunnel_opt(ctx, opt, opt_len);
-		if (unlikely(ret < 0))
-			return DROP_WRITE_ERROR;
-	}
-
-	return CTX_ACT_REDIRECT;
+	return ctx_set_encap_info(ctx, &key, key_size, opt, opt_len,
+				  BPF_F_TUNINFO_IPV6);
 }
 #endif /* HAVE_ENCAP */

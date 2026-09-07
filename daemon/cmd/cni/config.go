@@ -24,6 +24,7 @@ import (
 	"github.com/tidwall/sjson"
 
 	"github.com/cilium/cilium/api/v1/models"
+	"github.com/cilium/cilium/daemon/cmd/cni/config"
 	"github.com/cilium/cilium/pkg/controller"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/time"
@@ -33,7 +34,7 @@ import (
 var legacyConfFile = "05-cilium.conf"
 
 type cniConfigManager struct {
-	config      Config
+	config      config.Config
 	debug       bool
 	cniConfDir  string // computed from WriteCNIConfigWhenReady
 	cniConfFile string // computed from WriteCNIConfigWhenReady
@@ -99,7 +100,7 @@ var cniConfigs map[string]string = map[string]string{
 	// the default
 	"none": `
 {
-  "cniVersion": "0.3.1",
+  "cniVersion": "1.0.0",
   "name": "cilium",
   "plugins": [
     {
@@ -112,7 +113,7 @@ var cniConfigs map[string]string = map[string]string{
 
 	"flannel": `
 {
-  "cniVersion": "0.3.1",
+  "cniVersion": "1.0.0",
   "name": "flannel",
   "plugins": [
     {
@@ -139,7 +140,7 @@ var cniConfigs map[string]string = map[string]string{
 `,
 	"portmap": `
 {
-  "cniVersion": "0.3.1",
+  "cniVersion": "1.0.0",
   "name": "portmap",
   "plugins": [
     {

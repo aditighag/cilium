@@ -6,6 +6,7 @@
 - :ref:`CiliumCIDRGroup<CiliumCIDRGroup>`
 - CiliumClusterwideEnvoyConfig
 - :ref:`CiliumClusterwideNetworkPolicy<CiliumClusterwideNetworkPolicy>`
+- CiliumDatapathPlugin
 - CiliumEgressGatewayPolicy
 - :ref:`CiliumEndpoint<CiliumEndpoint>`
 - :ref:`CiliumEndpointSlice<CiliumEndpointSlice>`
@@ -15,7 +16,10 @@
 - CiliumL2AnnouncementPolicy
 - CiliumLoadBalancerIPPool
 - CiliumLocalRedirectPolicy
+- CiliumNetworkDriverClusterConfig
+- CiliumNetworkDriverNodeConfig
 - :ref:`CiliumNetworkPolicy<CiliumNetworkPolicy>`
 - CiliumNode
 - CiliumNodeConfig
 - CiliumPodIPPool
+- CiliumResourceIPPool

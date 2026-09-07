@@ -24,7 +24,7 @@ import (
 	v1 "sigs.k8s.io/gateway-api/apis/v1"
 	"sigs.k8s.io/gateway-api/apis/v1alpha2"
 	"sigs.k8s.io/gateway-api/apis/v1alpha3"
-	"sigs.k8s.io/gateway-api/apis/v1beta1"
+	xv1alpha1 "sigs.k8s.io/gateway-api/apisx/v1alpha1"
 	confv1 "sigs.k8s.io/gateway-api/conformance/apis/v1"
 	"sigs.k8s.io/gateway-api/conformance/tests"
 	conformanceconfig "sigs.k8s.io/gateway-api/conformance/utils/config"
@@ -62,49 +62,37 @@ func DefaultOptions(t *testing.T) suite.ConformanceOptions {
 
 	require.NoError(t, v1alpha3.Install(client.Scheme()))
 	require.NoError(t, v1alpha2.Install(client.Scheme()))
-	require.NoError(t, v1beta1.Install(client.Scheme()))
+	require.NoError(t, xv1alpha1.Install(client.Scheme()))
 	require.NoError(t, v1.Install(client.Scheme()))
 	require.NoError(t, apiextensionsv1.AddToScheme(client.Scheme()))
 
-	supportedFeatures := suite.ParseSupportedFeatures(*flags.SupportedFeatures)
-	exemptFeatures := suite.ParseSupportedFeatures(*flags.ExemptFeatures)
-	skipTests := suite.ParseSkipTests(*flags.SkipTests)
-	namespaceLabels := suite.ParseKeyValuePairs(*flags.NamespaceLabels)
-	namespaceAnnotations := suite.ParseKeyValuePairs(*flags.NamespaceAnnotations)
-	conformanceProfiles := suite.ParseConformanceProfiles(*flags.ConformanceProfiles)
+	// Load configurable conformance options, using flag defaults as needed.
+	configurableOpts := &suite.ConfigurableOptions{
+		CleanupBaseResources: flags.DefaultCleanupBaseResources,
+		CleanupTestResources: flags.DefaultCleanupTestResources,
+		GatewayClassName:     flags.DefaultGatewayClassName,
+		Mode:                 flags.DefaultMode,
+		TimeoutConfig:        conformanceconfig.DefaultTimeoutConfig(),
+	}
 
-	implementation := suite.ParseImplementation(
-		*flags.ImplementationOrganization,
-		*flags.ImplementationProject,
-		*flags.ImplementationURL,
-		*flags.ImplementationVersion,
-		*flags.ImplementationContact,
-	)
+	// Load conformance options provided via yaml file, overriding defaults.
+	if *flags.ConformanceOptionsFile != "" {
+		data, err := os.ReadFile(*flags.ConformanceOptionsFile)
+		require.NoError(t, err, "error reading conformance options file")
+
+		err = yaml.Unmarshal(data, configurableOpts)
+		require.NoError(t, err, "error unmarshalling conformance options file")
+	}
+	// Override options with any command line flags that were explicitly set.
+	flags.ApplyAll(configurableOpts)
 
 	return suite.ConformanceOptions{
-		AllowCRDsMismatch:          *flags.AllowCRDsMismatch,
-		CleanupBaseResources:       *flags.CleanupBaseResources,
-		Client:                     client,
-		ClientOptions:              clientOptions,
-		Clientset:                  clientset,
-		ConformanceProfiles:        conformanceProfiles,
-		Debug:                      *flags.ShowDebug,
-		EnableAllSupportedFeatures: *flags.EnableAllSupportedFeatures,
-		ExemptFeatures:             exemptFeatures,
-		ManifestFS:                 []fs.FS{&Manifests},
-		GatewayClassName:           *flags.GatewayClassName,
-		MeshName:                   *flags.MeshName,
-		Implementation:             implementation,
-		Mode:                       *flags.Mode,
-		NamespaceAnnotations:       namespaceAnnotations,
-		NamespaceLabels:            namespaceLabels,
-		ReportOutputPath:           *flags.ReportOutput,
-		RestConfig:                 cfg,
-		RunTest:                    *flags.RunTest,
-		SkipTests:                  skipTests,
-		SupportedFeatures:          supportedFeatures,
-		TimeoutConfig:              conformanceconfig.DefaultTimeoutConfig(),
-		SkipProvisionalTests:       *flags.SkipProvisionalTests,
+		ConfigurableOptions: *configurableOpts,
+		Client:              client,
+		ClientOptions:       clientOptions,
+		Clientset:           clientset,
+		ManifestFS:          []fs.FS{&Manifests},
+		RestConfig:          cfg,
 	}
 }
 
@@ -145,12 +133,13 @@ func RunConformanceWithOptions(t *testing.T, opts suite.ConformanceOptions) {
 
 func logOptions(t *testing.T, opts suite.ConformanceOptions) {
 	t.Logf("  GatewayClass: %s", opts.GatewayClassName)
-	t.Logf("  Cleanup Resources: %t", opts.CleanupBaseResources)
+	t.Logf("  Cleanup Base Resources: %t", opts.CleanupBaseResources)
+	t.Logf("  Cleanup Test Resources: %t", opts.CleanupTestResources)
 	t.Logf("  Debug: %t", opts.Debug)
 	t.Logf("  Enable All Features: %t", opts.EnableAllSupportedFeatures)
-	t.Logf("  Supported Features: %v", opts.SupportedFeatures.UnsortedList())
-	t.Logf("  ExemptFeatures: %v", opts.ExemptFeatures.UnsortedList())
-	t.Logf("  ConformanceProfiles: %v", opts.ConformanceProfiles.UnsortedList())
+	t.Logf("  Supported Features: %v", opts.SupportedFeatures)
+	t.Logf("  ExemptFeatures: %v", opts.ExemptFeatures)
+	t.Logf("  ConformanceProfiles: %v", opts.ConformanceProfiles)
 }
 
 func writeReport(logf func(string, ...any), report confv1.ConformanceReport, output string) error {

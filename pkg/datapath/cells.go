@@ -21,15 +21,17 @@ import (
 	"github.com/cilium/cilium/pkg/datapath/linux/bandwidth"
 	"github.com/cilium/cilium/pkg/datapath/linux/bigtcp"
 	dpcfg "github.com/cilium/cilium/pkg/datapath/linux/config"
+	deviceReconciler "github.com/cilium/cilium/pkg/datapath/linux/device"
 	"github.com/cilium/cilium/pkg/datapath/linux/ipsec"
 	routeReconciler "github.com/cilium/cilium/pkg/datapath/linux/route/reconciler"
 	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
 	"github.com/cilium/cilium/pkg/datapath/linux/utime"
 	"github.com/cilium/cilium/pkg/datapath/loader"
-	datapathmaps "github.com/cilium/cilium/pkg/datapath/maps"
+	"github.com/cilium/cilium/pkg/datapath/mapsweeper"
 	"github.com/cilium/cilium/pkg/datapath/neighbor"
 	"github.com/cilium/cilium/pkg/datapath/node"
 	"github.com/cilium/cilium/pkg/datapath/orchestrator"
+	"github.com/cilium/cilium/pkg/datapath/plugins"
 	"github.com/cilium/cilium/pkg/datapath/prefilter"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
@@ -54,8 +56,8 @@ var Cell = cell.Module(
 	// Provides all BPF Map which are already provided by via hive cell.
 	maps.Cell,
 
-	// Cleanup of stale and disabled BPF maps
-	datapathmaps.Cell,
+	// Cleanup of stale and disabled BPF maps.
+	mapsweeper.Cell,
 
 	// Utime synchronizes utime from userspace to datapath via configmap.Map.
 	utime.Cell,
@@ -80,8 +82,8 @@ var Cell = cell.Module(
 	// Provides the Table[NodeAddress] and the controller that populates it from Table[*Device]
 	tables.NodeAddressCell,
 
-	// Provides the legacy accessor for the above, the NodeAddressing interface.
-	NodeAddressingCell,
+	// Provides the legacy accessor for the above, the node.Addressing interface.
+	node.AddressingCell,
 
 	// Provides the DirectRoutingDevice selection logic.
 	tables.DirectRoutingDeviceCell,
@@ -140,8 +142,9 @@ var Cell = cell.Module(
 
 	vtep.Cell,
 
-	// Provides node handler, which handles node events.
-	cell.Provide(linuxdatapath.NewNodeHandler),
+	// Provides the Linux node reconciler, its policy hooks, and node ID API.
+	cell.Provide(linuxdatapath.NewNodePolicy, linuxdatapath.NewNodeHandler),
+	cell.Invoke(linuxdatapath.RegisterNodeReconciler),
 	cell.Provide(node.NewNodeIDApiHandler),
 
 	// Provides Active Connection Tracking metrics based on counts of
@@ -160,6 +163,12 @@ var Cell = cell.Module(
 	// Provides the desired route table, and a reconciler that installs these desired routes
 	// into the Linux kernel routing table.
 	routeReconciler.Cell,
+
+	// Provides the desired device table, and a reconciler that install these links into the Linux kernel.
+	deviceReconciler.Cell,
+
+	// Plugins cell keeps the plugin registry up to date.
+	plugins.Cell,
 )
 
 func initDatapath(rootLogger *slog.Logger, lifecycle cell.Lifecycle) {

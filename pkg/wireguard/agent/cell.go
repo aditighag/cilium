@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/pflag"
 
 	"github.com/cilium/cilium/pkg/datapath/linux/config/defines"
+	"github.com/cilium/cilium/pkg/datapath/tunnel"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/time"
 	"github.com/cilium/cilium/pkg/wireguard/types"
@@ -22,15 +23,17 @@ var Cell = cell.Module(
 	cell.ProvidePrivate(buildConfigFrom),
 )
 
-// newWireguardAgent returns the [*Agent] as an interface [types.WireguardAgent]
+var OperatorCell = cell.Config(defaultEnableConfig)
+
+// newWireguardAgent returns the [*Agent] as an interface [types.Agent]
 // and the map of macros [defines.NodeOut] for datapath compilation.
 func newWireguardAgent(p params) (out struct {
 	cell.Out
-	types.WireguardAgent
+	types.Agent
 	defines.NodeOut
 }) {
-	out.WireguardAgent = newAgent(p)
-	if out.WireguardAgent.Enabled() {
+	out.Agent = newAgent(p)
+	if out.Agent.Enabled() {
 		out.NodeDefines = map[string]string{
 			"ENABLE_WIREGUARD": "1",
 		}
@@ -41,13 +44,13 @@ func newWireguardAgent(p params) (out struct {
 	return
 }
 
-// newWireguardConfig returns the [Config] as an interface [types.WireguardConfig].
-func newWireguardConfig(c Config) types.WireguardConfig {
+// newWireguardConfig returns the [Config] as an interface [types.Config].
+func newWireguardConfig(c Config) types.Config {
 	return c
 }
 
 // buildConfigFrom creates the [Config] from [UserConfig] and [option.DaemonConfig].
-func buildConfigFrom(uc UserConfig, dc *option.DaemonConfig) Config {
+func buildConfigFrom(uc UserConfig, dc *option.DaemonConfig, tunnelConfig tunnel.Config) Config {
 	return Config{
 		UserConfig: uc,
 
@@ -56,11 +59,12 @@ func buildConfigFrom(uc UserConfig, dc *option.DaemonConfig) Config {
 		EnableIPv6:       dc.EnableIPv6,
 		TunnelingEnabled: dc.TunnelingEnabled(),
 		EncryptNode:      dc.EncryptNode,
+		UnderlayProtocol: tunnelConfig.UnderlayProtocol(),
 	}
 }
 
 var defaultUserConfig = UserConfig{
-	EnableWireguard:              false,
+	EnableConfig:                 defaultEnableConfig,
 	WireguardTrackAllIPsFallback: false,
 	WireguardPersistentKeepalive: 0,
 	NodeEncryptionOptOutLabels:   "node-role.kubernetes.io/control-plane",
@@ -68,18 +72,19 @@ var defaultUserConfig = UserConfig{
 
 // User provided flags.
 type UserConfig struct {
-	EnableWireguard              bool
+	EnableConfig                 `mapstructure:",squash"`
 	WireguardTrackAllIPsFallback bool
 	WireguardPersistentKeepalive time.Duration
 	NodeEncryptionOptOutLabels   string
 }
 
 func (def UserConfig) Flags(flags *pflag.FlagSet) {
-	flags.Bool(types.EnableWireguard, def.EnableWireguard, "Enable WireGuard")
+	def.EnableConfig.Flags(flags)
 	flags.Duration(types.WireguardPersistentKeepalive, def.WireguardPersistentKeepalive, "The Wireguard keepalive interval as a Go duration string")
 	flags.Bool(types.WireguardTrackAllIPsFallback, def.WireguardTrackAllIPsFallback, "Force WireGuard to track all IPs")
 	flags.MarkHidden(types.WireguardTrackAllIPsFallback)
 	flags.String(types.NodeEncryptionOptOutLabels, def.NodeEncryptionOptOutLabels, "Label selector for nodes which will opt-out of node-to-node encryption")
+	flags.MarkDeprecated(types.NodeEncryptionOptOutLabels, "This option is obsolete and will be removed in v1.22")
 }
 
 // Final config of the WireGuard agent.
@@ -91,9 +96,22 @@ type Config struct {
 	EnableIPv6       bool
 	TunnelingEnabled bool
 	EncryptNode      bool
+	UnderlayProtocol tunnel.UnderlayProtocol
 }
 
-// Returns true when enabled. Implements [types.WireguardConfig].
-func (c Config) Enabled() bool {
+var defaultEnableConfig = EnableConfig{
+	EnableWireguard: false,
+}
+
+type EnableConfig struct {
+	EnableWireguard bool
+}
+
+// Returns true when enabled. Implements [types.Config].
+func (c EnableConfig) Enabled() bool {
 	return c.EnableWireguard
+}
+
+func (def EnableConfig) Flags(flags *pflag.FlagSet) {
+	flags.Bool(types.EnableWireguard, def.EnableWireguard, "Enable WireGuard")
 }

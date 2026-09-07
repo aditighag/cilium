@@ -7,7 +7,6 @@ import (
 	"context"
 	"net/netip"
 	"testing"
-	"time"
 
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/hive/hivetest"
@@ -18,6 +17,7 @@ import (
 	"github.com/cilium/cilium/pkg/hive"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/testutils"
+	"github.com/cilium/cilium/pkg/time"
 	"github.com/cilium/cilium/standalone-dns-proxy/pkg/client"
 )
 
@@ -98,7 +98,7 @@ func TestLookupRegisteredEndpoint(t *testing.T) {
 	require.False(t, isHost)
 
 	ep, isHost, err = rc.LookupRegisteredEndpoint(netip.MustParseAddr("10.0.0.2"))
-	require.NoError(t, err)
+	require.Error(t, err)
 	require.Nil(t, ep)
 	require.False(t, isHost)
 

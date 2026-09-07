@@ -1,4 +1,4 @@
-#! --cluster-id=1 --cluster-name=cluster1
+#! --cluster-id=1 --cluster-name=cluster1 --clustermesh-service-v2=prefer-endpointslice
 
 hive/start
 
@@ -6,8 +6,8 @@ hive/start
 k8s/add service.yaml endpointslice.yaml
 db/cmp frontends frontends-local.table
 
-# Add the cluster service from "cluster2"
-kvstore/update cilium/state/services/v1/cluster2/test/echo clusterservice2.json
+# Add the endpoint slice from "cluster2"
+kvstore/update cilium/state/endpointslices/v1/cluster2/test/echo clusterendpointslice2.json
 
 # As there are healthy local backends the remote backends are ignored
 db/cmp backends backends.table
@@ -28,11 +28,11 @@ k8s/update service.yaml
 db/cmp frontends frontends-remote.table
 
 # Removing the remote backend will make us use the local one.
-kvstore/delete cilium/state/services/v1/cluster2/test/echo
+kvstore/delete cilium/state/endpointslices/v1/cluster2/test/echo
 db/cmp frontends frontends-local.table
 
 # Adding it back gets us back to using the remote one.
-kvstore/update cilium/state/services/v1/cluster2/test/echo clusterservice2.json
+kvstore/update cilium/state/endpointslices/v1/cluster2/test/echo clusterendpointslice2.json
 db/cmp frontends frontends-remote.table
 
 # Remove affinity. Now both local and remote are used.
@@ -40,12 +40,12 @@ sed 'affinity:' 'affinity-nope:' service.yaml
 k8s/update service.yaml
 db/cmp frontends frontends-all.table
 
-### Th-th-th-th-That's all Folks!
+###
 
 -- backends.table --
-Address              Instances         NodeName
-10.1.0.1:8080/TCP    test/echo (tcp)   nodeport-worker
-20.0.0.2:9090/TCP    test/echo (tcp)
+Address              PortNames  NodeName
+10.1.0.1:8080/TCP    tcp        nodeport-worker
+20.0.0.2:9090/TCP    tcp
 
 -- frontends-local.table --
 Address            Type       ServiceName   Status  Backends
@@ -59,22 +59,33 @@ Address            Type       ServiceName   Status  Backends
 Address            Type       ServiceName   Status  Backends
 10.0.0.1:8080/TCP  ClusterIP  test/echo     Done    10.1.0.1:8080/TCP, 20.0.0.2:9090/TCP
 
--- clusterservice2.json --
+-- clusterendpointslice2.json --
 {
-  "name": "echo",
-  "namespace": "test",
-  "includeExternal": true,
-  "shared": true,
   "cluster": "cluster2",
   "clusterID": 2,
-  "backends": {
-    "20.0.0.2": {
-      "tcp": {
-        "Protocol": "TCP",
-        "Port": 9090
+  "namespace": "test",
+  "name": "echo",
+  "labels": {
+    "kubernetes.io/service-name": "echo"
+  },
+  "addressType": "IPv4",
+  "endpoints": [
+    {
+      "addresses": ["20.0.0.2"],
+      "conditions": {
+        "ready": true,
+        "serving": true,
+        "terminating": false
       }
     }
-  }
+  ],
+  "ports": [
+    {
+      "name": "tcp",
+      "port": 9090,
+      "protocol": "TCP"
+    }
+  ]
 }
 
 -- service.yaml --

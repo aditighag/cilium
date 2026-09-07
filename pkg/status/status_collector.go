@@ -20,8 +20,7 @@ import (
 	"github.com/cilium/cilium/pkg/datapath/linux/probes"
 	datapathOption "github.com/cilium/cilium/pkg/datapath/option"
 	datapathTables "github.com/cilium/cilium/pkg/datapath/tables"
-	datapath "github.com/cilium/cilium/pkg/datapath/types"
-	"github.com/cilium/cilium/pkg/identity"
+	iputil "github.com/cilium/cilium/pkg/ip"
 	k8smetrics "github.com/cilium/cilium/pkg/k8s/metrics"
 	"github.com/cilium/cilium/pkg/loadbalancer"
 	"github.com/cilium/cilium/pkg/lock"
@@ -124,8 +123,8 @@ func (d *statusCollector) getMasqueradingStatus(ctx context.Context) (*models.Ma
 	s := &models.Masquerading{
 		Enabled: d.statusParams.DaemonConfig.MasqueradingEnabled(),
 		EnabledProtocols: &models.MasqueradingEnabledProtocols{
-			IPV4: d.statusParams.DaemonConfig.EnableIPv4Masquerade,
-			IPV6: d.statusParams.DaemonConfig.EnableIPv6Masquerade,
+			IPv4: d.statusParams.DaemonConfig.EnableIPv4Masquerade,
+			IPv6: d.statusParams.DaemonConfig.EnableIPv6Masquerade,
 		},
 	}
 
@@ -139,23 +138,23 @@ func (d *statusCollector) getMasqueradingStatus(ctx context.Context) (*models.Ma
 	}
 
 	if d.statusParams.DaemonConfig.EnableIPv4 {
-		// SnatExclusionCidr is the legacy field, continue to provide
-		// it for the time being
-		addr := datapath.RemoteSNATDstAddrExclusionCIDRv4(localNode)
-		if addr == nil {
+		prefix := localNode.RemoteSNATDstAddrExclusionCIDRv4()
+		if !prefix.IsValid() {
 			return s, errors.New("no local node v4 CIDR")
 		}
 
-		s.SnatExclusionCidr = addr.String()
-		s.SnatExclusionCidrV4 = addr.String()
+		// SnatExclusionCidr is the legacy field, continue to provide
+		// it for the time being
+		s.SnatExclusionCidr = iputil.PrefixFrom(prefix)
+		s.SnatExclusionCidrV4 = iputil.PrefixFrom(prefix)
 	}
 
 	if d.statusParams.DaemonConfig.EnableIPv6 {
-		addr := datapath.RemoteSNATDstAddrExclusionCIDRv6(localNode)
-		if addr == nil {
+		prefix := localNode.RemoteSNATDstAddrExclusionCIDRv6()
+		if !prefix.IsValid() {
 			return s, errors.New("no local node v6 CIDR")
 		}
-		s.SnatExclusionCidrV6 = addr.String()
+		s.SnatExclusionCidrV6 = iputil.PrefixFrom(prefix)
 	}
 
 	if d.statusParams.DaemonConfig.EnableBPFMasquerade {
@@ -177,7 +176,7 @@ func (d *statusCollector) getSRv6Status() *models.Srv6 {
 
 func (d *statusCollector) getIPV6BigTCPStatus() *models.IPV6BigTCP {
 	s := &models.IPV6BigTCP{
-		Enabled: d.statusParams.BigTCPConfig.EnableIPv6BIGTCP,
+		Enabled: d.statusParams.BigTCPConfig.IsIPv6Enabled(),
 		MaxGRO:  int64(d.statusParams.BigTCPConfig.GetGROIPv6MaxSize()),
 		MaxGSO:  int64(d.statusParams.BigTCPConfig.GetGSOIPv6MaxSize()),
 	}
@@ -187,7 +186,7 @@ func (d *statusCollector) getIPV6BigTCPStatus() *models.IPV6BigTCP {
 
 func (d *statusCollector) getIPV4BigTCPStatus() *models.IPV4BigTCP {
 	s := &models.IPV4BigTCP{
-		Enabled: d.statusParams.BigTCPConfig.EnableIPv4BIGTCP,
+		Enabled: d.statusParams.BigTCPConfig.IsIPv4Enabled(),
 		MaxGRO:  int64(d.statusParams.BigTCPConfig.GetGROIPv4MaxSize()),
 		MaxGSO:  int64(d.statusParams.BigTCPConfig.GetGSOIPv4MaxSize()),
 	}
@@ -220,7 +219,7 @@ func (d *statusCollector) getRoutingStatus() *models.Routing {
 		InterHostRoutingMode: models.RoutingInterHostRoutingModeTunnel,
 		TunnelProtocol:       d.statusParams.TunnelConfig.EncapProtocol().String(),
 	}
-	if d.statusParams.DaemonConfig.EnableHostLegacyRouting {
+	if d.statusParams.DaemonConfig.UnsafeDaemonConfigOption.EnableHostLegacyRouting {
 		s.IntraHostRoutingMode = models.RoutingIntraHostRoutingModeLegacy
 	}
 	if d.statusParams.DaemonConfig.RoutingMode == option.RoutingModeNative {
@@ -255,11 +254,24 @@ func (d *statusCollector) getAttachModeStatus() models.AttachMode {
 
 func (d *statusCollector) getDatapathModeStatus() models.DatapathMode {
 	mode := models.DatapathModeVeth
-	switch d.statusParams.DaemonConfig.DatapathMode {
+	switch d.statusParams.ConnectorConfig.GetOperationalMode().String() {
 	case datapathOption.DatapathModeNetkit:
 		mode = models.DatapathModeNetkit
 	case datapathOption.DatapathModeNetkitL2:
 		mode = models.DatapathModeNetkitDashL2
+	}
+	return mode
+}
+
+func (d *statusCollector) getConfiguredDatapathModeStatus() models.ConfiguredDatapathMode {
+	mode := models.ConfiguredDatapathModeVeth
+	switch d.statusParams.ConnectorConfig.GetConfiguredMode().String() {
+	case datapathOption.DatapathModeAuto:
+		mode = models.ConfiguredDatapathModeAuto
+	case datapathOption.DatapathModeNetkit:
+		mode = models.ConfiguredDatapathModeNetkit
+	case datapathOption.DatapathModeNetkitL2:
+		mode = models.ConfiguredDatapathModeNetkitDashL2
 	}
 	return mode
 }
@@ -301,7 +313,7 @@ func (d *statusCollector) getKubeProxyReplacementStatus(ctx context.Context) *mo
 		SocketLBTracing:       &models.KubeProxyReplacementFeaturesSocketLBTracing{},
 		SessionAffinity:       &models.KubeProxyReplacementFeaturesSessionAffinity{},
 		Nat46X64:              &models.KubeProxyReplacementFeaturesNat46X64{},
-		BpfSocketLBHostnsOnly: d.statusParams.DaemonConfig.BPFSocketLBHostnsOnly,
+		BpfSocketLBHostnsOnly: d.statusParams.DaemonConfig.UnsafeDaemonConfigOption.BPFSocketLBHostnsOnly,
 	}
 	if d.statusParams.KPRConfig.KubeProxyReplacement {
 		features.NodePort.Enabled = true
@@ -310,7 +322,7 @@ func (d *statusCollector) getKubeProxyReplacementStatus(ctx context.Context) *mo
 		case loadbalancer.DSRDispatchIPIP:
 			features.NodePort.DsrMode = models.KubeProxyReplacementFeaturesNodePortDsrModeIPIP
 		case loadbalancer.DSRDispatchOption:
-			features.NodePort.DsrMode = models.KubeProxyReplacementFeaturesNodePortDsrModeIPOptionExtension
+			features.NodePort.DsrMode = models.KubeProxyReplacementFeaturesNodePortDsrModeIPOptionSlashExtension
 		case loadbalancer.DSRDispatchGeneve:
 			features.NodePort.DsrMode = models.KubeProxyReplacementFeaturesNodePortDsrModeGeneve
 		}
@@ -494,8 +506,8 @@ func (d *statusCollector) getBPFMapStatus() *models.BPFMapStatus {
 
 func (d *statusCollector) getIdentityRange() *models.IdentityRange {
 	s := &models.IdentityRange{
-		MinIdentity: int64(identity.GetMinimalAllocationIdentity(d.statusParams.ClusterInfo.ID)),
-		MaxIdentity: int64(identity.GetMaximumAllocationIdentity(d.statusParams.ClusterInfo.ID)),
+		MinIdentity: int64(d.statusParams.ClusterInfo.MinimalAllocationIdentity()),
+		MaxIdentity: int64(d.statusParams.ClusterInfo.MaximumAllocationIdentity()),
 	}
 
 	return s
@@ -525,11 +537,11 @@ func (d *statusCollector) dumpIPAM() *models.IPAMStatus {
 	}
 
 	if d.statusParams.DaemonConfig.EnableIPv4 {
-		status.IPV4 = v4
+		status.IPv4 = v4
 	}
 
 	if d.statusParams.DaemonConfig.EnableIPv6 {
-		status.IPV6 = v6
+		status.IPv6 = v6
 	}
 
 	status.Allocations = allocv4
@@ -608,15 +620,6 @@ func (d *statusCollector) GetStatus(brief bool, requireK8sConnectivity bool) mod
 			State: d.statusResponse.Kvstore.State,
 			Msg:   fmt.Sprintf("%s    %s", ciliumVer, msg),
 		}
-	case d.statusResponse.ContainerRuntime != nil && d.statusResponse.ContainerRuntime.State != models.StatusStateOk:
-		msg := "Container runtime is not ready: " + d.statusResponse.ContainerRuntime.Msg
-		if d.statusResponse.ContainerRuntime.State == models.StatusStateDisabled {
-			msg = "Container runtime is disabled"
-		}
-		sr.Cilium = &models.Status{
-			State: d.statusResponse.ContainerRuntime.State,
-			Msg:   fmt.Sprintf("%s    %s", ciliumVer, msg),
-		}
 	case d.statusParams.Clientset.IsEnabled() && d.statusResponse.Kubernetes != nil && d.statusResponse.Kubernetes.State != models.StatusStateOk && requireK8sConnectivity:
 		msg := "Kubernetes service is not ready: " + d.statusResponse.Kubernetes.Msg
 		sr.Cilium = &models.Status{
@@ -684,7 +687,7 @@ func (d *statusCollector) getProbes() []Probe {
 					return backoff.ClusterSizeDependantInterval(2*time.Minute, 0)
 				}
 
-				// The base interval is dependant on the
+				// The base interval is dependent on the
 				// cluster size. One status interval does not
 				// automatically translate to an apiserver
 				// interaction as any regular apiserver
@@ -700,7 +703,7 @@ func (d *statusCollector) getProbes() []Probe {
 				// 2048  | 1m15s
 				// 8192  | 1m30s
 				// 16384 | 1m32s
-				return d.statusParams.NodeDiscovery.Manager.ClusterSizeDependantInterval(10 * time.Second)
+				return d.statusParams.ClusterSizeDependantInterval(10 * time.Second)
 			},
 			Probe: func(ctx context.Context) (any, error) {
 				return d.getK8sStatus(), nil
@@ -1017,7 +1020,7 @@ func (d *statusCollector) getProbes() []Probe {
 
 				if status.Err == nil {
 					if s, ok := status.Data.(*models.IPV6BigTCP); ok {
-						d.statusResponse.IPV6BigTCP = s
+						d.statusResponse.IPv6BigTCP = s
 					}
 				}
 			},
@@ -1033,7 +1036,7 @@ func (d *statusCollector) getProbes() []Probe {
 
 				if status.Err == nil {
 					if s, ok := status.Data.(*models.IPV4BigTCP); ok {
-						d.statusResponse.IPV4BigTCP = s
+						d.statusResponse.IPv4BigTCP = s
 					}
 				}
 			},
@@ -1194,6 +1197,22 @@ func (d *statusCollector) getProbes() []Probe {
 				if status.Err == nil {
 					if s, ok := status.Data.(models.DatapathMode); ok {
 						d.statusResponse.DatapathMode = s
+					}
+				}
+			},
+		},
+		{
+			Name: "configured-datapath-mode",
+			Probe: func(ctx context.Context) (any, error) {
+				return d.getConfiguredDatapathModeStatus(), nil
+			},
+			OnStatusUpdate: func(status Status) {
+				d.statusCollectMutex.Lock()
+				defer d.statusCollectMutex.Unlock()
+
+				if status.Err == nil {
+					if s, ok := status.Data.(models.ConfiguredDatapathMode); ok {
+						d.statusResponse.ConfiguredDatapathMode = s
 					}
 				}
 			},

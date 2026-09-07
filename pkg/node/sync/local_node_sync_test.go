@@ -17,7 +17,7 @@ import (
 	k8sRuntime "k8s.io/apimachinery/pkg/runtime"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 
-	fakeTypes "github.com/cilium/cilium/pkg/datapath/fake/types"
+	fakeipsec "github.com/cilium/cilium/pkg/datapath/linux/ipsec/fake"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
@@ -128,7 +128,13 @@ func TestLocalNodeSync(t *testing.T) {
 					},
 				},
 			},
-			IPsecConfig: fakeTypes.IPsecConfig{},
+			IPsecConfig: fakeipsec.Config{},
+			ExtraInitFuncs: []InitFunc{
+				func(_ context.Context, n *node.LocalNode) error {
+					n.Annotations["extra-init-func"] = "called"
+					return nil
+				},
+			},
 		})
 	)
 
@@ -138,7 +144,7 @@ func TestLocalNodeSync(t *testing.T) {
 	require.Equal(t, "10.0.0.1", local.GetNodeInternalIPv4().String())
 	require.Equal(t, "fc00::11", local.GetNodeInternalIPv6().String())
 	require.Equal(t, map[string]string{"ex": "label", "foo": "bar"}, local.Labels)
-	require.Equal(t, map[string]string{"ex": "annot", "cilium.io/baz": "qux"}, local.Annotations)
+	require.Equal(t, map[string]string{"ex": "annot", "cilium.io/baz": "qux", "extra-init-func": "called"}, local.Annotations)
 	require.Equal(t, k8stypes.UID("uid1"), local.Local.UID)
 	require.Equal(t, "provider://foobar", local.Local.ProviderID)
 
@@ -153,7 +159,7 @@ func TestLocalNodeSync(t *testing.T) {
 	updates := stream.ToChannel(t.Context(), store)
 	update := <-updates
 	require.Equal(t, map[string]string{"ex": "label", "qux": "baz"}, update.Labels)
-	require.Equal(t, map[string]string{"ex": "annot", "cilium.io/bar": "foo"}, update.Annotations)
+	require.Equal(t, map[string]string{"ex": "annot", "cilium.io/bar": "foo", "extra-init-func": "called"}, update.Annotations)
 	require.Equal(t, k8stypes.UID("uid2"), update.Local.UID)
 	require.Equal(t, "provider://foobaz", update.Local.ProviderID)
 
@@ -192,7 +198,7 @@ func TestInitLocalNode_initFromK8s(t *testing.T) {
 					},
 				},
 			},
-			IPsecConfig: fakeTypes.IPsecConfig{},
+			IPsecConfig: fakeipsec.Config{},
 			K8sCiliumLocalNode: &mockResource[*v2.CiliumNode]{
 				items: []resource.Event[*v2.CiliumNode]{
 					{
@@ -319,7 +325,7 @@ func testNodeDeletion(t *testing.T, nodeEvent resource.Event[*slim_corev1.Node])
 			IPv4NodeAddr: "1.2.3.4",
 			IPv6NodeAddr: "fd00::1",
 		},
-		IPsecConfig:  fakeTypes.IPsecConfig{},
+		IPsecConfig:  fakeipsec.Config{},
 		K8sLocalNode: fakeNode,
 		K8sCiliumLocalNode: &mockResource[*v2.CiliumNode]{
 			items: []resource.Event[*v2.CiliumNode]{

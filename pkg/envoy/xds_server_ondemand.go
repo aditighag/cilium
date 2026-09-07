@@ -9,7 +9,10 @@ import (
 	"sync"
 
 	"github.com/cilium/cilium/pkg/completion"
+	config "github.com/cilium/cilium/pkg/envoy/config"
+	"github.com/cilium/cilium/pkg/envoy/xds"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/policy"
 	"github.com/cilium/cilium/pkg/time"
 )
@@ -21,6 +24,7 @@ type onDemandXdsStarter struct {
 	runDir                         string
 	envoyLogPath                   string
 	envoyDefaultLogLevel           string
+	envoyNodeLocalityEnabled       bool
 	envoyBaseID                    uint64
 	keepCapNetBindService          bool
 	metricsListenerPort            int
@@ -33,51 +37,55 @@ type onDemandXdsStarter struct {
 	maxConcurrentRetries           uint32
 	maxConnections                 uint32
 	maxRequests                    uint32
+	maxPendingRequests             uint32
+	xdsMode                        config.XDSMode
+	localNodeStore                 *node.LocalNodeStore
 
 	envoyOnce sync.Once
 }
 
 var _ XDSServer = &onDemandXdsStarter{}
 
-func (o *onDemandXdsStarter) AddListener(name string, kind policy.L7ParserType, port uint16, isIngress bool, mayUseOriginalSourceAddr bool, wg *completion.WaitGroup, cb func(err error)) error {
-	if err := o.startEmbeddedEnvoy(nil); err != nil {
-		o.logger.Error("Envoy: Failed to start embedded Envoy proxy on demand",
+func (o *onDemandXdsStarter) AddListener(ctx context.Context, name string, kind policy.L7ParserType, port uint16, isIngress bool, mayUseOriginalSourceAddr bool, wg *completion.WaitGroup, cb func(err error)) error {
+	if err := o.startStandaloneEnvoy(ctx, nil); err != nil {
+		o.logger.Error("Envoy: Failed to start standalone Envoy proxy on demand",
 			logfields.Error, err,
 		)
 	}
 
-	return o.XDSServer.AddListener(name, kind, port, isIngress, mayUseOriginalSourceAddr, wg, cb)
+	return o.XDSServer.AddListener(ctx, name, kind, port, isIngress, mayUseOriginalSourceAddr, wg, cb)
 }
 
-func (o *onDemandXdsStarter) UpsertEnvoyResources(ctx context.Context, resources Resources) error {
-	if err := o.startEmbeddedEnvoy(nil); err != nil {
-		o.logger.Error("Envoy: Failed to start embedded Envoy proxy on demand",
+func (o *onDemandXdsStarter) UpsertEnvoyResources(ctx context.Context, resources xds.Resources, waitGroup *completion.WaitGroup) error {
+	if err := o.startStandaloneEnvoy(ctx, nil); err != nil {
+		o.logger.Error("Envoy: Failed to start standalone Envoy proxy on demand",
 			logfields.Error, err,
 		)
 	}
 
-	return o.XDSServer.UpsertEnvoyResources(ctx, resources)
+	return o.XDSServer.UpsertEnvoyResources(ctx, resources, waitGroup)
 }
 
-func (o *onDemandXdsStarter) UpdateEnvoyResources(ctx context.Context, old, new Resources) error {
-	if err := o.startEmbeddedEnvoy(nil); err != nil {
-		o.logger.Error("Envoy: Failed to start embedded Envoy proxy on demand",
+func (o *onDemandXdsStarter) UpdateEnvoyResources(ctx context.Context, old, new xds.Resources, waitGroup *completion.WaitGroup) error {
+	if err := o.startStandaloneEnvoy(ctx, nil); err != nil {
+		o.logger.Error("Envoy: Failed to start standalone Envoy proxy on demand",
 			logfields.Error, err,
 		)
 	}
 
-	return o.XDSServer.UpdateEnvoyResources(ctx, old, new)
+	return o.XDSServer.UpdateEnvoyResources(ctx, old, new, waitGroup)
 }
 
-func (o *onDemandXdsStarter) startEmbeddedEnvoy(wg *completion.WaitGroup) error {
+func (o *onDemandXdsStarter) startStandaloneEnvoy(ctx context.Context, wg *completion.WaitGroup) error {
 	var startErr error
 
 	o.envoyOnce.Do(func() {
-		// Start embedded Envoy on first invocation
-		_, startErr = o.startEmbeddedEnvoyInternal(embeddedEnvoyConfig{
+		// Start standalone Envoy on first invocation
+		_, startErr = o.startStandaloneEnvoyInternal(standaloneEnvoyConfig{
 			runDir:                         o.runDir,
 			logPath:                        o.envoyLogPath,
 			defaultLogLevel:                o.envoyDefaultLogLevel,
+			nodeLocalityEnabled:            o.envoyNodeLocalityEnabled,
 			baseID:                         o.envoyBaseID,
 			keepCapNetBindService:          o.keepCapNetBindService,
 			connectTimeout:                 o.connectTimeout,
@@ -88,6 +96,8 @@ func (o *onDemandXdsStarter) startEmbeddedEnvoy(wg *completion.WaitGroup) error 
 			maxConcurrentRetries:           o.maxConcurrentRetries,
 			maxConnections:                 o.maxConnections,
 			maxRequests:                    o.maxRequests,
+			maxPendingRequests:             o.maxPendingRequests,
+			xdsMode:                        o.xdsMode,
 		})
 
 		// Add Prometheus listener if the port is (properly) configured
@@ -98,7 +108,7 @@ func (o *onDemandXdsStarter) startEmbeddedEnvoy(wg *completion.WaitGroup) error 
 		} else if o.metricsListenerPort != 0 {
 			// We could do this in the bootstrap config as with the Envoy DaemonSet,
 			// but then a failure to bind to the configured port would fail starting Envoy.
-			o.AddMetricsListener(uint16(o.metricsListenerPort), wg)
+			o.AddMetricsListener(ctx, uint16(o.metricsListenerPort), wg)
 		}
 
 		// Add Admin listener if the port is (properly) configured
@@ -107,7 +117,7 @@ func (o *onDemandXdsStarter) startEmbeddedEnvoy(wg *completion.WaitGroup) error 
 				logfields.Port, o.adminListenerPort,
 			)
 		} else if o.adminListenerPort != 0 {
-			o.AddAdminListener(uint16(o.adminListenerPort), wg)
+			o.AddAdminListener(ctx, uint16(o.adminListenerPort), wg)
 		}
 	})
 

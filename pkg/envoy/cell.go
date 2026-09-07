@@ -17,6 +17,8 @@ import (
 	"github.com/cilium/cilium/pkg/endpointstate"
 	config "github.com/cilium/cilium/pkg/envoy/config"
 	envoypolicy "github.com/cilium/cilium/pkg/envoy/policy"
+	util "github.com/cilium/cilium/pkg/envoy/util"
+
 	"github.com/cilium/cilium/pkg/envoy/xds"
 	"github.com/cilium/cilium/pkg/ipcache"
 	"github.com/cilium/cilium/pkg/k8s/client"
@@ -25,6 +27,7 @@ import (
 	"github.com/cilium/cilium/pkg/k8s/utils"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/metrics"
+	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/promise"
 	"github.com/cilium/cilium/pkg/proxy/accesslog"
@@ -61,6 +64,7 @@ type xdsServerParams struct {
 	Logger             *slog.Logger
 	IPCache            *ipcache.IPCache
 	RestorerPromise    promise.Promise[endpointstate.Restorer]
+	LocalNodeStore     *node.LocalNodeStore
 	LocalEndpointStore *LocalEndpointStore
 
 	EnvoyProxyConfig config.ProxyConfig
@@ -78,53 +82,71 @@ type xdsServerParams struct {
 	Metrics       *xds.XDSMetrics
 }
 
+// runnableXDSServer extends XDSServer with the lifecycle method used internally by the cell.
+type runnableXDSServer interface {
+	XDSServer
+	run(ctx context.Context) error
+}
+
 func newEnvoyXDSServer(params xdsServerParams) (XDSServer, error) {
+	// Validate also applies the default value if empty.
+	if err := params.EnvoyProxyConfig.Validate(); err != nil {
+		return nil, err
+	}
+
 	// Override the default value before bootstrap is created for embedded envoy, or
 	// the xDS ConfigSource is used for CEC/CCEC.
-	CiliumXDSConfigSource.InitialFetchTimeout.Seconds = int64(params.EnvoyProxyConfig.ProxyInitialFetchTimeout)
+	SetXDSConfigSourceInitialFetchTimeout(params.EnvoyProxyConfig.ProxyInitialFetchTimeout)
 
-	xdsServer := newXDSServer(
-		params.Logger,
-		params.RestorerPromise,
-		params.IPCache,
-		params.LocalEndpointStore,
-		xdsServerConfig{
-			envoySocketDir:                GetSocketDir(option.Config.RunDir),
-			proxyGID:                      int(params.EnvoyProxyConfig.ProxyGID),
-			httpRequestTimeout:            int(params.EnvoyProxyConfig.HTTPRequestTimeout),
-			httpIdleTimeout:               params.EnvoyProxyConfig.ProxyIdleTimeoutSeconds,
-			httpMaxGRPCTimeout:            int(params.EnvoyProxyConfig.HTTPMaxGRPCTimeout),
-			httpRetryCount:                int(params.EnvoyProxyConfig.HTTPRetryCount),
-			httpRetryTimeout:              int(params.EnvoyProxyConfig.HTTPRetryTimeout),
-			httpStreamIdleTimeout:         int(params.EnvoyProxyConfig.HTTPStreamIdleTimeout),
-			httpNormalizePath:             params.EnvoyProxyConfig.HTTPNormalizePath,
-			useFullTLSContext:             params.EnvoyProxyConfig.UseFullTLSContext,
-			useSDS:                        params.SecretManager.PolicySecretSyncEnabled(),
-			proxyXffNumTrustedHopsIngress: params.EnvoyProxyConfig.ProxyXffNumTrustedHopsIngress,
-			proxyXffNumTrustedHopsEgress:  params.EnvoyProxyConfig.ProxyXffNumTrustedHopsEgress,
-			policyRestoreTimeout:          params.EnvoyProxyConfig.EnvoyPolicyRestoreTimeout,
-			metrics:                       params.Metrics,
-			httpLingerConfig:              params.EnvoyProxyConfig.EnvoyHTTPUpstreamLingerTimeout,
-		},
-		params.SecretManager)
+	xdsCfg := xdsServerConfig{
+		envoySocketDir:                util.GetSocketDir(option.Config.RunDir),
+		proxyGID:                      int(params.EnvoyProxyConfig.ProxyGID),
+		httpRequestTimeout:            int(params.EnvoyProxyConfig.HTTPRequestTimeout),
+		httpIdleTimeout:               int(params.EnvoyProxyConfig.HTTPIdleTimeout),
+		httpMaxGRPCTimeout:            int(params.EnvoyProxyConfig.HTTPMaxGRPCTimeout),
+		httpRetryCount:                int(params.EnvoyProxyConfig.HTTPRetryCount),
+		httpRetryTimeout:              int(params.EnvoyProxyConfig.HTTPRetryTimeout),
+		httpStreamIdleTimeout:         int(params.EnvoyProxyConfig.HTTPStreamIdleTimeout),
+		httpNormalizePath:             params.EnvoyProxyConfig.HTTPNormalizePath,
+		useFullTLSContext:             params.EnvoyProxyConfig.UseFullTLSContext,
+		useSDS:                        params.SecretManager.PolicySecretSyncEnabled(),
+		proxyXffNumTrustedHopsIngress: params.EnvoyProxyConfig.ProxyXffNumTrustedHopsIngress,
+		proxyXffNumTrustedHopsEgress:  params.EnvoyProxyConfig.ProxyXffNumTrustedHopsEgress,
+		policyRestoreTimeout:          params.EnvoyProxyConfig.EnvoyPolicyRestoreTimeout,
+		metrics:                       params.Metrics,
+		httpLingerConfig:              params.EnvoyProxyConfig.EnvoyHTTPUpstreamLingerTimeout,
+		envoyAccessLogEnabled:         params.EnvoyProxyConfig.EnvoyAccessLogEnabled,
+		envoyXDSMode:                  params.EnvoyProxyConfig.EnvoyXDSMode,
+	}
+
+	var xdsServer runnableXDSServer
+	if params.EnvoyProxyConfig.ADSModeEnabled() {
+		xdsServer = newADSServer(
+			params.Logger,
+			params.IPCache,
+			params.LocalEndpointStore,
+			xdsCfg,
+			params.SecretManager,
+			params.RestorerPromise,
+		)
+	} else {
+		xdsServer = newXDSServer(
+			params.Logger,
+			params.RestorerPromise,
+			params.IPCache,
+			params.LocalEndpointStore,
+			xdsCfg,
+			params.SecretManager)
+	}
 
 	if !option.Config.EnableL7Proxy {
 		params.Logger.Debug("L7 proxies are disabled - not starting Envoy xDS server")
 		return xdsServer, nil
 	}
 
-	params.Lifecycle.Append(cell.Hook{
-		OnStart: func(_ cell.HookContext) error {
-			params.JobGroup.Add(job.OneShot("xds-server", func(ctx context.Context, _ cell.Health) error {
-				return xdsServer.start(ctx)
-			}, job.WithShutdown()))
-			return nil
-		},
-		OnStop: func(_ cell.HookContext) error {
-			xdsServer.stop()
-			return nil
-		},
-	})
+	params.JobGroup.Add(job.OneShot("xds-server", func(ctx context.Context, _ cell.Health) error {
+		return xdsServer.run(ctx)
+	}, job.WithShutdown()))
 
 	if !option.Config.ExternalEnvoyProxy {
 		return &onDemandXdsStarter{
@@ -133,6 +155,7 @@ func newEnvoyXDSServer(params xdsServerParams) (XDSServer, error) {
 			runDir:                         option.Config.RunDir,
 			envoyLogPath:                   params.EnvoyProxyConfig.EnvoyLog,
 			envoyDefaultLogLevel:           params.EnvoyProxyConfig.EnvoyDefaultLogLevel,
+			envoyNodeLocalityEnabled:       params.EnvoyProxyConfig.EnvoyNodeLocalityEnabled,
 			envoyBaseID:                    params.EnvoyProxyConfig.EnvoyBaseID,
 			keepCapNetBindService:          params.EnvoyProxyConfig.EnvoyKeepCapNetbindservice,
 			metricsListenerPort:            params.EnvoyProxyConfig.ProxyPrometheusPort,
@@ -145,6 +168,9 @@ func newEnvoyXDSServer(params xdsServerParams) (XDSServer, error) {
 			maxConcurrentRetries:           params.EnvoyProxyConfig.ProxyMaxConcurrentRetries,
 			maxConnections:                 params.EnvoyProxyConfig.ProxyClusterMaxConnections,
 			maxRequests:                    params.EnvoyProxyConfig.ProxyClusterMaxRequests,
+			maxPendingRequests:             params.EnvoyProxyConfig.ProxyClusterMaxPendingRequests,
+			xdsMode:                        params.EnvoyProxyConfig.EnvoyXDSMode,
+			localNodeStore:                 params.LocalNodeStore,
 		}, nil
 	}
 
@@ -152,7 +178,7 @@ func newEnvoyXDSServer(params xdsServerParams) (XDSServer, error) {
 }
 
 func newEnvoyAdminClient(logger *slog.Logger, envoyProxyConfig config.ProxyConfig) *EnvoyAdminClient {
-	return NewEnvoyAdminClientForSocket(logger, GetSocketDir(option.Config.RunDir), envoyProxyConfig.EnvoyDefaultLogLevel)
+	return NewEnvoyAdminClientForSocket(logger, util.GetSocketDir(option.Config.RunDir), envoyProxyConfig.EnvoyDefaultLogLevel)
 }
 
 type accessLogServerParams struct {
@@ -175,25 +201,15 @@ func newEnvoyAccessLogServer(params accessLogServerParams) *AccessLogServer {
 	accessLogServer := newAccessLogServer(
 		params.Logger,
 		params.AccessLogger,
-		GetSocketDir(option.Config.RunDir),
+		util.GetSocketDir(option.Config.RunDir),
 		params.EnvoyProxyConfig.ProxyGID,
 		params.LocalEndpointStore,
 		params.EnvoyProxyConfig.EnvoyAccessLogBufferSize,
 	)
 
-	params.Lifecycle.Append(cell.Hook{
-		OnStart: func(_ cell.HookContext) error {
-			params.JobGroup.Add(job.OneShot("accesslog-server", func(ctx context.Context, _ cell.Health) error {
-				return accessLogServer.start(ctx)
-			}, job.WithShutdown()))
-			return nil
-		},
-		OnStop: func(_ cell.HookContext) error {
-			accessLogServer.stop()
-			return nil
-		},
-	})
-
+	params.JobGroup.Add(job.OneShot("accesslog-server", func(ctx context.Context, _ cell.Health) error {
+		return accessLogServer.run(ctx)
+	}, job.WithShutdown()))
 	return accessLogServer
 }
 

@@ -30,19 +30,27 @@ enum {
 /* Wrapper for specifying empty flags during the trace/drop event. */
 #define CLS_FLAG_NONE ((cls_flags_t)0)
 
+static __always_inline __u8
+cls_flag_tunnel()
+{
 #ifdef HAVE_ENCAP
-/* Return the correct overlay flag CLS_FLAG_{VXLAN,GENEVE} based on the current TUNNEL_PROTOCOL. */
-#define CLS_FLAG_TUNNEL                               \
-	(__builtin_constant_p(TUNNEL_PROTOCOL) ?              \
-		((TUNNEL_PROTOCOL) == TUNNEL_PROTOCOL_VXLAN ? CLS_FLAG_VXLAN : \
-		 (TUNNEL_PROTOCOL) == TUNNEL_PROTOCOL_GENEVE ? CLS_FLAG_GENEVE : \
-		 (__throw_build_bug(), 0))                        \
-	: (__throw_build_bug(), 0))
-#define is_tunnel_port(dport) (dport == bpf_htons(TUNNEL_PORT))
-#else
-#define CLS_FLAG_TUNNEL 0
-#define is_tunnel_port(dport) false
+	if (CONFIG(tunnel_protocol) == TUNNEL_PROTOCOL_VXLAN)
+		return CLS_FLAG_VXLAN;
+	if (CONFIG(tunnel_protocol) == TUNNEL_PROTOCOL_GENEVE)
+		return CLS_FLAG_GENEVE;
 #endif
+	return 0;
+}
+
+static __always_inline bool
+is_tunnel_port(__be16 dport __maybe_unused)
+{
+#ifdef HAVE_ENCAP
+	return dport == bpf_htons(CONFIG(tunnel_port));
+#else
+	return false;
+#endif
+}
 
 /**
  * can_observe_overlay_mark
@@ -100,10 +108,10 @@ can_observe_overlay_hdr(enum trace_point obs_point)
  * @proto: the layer 3 protocol (ETH_P_IP, ETH_P_IPV6).
  *
  * Returns true whether the packet carries Overlay traffic. This is true when the
- * outer L4 header is UDP and the destination port matches TUNNEL_PORT.
+ * outer L4 header is UDP and the destination port matches tunnel_port.
  */
 static __always_inline bool
-ctx_is_overlay_hdr(struct __ctx_buff *ctx, __be16 proto)
+ctx_is_overlay_hdr(const struct __ctx_buff *ctx, __be16 proto)
 {
 	void __maybe_unused *data;
 	void __maybe_unused *data_end;
@@ -159,7 +167,6 @@ ctx_is_overlay_hdr(struct __ctx_buff *ctx, __be16 proto)
  * The following cases are handled:
  * 1. Encrypted IPSec/WireGuard packets pre-decryption in from-netdev.
  * 2. Encrypted IPSec/WireGuard packets post-encryption in to-netdev.
- * 3. Encrypted IPSec packets pre-decryption in from-network.
  *
  * The TRACE_{FROM,TO}_CRYPTO in bpf_wireguard are explicitly ignored, given
  * they handle post-decryption/pre-encryption packets. This can come at hand in
@@ -168,22 +175,20 @@ ctx_is_overlay_hdr(struct __ctx_buff *ctx, __be16 proto)
  * so we don't want to skip the `ctx_is_overlay_hdr` parsing in `ctx_classify`.
  */
 static __always_inline bool
-ctx_is_encrypted_by_point(struct __ctx_buff *ctx __maybe_unused,
+ctx_is_encrypted_by_point(const struct __ctx_buff *ctx __maybe_unused,
 			  enum trace_point obs_point __maybe_unused)
 {
 #if __ctx_is == __ctx_skb
 	if (is_defined(IS_BPF_HOST) &&
 	    (is_defined(ENABLE_IPSEC) || is_defined(ENABLE_WIREGUARD)) &&
-	    (obs_point == TRACE_FROM_NETWORK || obs_point == TRACE_TO_NETWORK || obs_point == TRACE_POINT_UNKNOWN))
+	    (obs_point == TRACE_FROM_NETWORK ||
+	     obs_point == TRACE_TO_NETWORK ||
+	     obs_point == TRACE_POINT_UNKNOWN))
 		return ctx_is_decrypt(ctx);
 
 	if (is_defined(IS_BPF_HOST) && is_defined(ENABLE_IPSEC) &&
 	    (obs_point == TRACE_FROM_STACK || obs_point == TRACE_POINT_UNKNOWN))
 		return ctx_is_encrypt(ctx);
-
-	if (is_defined(IS_BPF_NETWORK) && is_defined(ENABLE_IPSEC) &&
-	    (obs_point == TRACE_FROM_NETWORK || obs_point == TRACE_TO_HOST || obs_point == TRACE_POINT_UNKNOWN))
-		return ctx_is_decrypt(ctx);
 #endif
 
 	return false;
@@ -208,7 +213,7 @@ ctx_is_encrypted_by_point(struct __ctx_buff *ctx __maybe_unused,
  * performance and verifier complexity.
  */
 static __always_inline cls_flags_t
-ctx_classify(struct __ctx_buff *ctx, __be16 proto, enum trace_point obs_point)
+ctx_classify(const struct __ctx_buff *ctx, __be16 proto, enum trace_point obs_point)
 {
 	cls_flags_t flags = CLS_FLAG_NONE;
 
@@ -232,14 +237,14 @@ ctx_classify(struct __ctx_buff *ctx, __be16 proto, enum trace_point obs_point)
 
 	/* Check if Overlay by packet mark. */
 	if (can_observe_overlay_mark(obs_point) && ctx_is_overlay(ctx)) {
-		flags |= CLS_FLAG_TUNNEL;
+		flags |= cls_flag_tunnel();
 		goto out;
 	}
 #endif /* __ctx_skb */
 
 	/* Check if Overlay by packet header. */
 	if (can_observe_overlay_hdr(obs_point) && ctx_is_overlay_hdr(ctx, proto))
-		flags |= CLS_FLAG_TUNNEL;
+		flags |= cls_flag_tunnel();
 
 out: __maybe_unused
 	return flags;
@@ -259,12 +264,13 @@ out: __maybe_unused
  * packets, reuse the `obs_point` to save complexity.
  */
 static __always_inline __u64
-compute_capture_len(struct __ctx_buff *ctx, __u64 monitor,
+compute_capture_len(const struct __ctx_buff *ctx, __u64 monitor,
 		    cls_flags_t flags, enum trace_point obs_point)
 {
 	__u32 cap_len_default = CONFIG(trace_payload_len);
 
-	if ((can_observe_overlay_mark(obs_point) || can_observe_overlay_hdr(obs_point)) && flags & CLS_FLAG_TUNNEL)
+	if ((can_observe_overlay_mark(obs_point) || can_observe_overlay_hdr(obs_point)) &&
+	    flags & cls_flag_tunnel())
 		cap_len_default = CONFIG(trace_payload_len_overlay);
 
 	if (monitor == 0 || monitor == CONFIG(trace_payload_len))

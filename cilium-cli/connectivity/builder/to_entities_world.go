@@ -8,7 +8,6 @@ import (
 
 	"github.com/cilium/cilium/cilium-cli/connectivity/check"
 	"github.com/cilium/cilium/cilium-cli/connectivity/tests"
-	"github.com/cilium/cilium/cilium-cli/utils/features"
 )
 
 //go:embed manifests/client-egress-to-entities-world.yaml
@@ -21,9 +20,7 @@ type toEntitiesWorld struct{}
 
 func (t toEntitiesWorld) build(ct *check.ConnectivityTest, _ map[string]string) {
 	toEntitiesWorldTest(ct, false)
-	if ct.Features[features.PortRanges].Enabled {
-		toEntitiesWorldTest(ct, true)
-	}
+	toEntitiesWorldTest(ct, true)
 }
 
 func toEntitiesWorldTest(ct *check.ConnectivityTest, portRanges bool) {
@@ -36,7 +33,11 @@ func toEntitiesWorldTest(ct *check.ConnectivityTest, portRanges bool) {
 	// This policy allows UDP to kube-dns and port 80 TCP to all 'world' endpoints.
 	newTest(testName, ct).
 		WithCiliumPolicy(policyYAML).
-		WithScenarios(tests.PodToWorld(ct.Params().ExternalTargetIPv6Capable, tests.WithRetryDestPort(80))).
+		WithScenarios(tests.PodToWorld(
+			ct.Params().ExternalTargetIPv6Capable,
+			false,
+			tests.WithRetryDestPort(80),
+		)).
 		WithExpectations(func(a *check.Action) (egress, ingress check.Result) {
 			if a.Destination().Port() == 80 {
 				return check.ResultOK, check.ResultNone

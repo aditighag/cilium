@@ -21,9 +21,9 @@ import (
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/utils/ptr"
 
+	"github.com/cilium/cilium/pkg/bgp/config"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	slim_meta_v1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
-	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/time"
 )
 
@@ -129,11 +129,10 @@ var (
 			},
 		},
 	}
-	defaultDaemonConfig = &option.DaemonConfig{
-		EnableBGPControlPlane:             true,
-		Debug:                             true,
-		BGPSecretsNamespace:               "kube-system",
-		EnableBGPControlPlaneStatusReport: true,
+	defaultBGPConfig = config.BGPConfig{
+		Enable:             true,
+		SecretsNamespace:   "kube-system",
+		EnableStatusReport: true,
 	}
 )
 
@@ -303,7 +302,7 @@ func Test_NodeLabels(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), TestTimeout)
 			defer cancel()
 
-			f, watcherReady := newFixture(t, ctx, req, defaultDaemonConfig)
+			f, watcherReady := newFixture(t, ctx, req, defaultBGPConfig)
 
 			tlog := hivetest.Logger(t)
 			f.hive.Start(tlog, ctx)
@@ -316,7 +315,7 @@ func Test_NodeLabels(t *testing.T) {
 			upsertNode(req, ctx, f, tt.node)
 
 			// upsert BGP cluster config
-			upsertBGPCC(req, ctx, f, tt.clusterConfig)
+			req.NoError(upsertBGPCC(ctx, f, tt.clusterConfig))
 
 			// validate node configs
 			assert.EventuallyWithT(t, func(c *assert.CollectT) {
@@ -339,7 +338,6 @@ func Test_NodeLabels(t *testing.T) {
 
 				assert.True(c, isSameOwner(tt.expectedNodeConfig.GetOwnerReferences(), nodeConfig.GetOwnerReferences()))
 				assert.Equal(c, tt.expectedNodeConfig.Spec, nodeConfig.Spec)
-
 			}, TestTimeout, 50*time.Millisecond)
 		})
 	}
@@ -618,7 +616,7 @@ func Test_ClusterConfigSteps(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), TestTimeout)
 	defer cancel()
 
-	f, watchersReady := newFixture(t, ctx, require.New(t), defaultDaemonConfig)
+	f, watchersReady := newFixture(t, ctx, require.New(t), defaultBGPConfig)
 
 	tlog := hivetest.Logger(t)
 	f.hive.Start(tlog, ctx)
@@ -636,7 +634,7 @@ func Test_ClusterConfigSteps(t *testing.T) {
 			}
 
 			// upsert BGP cluster config
-			upsertBGPCC(req, ctx, f, step.clusterConfig)
+			req.NoError(upsertBGPCC(ctx, f, step.clusterConfig))
 
 			// upsert node overrides
 			for _, nodeOverride := range step.nodeOverrides {
@@ -703,9 +701,11 @@ func TestClusterConfigConditions(t *testing.T) {
 	}
 
 	tests := []struct {
-		name                    string
-		clusterConfig           *v2.CiliumBGPClusterConfig
-		expectedConditionStatus map[string]meta_v1.ConditionStatus
+		name                     string
+		clusterConfig            *v2.CiliumBGPClusterConfig
+		expectedConditionStatus  map[string]meta_v1.ConditionStatus
+		expectedConditionMessage map[string]string
+		expectedConditionReason  map[string]string
 	}{
 		{
 			name: "NoMatchingNode False",
@@ -724,6 +724,12 @@ func TestClusterConfigConditions(t *testing.T) {
 			expectedConditionStatus: map[string]meta_v1.ConditionStatus{
 				v2.BGPClusterConfigConditionNoMatchingNode: meta_v1.ConditionFalse,
 			},
+			expectedConditionMessage: map[string]string{
+				v2.BGPClusterConfigConditionNoMatchingNode: "",
+			},
+			expectedConditionReason: map[string]string{
+				v2.BGPClusterConfigConditionNoMatchingNode: "MatchingNodeSelected",
+			},
 		},
 		{
 			name: "NoMatchingNode False Nil Selector",
@@ -737,6 +743,12 @@ func TestClusterConfigConditions(t *testing.T) {
 			},
 			expectedConditionStatus: map[string]meta_v1.ConditionStatus{
 				v2.BGPClusterConfigConditionNoMatchingNode: meta_v1.ConditionFalse,
+			},
+			expectedConditionMessage: map[string]string{
+				v2.BGPClusterConfigConditionNoMatchingNode: "",
+			},
+			expectedConditionReason: map[string]string{
+				v2.BGPClusterConfigConditionNoMatchingNode: "MatchingNodeSelected",
 			},
 		},
 		{
@@ -755,6 +767,12 @@ func TestClusterConfigConditions(t *testing.T) {
 			},
 			expectedConditionStatus: map[string]meta_v1.ConditionStatus{
 				v2.BGPClusterConfigConditionNoMatchingNode: meta_v1.ConditionTrue,
+			},
+			expectedConditionMessage: map[string]string{
+				v2.BGPClusterConfigConditionNoMatchingNode: "No node matches spec.nodeSelector",
+			},
+			expectedConditionReason: map[string]string{
+				v2.BGPClusterConfigConditionNoMatchingNode: "MatchingNodeUnavailable",
 			},
 		},
 		{
@@ -782,6 +800,12 @@ func TestClusterConfigConditions(t *testing.T) {
 			expectedConditionStatus: map[string]meta_v1.ConditionStatus{
 				v2.BGPClusterConfigConditionMissingPeerConfigs: meta_v1.ConditionFalse,
 			},
+			expectedConditionMessage: map[string]string{
+				v2.BGPClusterConfigConditionMissingPeerConfigs: "",
+			},
+			expectedConditionReason: map[string]string{
+				v2.BGPClusterConfigConditionMissingPeerConfigs: "PeerConfigsResolved",
+			},
 		},
 		{
 			name: "MissingPeerConfig False nil PeerConfigRef",
@@ -804,6 +828,12 @@ func TestClusterConfigConditions(t *testing.T) {
 			},
 			expectedConditionStatus: map[string]meta_v1.ConditionStatus{
 				v2.BGPClusterConfigConditionMissingPeerConfigs: meta_v1.ConditionFalse,
+			},
+			expectedConditionMessage: map[string]string{
+				v2.BGPClusterConfigConditionMissingPeerConfigs: "",
+			},
+			expectedConditionReason: map[string]string{
+				v2.BGPClusterConfigConditionMissingPeerConfigs: "PeerConfigsResolved",
 			},
 		},
 		{
@@ -831,6 +861,12 @@ func TestClusterConfigConditions(t *testing.T) {
 			expectedConditionStatus: map[string]meta_v1.ConditionStatus{
 				v2.BGPClusterConfigConditionMissingPeerConfigs: meta_v1.ConditionTrue,
 			},
+			expectedConditionMessage: map[string]string{
+				v2.BGPClusterConfigConditionMissingPeerConfigs: "Referenced CiliumBGPPeerConfig(s) are missing: peer0-foo",
+			},
+			expectedConditionReason: map[string]string{
+				v2.BGPClusterConfigConditionMissingPeerConfigs: "PeerConfigsMissing",
+			},
 		},
 	}
 
@@ -841,7 +877,7 @@ func TestClusterConfigConditions(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), TestTimeout)
 			defer cancel()
 
-			f, watchersReady := newFixture(t, ctx, require.New(t), defaultDaemonConfig)
+			f, watchersReady := newFixture(t, ctx, require.New(t), defaultBGPConfig)
 
 			tlog := hivetest.Logger(t)
 			f.hive.Start(tlog, ctx)
@@ -851,7 +887,8 @@ func TestClusterConfigConditions(t *testing.T) {
 
 			// Setup resources
 			upsertNode(req, ctx, f, &node)
-			upsertBGPCC(req, ctx, f, tt.clusterConfig)
+			req.NoError(upsertBGPCC(ctx, f, tt.clusterConfig))
+
 			upsertBGPPC(req, ctx, f, &peerConfig)
 
 			require.EventuallyWithT(t, func(ct *assert.CollectT) {
@@ -1079,7 +1116,7 @@ func TestConflictingClusterConfigCondition(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), TestTimeout)
 			defer cancel()
 
-			f, watchersReady := newFixture(t, ctx, require.New(t), defaultDaemonConfig)
+			f, watchersReady := newFixture(t, ctx, require.New(t), defaultBGPConfig)
 
 			tlog := hivetest.Logger(t)
 			f.hive.Start(tlog, ctx)
@@ -1108,7 +1145,7 @@ func TestConflictingClusterConfigCondition(t *testing.T) {
 						},
 					},
 				}
-				upsertBGPCC(req, ctx, f, clusterConfig)
+				req.NoError(upsertBGPCC(ctx, f, clusterConfig))
 			}
 
 			require.EventuallyWithT(t, func(ct *assert.CollectT) {
@@ -1140,7 +1177,13 @@ func TestConflictingClusterConfigCondition(t *testing.T) {
 					}
 
 					if cond.Status == meta_v1.ConditionFalse {
+						if !assert.Equal(ct, "ClusterConfigValidated", cond.Reason, "Expected condition reason to be NoConflictingClusterConfigsFound") {
+							return
+						}
+
 						continue
+					} else if !assert.Equal(ct, "ClusterConfigConflict", cond.Reason, "Expected condition reason to be ConflictingClusterConfigsFound") {
+						return
 					}
 
 					expr, err := regexp.Compile(
@@ -1162,7 +1205,7 @@ func TestConflictingClusterConfigCondition(t *testing.T) {
 				}
 
 				// Short circuit if the number of conflict relations is not the same.
-				if !assert.Len(ct, conflictingRelations, len(tt.conflictingRelations), "Exexpected number of conflicts") {
+				if !assert.Len(ct, conflictingRelations, len(tt.conflictingRelations), "Expected number of conflicts") {
 					return
 				}
 
@@ -1187,13 +1230,12 @@ func TestDisableClusterConfigStatusReport(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), TestTimeout)
 	defer cancel()
 
-	daemonConfigStatusFalse := &option.DaemonConfig{
-		EnableBGPControlPlane:             true,
-		Debug:                             true,
-		BGPSecretsNamespace:               "kube-system",
-		EnableBGPControlPlaneStatusReport: false,
+	configStatusFalse := config.BGPConfig{
+		Enable:             true,
+		SecretsNamespace:   "kube-system",
+		EnableStatusReport: false,
 	}
-	f, watchersReady := newFixture(t, ctx, require.New(t), daemonConfigStatusFalse)
+	f, watchersReady := newFixture(t, ctx, require.New(t), configStatusFalse)
 
 	tlog := hivetest.Logger(t)
 	f.hive.Start(tlog, ctx)
@@ -1219,7 +1261,7 @@ func TestDisableClusterConfigStatusReport(t *testing.T) {
 	}
 
 	// Setup resourses with status
-	upsertBGPCC(req, ctx, f, clusterConfig)
+	req.NoError(upsertBGPCC(ctx, f, clusterConfig))
 
 	// Wait for status to be cleared
 	require.EventuallyWithT(t, func(ct *assert.CollectT) {
@@ -1234,13 +1276,12 @@ func TestDisableClusterConfigStatusReport(t *testing.T) {
 }
 
 func TestRouterIDAllocation(t *testing.T) {
-	daemonConfigBGPRouterID := &option.DaemonConfig{
-		EnableBGPControlPlane:             true,
-		Debug:                             true,
-		BGPSecretsNamespace:               "kube-system",
-		EnableBGPControlPlaneStatusReport: true,
-		BGPRouterIDAllocationMode:         option.BGPRouterIDAllocationModeIPPool,
-		BGPRouterIDAllocationIPPool:       "10.0.0.0/24",
+	configBGPRouterID := config.BGPConfig{
+		Enable:                   true,
+		SecretsNamespace:         "kube-system",
+		EnableStatusReport:       true,
+		RouterIDAllocationMode:   config.BGPRouterIDAllocationModeIPPool,
+		RouterIDAllocationIPPool: "10.0.0.0/24",
 	}
 	tests := []struct {
 		name                       string
@@ -1518,7 +1559,7 @@ func TestRouterIDAllocation(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), TestTimeout)
 			defer cancel()
 
-			f, watchersReady := newFixture(t, ctx, require.New(t), daemonConfigBGPRouterID)
+			f, watchersReady := newFixture(t, ctx, require.New(t), configBGPRouterID)
 
 			tlog := hivetest.Logger(t)
 			f.hive.Start(tlog, ctx)
@@ -1532,7 +1573,7 @@ func TestRouterIDAllocation(t *testing.T) {
 			}
 			for _, clusterConfig := range tt.InitClusterConfigs {
 				config := clusterConfig
-				upsertBGPCC(req, ctx, f, config)
+				req.NoError(upsertBGPCC(ctx, f, config))
 			}
 
 			if tt.nodeOverrides != nil {
@@ -1574,7 +1615,9 @@ func TestRouterIDAllocation(t *testing.T) {
 				// version even after receiving an event for the new version.
 				if tt.FinalClusterConfigs != nil {
 					for _, clusterConfig := range tt.FinalClusterConfigs {
-						upsertBGPCC(req, ctx, f, clusterConfig)
+						if err := upsertBGPCC(ctx, f, clusterConfig); !assert.NoError(c, err) {
+							return
+						}
 					}
 				}
 				NodeConfigs, err := f.bgpnClient.List(ctx, meta_v1.ListOptions{})
@@ -1606,32 +1649,35 @@ func TestRouterIDAllocation(t *testing.T) {
 }
 
 func upsertNode(req *require.Assertions, ctx context.Context, f *fixture, node *v2.CiliumNode) {
-	_, err := f.nodeClient.Get(ctx, node.Name, meta_v1.GetOptions{})
+	existing, err := f.nodeClient.Get(ctx, node.Name, meta_v1.GetOptions{})
 	if err != nil && k8sErrors.IsNotFound(err) {
 		_, err = f.nodeClient.Create(ctx, node, meta_v1.CreateOptions{})
 	} else if err != nil {
 		req.Fail(err.Error())
 	} else {
+		node = node.DeepCopy()
+		node.SetResourceVersion(existing.GetResourceVersion())
 		_, err = f.nodeClient.Update(ctx, node, meta_v1.UpdateOptions{})
 	}
 	req.NoError(err)
 }
 
-func upsertBGPCC(req *require.Assertions, ctx context.Context, f *fixture, bgpcc *v2.CiliumBGPClusterConfig) {
+func upsertBGPCC(ctx context.Context, f *fixture, bgpcc *v2.CiliumBGPClusterConfig) error {
 	if bgpcc == nil {
-		return
+		return nil
 	}
 
 	existing, err := f.bgpcClient.Get(ctx, bgpcc.Name, meta_v1.GetOptions{})
 	if err != nil && k8sErrors.IsNotFound(err) {
 		_, err = f.bgpcClient.Create(ctx, bgpcc, meta_v1.CreateOptions{})
 	} else if err != nil {
-		req.Fail(err.Error())
+		return err
 	} else {
 		bgpcc.SetUID(existing.GetUID())
+		bgpcc.SetResourceVersion(existing.GetResourceVersion())
 		_, err = f.bgpcClient.Update(ctx, bgpcc, meta_v1.UpdateOptions{})
 	}
-	req.NoError(err)
+	return err
 }
 
 func upsertBGPPC(req *require.Assertions, ctx context.Context, f *fixture, bgppc *v2.CiliumBGPPeerConfig) {
@@ -1639,22 +1685,26 @@ func upsertBGPPC(req *require.Assertions, ctx context.Context, f *fixture, bgppc
 		return
 	}
 
-	_, err := f.bgpcClient.Get(ctx, bgppc.Name, meta_v1.GetOptions{})
+	existing, err := f.bgpcClient.Get(ctx, bgppc.Name, meta_v1.GetOptions{})
 	if err != nil && k8sErrors.IsNotFound(err) {
 		_, err = f.bgppcClient.Create(ctx, bgppc, meta_v1.CreateOptions{})
 	} else if err != nil {
 		req.Fail(err.Error())
 	} else {
+		bgppc = bgppc.DeepCopy()
+		bgppc.SetResourceVersion(existing.ResourceVersion)
 		_, err = f.bgppcClient.Update(ctx, bgppc, meta_v1.UpdateOptions{})
 	}
 	req.NoError(err)
 }
 
 func upsertNodeOverrides(req *require.Assertions, ctx context.Context, f *fixture, nodeOverride *v2.CiliumBGPNodeConfigOverride) {
-	_, err := f.bgpncoClient.Get(ctx, nodeOverride.Name, meta_v1.GetOptions{})
+	existing, err := f.bgpncoClient.Get(ctx, nodeOverride.Name, meta_v1.GetOptions{})
 	if err != nil && k8sErrors.IsNotFound(err) {
 		_, err = f.bgpncoClient.Create(ctx, nodeOverride, meta_v1.CreateOptions{})
 	} else {
+		nodeOverride = nodeOverride.DeepCopy()
+		nodeOverride.SetResourceVersion(existing.ResourceVersion)
 		_, err = f.bgpncoClient.Update(ctx, nodeOverride, meta_v1.UpdateOptions{})
 	}
 	req.NoError(err)

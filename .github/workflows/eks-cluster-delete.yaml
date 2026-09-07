@@ -18,7 +18,7 @@ permissions:
 
 env:
   # renovate: datasource=github-releases depName=eksctl-io/eksctl
-  eksctl_version: v0.221.0
+  eksctl_version: v0.230.0
 
 jobs:
   delete-cluster:
@@ -27,20 +27,35 @@ jobs:
     timeout-minutes: 30
     continue-on-error: true
     steps:
+      - name: Checkout context ref (trusted)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Install eksctl CLI
         run: |
-          curl -LO "https://github.com/eksctl-io/eksctl/releases/download/${{ env.eksctl_version }}/eksctl_$(uname -s)_amd64.tar.gz"
+          curl -fL --retry 5 --retry-all-errors --retry-delay 3 -O "https://github.com/eksctl-io/eksctl/releases/download/${{ env.eksctl_version }}/eksctl_$(uname -s)_amd64.tar.gz"
           sudo tar -xzvf "eksctl_$(uname -s)_amd64.tar.gz" -C /usr/bin
           rm "eksctl_$(uname -s)_amd64.tar.gz"
 
       - name: Set up AWS CLI credentials
-        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
         with:
           role-to-assume: ${{ secrets.AWS_PR_ASSUME_ROLE }}
           aws-region: ${{ inputs.region }}
 
+      - name: Get runner public IP
+        id: get-runner-ip
+        uses: ./.github/actions/get-runner-ip
+        with:
+          source: https://checkip.amazonaws.com
+          parsing: text
+
       - name: Delete EKS cluster
         run: |
+          eksctl utils update-cluster-vpc-config --cluster "${{ inputs.cluster_name }}" \
+            --public-access-cidrs="${{ steps.get-runner-ip.outputs.cidr }}" \
+            --public-access=true --private-access=true --approve && \
           eksctl delete cluster --name "${{ inputs.cluster_name }}" --region ${{ inputs.region }}
         shell: bash {0} # Disable default fail-fast behaviour
 

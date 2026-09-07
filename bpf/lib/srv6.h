@@ -6,60 +6,9 @@
 #include "lib/common.h"
 #include "lib/drop.h"
 #include "lib/identity.h"
+#include "lib/ipv6_core.h"
 #include "lib/tailcall.h"
-
-struct {
-	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
-	__type(key, struct srv6_vrf_key6);
-	__type(value, __u32);
-	__uint(pinning, LIBBPF_PIN_BY_NAME);
-	__uint(max_entries, SRV6_VRF_MAP_SIZE);
-	__uint(map_flags, BPF_F_NO_PREALLOC | BPF_F_RDONLY_PROG_COND);
-} cilium_srv6_vrf_v6 __section_maps_btf;
-
-struct {
-	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
-	__type(key, struct srv6_policy_key6);
-	__type(value, union v6addr);
-	__uint(pinning, LIBBPF_PIN_BY_NAME);
-	__uint(max_entries, SRV6_POLICY_MAP_SIZE);
-	__uint(map_flags, BPF_F_NO_PREALLOC | BPF_F_RDONLY_PROG_COND);
-} cilium_srv6_policy_v6 __section_maps_btf;
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, union v6addr); /* SID */
-    __type(value, __u32);      /* VRF ID */
-    __uint(pinning, LIBBPF_PIN_BY_NAME);
-    __uint(max_entries, SRV6_SID_MAP_SIZE);
-    __uint(map_flags, BPF_F_NO_PREALLOC | BPF_F_RDONLY_PROG_COND);
-} cilium_srv6_sid __section_maps_btf;
-
-struct srv6_srh {
-	struct ipv6_rt_hdr rthdr;
-	__u8 first_segment;
-	__u8 flags;
-	__u16 reserved;
-	struct in6_addr segments[0];
-};
-
-struct {
-	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
-	__type(key, struct srv6_vrf_key4);
-	__type(value, __u32);
-	__uint(pinning, LIBBPF_PIN_BY_NAME);
-	__uint(max_entries, SRV6_VRF_MAP_SIZE);
-	__uint(map_flags, BPF_F_NO_PREALLOC | BPF_F_RDONLY_PROG_COND);
-} cilium_srv6_vrf_v4 __section_maps_btf;
-
-struct {
-	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
-	__type(key, struct srv6_policy_key4);
-	__type(value, union v6addr);
-	__uint(pinning, LIBBPF_PIN_BY_NAME);
-	__uint(max_entries, SRV6_POLICY_MAP_SIZE);
-	__uint(map_flags, BPF_F_NO_PREALLOC | BPF_F_RDONLY_PROG_COND);
-} cilium_srv6_policy_v4 __section_maps_btf;
+#include "lib/srv6_maps.h"
 
 #ifdef ENABLE_SRV6
 # ifdef ENABLE_IPV4
@@ -196,11 +145,9 @@ srv6_encapsulation(struct __ctx_buff *ctx, int growth, __u16 new_payload_len,
 		return DROP_INVALID;
 	if (ctx_store_bytes(ctx, ETH_HLEN, &new_ip6, len, 0) < 0)
 		return DROP_WRITE_ERROR;
-	if (ctx_store_bytes(ctx, ETH_HLEN + offsetof(struct ipv6hdr, saddr),
-			    saddr, sizeof(union v6addr), 0) < 0)
+	if (ipv6_store_saddr(ctx, saddr->addr, ETH_HLEN) < 0)
 		return DROP_WRITE_ERROR;
-	if (ctx_store_bytes(ctx, ETH_HLEN + offsetof(struct ipv6hdr, daddr),
-			    sid, sizeof(struct in6_addr), 0) < 0)
+	if (ipv6_store_daddr(ctx, (const __u8 *)sid, ETH_HLEN) < 0)
 		return DROP_WRITE_ERROR;
 
 #ifdef ENABLE_SRV6_SRH_ENCAP
@@ -271,8 +218,7 @@ srv6_decapsulation(struct __ctx_buff *ctx, __u8 *nexthdr)
 parse_outer_ipv4: __maybe_unused;
 		if (ctx_change_proto(ctx, new_proto, 0) < 0)
 			return DROP_WRITE_ERROR;
-		if (ctx_store_bytes(ctx, offsetof(struct ethhdr, h_proto),
-				    &new_proto, sizeof(new_proto), 0) < 0)
+		if (eth_store_proto(ctx, new_proto, 0) < 0)
 			return DROP_WRITE_ERROR;
 		/* ctx_change_proto above shrinks the packet from IPv6 header
 		 * length to IPv4 header length. It removes that space from the
@@ -293,7 +239,7 @@ parse_outer_ipv6: __maybe_unused;
 
 	/* Remove the outer IPv6 header. */
 	if (ctx_adjust_hroom(ctx, -shrink, BPF_ADJ_ROOM_MAC,
-			     ctx_adjust_hroom_flags()))
+			     BPF_F_ADJ_ROOM_NO_CSUM_RESET))
 		return DROP_INVALID;
 	return 0;
 }
@@ -320,8 +266,7 @@ srv6_handling4(struct __ctx_buff *ctx, union v6addr *src_sid,
 	 */
 	new_payload_len = bpf_ntohs(ip4->tot_len) - (__u16)(ip4->ihl << 2) + sizeof(struct iphdr);
 
-	if (ctx_store_bytes(ctx, offsetof(struct ethhdr, h_proto),
-			    &outer_proto, sizeof(outer_proto), 0) < 0)
+	if (eth_store_proto(ctx, outer_proto, 0) < 0)
 		return DROP_WRITE_ERROR;
 
 #ifdef ENABLE_SRV6_SRH_ENCAP
@@ -414,7 +359,6 @@ int tail_srv6_encap(struct __ctx_buff *ctx)
 {
 	struct in6_addr dst_sid;
 	int ret = 0;
-	int __maybe_unused ext_err = 0;
 
 	srv6_load_meta_sid(ctx, &dst_sid);
 	ret = srv6_handling(ctx, &dst_sid);

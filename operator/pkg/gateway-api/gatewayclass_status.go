@@ -8,6 +8,8 @@ import (
 	"slices"
 	"time"
 
+	"github.com/cilium/cilium/operator/pkg/gateway-api/helpers"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	"sigs.k8s.io/gateway-api/pkg/features"
@@ -22,11 +24,16 @@ var supportedFeatures = features.AllFeatures
 
 var gatewayClassSupportedFeatures = getSupportedFeatures()
 
+// This lists the features we do _not_ support, so that we can skip
+// them in the supportedFeatures list in the GatewayClass.
 var exemptFeatures = []features.Feature{
 	features.HTTPRouteParentRefPortFeature,
 	features.MeshConsumerRouteFeature,
-	features.BackendTLSPolicyFeature,
-	features.HTTPRouteCORS,
+	features.BackendTLSPolicySanValidationFeature,
+	features.TLSRouteModeTerminateFeature,
+	features.GatewayBackendClientCertificateFeature,
+	features.GatewayFrontendClientCertificateValidationFeature,
+	features.GatewayHTTPSListenerDetectMisdirectedRequestsFeature,
 }
 
 // List of Gateway API features supported by Cilium.
@@ -35,7 +42,7 @@ func getSupportedFeatures() []gatewayv1.SupportedFeature {
 	for _, feature := range exemptFeatures {
 		supportedFeatures.Delete(feature)
 	}
-	ret := []gatewayv1.SupportedFeature{}
+	ret := make([]gatewayv1.SupportedFeature, 0, len(supportedFeatures))
 	for _, feat := range supportedFeatures.UnsortedList() {
 		ret = append(ret, gatewayv1.SupportedFeature{Name: gatewayv1.FeatureName(feat.Name)})
 	}
@@ -48,7 +55,7 @@ func getSupportedFeatures() []gatewayv1.SupportedFeature {
 // setGatewayClassAccepted inserts or updates the Accepted condition
 // for the provided GatewayClass.
 func setGatewayClassAccepted(gwc *gatewayv1.GatewayClass, accepted bool) *gatewayv1.GatewayClass {
-	gwc.Status.Conditions = merge(gwc.Status.Conditions, gatewayClassAcceptedCondition(gwc, accepted))
+	gwc.Status.Conditions = helpers.MergeConditions(gwc.Status.Conditions, gatewayClassAcceptedCondition(gwc, accepted))
 	return gwc
 }
 

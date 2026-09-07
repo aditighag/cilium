@@ -15,6 +15,143 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
+// Gateway fixture with kind restrictions on each listener:
+//
+// - https: kinds [HTTPRoute]
+// - grpcs: kinds [GRPCRoute]
+//
+// Used to test that CheckGatewayRouteKindAllowed evaluates only the
+// listener targeted by parentRef.sectionName, not all listeners.
+var kindRestrictedGateway = &gatewayv1.Gateway{
+	ObjectMeta: metav1.ObjectMeta{
+		Name:      "kind-restricted-gateway",
+		Namespace: "default",
+	},
+	Spec: gatewayv1.GatewaySpec{
+		GatewayClassName: "cilium",
+		Listeners: []gatewayv1.Listener{
+			{
+				Name:     "https",
+				Port:     443,
+				Protocol: gatewayv1.HTTPSProtocolType,
+				AllowedRoutes: &gatewayv1.AllowedRoutes{
+					Kinds: []gatewayv1.RouteGroupKind{
+						{
+							Group: ptr.To[gatewayv1.Group](gatewayv1.GroupName),
+							Kind:  "HTTPRoute",
+						},
+					},
+				},
+			},
+			{
+				Name:     "grpcs",
+				Port:     50051,
+				Protocol: gatewayv1.HTTPSProtocolType,
+				AllowedRoutes: &gatewayv1.AllowedRoutes{
+					Kinds: []gatewayv1.RouteGroupKind{
+						{
+							Group: ptr.To[gatewayv1.Group](gatewayv1.GroupName),
+							Kind:  "GRPCRoute",
+						},
+					},
+				},
+			},
+		},
+	},
+}
+
+// Gateway fixture with restrictive Selector listener first, permissive All
+// listener second. Used to test that CheckGatewayAllowedForNamespace does not
+// early-return on a Selector failure before checking remaining listeners.
+var mixedNamespaceGateway = &gatewayv1.Gateway{
+	ObjectMeta: metav1.ObjectMeta{
+		Name:      "mixed-ns-gateway",
+		Namespace: "default",
+	},
+	Spec: gatewayv1.GatewaySpec{
+		GatewayClassName: "cilium",
+		Listeners: []gatewayv1.Listener{
+			{
+				Name:     "http-selector",
+				Port:     8082,
+				Protocol: gatewayv1.HTTPProtocolType,
+				Hostname: ptr.To[gatewayv1.Hostname]("*.http-selector.io"),
+				AllowedRoutes: &gatewayv1.AllowedRoutes{
+					Namespaces: &gatewayv1.RouteNamespaces{
+						From: ptr.To(gatewayv1.NamespacesFromSelector),
+						Selector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{
+								"kubernetes.io/metadata.name": "default",
+							},
+						},
+					},
+				},
+			},
+			{
+				Name:     "http-all",
+				Port:     8081,
+				Protocol: gatewayv1.HTTPProtocolType,
+				Hostname: ptr.To[gatewayv1.Hostname]("*.http-all.io"),
+				AllowedRoutes: &gatewayv1.AllowedRoutes{
+					Namespaces: &gatewayv1.RouteNamespaces{
+						From: ptr.To(gatewayv1.NamespacesFromAll),
+					},
+				},
+			},
+		},
+	},
+}
+
+// Gateway fixture mixing an unrestricted HTTP listener with an explicit-TCPRoute
+// TCP listener; used to test that the TCP restriction doesn't block HTTPRoute.
+var mixedKindGateway = &gatewayv1.Gateway{
+	ObjectMeta: metav1.ObjectMeta{
+		Name:      "mixed-kind-gateway",
+		Namespace: "default",
+	},
+	Spec: gatewayv1.GatewaySpec{
+		GatewayClassName: "cilium",
+		Listeners: []gatewayv1.Listener{
+			{
+				Name:     "http",
+				Port:     80,
+				Protocol: gatewayv1.HTTPProtocolType,
+			},
+			{
+				Name:     "tcp",
+				Port:     8090,
+				Protocol: gatewayv1.TCPProtocolType,
+				AllowedRoutes: &gatewayv1.AllowedRoutes{
+					Kinds: []gatewayv1.RouteGroupKind{
+						{
+							Group: ptr.To[gatewayv1.Group](gatewayv1.GroupName),
+							Kind:  "TCPRoute",
+						},
+					},
+				},
+			},
+		},
+	},
+}
+
+// Gateway fixture with no kind restrictions on any listener.
+var noKindRestrictedGateway = &gatewayv1.Gateway{
+	ObjectMeta: metav1.ObjectMeta{
+		Name:      "no-kind-restricted-gateway",
+		Namespace: "default",
+	},
+	Spec: gatewayv1.GatewaySpec{
+		GatewayClassName: "cilium",
+		Listeners: []gatewayv1.Listener{
+			{
+				Name:     "http",
+				Port:     80,
+				Protocol: gatewayv1.HTTPProtocolType,
+			},
+		},
+	},
+}
+
 var gatewayFixtures = []client.Object{
 	// Gateway fixture with allow rules:
 	//
@@ -42,16 +179,7 @@ var gatewayFixtures = []client.Object{
 						},
 					},
 				},
-				{
-					Name:     "http-all",
-					Port:     8081,
-					Hostname: ptr.To[gatewayv1.Hostname]("*.http-all.io"),
-					AllowedRoutes: &gatewayv1.AllowedRoutes{
-						Namespaces: &gatewayv1.RouteNamespaces{
-							From: ptr.To(gatewayv1.NamespacesFromAll),
-						},
-					},
-				},
+
 				{
 					Name:     "http-selector",
 					Port:     8082,
@@ -77,16 +205,7 @@ var gatewayFixtures = []client.Object{
 						},
 					},
 				},
-				{
-					Name:     "https-all",
-					Port:     8444,
-					Hostname: ptr.To[gatewayv1.Hostname]("*.https-all.io"),
-					AllowedRoutes: &gatewayv1.AllowedRoutes{
-						Namespaces: &gatewayv1.RouteNamespaces{
-							From: ptr.To(gatewayv1.NamespacesFromAll),
-						},
-					},
-				},
+
 				{
 					Name:     "https-selector",
 					Port:     8445,
@@ -99,6 +218,37 @@ var gatewayFixtures = []client.Object{
 									"allowed": "true",
 								},
 							},
+						},
+					},
+				},
+			},
+		},
+	},
+	&gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "dummy-all-gateway",
+			Namespace: "default",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "cilium",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http-all",
+					Port:     8081,
+					Hostname: ptr.To[gatewayv1.Hostname]("*.http-all.io"),
+					AllowedRoutes: &gatewayv1.AllowedRoutes{
+						Namespaces: &gatewayv1.RouteNamespaces{
+							From: ptr.To(gatewayv1.NamespacesFromAll),
+						},
+					},
+				},
+				{
+					Name:     "https-all",
+					Port:     8444,
+					Hostname: ptr.To[gatewayv1.Hostname]("*.https-all.io"),
+					AllowedRoutes: &gatewayv1.AllowedRoutes{
+						Namespaces: &gatewayv1.RouteNamespaces{
+							From: ptr.To(gatewayv1.NamespacesFromAll),
 						},
 					},
 				},
@@ -152,7 +302,13 @@ func TestCheckGatewayAllowedForNamespace(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(gatewayFixtures...).
+		WithObjects(mixedNamespaceGateway).
 		WithObjects(namespaceFixture...).
+		WithObjects(&corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "cross-ns",
+			},
+		}).
 		WithStatusSubresource(&gatewayv1.HTTPRoute{}).
 		Build()
 
@@ -263,7 +419,7 @@ func TestCheckGatewayAllowedForNamespace(t *testing.T) {
 					},
 				},
 				parentRef: gatewayv1.ParentReference{
-					Name:        "dummy-gateway",
+					Name:        "dummy-all-gateway",
 					Namespace:   ptr.To[gatewayv1.Namespace]("default"),
 					SectionName: ptr.To[gatewayv1.SectionName]("http-all"),
 				},
@@ -368,6 +524,44 @@ func TestCheckGatewayAllowedForNamespace(t *testing.T) {
 		},
 
 		{
+			name: "listener with selector label match not allowed and the section name omitted (allowed)",
+			args: args{
+				input: &HTTPRouteInput{
+					Client: c,
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "allowed-1",
+						},
+						Spec: gatewayv1.HTTPRouteSpec{},
+					},
+				},
+				parentRef: gatewayv1.ParentReference{
+					Name:      "dummy-gateway",
+					Namespace: ptr.To[gatewayv1.Namespace]("default"),
+				},
+			},
+			want: true,
+		},
+		{
+			name: "listener with selector label match not allowed and the section name omitted (disallowed)",
+			args: args{
+				input: &HTTPRouteInput{
+					Client: c,
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "disallowed-2",
+						},
+						Spec: gatewayv1.HTTPRouteSpec{},
+					},
+				},
+				parentRef: gatewayv1.ParentReference{
+					Name:      "dummy-gateway",
+					Namespace: ptr.To[gatewayv1.Namespace]("default"),
+				},
+			},
+			want: false,
+		},
+		{
 			name: "https listener with all namespaces (allowed)",
 			args: args{
 				input: &HTTPRouteInput{
@@ -384,7 +578,7 @@ func TestCheckGatewayAllowedForNamespace(t *testing.T) {
 					},
 				},
 				parentRef: gatewayv1.ParentReference{
-					Name:        "dummy-gateway",
+					Name:        "dummy-all-gateway",
 					Namespace:   ptr.To[gatewayv1.Namespace]("default"),
 					SectionName: ptr.To[gatewayv1.SectionName]("https-all"),
 				},
@@ -487,6 +681,48 @@ func TestCheckGatewayAllowedForNamespace(t *testing.T) {
 			},
 			want: false,
 		},
+		{
+			name: "selector-first then all-second without sectionName, cross-namespace (allowed by all listener)",
+			args: args{
+				input: &HTTPRouteInput{
+					Client: c,
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "cross-ns",
+						},
+					},
+				},
+				parentRef: gatewayv1.ParentReference{
+					Name:      "mixed-ns-gateway",
+					Namespace: ptr.To[gatewayv1.Namespace]("default"),
+				},
+			},
+			want: true,
+		},
+		{
+			name: "selector-first then all-second with sectionName targeting all listener (allowed)",
+			args: args{
+				input: &HTTPRouteInput{
+					Client: c,
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "cross-ns",
+						},
+						Spec: gatewayv1.HTTPRouteSpec{
+							Hostnames: []gatewayv1.Hostname{
+								"*.http-all.io",
+							},
+						},
+					},
+				},
+				parentRef: gatewayv1.ParentReference{
+					Name:        "mixed-ns-gateway",
+					Namespace:   ptr.To[gatewayv1.Namespace]("default"),
+					SectionName: ptr.To[gatewayv1.SectionName]("http-all"),
+				},
+			},
+			want: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -497,6 +733,191 @@ func TestCheckGatewayAllowedForNamespace(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Errorf("CheckGatewayAllowedForNamespace() got = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCheckGatewayRouteKindAllowed(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = gatewayv1.Install(scheme)
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(kindRestrictedGateway, noKindRestrictedGateway, mixedKindGateway).
+		WithStatusSubresource(&gatewayv1.HTTPRoute{}).
+		Build()
+
+	type args struct {
+		input     Input
+		parentRef gatewayv1.ParentReference
+	}
+	tests := []struct {
+		name    string
+		args    args
+		want    bool
+		wantErr bool
+	}{
+		{
+			name: "gateway not found",
+			args: args{
+				input: &HTTPRouteInput{
+					Client: c,
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "default",
+						},
+					},
+				},
+				parentRef: gatewayv1.ParentReference{
+					Name:      "non-existing-gateway",
+					Namespace: ptr.To[gatewayv1.Namespace]("default"),
+				},
+			},
+			want: false,
+		},
+		{
+			name: "no kind restrictions on listener (allowed)",
+			args: args{
+				input: &HTTPRouteInput{
+					Client: c,
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "default",
+						},
+					},
+				},
+				parentRef: gatewayv1.ParentReference{
+					Name:        "no-kind-restricted-gateway",
+					Namespace:   ptr.To[gatewayv1.Namespace]("default"),
+					SectionName: ptr.To[gatewayv1.SectionName]("http"),
+				},
+			},
+			want: true,
+		},
+		{
+			name: "HTTPRoute targeting https listener with kinds [HTTPRoute] (allowed)",
+			args: args{
+				input: &HTTPRouteInput{
+					Client: c,
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "default",
+						},
+					},
+				},
+				parentRef: gatewayv1.ParentReference{
+					Name:        "kind-restricted-gateway",
+					Namespace:   ptr.To[gatewayv1.Namespace]("default"),
+					SectionName: ptr.To[gatewayv1.SectionName]("https"),
+				},
+			},
+			want: true,
+		},
+		{
+			name: "HTTPRoute targeting grpcs listener with kinds [GRPCRoute] (rejected)",
+			args: args{
+				input: &HTTPRouteInput{
+					Client: c,
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "default",
+						},
+					},
+				},
+				parentRef: gatewayv1.ParentReference{
+					Name:        "kind-restricted-gateway",
+					Namespace:   ptr.To[gatewayv1.Namespace]("default"),
+					SectionName: ptr.To[gatewayv1.SectionName]("grpcs"),
+				},
+			},
+			want: false,
+		},
+		{
+			// Regression: TCP listener's explicit [TCPRoute] must not poison the unrestricted HTTP listener.
+			name: "HTTPRoute on mixed HTTP+TCP gateway without sectionName (allowed by unrestricted HTTP listener)",
+			args: args{
+				input: &HTTPRouteInput{
+					Client: c,
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "default",
+						},
+					},
+				},
+				parentRef: gatewayv1.ParentReference{
+					Name:      "mixed-kind-gateway",
+					Namespace: ptr.To[gatewayv1.Namespace]("default"),
+				},
+			},
+			want: true,
+		},
+		{
+			name: "HTTPRoute on mixed HTTP+TCP gateway targeting http section (allowed)",
+			args: args{
+				input: &HTTPRouteInput{
+					Client: c,
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "default",
+						},
+					},
+				},
+				parentRef: gatewayv1.ParentReference{
+					Name:        "mixed-kind-gateway",
+					Namespace:   ptr.To[gatewayv1.Namespace]("default"),
+					SectionName: ptr.To[gatewayv1.SectionName]("http"),
+				},
+			},
+			want: true,
+		},
+		{
+			name: "HTTPRoute on mixed HTTP+TCP gateway targeting tcp section (rejected)",
+			args: args{
+				input: &HTTPRouteInput{
+					Client: c,
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "default",
+						},
+					},
+				},
+				parentRef: gatewayv1.ParentReference{
+					Name:        "mixed-kind-gateway",
+					Namespace:   ptr.To[gatewayv1.Namespace]("default"),
+					SectionName: ptr.To[gatewayv1.SectionName]("tcp"),
+				},
+			},
+			want: false,
+		},
+		{
+			name: "HTTPRoute without sectionName on kind-restricted gateway (allowed by https listener)",
+			args: args{
+				input: &HTTPRouteInput{
+					Client: c,
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "default",
+						},
+					},
+				},
+				parentRef: gatewayv1.ParentReference{
+					Name:      "kind-restricted-gateway",
+					Namespace: ptr.To[gatewayv1.Namespace]("default"),
+				},
+			},
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := CheckGatewayRouteKindAllowed(tt.args.input, tt.args.parentRef)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("CheckGatewayRouteKindAllowed() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("CheckGatewayRouteKindAllowed() got = %v, want %v", got, tt.want)
 			}
 		})
 	}

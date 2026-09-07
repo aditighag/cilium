@@ -16,6 +16,8 @@ import (
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/allocator"
 	"github.com/cilium/cilium/pkg/clustermesh/common"
+	cmendpointslice "github.com/cilium/cilium/pkg/clustermesh/endpointslice"
+	cmlb "github.com/cilium/cilium/pkg/clustermesh/loadbalancer"
 	"github.com/cilium/cilium/pkg/clustermesh/observer"
 	serviceStore "github.com/cilium/cilium/pkg/clustermesh/store"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
@@ -25,6 +27,7 @@ import (
 	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/kvstore/store"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/node"
 	nodeStore "github.com/cilium/cilium/pkg/node/store"
 	"github.com/cilium/cilium/pkg/source"
 )
@@ -35,6 +38,7 @@ type Configuration struct {
 	cell.In
 
 	common.Config
+	cmtypes.ServiceModeV2Config
 	wait.TimeoutConfig
 
 	// ClusterInfo is the id/name of the local cluster.
@@ -45,7 +49,7 @@ type Configuration struct {
 
 	// ServiceMerger is the interface responsible to merge service and
 	// endpoints into an existing cache
-	ServiceMerger ServiceMerger
+	ServiceMerger cmlb.ServiceMerger
 
 	// NodeObserver reacts to node events.
 	NodeObserver nodeStore.NodeManager
@@ -57,7 +61,7 @@ type Configuration struct {
 	IPCache ipcache.IPCacher
 
 	// ClusterSizeDependantInterval allows to calculate intervals based on cluster size.
-	ClusterSizeDependantInterval kvstore.ClusterSizeDependantIntervalFunc
+	ClusterSizeDependantInterval node.ClusterSizeDependantIntervalFunc
 
 	// ServiceResolver, if not nil, is used to create a custom dialer for service resolution.
 	ServiceResolver dial.Resolver
@@ -70,7 +74,7 @@ type Configuration struct {
 
 	// ClusterIDsManager handles the reservation of the ClusterIDs associated
 	// with remote clusters, to ensure their uniqueness.
-	ClusterIDsManager clusterIDsManager
+	ClusterIDsManager common.ClusterIDsManager
 
 	// ObserverFactories is the list of factories to instantiate additional observers.
 	ObserverFactories []observer.Factory `group:"clustermesh-observers"`
@@ -153,7 +157,8 @@ func NewClusterMesh(lifecycle cell.Lifecycle, c Configuration) *ClusterMesh {
 			return out
 		}(),
 
-		NewRemoteCluster: cm.NewRemoteCluster,
+		NewRemoteCluster:  cm.NewRemoteCluster,
+		ClusterIDsManager: c.ClusterIDsManager,
 
 		Metrics: c.CommonMetrics,
 	})
@@ -166,8 +171,8 @@ func (cm *ClusterMesh) NewRemoteCluster(name string, status common.StatusFunc) c
 	rc := &remoteCluster{
 		name:                     name,
 		clusterID:                cmtypes.ClusterIDUnset,
-		clusterConfigValidator:   cm.conf.ClusterInfo.ValidateRemoteConfig,
-		usedIDs:                  cm.conf.ClusterIDsManager,
+		localClusterInfo:         cm.conf.ClusterInfo,
+		serviceModeV2:            cm.conf.ServiceModeV2,
 		status:                   status,
 		storeFactory:             cm.conf.StoreFactory,
 		remoteIdentityWatcher:    cm.conf.RemoteIdentityWatcher,
@@ -201,7 +206,7 @@ func (cm *ClusterMesh) NewRemoteCluster(name string, status common.StatusFunc) c
 			cm.conf.ServiceMerger.MergeExternalServiceUpdate,
 			cm.conf.ServiceMerger.MergeExternalServiceDelete,
 		),
-		store.RWSWithOnSyncCallback(func(ctx context.Context) { close(rc.synced.services) }),
+		store.RWSWithOnSyncCallback(func(ctx context.Context) { rc.synced.services.Stop() }),
 		store.RWSWithEntriesMetric(cm.conf.Metrics.TotalServices.WithLabelValues(rc.name)),
 	)
 
@@ -248,6 +253,14 @@ func (cm *ClusterMesh) NodesSynced(ctx context.Context) error {
 // It returns an error if the given context expired.
 func (cm *ClusterMesh) ServicesSynced(ctx context.Context) error {
 	return cm.synced(ctx, func(rc *remoteCluster) wait.Fn { return rc.synced.Services })
+}
+
+// EndpointSlicesSynced() returns after that either the initial list of endpoint slices has
+// been received from all remote clusters, and synchronized with the BPF datapath, or
+// the maximum wait period controlled by the clustermesh-sync-timeout flag elapsed.
+// It returns an error if the given context expired.
+func (cm *ClusterMesh) EndpointSlicesSynced(ctx context.Context) error {
+	return cm.ObserverSynced(ctx, cmendpointslice.Name)
 }
 
 // IPIdentitiesSynced returns after that either the initial list of ipcache entries

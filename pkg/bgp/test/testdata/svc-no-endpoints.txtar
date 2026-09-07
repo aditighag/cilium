@@ -1,16 +1,13 @@
-#! --test-peering-ips=10.99.4.111,10.99.4.112 --bgp-no-endpoints-routable=false 
+#! --test-peering-ips=10.99.4.111,10.99.4.112 --enable-no-service-endpoints-routable=false
 
-# Tests sharing of the same LB VIP across multiple services.
-# VIP should be advertised if one of the shared services disappears but the other one remains.
+# Tests that services with externalTrafficPolicy=Cluster and no endpoints are not advertised
+# when --enable-no-service-endpoints-routable option is set to false
 
 # Start the hive
 hive start
 
 # Configure gobgp server
-gobgp/add-server test 65010 10.99.4.111 1790
-
-# Configure peers on GoBGP
-gobgp/add-peer 10.99.4.112 65001
+gobgp/add-server test gobgp-server.toml
 
 # Add a k8s service
 k8s/add service.yaml
@@ -32,8 +29,8 @@ k8s/add endpoints.yaml
 gobgp/routes -o routes.actual
 * cmp gobgp-routes.expected routes.actual
 
-# Delete the service
-k8s/delete service.yaml
+# Update endpoints with terminating=true, ready=false
+k8s/update endpoints-terminating.yaml
 sleep 0.1s # give some time for the change to propagate to avoid false positive
 
 # Validate that LB IP is withdrawn
@@ -42,6 +39,22 @@ gobgp/routes -o routes.actual
 
 #####
 
+-- gobgp-server.toml --
+[global.config]
+  as = 65010
+  router-id = "10.99.4.111"
+  local-address-list = ["10.99.4.111"]
+  port = 1790
+
+[[neighbors]]
+  [neighbors.config]
+    neighbor-address = "10.99.4.112"
+    peer-as = 65001
+  [neighbors.transport.config]
+    passive-mode = true
+  [[neighbors.afi-safis]]
+    [neighbors.afi-safis.config]
+      afi-safi-name = "ipv4-unicast"
 -- cilium-node.yaml --
 apiVersion: cilium.io/v2
 kind: CiliumNode
@@ -155,6 +168,28 @@ endpoints:
     ready: true
     serving: true
     terminating: false
+  nodeName: test-node
+ports:
+- name: http
+  port: 80
+  protocol: TCP
+
+-- endpoints-terminating.yaml --
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  labels:
+    kubernetes.io/service-name: echo1
+  name: echo-eps1
+  namespace: test
+addressType: IPv4
+endpoints:
+- addresses:
+  - 10.244.1.20
+  conditions:
+    ready: false
+    serving: false
+    terminating: true
   nodeName: test-node
 ports:
 - name: http

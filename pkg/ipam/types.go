@@ -5,21 +5,22 @@ package ipam
 
 import (
 	"log/slog"
-	"net"
+	"net/netip"
 
 	"github.com/davecgh/go-spew/spew"
 
+	"github.com/cilium/hive/job"
 	"github.com/cilium/statedb"
 
 	agentK8s "github.com/cilium/cilium/daemon/k8s"
 	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
-	"github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/endpoint"
 	"github.com/cilium/cilium/pkg/ipam/podippool"
 	"github.com/cilium/cilium/pkg/ipmasq"
 	"github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/mac"
 	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
 )
@@ -27,7 +28,7 @@ import (
 // AllocationResult is the result of an allocation
 type AllocationResult struct {
 	// IP is the allocated IP
-	IP net.IP
+	IP netip.Addr
 
 	// IPPoolName is the IPAM pool from which the above IP was allocated from
 	IPPoolName Pool
@@ -36,18 +37,19 @@ type AllocationResult struct {
 	// This is primarily useful if the IP has been allocated out of a VPC
 	// subnet range and the VPC provides routing to a set of CIDRs in which
 	// the IP is routable.
-	CIDRs []string
+	CIDRs []netip.Prefix
 
 	// PrimaryMAC is the MAC address of the primary interface. This is useful
 	// when the IP is a secondary address of an interface which is
 	// represented on the node as a Linux device and all routing of the IP
-	// must occur through that master interface.
-	PrimaryMAC string
+	// must occur through that master interface. It is unset for the IPAM
+	// modes which have no master interface.
+	PrimaryMAC mac.MAC
 
 	// GatewayIP is the IP of the gateway which must be used for this IP.
 	// If the allocated IP is derived from a VPC, then the gateway
 	// represented the gateway of the VPC or VPC subnet.
-	GatewayIP string
+	GatewayIP netip.Addr
 
 	// ExpirationUUID is the UUID of the expiration timer. This field is
 	// only set if AllocateNextWithExpiration is used.
@@ -64,14 +66,14 @@ type AllocationResult struct {
 // Allocator is the interface for an IP allocator implementation
 type Allocator interface {
 	// Allocate allocates a specific IP or fails
-	Allocate(ip net.IP, owner string, pool Pool) (*AllocationResult, error)
+	Allocate(addr netip.Addr, owner string, pool Pool) (*AllocationResult, error)
 
 	// AllocateWithoutSyncUpstream allocates a specific IP without syncing
 	// upstream or fails
-	AllocateWithoutSyncUpstream(ip net.IP, owner string, pool Pool) (*AllocationResult, error)
+	AllocateWithoutSyncUpstream(addr netip.Addr, owner string, pool Pool) (*AllocationResult, error)
 
 	// Release releases a previously allocated IP or fails
-	Release(ip net.IP, pool Pool) error
+	Release(addr netip.Addr, pool Pool) error
 
 	// AllocateNext allocates the next available IP or fails if no more IPs
 	// are available
@@ -98,7 +100,7 @@ type Allocator interface {
 type IPAM struct {
 	logger *slog.Logger
 
-	nodeAddressing types.NodeAddressing
+	nodeAddressing node.Addressing
 	config         *option.DaemonConfig
 
 	ipv6Allocator Allocator
@@ -118,7 +120,7 @@ type IPAM struct {
 	// mutex covers access to all members of this struct
 	allocatorMutex lock.RWMutex
 
-	// excludedIPS contains excluded IPs and their respective owners per pool. The key is a
+	// excludedIPs contains excluded IPs and their respective owners per pool. The key is a
 	// combination pool:ip to avoid having to maintain a map of maps.
 	excludedIPs map[string]string
 
@@ -131,10 +133,16 @@ type IPAM struct {
 	sysctl         sysctl.Sysctl
 	ipMasqAgent    *ipmasq.IPMasqAgent
 
+	jg job.Group
+
 	db         *statedb.DB
 	podIPPools statedb.Table[podippool.LocalPodIPPool]
 
 	onlyMasqueradeDefaultPool bool
+
+	// cloudProviders holds the registered cloud providers, keyed by the IPAM
+	// mode each one handles.
+	cloudProviders map[string]CloudProvider
 }
 
 func (ipam *IPAM) EndpointCreated(ep *endpoint.Endpoint) {}
@@ -142,12 +150,12 @@ func (ipam *IPAM) EndpointCreated(ep *endpoint.Endpoint) {}
 func (ipam *IPAM) EndpointDeleted(ep *endpoint.Endpoint, conf endpoint.DeleteConfig) {
 	if !conf.NoIPRelease {
 		if option.Config.EnableIPv4 {
-			if err := ipam.ReleaseIP(ep.IPv4.AsSlice(), PoolOrDefault(ep.IPv4IPAMPool)); err != nil {
+			if err := ipam.ReleaseIP(ep.IPv4, PoolOrDefault(ep.IPv4IPAMPool)); err != nil {
 				ipam.logger.Warn("Unable to release IPv4 address during endpoint deletion", logfields.Error, err)
 			}
 		}
 		if option.Config.EnableIPv6 {
-			if err := ipam.ReleaseIP(ep.IPv6.AsSlice(), PoolOrDefault(ep.IPv6IPAMPool)); err != nil {
+			if err := ipam.ReleaseIP(ep.IPv6, PoolOrDefault(ep.IPv6IPAMPool)); err != nil {
 				ipam.logger.Warn("Unable to release IPv6 address during endpoint deletion", logfields.Error, err)
 			}
 		}
@@ -187,19 +195,11 @@ func (p Pool) String() string {
 }
 
 type timerKey struct {
-	ip   string
+	ip   netip.Addr
 	pool Pool
 }
 
 type expirationTimer struct {
 	uuid string
 	stop chan<- struct{}
-}
-
-// LimitsNotFound is an error that signals lack of limits for given instance type
-type LimitsNotFound struct{}
-
-// Error implements error interface
-func (_ LimitsNotFound) Error() string {
-	return "Limits not found"
 }

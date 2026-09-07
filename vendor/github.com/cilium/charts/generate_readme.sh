@@ -8,9 +8,9 @@ This repository holds helm templates for the following Cilium releases:
 EOF
 
 for version in \
-    $(find -- * -name 'cilium-*.tgz' ! -name "*dev*" \
-    | cut -d - -f 2- \
-    | xargs basename -s .tgz \
+    $(find . -maxdepth 1 -type f -name 'cilium-*.tgz' ! -name "*dev*" \
+    | xargs -n1 basename -s .tgz \
+    | sed 's/^cilium-//' \
     | sed '/-/!{s/$/_/;}' \
     | sort -Vr \
     | sed 's/_$//'); do
@@ -24,9 +24,9 @@ This repository holds helm templates for the following Tetragon releases:
 EOF
 
 for version in \
-    $(find -- * -name 'tetragon-*.tgz' ! -name "*dev*" \
-    | cut -d - -f 2- \
-    | xargs basename -s .tgz \
+    $(find . -maxdepth 1 -type f -name 'tetragon-*.tgz' ! -name "*dev*" \
+    | xargs -n1 basename -s .tgz \
+    | sed 's/^tetragon-//' \
     | sed '/-/!{s/$/_/;}' \
     | sort -Vr \
     | sed 's/_$//'); do
@@ -34,10 +34,8 @@ for version in \
   TETRAGON_CHART_DIR="install/kubernetes/tetragon"
   MAJOR=$(echo "$version" | cut -d. -f1)
   MINOR=$(echo "$version" | cut -d. -f2)
-  if [ "$MAJOR" -lt 1 ] || ([ "$MAJOR" -eq 1 ] && [ "$MINOR" -lt 1 ]); then
+  if [ "$MAJOR" -lt 1 ] || { [ "$MAJOR" -eq 1 ] && [ "$MINOR" -lt 1 ]; }; then
     TETRAGON_CHART_DIR="install/kubernetes"
   fi
   echo "* [v$version](https://github.com/cilium/tetragon/releases/tag/v$version) (_[source](https://github.com/cilium/tetragon/tree/v$version/$TETRAGON_CHART_DIR)_)"
 done
-
-cat << EOF

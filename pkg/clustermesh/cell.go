@@ -10,11 +10,12 @@ import (
 
 	"github.com/cilium/cilium/daemon/cmd/cni"
 	"github.com/cilium/cilium/pkg/clustermesh/common"
+	cmendpointslice "github.com/cilium/cilium/pkg/clustermesh/endpointslice"
+	cmlb "github.com/cilium/cilium/pkg/clustermesh/loadbalancer"
 	"github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/clustermesh/wait"
 	"github.com/cilium/cilium/pkg/dial"
 	"github.com/cilium/cilium/pkg/ipcache"
-	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/metrics"
 	nodemanager "github.com/cilium/cilium/pkg/node/manager"
@@ -37,19 +38,36 @@ var Cell = cell.Module(
 
 	// Convert concrete objects into more restricted interfaces used by clustermesh.
 	cell.ProvidePrivate(func(ipcache *ipcache.IPCache) ipcache.IPCacher { return ipcache }),
-	cell.ProvidePrivate(func(mgr nodemanager.NodeManager) (nodeStore.NodeManager, kvstore.ClusterSizeDependantIntervalFunc) {
-		return mgr, mgr.ClusterSizeDependantInterval
+	cell.ProvidePrivate(func(
+		mgr nodemanager.NodeManager,
+	) nodeStore.NodeManager {
+		return mgr
 	}),
-	cell.ProvidePrivate(idsMgrProvider),
+	cell.ProvidePrivate(common.NewClusterIDsManager),
 
 	cell.Config(common.DefaultConfig),
+	cell.Config(types.DefaultServiceModeV2Config),
+	cell.Invoke(types.ServiceModeV2Config.Validate),
 	cell.Config(wait.TimeoutConfigDefault),
 
 	metrics.Metric(NewMetrics),
 	metrics.Metric(common.MetricsProvider(metrics.SubsystemClusterMesh)),
 
-	cell.ProvidePrivate(newServiceMerger),
-	cell.Invoke(registerServicesInitialized),
+	cmendpointslice.Cell,
+	metrics.Metric(cmendpointslice.MetricsProvider(metrics.Namespace)),
+	cell.Provide(func(cm *ClusterMesh) cmlb.ServicesSyncedFunc {
+		if cm == nil {
+			return nil
+		}
+		return cm.ServicesSynced
+	}),
+	cell.Provide(func(cm *ClusterMesh) cmlb.EndpointSlicesSyncedFunc {
+		if cm == nil {
+			return nil
+		}
+		return cm.EndpointSlicesSynced
+	}),
+	cmlb.Cell,
 
 	cell.Config(types.DefaultQuirks),
 	cell.Invoke(func(info types.ClusterInfo, dcfg *option.DaemonConfig, cnimgr cni.CNIConfigManager, log *slog.Logger, quirks types.QuirksConfig) error {
@@ -60,7 +78,5 @@ var Cell = cell.Module(
 		}
 		return err
 	}),
-	cell.Invoke(ipsetNotifier),
 	cell.Invoke(nodeManagerNotifier),
-	cell.Invoke(injectSelectBackends),
 )

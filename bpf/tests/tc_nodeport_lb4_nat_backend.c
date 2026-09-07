@@ -8,7 +8,6 @@
 /* Enable code paths under test */
 #define ENABLE_IPV4
 #define ENABLE_NODEPORT
-#define ENABLE_HOST_ROUTING
 
 #define CLIENT_IP		v4_ext_one
 #define CLIENT_PORT		__bpf_htons(111)
@@ -58,11 +57,13 @@ mock_tail_call_dynamic(struct __ctx_buff *ctx __maybe_unused,
 #include "lib/ipcache.h"
 #include "lib/lb.h"
 
+ASSIGN_CONFIG(bool, enable_bpf_host_routing, true)
+
 /* Test that a remote LB
  * - doesn't touch a NATed request,
- * - redirects it to the pod (as ENABLE_HOST_ROUTING is set)
+ * - redirects it to the pod (as BPF Host Routing is enabled)
  */
-PKTGEN("tc", "tc_nodeport_nat_backend")
+PKTGEN(PROG_TYPE, "tc_nodeport_nat_backend")
 int nodeport_nat_backend_pktgen(struct __ctx_buff *ctx)
 {
 	volatile const __u8 *src = mac_one;
@@ -91,7 +92,7 @@ int nodeport_nat_backend_pktgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("tc", "tc_nodeport_nat_backend")
+SETUP(PROG_TYPE, "tc_nodeport_nat_backend")
 int nodeport_nat_backend_setup(struct __ctx_buff *ctx)
 {
 	lb_v4_add_service(FRONTEND_IP, FRONTEND_PORT, IPPROTO_TCP, 1, 1);
@@ -106,7 +107,7 @@ int nodeport_nat_backend_setup(struct __ctx_buff *ctx)
 	return netdev_receive_packet(ctx);
 }
 
-CHECK("tc", "tc_nodeport_nat_backend")
+CHECK(PROG_TYPE, "tc_nodeport_nat_backend")
 int nodeport_nat_backend_check(const struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -116,6 +117,8 @@ int nodeport_nat_backend_check(const struct __ctx_buff *ctx)
 	struct iphdr *l3;
 
 	test_init();
+
+	endpoint_v4_del_entry(BACKEND_IP);
 
 	data = (void *)(long)ctx_data(ctx);
 	data_end = (void *)(long)ctx->data_end;
@@ -159,8 +162,8 @@ int nodeport_nat_backend_check(const struct __ctx_buff *ctx)
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst port has changed");
 
-	if (l4->check != bpf_htons(0x3c62))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+	if (l4->check != bpf_htons(0x9c02))
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_htons(0x9c02));
 
 	test_finish();
 }

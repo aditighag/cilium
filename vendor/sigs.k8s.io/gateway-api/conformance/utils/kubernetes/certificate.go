@@ -18,6 +18,7 @@ package kubernetes
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -35,7 +36,9 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	kvalidation "k8s.io/apimachinery/pkg/util/validation"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
@@ -49,7 +52,7 @@ func MustCreateSelfSignedCertSecret(t *testing.T, namespace, secretName string, 
 
 	var serverKey, serverCert bytes.Buffer
 
-	require.NoError(t, generateRSACert(hosts, &serverKey, &serverCert, nil, nil), "failed to generate RSA certificate")
+	require.NoError(t, generateRSACert(hosts, &serverKey, &serverCert, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, nil, nil), "failed to generate RSA certificate")
 
 	return formatSecret(serverCert, serverKey, namespace, secretName)
 }
@@ -60,17 +63,26 @@ func MustCreateCASignedCertSecret(t *testing.T, namespace, secretName string, ho
 
 	var serverCert, serverKey bytes.Buffer
 
-	require.NoError(t, generateRSACert(hosts, &serverKey, &serverCert, ca, caPrivKey), "failed to generate CA signed RSA certificate")
+	require.NoError(t, generateRSACert(hosts, &serverKey, &serverCert, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, ca, caPrivKey), "failed to generate CA signed RSA certificate")
 
 	return formatSecret(serverCert, serverKey, namespace, secretName)
 }
 
-// formatSecret formats the server certificate, key, namespace, and secretName
+// MustCreateCASignedClientCertSecret creates a CA-signed SSL client certificate and stores it in a secret
+func MustCreateCASignedClientCertSecret(t *testing.T, namespace, secretName string, ca *x509.Certificate, caPrivKey *rsa.PrivateKey) *corev1.Secret {
+	var clientCert, clientKey bytes.Buffer
+
+	require.NoError(t, generateRSACert([]string{}, &clientKey, &clientCert, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, ca, caPrivKey), "failed to generate CA signed RSA client certificate")
+
+	return formatSecret(clientCert, clientKey, namespace, secretName)
+}
+
+// formatSecret formats the certificate, key, namespace, and secretName
 // and converts it to a Kubernetes Secret object.
-func formatSecret(serverCert bytes.Buffer, serverKey bytes.Buffer, namespace string, secretName string) *corev1.Secret {
+func formatSecret(cert bytes.Buffer, privateKey bytes.Buffer, namespace string, secretName string) *corev1.Secret {
 	data := map[string][]byte{
-		corev1.TLSCertKey:       serverCert.Bytes(),
-		corev1.TLSPrivateKeyKey: serverKey.Bytes(),
+		corev1.TLSCertKey:       cert.Bytes(),
+		corev1.TLSPrivateKeyKey: privateKey.Bytes(),
 	}
 
 	newSecret := &corev1.Secret{
@@ -87,7 +99,7 @@ func formatSecret(serverCert bytes.Buffer, serverKey bytes.Buffer, namespace str
 
 // generateRSACert generates a basic self-signed certificate if ca and caPrivKey are nil,
 // otherwise it creates CA-signed cert with ca and caPrivkey input. Certs are valid for a year.
-func generateRSACert(hosts []string, keyOut, certOut io.Writer, ca *x509.Certificate, caPrivKey *rsa.PrivateKey) error {
+func generateRSACert(hosts []string, keyOut, certOut io.Writer, extKeyUsage []x509.ExtKeyUsage, ca *x509.Certificate, caPrivKey *rsa.PrivateKey) error {
 	priv, err := rsa.GenerateKey(rand.Reader, rsaBits)
 	if err != nil {
 		return fmt.Errorf("failed to generate key: %w", err)
@@ -111,7 +123,7 @@ func generateRSACert(hosts []string, keyOut, certOut io.Writer, ca *x509.Certifi
 		NotAfter:  notAfter,
 
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		ExtKeyUsage:           extKeyUsage,
 		BasicConstraintsValid: true,
 	}
 
@@ -242,12 +254,30 @@ func validateHost(host string) error {
 		return fmt.Errorf("host %s must conform to DNS naming conventions: %v", host, errs)
 	}
 
-	labels := strings.Split(host, ".")
-	for _, l := range labels {
+	labels := strings.SplitSeq(host, ".")
+	for l := range labels {
 		errs := kvalidation.IsDNS1123Label(l)
 		if len(errs) != 0 {
 			return fmt.Errorf("label %s in host %s must conform to DNS naming conventions: %v", l, host, errs)
 		}
 	}
 	return nil
+}
+
+// GetTLSSecret fetches the named Secret and converts both cert and key to []byte
+func GetTLSSecret(client client.Client, secretName types.NamespacedName) ([]byte, []byte, error) {
+	var cert, key []byte
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	secret := &corev1.Secret{}
+	err := client.Get(ctx, secretName, secret)
+	if err != nil {
+		return cert, key, fmt.Errorf("error fetching TLS Secret: %w", err)
+	}
+	cert = secret.Data["tls.crt"]
+	key = secret.Data["tls.key"]
+
+	return cert, key, nil
 }

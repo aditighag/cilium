@@ -14,9 +14,10 @@ import (
 	"syscall"
 
 	cilium "github.com/cilium/proxy/go/cilium/api"
-	"github.com/cilium/proxy/pkg/policy/api/kafka"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
+
+	util "github.com/cilium/cilium/pkg/envoy/util"
 
 	"github.com/cilium/cilium/pkg/flowdebug"
 	"github.com/cilium/cilium/pkg/identity"
@@ -39,15 +40,15 @@ func newAccessLogServer(logger *slog.Logger, accessLogger accesslog.ProxyAccessL
 	return &AccessLogServer{
 		logger:             logger,
 		accessLogger:       accessLogger,
-		socketPath:         getAccessLogSocketPath(envoySocketDir),
+		socketPath:         util.GetAccessLogSocketPath(envoySocketDir),
 		proxyGID:           proxyGID,
 		localEndpointStore: localEndpointStore,
 		bufferSize:         bufferSize,
 	}
 }
 
-// start starts the access log server.
-func (s *AccessLogServer) start(ctx context.Context) error {
+// run runs the access log server.
+func (s *AccessLogServer) run(ctx context.Context) error {
 	socketListener, err := s.newSocketListener()
 	if err != nil {
 		return fmt.Errorf("failed to create socket listener: %w", err)
@@ -57,6 +58,14 @@ func (s *AccessLogServer) start(ctx context.Context) error {
 	s.logger.Info("Envoy: Starting access log server listening",
 		logfields.Address, socketListener.Addr(),
 	)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		<-ctx.Done()
+		socketListener.Close()
+	}()
+
 	for {
 		// Each Envoy listener opens a new connection over the Unix domain socket.
 		// Multiple worker threads serving the listener share that same connection
@@ -104,12 +113,6 @@ func (s *AccessLogServer) newSocketListener() (*net.UnixListener, error) {
 		)
 	}
 	return accessLogListener, nil
-}
-
-func (s *AccessLogServer) stop() {
-	if s.socketListener != nil {
-		_ = s.socketListener.Close()
-	}
 }
 
 func (s *AccessLogServer) handleConn(ctx context.Context, conn *net.UnixConn) {
@@ -163,7 +166,11 @@ func (s *AccessLogServer) handleConn(ctx context.Context, conn *net.UnixConn) {
 			)
 		}
 
-		r := s.logRecord(ctx, &pblog)
+		r, err := s.logRecord(ctx, &pblog)
+		if err != nil {
+			s.logger.Error("Envoy: Failed to log access log message", logfields.Error, err)
+			continue
+		}
 
 		// Update proxy stats for the endpoint if it still exists
 		localEndpoint := s.localEndpointStore.getLocalEndpoint(pblog.PolicyName)
@@ -180,10 +187,7 @@ func (s *AccessLogServer) handleConn(ctx context.Context, conn *net.UnixConn) {
 	}
 }
 
-func (s *AccessLogServer) logRecord(ctx context.Context, pblog *cilium.LogEntry) *accesslog.LogRecord {
-	var kafkaRecord *accesslog.LogRecordKafka
-	var kafkaTopics []string
-
+func (s *AccessLogServer) logRecord(ctx context.Context, pblog *cilium.LogEntry) (*accesslog.LogRecord, error) {
 	var l7tags accesslog.LogTag = func(lr *accesslog.LogRecord, endpointInfoRegistry accesslog.EndpointInfoRegistry) {}
 
 	if httpLogEntry := pblog.GetHttp(); httpLogEntry != nil {
@@ -196,20 +200,6 @@ func (s *AccessLogServer) logRecord(ctx context.Context, pblog *cilium.LogEntry)
 			MissingHeaders:  GetNetHttpHeaders(httpLogEntry.MissingHeaders),
 			RejectedHeaders: GetNetHttpHeaders(httpLogEntry.RejectedHeaders),
 		})
-	} else if kafkaLogEntry := pblog.GetKafka(); kafkaLogEntry != nil {
-		kafkaRecord = &accesslog.LogRecordKafka{
-			ErrorCode:     int(kafkaLogEntry.ErrorCode),
-			APIVersion:    int16(kafkaLogEntry.ApiVersion),
-			APIKey:        kafka.ApiKeyToString(int16(kafkaLogEntry.ApiKey)),
-			CorrelationID: kafkaLogEntry.CorrelationId,
-		}
-		if len(kafkaLogEntry.Topics) > 0 {
-			kafkaRecord.Topic.Topic = kafkaLogEntry.Topics[0]
-			if len(kafkaLogEntry.Topics) > 1 {
-				kafkaTopics = kafkaLogEntry.Topics[1:] // Rest of the topics
-			}
-		}
-		l7tags = accesslog.LogTags.Kafka(kafkaRecord)
 	} else if l7LogEntry := pblog.GetGenericL7(); l7LogEntry != nil {
 		l7tags = accesslog.LogTags.L7(&accesslog.LogRecordL7{
 			Proto:  l7LogEntry.GetProto(),
@@ -234,19 +224,17 @@ func (s *AccessLogServer) logRecord(ctx context.Context, pblog *cilium.LogEntry)
 		addrInfo.DstIPPort = pblog.DestinationAddress
 		addrInfo.DstIdentity = identity.NumericIdentity(pblog.DestinationSecurityId)
 	}
-	r := s.accessLogger.NewLogRecord(flowType, pblog.IsIngress,
+	r, err := s.accessLogger.NewLogRecord(ctx, flowType, pblog.IsIngress,
 		accesslog.LogTags.Timestamp(time.Unix(int64(pblog.Timestamp/1000000000), int64(pblog.Timestamp%1000000000))),
 		accesslog.LogTags.Verdict(GetVerdict(pblog), pblog.CiliumRuleRef),
 		accesslog.LogTags.Addressing(ctx, addrInfo),
 		l7tags,
 	)
-	s.accessLogger.Log(r)
-
-	// Each kafka topic needs to be logged separately, log the rest if any
-	for i := range kafkaTopics {
-		kafkaRecord.Topic.Topic = kafkaTopics[i]
-		s.accessLogger.Log(r)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create log record: %w", err)
 	}
 
-	return r
+	s.accessLogger.Log(r)
+
+	return r, nil
 }

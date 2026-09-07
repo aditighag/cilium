@@ -552,7 +552,7 @@ func TestDecodeTraceNotify(t *testing.T) {
 			}
 
 			buf := &bytes.Buffer{}
-			err := binary.Write(buf, byteorder.Native, &tn)
+			err := binary.Write(buf, binary.NativeEndian, &tn)
 			require.NoError(t, err)
 			buffer := gopacket.NewSerializeBuffer()
 			err = gopacket.SerializeLayers(buffer, gopacket.SerializeOptions{}, lay...)
@@ -620,6 +620,12 @@ func TestDecodeDropNotify(t *testing.T) {
 			IPTraceID: id,
 		}
 	}
+	dropNotifyWithReason := func(version uint8, subType uint8, extError int8) monitor.DropNotify {
+		dn := dropNotify(version)
+		dn.SubType = subType
+		dn.ExtError = extError
+		return dn
+	}
 	identityGetter := &testutils.FakeIdentityGetter{
 		OnGetIdentity: func(securityIdentity uint32) (*identity.Identity, error) {
 			m := map[identity.NumericIdentity][]string{
@@ -675,6 +681,73 @@ func TestDecodeDropNotify(t *testing.T) {
 			},
 		},
 		{
+			name:      "v3 with ext_error",
+			dn:        dropNotifyWithReason(3, 132 /* Invalid source ip */, 7),
+			srcLabels: []string{"k8s:src=label"},
+			dstLabels: []string{"k8s:dst=label"},
+			want: &flowpb.Flow{
+				Verdict: flowpb.Verdict_DROPPED,
+				Ethernet: &flowpb.Ethernet{
+					Source:      "01:02:03:04:05:06",
+					Destination: "04:05:06:07:08:09",
+				},
+				IP: &flowpb.IP{
+					Source:      "1.2.3.4",
+					Destination: "1.2.3.4",
+					IpVersion:   flowpb.IPVersion_IPv4,
+				},
+				Source: &flowpb.Endpoint{
+					Identity: 123,
+					Labels:   []string{"k8s:src=label"},
+				},
+				Destination: &flowpb.Endpoint{
+					Identity: 456,
+					Labels:   []string{"k8s:dst=label"},
+				},
+				Type:              flowpb.FlowType_L3_L4,
+				EventType:         &flowpb.CiliumEventType{Type: 1, SubType: 132},
+				Summary:           "IPv4",
+				File:              &flowpb.FileInfo{Name: "bpf_host.c"},
+				DropReason:        132,
+				DropReasonDesc:    flowpb.DropReason_INVALID_SOURCE_IP,
+				ExtError:          7,
+				ExtDropReasonDesc: "Invalid source ip, 7",
+			},
+		},
+		{
+			name:      "v3 with drop reason but no ext_error",
+			dn:        dropNotifyWithReason(3, 169 /* FIB lookup failed */, 0),
+			srcLabels: []string{"k8s:src=label"},
+			dstLabels: []string{"k8s:dst=label"},
+			want: &flowpb.Flow{
+				Verdict: flowpb.Verdict_DROPPED,
+				Ethernet: &flowpb.Ethernet{
+					Source:      "01:02:03:04:05:06",
+					Destination: "04:05:06:07:08:09",
+				},
+				IP: &flowpb.IP{
+					Source:      "1.2.3.4",
+					Destination: "1.2.3.4",
+					IpVersion:   flowpb.IPVersion_IPv4,
+				},
+				Source: &flowpb.Endpoint{
+					Identity: 123,
+					Labels:   []string{"k8s:src=label"},
+				},
+				Destination: &flowpb.Endpoint{
+					Identity: 456,
+					Labels:   []string{"k8s:dst=label"},
+				},
+				Type:              flowpb.FlowType_L3_L4,
+				EventType:         &flowpb.CiliumEventType{Type: 1, SubType: 169},
+				Summary:           "IPv4",
+				File:              &flowpb.FileInfo{Name: "bpf_host.c"},
+				DropReason:        169,
+				DropReasonDesc:    flowpb.DropReason_FIB_LOOKUP_FAILED,
+				ExtDropReasonDesc: "FIB lookup failed",
+			},
+		},
+		{
 			name:      "v2 with IP Trace ID",
 			dn:        dropNotify(3, 0x12345678),
 			srcLabels: []string{"k8s:src=label"},
@@ -712,7 +785,7 @@ func TestDecodeDropNotify(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			n := tc.dn
 			buf := &bytes.Buffer{}
-			if err := binary.Write(buf, byteorder.Native, n); err != nil {
+			if err := binary.Write(buf, binary.NativeEndian, n); err != nil {
 				t.Fatalf("Write(...) %T to buffer: %v", n, err)
 			}
 
@@ -1847,7 +1920,7 @@ func TestDecode_DropNotify(t *testing.T) {
 			event: monitor.DropNotify{
 				Type:    byte(monitorAPI.MessageTypeDrop),
 				Source:  localEP,
-				File:    6,
+				File:    3,
 				Line:    12,
 				Version: monitor.DropNotifyVersion2,
 			},
@@ -1856,7 +1929,7 @@ func TestDecode_DropNotify(t *testing.T) {
 				Source:           &flowpb.Endpoint{ID: 1234},
 				TrafficDirection: flowpb.TrafficDirection_EGRESS,
 				File: &flowpb.FileInfo{
-					Name: "bpf_network.c",
+					Name: "bpf_overlay.c",
 					Line: 12,
 				},
 			},
@@ -2725,5 +2798,126 @@ func TestDecode_CustomPacketDecoder(t *testing.T) {
 	}
 	if diff := cmp.Diff(want, got, opts...); diff != "" {
 		t.Errorf("Unexpected diff (-want +got):\n%s", diff)
+	}
+}
+
+// The host endpoint registers no IP, so the flow carries no endpoint ID and only
+// the notification's own ID can correlate the verdict. See cilium/cilium#33870.
+func TestDecode_PolicyVerdictNotifyHostEndpoint(t *testing.T) {
+	nodeIP := netip.MustParseAddr("10.211.60.1")
+
+	policyLabel := utils.GetPolicyLabels("", "host-fw", "1234-5678", utils.ResourceTypeCiliumClusterwideNetworkPolicy)
+	expectedPolicy := []*flowpb.Policy{
+		{
+			Name: "host-fw",
+			Kind: "CiliumClusterwideNetworkPolicy",
+			Labels: []string{
+				"k8s:io.cilium.k8s.policy.derived-from=CiliumClusterwideNetworkPolicy",
+				"k8s:io.cilium.k8s.policy.name=host-fw",
+				"k8s:io.cilium.k8s.policy.uid=1234-5678",
+			},
+			Revision: 1,
+		},
+	}
+
+	ingressKey := policy.IngressKey().WithIdentity(remoteID).WithTCPPort(22)
+	egressKey := policy.EgressKey().WithIdentity(remoteID).WithTCPPort(443)
+
+	testCases := []struct {
+		name      string
+		key       policyTypes.Key
+		audited   bool
+		verdict   int32
+		allowedBy func(*flowpb.Flow) []*flowpb.Policy
+	}{
+		{
+			name:      "ingress_allowed",
+			key:       ingressKey,
+			allowedBy: (*flowpb.Flow).GetIngressAllowedBy,
+		},
+		{
+			name:      "egress_allowed",
+			key:       egressKey,
+			allowedBy: (*flowpb.Flow).GetEgressAllowedBy,
+		},
+		{
+			name:      "ingress_audited",
+			key:       ingressKey,
+			audited:   true,
+			allowedBy: (*flowpb.Flow).GetIngressDeniedBy,
+		},
+		{
+			name:      "ingress_denied",
+			key:       ingressKey,
+			verdict:   -int32(flowpb.DropReason_POLICY_DENIED),
+			allowedBy: (*flowpb.Flow).GetIngressDeniedBy,
+		},
+		{
+			name:      "egress_denied",
+			key:       egressKey,
+			verdict:   -int32(flowpb.DropReason_POLICY_DENIED),
+			allowedBy: (*flowpb.Flow).GetEgressDeniedBy,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			hostEPInfo := &testutils.FakeEndpointInfo{
+				PolicyMap: map[policyTypes.Key]labels.LabelArrayListString{
+					tc.key: labels.LabelArrayList{policyLabel}.ArrayListString(),
+				},
+				PolicyRevision: 1,
+			}
+
+			endpointGetter := &testutils.FakeEndpointGetter{
+				OnGetEndpointInfo: func(netip.Addr) (endpoint getters.EndpointInfo, ok bool) {
+					return nil, false
+				},
+				OnGetEndpointInfoByID: func(id uint16) (endpoint getters.EndpointInfo, ok bool) {
+					if id == hostEP {
+						return hostEPInfo, true
+					}
+					return nil, false
+				},
+			}
+
+			parser, err := New(hivetest.Logger(t), endpointGetter, nil, nil, nil, nil, nil)
+			require.NoError(t, err)
+
+			flags, srcIP, dstIP := uint8(monitorAPI.PolicyEgress), nodeIP, remoteIP
+			if tc.key.IsIngress() {
+				flags, srcIP, dstIP = monitorAPI.PolicyIngress, remoteIP, nodeIP
+			}
+			if tc.audited {
+				flags |= monitor.PolicyVerdictNotifyFlagIsAudited
+			}
+
+			pvn := monitor.PolicyVerdictNotify{
+				Type:        byte(monitorAPI.MessageTypePolicyVerdict),
+				Source:      hostEP,
+				Flags:       flags,
+				RemoteLabel: remoteID,
+				Verdict:     tc.verdict,
+			}
+			data, err := testutils.CreateL3L4Payload(pvn,
+				&layers.Ethernet{
+					SrcMAC:       srcMAC,
+					DstMAC:       dstMAC,
+					EthernetType: layers.EthernetTypeIPv4,
+				},
+				&layers.IPv4{
+					SrcIP:    srcIP.AsSlice(),
+					DstIP:    dstIP.AsSlice(),
+					Protocol: layers.IPProtocolTCP,
+				},
+				&layers.TCP{SrcPort: 37304, DstPort: layers.TCPPort(tc.key.DestPort), SYN: true})
+			require.NoError(t, err)
+
+			f := new(flowpb.Flow)
+			require.NoError(t, parser.Decode(data, f))
+
+			require.Zero(t, f.GetSource().GetID())
+			require.Zero(t, f.GetDestination().GetID())
+			testutils.AssertProtoEqual(t, expectedPolicy, tc.allowedBy(f))
+		})
 	}
 }

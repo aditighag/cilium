@@ -531,11 +531,9 @@ func TestWatchRemoteKVStore(t *testing.T) {
 
 	run := func(ctx context.Context, rc RemoteIDCache) context.CancelFunc {
 		ctx, cancel := context.WithCancel(ctx)
-		wg.Add(1)
-		go func() {
+		wg.Go(func() {
 			rc.Watch(ctx, func(context.Context) { synced.Store(true) })
-			wg.Done()
-		}()
+		})
 		return cancel
 	}
 
@@ -586,8 +584,11 @@ func TestWatchRemoteKVStore(t *testing.T) {
 		return global.remoteCaches["remote"] == rc
 	}, 1*time.Second, 10*time.Millisecond)
 
-	require.True(t, rc.Synced(), "The cache should now be synchronized")
-	require.True(t, synced.Load(), "The on-sync callback should have been executed")
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.True(c, rc.Synced(), "The cache should now be synchronized")
+		assert.True(c, synced.Load(), "The on-sync callback should have been executed")
+	}, 1*time.Second, 10*time.Millisecond)
+
 	stop(cancel)
 	require.False(t, rc.Synced(), "The cache should no longer be synchronized when stopped")
 

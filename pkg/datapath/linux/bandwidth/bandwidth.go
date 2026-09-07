@@ -11,15 +11,17 @@ package bandwidth
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/statedb"
 	"k8s.io/apimachinery/pkg/api/resource"
 
+	"github.com/cilium/cilium/pkg/datapath/linux/bandwidth/types"
 	"github.com/cilium/cilium/pkg/datapath/linux/config/defines"
 	"github.com/cilium/cilium/pkg/datapath/linux/probes"
 	"github.com/cilium/cilium/pkg/datapath/tables"
-	"github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/maps/bwmap"
 	"github.com/cilium/cilium/pkg/node"
@@ -62,10 +64,26 @@ const (
 	DirectionIngress uint8 = 1
 )
 
+type Manager interface {
+	BBREnabled() bool
+	Enabled() bool
+
+	UpdateBandwidthLimit(endpointID uint16, bytesPerSecond uint64, prio uint32)
+	DeleteBandwidthLimit(endpointID uint16)
+
+	UpdateIngressBandwidthLimit(endpointID uint16, bytesPerSecond uint64)
+	DeleteIngressBandwidthLimit(endpointID uint16)
+}
+
 type manager struct {
 	enabled bool
 
 	params bandwidthManagerParams
+
+	// hostEpDone tracks whether the host endpoint has been set up with
+	// Guaranteed QoS priority. This is done lazily on the first bandwidth
+	// update after the host endpoint becomes available.
+	hostEpDone atomic.Bool
 }
 
 func (m *manager) Enabled() bool {
@@ -83,43 +101,60 @@ func (m *manager) defines() (defines.Map, error) {
 		cDefinesMap["ENABLE_BANDWIDTH_MANAGER"] = "1"
 	}
 
-	cDefinesMap["THROTTLE_MAP_SIZE"] = fmt.Sprintf("%d", bwmap.MapSize)
-
 	return cDefinesMap, nil
 }
 
 func (m *manager) UpdateBandwidthLimit(epID uint16, bytesPerSecond uint64, prio uint32) {
-	if m.enabled {
-		txn := m.params.DB.WriteTxn(m.params.EdtTable)
-
-		// Set host endpoint to guaranteed QoS class
-		// TODO: This attempts to lookup host endpoint for every BW manager update event.
-		// Find a way to get host endpoint ID during BW manager initialization and move this section to init().
-		// * init() seems to be too early to call node.GetEndpointID()
-		// * Adding a dependency to node manager to call GetHostEndpoint() introduces a nested import.
-		hostEpID := uint16(node.GetEndpointID())
-		_, _, found := m.params.EdtTable.Get(txn, bwmap.EdtIDIndex.Query(bwmap.EdtIDKey{
-			EndpointID: epID,
-			Direction:  DirectionEgress,
-		}))
-		if !found {
-			m.params.EdtTable.Insert(
-				txn,
-				bwmap.NewEdt(hostEpID, DirectionEgress, 0, GuaranteedQoSDefaultPriority),
-			)
-		}
-		m.params.EdtTable.Insert(
-			txn,
-			bwmap.NewEdt(epID, DirectionEgress, bytesPerSecond, prio),
-		)
-		txn.Commit()
+	if !m.enabled {
+		return
 	}
+
+	txn := m.params.DB.WriteTxn(m.params.EdtTable)
+
+	// Ensure host endpoint has Guaranteed QoS priority (lazy one-time setup)
+	m.ensureHostEndpointQoS(txn)
+
+	m.params.EdtTable.Insert(
+		txn,
+		bwmap.NewEdt(epID, DirectionEgress, bytesPerSecond, prio),
+	)
+	txn.Commit()
+}
+
+// ensureHostEndpointQoS sets up the host endpoint with Guaranteed QoS priority.
+// This is done lazily because the host endpoint ID is not available during
+// bandwidth manager initialization. The setup is only performed once; subsequent
+// calls return immediately after checking an atomic flag.
+func (m *manager) ensureHostEndpointQoS(txn statedb.WriteTxn) {
+	// Fast path: already done
+	if m.hostEpDone.Load() {
+		return
+	}
+
+	// Host endpoint not created yet (still using template ID).
+	// Return without setting the flag so we retry on the next call.
+	id, ok := node.GetEndpointID()
+	if !ok {
+		return
+	}
+	hostEpID := uint16(id)
+
+	// Host endpoint is available, set it up with Guaranteed QoS priority
+	m.params.EdtTable.Insert(
+		txn,
+		bwmap.NewEdt(hostEpID, DirectionEgress, 0, GuaranteedQoSDefaultPriority),
+	)
+
+	m.hostEpDone.Store(true)
+
+	m.params.Log.Info("Set host endpoint to Guaranteed QoS class",
+		logfields.EndpointID, hostEpID)
 }
 
 func (m *manager) DeleteBandwidthLimit(epID uint16) {
 	if m.enabled {
 		txn := m.params.DB.WriteTxn(m.params.EdtTable)
-		obj, _, found := m.params.EdtTable.Get(txn, bwmap.EdtIDIndex.Query(bwmap.EdtIDKey{
+		obj, _, found := m.params.EdtTable.Get(txn, bwmap.EDTByID(bwmap.EdtIDKey{
 			EndpointID: epID,
 			Direction:  DirectionEgress,
 		}))
@@ -144,7 +179,7 @@ func (m *manager) UpdateIngressBandwidthLimit(epID uint16, bytesPerSecond uint64
 func (m *manager) DeleteIngressBandwidthLimit(epID uint16) {
 	if m.enabled {
 		txn := m.params.DB.WriteTxn(m.params.EdtTable)
-		obj, _, found := m.params.EdtTable.Get(txn, bwmap.EdtIDIndex.Query(bwmap.EdtIDKey{
+		obj, _, found := m.params.EdtTable.Get(txn, bwmap.EDTByID(bwmap.EdtIDKey{
 			EndpointID: epID,
 			Direction:  DirectionIngress,
 		}))
@@ -191,7 +226,7 @@ func (m *manager) probe() error {
 
 	// Going via host stack will orphan skb->sk, so we do need BPF host
 	// routing for it to work properly.
-	if m.params.Config.EnableBBR && m.params.DaemonConfig.EnableHostLegacyRouting && !m.params.Config.EnableBBRHostnsOnly {
+	if m.params.Config.EnableBBR && m.params.DaemonConfig.UnsafeDaemonConfigOption.EnableHostLegacyRouting && !m.params.Config.EnableBBRHostnsOnly {
 		return fmt.Errorf("BPF bandwidth manager's BBR setup requires BPF host routing.")
 	}
 
@@ -206,10 +241,6 @@ func (m *manager) probe() error {
 
 func (m *manager) init() error {
 	m.params.Log.Info("Setting up BPF bandwidth manager")
-
-	if err := bwmap.ThrottleMap().OpenOrCreate(); err != nil {
-		return fmt.Errorf("failed to access ThrottleMap: %w", err)
-	}
 
 	if err := setBaselineSysctls(m.params); err != nil {
 		return fmt.Errorf("failed to set sysctl needed by BPF bandwidth manager: %w", err)

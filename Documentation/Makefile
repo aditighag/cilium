@@ -18,8 +18,8 @@ default: html
 define build_image
   $(ECHO_DOCKER) $(3)
   # Pre-pull FROM docker image due to Buildkit sometimes failing to pull them.
-  grep -m 1 "^FROM " $(1) | tr -d '\r' | cut -d ' ' -f2 | xargs -n1 $(CONTAINER_ENGINE) pull
-  $(QUIET)tar c $(REQUIREMENTS) Dockerfile \
+  grep --color=never -m 1 "^FROM " $(1) | tr -d '\r' | cut -d ' ' -f2 | xargs -n1 $(CONTAINER_ENGINE) pull
+  $(QUIET)tar --owner=0 --group=0 -c $(REQUIREMENTS) Dockerfile \
     | $(CONTAINER_ENGINE) build $(DOCKER_BUILD_FLAGS) \
                           --build-arg READTHEDOCS_VERSION \
                           --target $(2) --tag $(3) -
@@ -31,10 +31,12 @@ DOCS_BASE_IMG ?= cilium/docs-base
 base-image: Dockerfile ## Build the docs-base image for updating the requirements.txt file.
 	$(call build_image,$<,docs-base,$(DOCS_BASE_IMG))
 
-DOCS_BUILDER_IMG ?= cilium/docs-builder
+DOCS_BUILDER_IMG ?= quay.io/cilium/docs-builder:e6773ed21ab03066c0f24e68f342f18804a8ee0a@sha256:d3beff6d6408c09f6e1dbc637f7e98962b7d1fd2a81bf1d2a27ff8817dafb51f
+DOCS_BUILDER_REPO := $(shell echo $(DOCS_BUILDER_IMG) | sed -E 's/:.*//')
+
 ifndef SKIP_BUILDER_IMAGE
 builder-image: Dockerfile $(REQUIREMENTS) ## Build the docs-builder image for rendering and checking the documentation.
-	$(call build_image,$<,docs-builder,$(DOCS_BUILDER_IMG))
+	$(call build_image,$<,docs-builder,$(DOCS_BUILDER_REPO))
 else
 builder-image:
 	@echo "SKIP_BUILDER_IMAGE set, assuming image is already present and up-to-date."
@@ -80,6 +82,12 @@ update-cmdref: cilium-build ## Update the command reference documents (agent, bu
 	-$(QUIET)rm -rf cmdref/cilium*.md
 	$(QUIET)$(DOCKER_RUN) ./update-cmdref.sh
 
+.PHONY: update-feature-metrics
+update-feature-metrics: cilium-build ## Update the observability feature metrics documents (agent, operator).
+	@$(ECHO_GEN)feature-metrics
+	-$(QUIET)rm -rf observability/cilium*.feature-metrics.prom
+	$(QUIET)$(DOCKER_RUN) ./update-feature-metrics.sh
+
 .PHONY: codeowners.rst
 codeowners.rst:
 	@$(ECHO_GEN)$@
@@ -116,9 +124,11 @@ $(HELM_VALUES): FORCE
 	$(QUIET)printf '..\n  %s\n\n%s\n' "AUTO-GENERATED. Please DO NOT edit manually." "$$(cat $(TMP_FILE_3))" > $@
 	$(QUIET)$(RM) -- $(TMP_FILE_1) $(TMP_FILE_2) $(TMP_FILE_3)
 
-check: builder-image api-flaggen update-cmdref update-crdlist update-helm-values update-codeowners update-redirects ## Validate command and Helm references, policy examples, and others.
+check: builder-image api-flaggen update-cmdref update-feature-metrics update-crdlist update-helm-values update-codeowners update-redirects ## Validate command and Helm references, policy examples, and others.
 	@$(ECHO_CHECK) cmdref
 	$(QUIET) ./check-cmdref.sh
+	@$(ECHO_CHECK) feature-metrics
+	$(QUIET) ./check-feature-metrics.sh
 	@$(ECHO_CHECK) $(HELM_VALUES)
 	$(QUIET) ./check-helmvalues.sh
 	@$(ECHO_CHECK) examples
@@ -153,7 +163,7 @@ live-preview: builder-image ## Build and serve the documentation locally.
 	$(QUIET)$(DOCKER_CTR) \
 		--publish $(DOCS_PORT):$(DOCS_PORT) \
 			$(DOCS_BUILDER_IMG) \
-		sphinx-autobuild --open-browser --host 0.0.0.0 --port $(DOCS_PORT) $(SPHINX_OPTS) --ignore *.swp -Q . _preview
+		sphinx-autobuild --open-browser --host 0.0.0.0 --port $(DOCS_PORT) $(SPHINX_OPTS) --ignore "*.swp" -Q . _preview
 
 update-redirects: builder-image ## Build and serve the documentation locally.
 	@echo "$$(tput setaf 2)Writing redirects$$(tput sgr0)"

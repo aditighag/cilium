@@ -1,6 +1,27 @@
 // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 /* Copyright Authors of Cilium */
 
+/*
+ * Test Matrix:
+ * This file tests the interaction between skip_tunnel flag and subnet-based routing.
+ *
+ * | IP Type | skip_tunnel_flag | Source Subnet ID | Dest Subnet ID | Expected Result   |
+ * |---------|------------------|------------------|----------------|-------------------|
+ * | v4      | true             | 100              | 100            | CTX_ACT_OK        |
+ * | v4      | true             | 100              | 101            | CTX_ACT_OK        |
+ * | v4      | false            | 100              | 100            | CTX_ACT_OK        |
+ * | v4      | false            | 100              | 101            | CTX_ACT_REDIRECT  |
+ * | v6      | true             | 100              | 100            | CTX_ACT_OK        |
+ * | v6      | true             | 100              | 101            | CTX_ACT_OK        |
+ * | v6      | false            | 100              | 100            | CTX_ACT_OK        |
+ * | v6      | false            | 100              | 101            | CTX_ACT_REDIRECT  |
+ *
+ * Key behaviors:
+ * - When skip_tunnel=true: Always skip tunneling (CTX_ACT_OK)
+ * - When skip_tunnel=false and same subnet: Skip tunneling (CTX_ACT_OK)
+ * - When skip_tunnel=false and different subnet: Use tunnel (CTX_ACT_REDIRECT)
+ */
+
 #include <bpf/ctx/skb.h>
 #include "common.h"
 #include "pktgen.h"
@@ -19,11 +40,8 @@
  *
  * cil_from_host will lead us to handle_ipv{4,6}_cont,
  * which rewrites the destination mac address to
- * CIILUM_NET_MAC to send the packet to the
+ * cilium_net_mac to send the packet to the
  * cilium_net interface.
- *
- * CILIUM_NET_MAC is set in node_config.h, so below we pull
- * it into a format that pktgen can use.
  */
 #define SRC_MAC mac_one
 #define SRC_IPV4 v4_node_one
@@ -40,14 +58,20 @@
  */
 #include "lib/bpf_host.h"
 
+const union macaddr cilium_net_mac = { .addr = {0xce, 0x72, 0xa7, 0x03, 0x88, 0x57} };
+ASSIGN_CONFIG(union macaddr, cilium_net_mac, cilium_net_mac)
+
 #include "lib/eth.h"
-static volatile const union macaddr __cilium_net_mac = CILIUM_NET_MAC;
-#define DST_MAC __cilium_net_mac.addr
+#define DST_MAC CONFIG(cilium_net_mac).addr
 
 /*
  * Include test helpers
  */
 #include "lib/ipcache.h"
+#include "lib/metrics.h"
+#include "lib/subnet.h"
+
+ASSIGN_CONFIG(bool, hybrid_routing_enabled, true)
 
 static __always_inline int
 pktgen_from_host(struct __ctx_buff *ctx, bool v4)
@@ -89,12 +113,7 @@ setup(struct __ctx_buff *ctx, bool flag_skip_tunnel, bool v4)
 	 * Otherwise, the metric we want to check would increase by one
 	 * after each test.
 	 */
-	struct metrics_key key = {};
-
-	key.reason = REASON_FORWARDED;
-	key.dir = METRIC_EGRESS;
-
-	map_delete_elem(&cilium_metrics, &key);
+	metrics_del_entry(REASON_FORWARDED, METRIC_EGRESS);
 
 	if (v4)
 		ipcache_v4_add_entry_with_flags(DST_IPV4,
@@ -104,6 +123,20 @@ setup(struct __ctx_buff *ctx, bool flag_skip_tunnel, bool v4)
 						0, 1230, v4_node_two, 0, flag_skip_tunnel);
 
 	return host_send_packet(ctx);
+}
+
+static __always_inline void
+setup_subnet_table_v4(__u32 src_id, __u32 dst_id)
+{
+	subnet_v4_add_entry(SRC_IPV4, src_id);
+	subnet_v4_add_entry(DST_IPV4, dst_id);
+}
+
+static __always_inline void
+setup_subnet_table_v6(__u32 src_id, __u32 dst_id)
+{
+	subnet_v6_add_entry((union v6addr *)SRC_IPV6, src_id);
+	subnet_v6_add_entry((union v6addr *)DST_IPV6, dst_id);
 }
 
 static __always_inline int
@@ -228,74 +261,226 @@ check_ctx(const struct __ctx_buff *ctx, __u32 expected_result, bool v4)
 	test_finish();
 }
 
-PKTGEN("tc", "01_ipv4_from_host_no_flags")
+PKTGEN(PROG_TYPE, "01_ipv4_from_host_no_flags")
 int ipv4_from_host_no_flags_pktgen(struct __ctx_buff *ctx)
 {
 	return pktgen_from_host(ctx, true);
 }
 
-SETUP("tc", "01_ipv4_from_host_no_flags")
+SETUP(PROG_TYPE, "01_ipv4_from_host_no_flags")
 int ipv4_from_host_no_flags_setup(struct __ctx_buff *ctx)
 {
 	return setup(ctx, false, true);
 }
 
-CHECK("tc", "01_ipv4_from_host_no_flags")
+CHECK(PROG_TYPE, "01_ipv4_from_host_no_flags")
 int ipv4_from_host_no_flags_check(__maybe_unused const struct __ctx_buff *ctx)
 {
 	return check_ctx(ctx, CTX_ACT_REDIRECT, true);
 }
 
-PKTGEN("tc", "02_ipv4_from_host_skip_tunnel")
+PKTGEN(PROG_TYPE, "02_ipv4_from_host_skip_tunnel")
 int ipv4_from_host_skip_tunnel_pktgen(struct __ctx_buff *ctx)
 {
 	return pktgen_from_host(ctx, true);
 }
 
-SETUP("tc", "02_ipv4_from_host_skip_tunnel")
+SETUP(PROG_TYPE, "02_ipv4_from_host_skip_tunnel")
 int ipv4_from_host_skip_tunnel_setup(struct __ctx_buff *ctx)
 {
 	return setup(ctx, true, true);
 }
 
-CHECK("tc", "02_ipv4_from_host_skip_tunnel")
+CHECK(PROG_TYPE, "02_ipv4_from_host_skip_tunnel")
 int ipv4_from_host_skip_tunnel_check(__maybe_unused const struct __ctx_buff *ctx)
 {
 	return check_ctx(ctx, CTX_ACT_OK, true);
 }
 
-PKTGEN("tc", "03_ipv6_from_host_no_flags")
+PKTGEN(PROG_TYPE, "03_ipv6_from_host_no_flags")
 int ipv6_from_host_no_flags_pktgen(struct __ctx_buff *ctx)
 {
 	return pktgen_from_host(ctx, false);
 }
 
-SETUP("tc", "03_ipv6_from_host_no_flags")
+SETUP(PROG_TYPE, "03_ipv6_from_host_no_flags")
 int ipv6_from_host_no_flags_setup(struct __ctx_buff *ctx)
 {
 	return setup(ctx, false, false);
 }
 
-CHECK("tc", "03_ipv6_from_host_no_flags")
+CHECK(PROG_TYPE, "03_ipv6_from_host_no_flags")
 int ipv6_from_host_no_flags_check(__maybe_unused const struct __ctx_buff *ctx)
 {
 	return check_ctx(ctx, CTX_ACT_REDIRECT, false);
 }
 
-PKTGEN("tc", "04_ipv6_from_host_skip_tunnel")
+PKTGEN(PROG_TYPE, "04_ipv6_from_host_skip_tunnel")
 int ipv6_from_host_skip_tunnel_pktgen(struct __ctx_buff *ctx)
 {
 	return pktgen_from_host(ctx, false);
 }
 
-SETUP("tc", "04_ipv6_from_host_skip_tunnel")
+SETUP(PROG_TYPE, "04_ipv6_from_host_skip_tunnel")
 int ipv6_from_host_skip_tunnel_setup(struct __ctx_buff *ctx)
 {
 	return setup(ctx, true, false);
 }
 
-CHECK("tc", "04_ipv6_from_host_skip_tunnel")
+CHECK(PROG_TYPE, "04_ipv6_from_host_skip_tunnel")
 int ipv6_from_host_skip_tunnel_check(__maybe_unused const struct __ctx_buff *ctx)
+{
+	return check_ctx(ctx, CTX_ACT_OK, false);
+}
+
+PKTGEN(PROG_TYPE, "05_ipv4_from_host_no_flags_same_subnet")
+int ipv4_from_host_no_flags_same_subnet_pktgen(struct __ctx_buff *ctx)
+{
+	return pktgen_from_host(ctx, true);
+}
+
+SETUP(PROG_TYPE, "05_ipv4_from_host_no_flags_same_subnet")
+int ipv4_from_host_no_flags_same_subnet_setup(struct __ctx_buff *ctx)
+{
+	setup_subnet_table_v4(100, 100);
+	return setup(ctx, false, true);
+}
+
+CHECK(PROG_TYPE, "05_ipv4_from_host_no_flags_same_subnet")
+int ipv4_from_host_no_flags_same_subnet_check(__maybe_unused const struct __ctx_buff *ctx)
+{
+	return check_ctx(ctx, CTX_ACT_OK, true);
+}
+
+PKTGEN(PROG_TYPE, "06_ipv4_from_host_skip_tunnel_same_subnet")
+int ipv4_from_host_skip_tunnel_same_subnet_pktgen(struct __ctx_buff *ctx)
+{
+	return pktgen_from_host(ctx, true);
+}
+
+SETUP(PROG_TYPE, "06_ipv4_from_host_skip_tunnel_same_subnet")
+int ipv4_from_host_skip_tunnel_same_subnet_setup(struct __ctx_buff *ctx)
+{
+	setup_subnet_table_v4(100, 100);
+	return setup(ctx, true, true);
+}
+
+CHECK(PROG_TYPE, "06_ipv4_from_host_skip_tunnel_same_subnet")
+int ipv4_from_host_skip_tunnel_same_subnet_check(__maybe_unused const struct __ctx_buff *ctx)
+{
+	return check_ctx(ctx, CTX_ACT_OK, true);
+}
+
+PKTGEN(PROG_TYPE, "07_ipv4_from_host_no_flags_different_subnet")
+int ipv4_from_host_no_flags_different_subnet_pktgen(struct __ctx_buff *ctx)
+{
+	return pktgen_from_host(ctx, true);
+}
+
+SETUP(PROG_TYPE, "07_ipv4_from_host_no_flags_different_subnet")
+int ipv4_from_host_no_flags_different_subnet_setup(struct __ctx_buff *ctx)
+{
+	setup_subnet_table_v4(100, 101);
+	return setup(ctx, false, true);
+}
+
+CHECK(PROG_TYPE, "07_ipv4_from_host_no_flags_different_subnet")
+int ipv4_from_host_no_flags_different_subnet_check(__maybe_unused const struct __ctx_buff *ctx)
+{
+	return check_ctx(ctx, CTX_ACT_REDIRECT, true);
+}
+
+PKTGEN(PROG_TYPE, "08_ipv4_from_host_skip_tunnel_different_subnet")
+int ipv4_from_host_skip_tunnel_different_subnet_pktgen(struct __ctx_buff *ctx)
+{
+	return pktgen_from_host(ctx, true);
+}
+
+SETUP(PROG_TYPE, "08_ipv4_from_host_skip_tunnel_different_subnet")
+int ipv4_from_host_skip_tunnel_different_subnet_setup(struct __ctx_buff *ctx)
+{
+	setup_subnet_table_v4(100, 101);
+	return setup(ctx, true, true);
+}
+
+CHECK(PROG_TYPE, "08_ipv4_from_host_skip_tunnel_different_subnet")
+int ipv4_from_host_skip_tunnel_different_subnet_check(__maybe_unused const struct __ctx_buff *ctx)
+{
+	return check_ctx(ctx, CTX_ACT_OK, true);
+}
+
+PKTGEN(PROG_TYPE, "09_ipv6_from_host_no_flags_same_subnet")
+int ipv6_from_host_no_flags_same_subnet_pktgen(struct __ctx_buff *ctx)
+{
+	return pktgen_from_host(ctx, false);
+}
+
+SETUP(PROG_TYPE, "09_ipv6_from_host_no_flags_same_subnet")
+int ipv6_from_host_no_flags_same_subnet_setup(struct __ctx_buff *ctx)
+{
+	setup_subnet_table_v6(100, 100);
+	return setup(ctx, false, false);
+}
+
+CHECK(PROG_TYPE, "09_ipv6_from_host_no_flags_same_subnet")
+int ipv6_from_host_no_flags_same_subnet_check(__maybe_unused const struct __ctx_buff *ctx)
+{
+	return check_ctx(ctx, CTX_ACT_OK, false);
+}
+
+PKTGEN(PROG_TYPE, "10_ipv6_from_host_no_flags_different_subnet")
+int ipv6_from_host_no_flags_different_subnet_pktgen(struct __ctx_buff *ctx)
+{
+	return pktgen_from_host(ctx, false);
+}
+
+SETUP(PROG_TYPE, "10_ipv6_from_host_no_flags_different_subnet")
+int ipv6_from_host_no_flags_different_subnet_setup(struct __ctx_buff *ctx)
+{
+	setup_subnet_table_v6(100, 101);
+	return setup(ctx, false, false);
+}
+
+CHECK(PROG_TYPE, "10_ipv6_from_host_no_flags_different_subnet")
+int ipv6_from_host_no_flags_different_subnet_check(__maybe_unused const struct __ctx_buff *ctx)
+{
+	return check_ctx(ctx, CTX_ACT_REDIRECT, false);
+}
+
+PKTGEN(PROG_TYPE, "11_ipv6_from_host_skip_tunnel_same_subnet")
+int ipv6_from_host_same_subnet_pktgen(struct __ctx_buff *ctx)
+{
+	return pktgen_from_host(ctx, false);
+}
+
+SETUP(PROG_TYPE, "11_ipv6_from_host_skip_tunnel_same_subnet")
+int ipv6_from_host_same_subnet_setup(struct __ctx_buff *ctx)
+{
+	setup_subnet_table_v6(100, 100);
+	return setup(ctx, true, false);
+}
+
+CHECK(PROG_TYPE, "11_ipv6_from_host_skip_tunnel_same_subnet")
+int ipv6_from_host_same_subnet_check(__maybe_unused const struct __ctx_buff *ctx)
+{
+	return check_ctx(ctx, CTX_ACT_OK, false);
+}
+
+PKTGEN(PROG_TYPE, "12_ipv6_from_host_skip_tunnel_different_subnet")
+int ipv6_from_host_skip_tunnel_different_subnet_pktgen(struct __ctx_buff *ctx)
+{
+	return pktgen_from_host(ctx, false);
+}
+
+SETUP(PROG_TYPE, "12_ipv6_from_host_skip_tunnel_different_subnet")
+int ipv6_from_host_skip_tunnel_different_subnet_setup(struct __ctx_buff *ctx)
+{
+	setup_subnet_table_v6(100, 101);
+	return setup(ctx, true, false);
+}
+
+CHECK(PROG_TYPE, "12_ipv6_from_host_skip_tunnel_different_subnet")
+int ipv6_from_host_skip_tunnel_different_subnet_check(__maybe_unused const struct __ctx_buff *ctx)
 {
 	return check_ctx(ctx, CTX_ACT_OK, false);
 }

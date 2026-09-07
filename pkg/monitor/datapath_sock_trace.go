@@ -4,10 +4,10 @@
 package monitor
 
 import (
+	"encoding/binary"
 	"fmt"
-	"net"
+	"net/netip"
 
-	"github.com/cilium/cilium/pkg/byteorder"
 	"github.com/cilium/cilium/pkg/monitor/api"
 	"github.com/cilium/cilium/pkg/types"
 )
@@ -71,9 +71,9 @@ func (t *TraceSockNotify) Decode(data []byte) error {
 	t.XlatePoint = data[1]
 	t.L4Proto = data[2]
 	t.Flags = data[3]
-	t.DstPort = byteorder.Native.Uint16(data[4:6])
-	t.SockCookie = byteorder.Native.Uint64(data[8:16])
-	t.CgroupId = byteorder.Native.Uint64(data[16:24])
+	t.DstPort = binary.NativeEndian.Uint16(data[4:6])
+	t.SockCookie = binary.NativeEndian.Uint64(data[8:16])
+	t.CgroupId = binary.NativeEndian.Uint64(data[16:24])
 	copy(t.DstIP[:], data[24:40])
 
 	return nil
@@ -95,11 +95,13 @@ func (t *TraceSockNotify) XlatePointStr() string {
 }
 
 // IP returns the IPv4 or IPv6 address field.
-func (t *TraceSockNotify) IP() net.IP {
+func (t *TraceSockNotify) IP() netip.Addr {
 	if (t.Flags & TraceSockNotifyFlagIPv6) != 0 {
-		return t.DstIP[:]
+		return netip.AddrFrom16(t.DstIP)
 	}
-	return t.DstIP[:4]
+	var arr [4]byte
+	copy(arr[:], t.DstIP[:4])
+	return netip.AddrFrom4(arr)
 }
 
 func (t *TraceSockNotify) L4ProtoStr() string {

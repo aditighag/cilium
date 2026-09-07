@@ -5,10 +5,28 @@
 
 #include <linux/udp.h>
 #include <linux/ip.h>
+#include "identity.h"
+#include "tunnel.h"
 
 static __always_inline __maybe_unused void
 bpf_clear_meta(struct xdp_md *ctx __maybe_unused)
 {
+	__u32 zero = 0, *data_meta = map_lookup_elem(&cilium_xdp_scratch, &zero);
+
+	/* Unlike __sk_buff->cb[] in tcx (per-skb), the XDP "meta" lives
+	 * in a per-CPU PERCPU_ARRAY (cilium_xdp_scratch) that persists
+	 * across packets on the same CPU. CB slots can alias. Thus zero
+	 * the CB region on each program entry to mirror the TC behavior.
+	 * Leave RECIRC_MARKER / XFER_MARKER (offsets 5/6) intact; they
+	 * have their own dedicated clears.
+	 */
+	if (always_succeeds(data_meta)) {
+		data_meta[0] = 0;
+		data_meta[1] = 0;
+		data_meta[2] = 0;
+		data_meta[3] = 0;
+		data_meta[4] = 0;
+	}
 }
 
 static __always_inline __maybe_unused void
@@ -35,16 +53,10 @@ ctx_load_meta_ipv6(const struct xdp_md *ctx __maybe_unused,
 	build_bug_on((off + 4) * sizeof(__u32) > META_PIVOT);
 }
 
-static __always_inline __maybe_unused void
-set_identity_meta(struct xdp_md *ctx __maybe_unused,
-		__u32 identity __maybe_unused)
-{
-}
-
 static __always_inline __maybe_unused int
 redirect_self(struct xdp_md *ctx __maybe_unused)
 {
-	return XDP_TX;
+	return CTX_ACT_TX;
 }
 
 static __always_inline __maybe_unused int
@@ -147,8 +159,8 @@ static __always_inline bool ctx_snat_done(struct xdp_md *ctx)
 #ifdef HAVE_ENCAP
 static __always_inline __maybe_unused int
 ctx_set_encap_info4(struct xdp_md *ctx, __u32 src_ip, __be16 src_port,
-		    __u32 daddr, __u32 seclabel __maybe_unused,
-		    __u32 vni __maybe_unused, void *opt, __u32 opt_len)
+		    __u32 daddr, __u32 seclabel, __u32 vni __maybe_unused,
+		    void *opt, __u32 opt_len)
 {
 	__u32 inner_len = (__u32)ctx_full_len(ctx);
 	__u32 tunnel_hdr_len = 8; /* geneve / vxlan */
@@ -161,7 +173,7 @@ ctx_set_encap_info4(struct xdp_md *ctx, __u32 src_ip, __be16 src_port,
 	/* Add space in front (50 bytes + options) */
 	outer_len = sizeof(*eth) + sizeof(*ip4) + sizeof(*udp) + tunnel_hdr_len + opt_len;
 
-	if (ctx_adjust_hroom(ctx, outer_len, BPF_ADJ_ROOM_NET, ctx_adjust_hroom_flags()))
+	if (ctx_adjust_hroom(ctx, outer_len, BPF_ADJ_ROOM_MAC, BPF_F_ADJ_ROOM_NO_CSUM_RESET))
 		return DROP_INVALID;
 
 	/* validate access to outer headers: */
@@ -177,7 +189,7 @@ ctx_set_encap_info4(struct xdp_md *ctx, __u32 src_ip, __be16 src_port,
 
 	memset(data, 0, sizeof(*eth) + sizeof(*ip4) + sizeof(*udp) + tunnel_hdr_len);
 
-	switch (TUNNEL_PROTOCOL) {
+	switch (CONFIG(tunnel_protocol)) {
 	case TUNNEL_PROTOCOL_GENEVE:
 		{
 			struct genevehdr *geneve = (void *)udp + sizeof(*udp);
@@ -188,7 +200,7 @@ ctx_set_encap_info4(struct xdp_md *ctx, __u32 src_ip, __be16 src_port,
 			geneve->opt_len = (__u8)(opt_len >> 2);
 			geneve->protocol_type = bpf_htons(ETH_P_TEB);
 
-			seclabel = bpf_htonl(get_tunnel_id(seclabel) << 8);
+			seclabel = sec_identity_to_tunnel_vni(get_tunnel_id(seclabel));
 			memcpy(&geneve->vni, &seclabel, sizeof(__u32));
 		}
 		break;
@@ -201,16 +213,14 @@ ctx_set_encap_info4(struct xdp_md *ctx, __u32 src_ip, __be16 src_port,
 
 			vxlan->vx_flags = bpf_htonl(1U << 27);
 
-			seclabel = bpf_htonl(get_tunnel_id(seclabel) << 8);
+			seclabel = sec_identity_to_tunnel_vni(get_tunnel_id(seclabel));
 			memcpy(&vxlan->vx_vni, &seclabel, sizeof(__u32));
 		}
 		break;
-	default:
-		__throw_build_bug();
 	}
 
 	udp->source = src_port;
-	udp->dest = bpf_htons(TUNNEL_PORT);
+	udp->dest = bpf_htons(CONFIG(tunnel_port));
 	udp->len = bpf_htons((__u16)(sizeof(*udp) + tunnel_hdr_len + opt_len + inner_len));
 	udp->check = 0; /* we use BPF_F_ZERO_CSUM_TX */
 
@@ -234,32 +244,6 @@ ctx_set_encap_info6(struct xdp_md *ctx __maybe_unused,
 		    __u32 seclabel __maybe_unused, void *opt __maybe_unused,
 		    __u32 opt_len __maybe_unused)
 {
-	return 0;
-}
-
-static __always_inline __maybe_unused int
-ctx_set_tunnel_opt(struct xdp_md *ctx, void *opt, __u32 opt_len)
-{
-	const __u32 geneve_off = ETH_HLEN + sizeof(struct iphdr) + sizeof(struct udphdr);
-	struct genevehdr geneve;
-
-	/* add free space after GENEVE header: */
-	if (ctx_adjust_hroom(ctx, opt_len, BPF_ADJ_ROOM_MAC, ctx_adjust_hroom_flags()) < 0)
-		return DROP_INVALID;
-
-	/* write the options */
-	if (ctx_store_bytes(ctx, geneve_off + sizeof(geneve), opt, opt_len, 0) < 0)
-		return DROP_WRITE_ERROR;
-
-	/* update the options length in the GENEVE header: */
-	if (ctx_load_bytes(ctx, geneve_off, &geneve, sizeof(geneve)) < 0)
-		return DROP_INVALID;
-
-	geneve.opt_len += (__u8)(opt_len >> 2);
-
-	if (ctx_store_bytes(ctx, geneve_off, &geneve, sizeof(geneve), 0) < 0)
-		return DROP_WRITE_ERROR;
-
 	return 0;
 }
 #endif /* HAVE_ENCAP */

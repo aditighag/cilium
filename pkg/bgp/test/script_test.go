@@ -26,17 +26,22 @@ import (
 	daemonk8s "github.com/cilium/cilium/daemon/k8s"
 	"github.com/cilium/cilium/pkg/bgp"
 	"github.com/cilium/cilium/pkg/bgp/agent"
+	"github.com/cilium/cilium/pkg/bgp/config"
 	"github.com/cilium/cilium/pkg/bgp/manager"
 	"github.com/cilium/cilium/pkg/bgp/test/commands"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	envoyCfg "github.com/cilium/cilium/pkg/envoy/config"
 	"github.com/cilium/cilium/pkg/hive"
+	k8sTables "github.com/cilium/cilium/pkg/k8s/tables"
 	"github.com/cilium/cilium/pkg/kpr"
+	"github.com/cilium/cilium/pkg/lbipamconfig"
 	"github.com/cilium/cilium/pkg/loadbalancer"
-	lbcell "github.com/cilium/cilium/pkg/loadbalancer/cell"
-	"github.com/cilium/cilium/pkg/maglev"
+	"github.com/cilium/cilium/pkg/loadbalancer/reflectors"
+	"github.com/cilium/cilium/pkg/loadbalancer/writer"
 	"github.com/cilium/cilium/pkg/node"
+	"github.com/cilium/cilium/pkg/nodeipamconfig"
 	"github.com/cilium/cilium/pkg/source"
 	"github.com/cilium/cilium/pkg/svcrouteconfig"
 
@@ -58,11 +63,11 @@ const (
 	testLinkName         = "cilium-bgp-test"
 
 	// test arguments
-	testPeeringIPsFlag         = "test-peering-ips"
-	bgpNoEndpointsRoutableFlag = "bgp-no-endpoints-routable"
-	ipamFlag                   = "ipam"
-	probeTCPMD5Flag            = "probe-tcp-md5"
-	kubeProxyReplacementFlag   = "kube-proxy-replacement"
+	testPeeringIPsFlag            = "test-peering-ips"
+	enableNoEndpointsRoutableFlag = "enable-no-service-endpoints-routable"
+	ipamFlag                      = "ipam"
+	probeTCPMD5Flag               = "probe-tcp-md5"
+	kubeProxyReplacementFlag      = "kube-proxy-replacement"
 )
 
 func TestPrivilegedScript(t *testing.T) {
@@ -84,15 +89,15 @@ func TestPrivilegedScript(t *testing.T) {
 
 	setup := func(t testing.TB, args []string) *script.Engine {
 		var err error
-		var bgpMgr agent.BGPRouterManager
+		var lbWriter *writer.Writer
 
 		// parse the shebang arguments in the script
 		flags := pflag.NewFlagSet("test-flags", pflag.ContinueOnError)
 		peeringIPs := flags.StringSlice(testPeeringIPsFlag, nil, "List of IPs used for peering in the test")
 		ipam := flags.String(ipamFlag, ipamOption.IPAMKubernetes, "IPAM used by the test")
 		probeTCPMD5 := flags.Bool(probeTCPMD5Flag, false, "Probe if TCP_MD5SIG socket option is available")
-		noEndpointsRoutable := flags.Bool(bgpNoEndpointsRoutableFlag, true, "")
 		kubeProxyReplacement := flags.Bool(kubeProxyReplacementFlag, true, "")
+		noEndpointsRoutable := flags.Bool(enableNoEndpointsRoutableFlag, true, "")
 		require.NoError(t, flags.Parse(args), "Error parsing test flags")
 
 		if *probeTCPMD5 {
@@ -123,28 +128,26 @@ func TestPrivilegedScript(t *testing.T) {
 			// Dependencies
 			k8sClient.FakeClientCell(),
 			daemonk8s.ResourcesCell,
-			daemonk8s.TablesCell,
+			k8sTables.TablesCell,
 			node.LocalNodeStoreTestCell,
 			cell.Config(envoyCfg.SecretSyncConfig{}),
 
-			// LB cell to populate LB tables from k8s services / endpoints
-			lbcell.Cell,
-			maglev.Cell,
-			cell.Provide(source.NewSources),
-			cell.Config(loadbalancer.TestConfig{}),
-			cell.Provide(
-				func(cfg loadbalancer.TestConfig) *loadbalancer.TestConfig { return &cfg }, // newLBMaps expects *TestConfig
-			),
+			// Load-balancer writer (provides Frontend table) and reflectors (populate from K8s services)
+			loadbalancer.ConfigCell,
+			writer.Cell,
+			reflectors.Cell,
+			lbipamconfig.Cell,
+			nodeipamconfig.Cell,
+
+			// Provide source.Sources for loadbalancer writer
+			cell.Provide(func() source.Sources { return source.Sources{} }),
 
 			cell.Provide(
 				func() *option.DaemonConfig {
 					option.Config = &option.DaemonConfig{
-						EnableBGPControlPlane:     true,
-						BGPSecretsNamespace:       testSecretsNamespace,
-						BGPRouterIDAllocationMode: option.BGPRouterIDAllocationModeDefault,
-						IPAM:                      *ipam,
-						EnableIPv4:                true,
-						EnableIPv6:                true,
+						IPAM:       *ipam,
+						EnableIPv4: true,
+						EnableIPv6: true,
 					}
 					return option.Config
 				},
@@ -153,12 +156,25 @@ func TestPrivilegedScript(t *testing.T) {
 						KubeProxyReplacement: *kubeProxyReplacement,
 					}
 				},
+				func() cmtypes.ClusterInfo {
+					return cmtypes.DefaultClusterInfo
+				},
 			),
 			cell.Invoke(func(m agent.BGPRouterManager) {
-				bgpMgr = m
 				m.(*manager.BGPRouterManager).DestroyRouterOnStop(true) // fully destroy GoBGP server on Stop()
 			}),
+			cell.Invoke(func(w *writer.Writer) {
+				lbWriter = w
+			}),
 		)
+
+		hive.AddConfigOverride(
+			h,
+			func(cfg *config.BGPConfig) {
+				cfg.Enable = true
+				cfg.SecretsNamespace = testSecretsNamespace
+				cfg.RouterIDAllocationMode = config.BGPRouterIDAllocationModeDefault
+			})
 
 		hive.AddConfigOverride(
 			h,
@@ -197,7 +213,7 @@ func TestPrivilegedScript(t *testing.T) {
 		require.NoError(t, err, "ScriptCommands")
 		maps.Insert(cmds, maps.All(script.DefaultCmds()))
 		maps.Insert(cmds, maps.All(commands.GoBGPScriptCmds(gobgpCmdCtx)))
-		maps.Insert(cmds, maps.All(commands.BGPScriptCmds(bgpMgr)))
+		maps.Insert(cmds, maps.All(commands.SvcScriptCmds(lbWriter)))
 
 		return &script.Engine{
 			Cmds: cmds,

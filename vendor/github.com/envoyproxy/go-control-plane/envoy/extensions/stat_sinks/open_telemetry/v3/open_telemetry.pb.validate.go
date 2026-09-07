@@ -185,6 +185,8 @@ func (m *SinkConfig) validate(all bool) error {
 		}
 	}
 
+	// no validation rules for MaxDataPointsPerRequest
+
 	oneofProtocolSpecifierPresent := false
 	switch v := m.ProtocolSpecifier.(type) {
 	case *SinkConfig_GrpcService:
@@ -240,6 +242,48 @@ func (m *SinkConfig) validate(all bool) error {
 			}
 		}
 
+	case *SinkConfig_HttpService:
+		if v == nil {
+			err := SinkConfigValidationError{
+				field:  "ProtocolSpecifier",
+				reason: "oneof value cannot be a typed-nil",
+			}
+			if !all {
+				return err
+			}
+			errors = append(errors, err)
+		}
+		oneofProtocolSpecifierPresent = true
+
+		if all {
+			switch v := interface{}(m.GetHttpService()).(type) {
+			case interface{ ValidateAll() error }:
+				if err := v.ValidateAll(); err != nil {
+					errors = append(errors, SinkConfigValidationError{
+						field:  "HttpService",
+						reason: "embedded message failed validation",
+						cause:  err,
+					})
+				}
+			case interface{ Validate() error }:
+				if err := v.Validate(); err != nil {
+					errors = append(errors, SinkConfigValidationError{
+						field:  "HttpService",
+						reason: "embedded message failed validation",
+						cause:  err,
+					})
+				}
+			}
+		} else if v, ok := interface{}(m.GetHttpService()).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return SinkConfigValidationError{
+					field:  "HttpService",
+					reason: "embedded message failed validation",
+					cause:  err,
+				}
+			}
+		}
+
 	default:
 		_ = v // ensures v is used
 	}
@@ -267,7 +311,7 @@ type SinkConfigMultiError []error
 
 // Error returns a concatenation of all the error messages it wraps.
 func (m SinkConfigMultiError) Error() string {
-	var msgs []string
+	msgs := make([]string, 0, len(m))
 	for _, err := range m {
 		msgs = append(msgs, err.Error())
 	}
@@ -403,7 +447,7 @@ type SinkConfig_ConversionActionMultiError []error
 
 // Error returns a concatenation of all the error messages it wraps.
 func (m SinkConfig_ConversionActionMultiError) Error() string {
-	var msgs []string
+	msgs := make([]string, 0, len(m))
 	for _, err := range m {
 		msgs = append(msgs, err.Error())
 	}
@@ -469,3 +513,105 @@ var _ interface {
 	Cause() error
 	ErrorName() string
 } = SinkConfig_ConversionActionValidationError{}
+
+// Validate checks the field values on SinkConfig_DropAction with the rules
+// defined in the proto definition for this message. If any rules are
+// violated, the first error encountered is returned, or nil if there are no violations.
+func (m *SinkConfig_DropAction) Validate() error {
+	return m.validate(false)
+}
+
+// ValidateAll checks the field values on SinkConfig_DropAction with the rules
+// defined in the proto definition for this message. If any rules are
+// violated, the result is a list of violation errors wrapped in
+// SinkConfig_DropActionMultiError, or nil if none found.
+func (m *SinkConfig_DropAction) ValidateAll() error {
+	return m.validate(true)
+}
+
+func (m *SinkConfig_DropAction) validate(all bool) error {
+	if m == nil {
+		return nil
+	}
+
+	var errors []error
+
+	if len(errors) > 0 {
+		return SinkConfig_DropActionMultiError(errors)
+	}
+
+	return nil
+}
+
+// SinkConfig_DropActionMultiError is an error wrapping multiple validation
+// errors returned by SinkConfig_DropAction.ValidateAll() if the designated
+// constraints aren't met.
+type SinkConfig_DropActionMultiError []error
+
+// Error returns a concatenation of all the error messages it wraps.
+func (m SinkConfig_DropActionMultiError) Error() string {
+	msgs := make([]string, 0, len(m))
+	for _, err := range m {
+		msgs = append(msgs, err.Error())
+	}
+	return strings.Join(msgs, "; ")
+}
+
+// AllErrors returns a list of validation violation errors.
+func (m SinkConfig_DropActionMultiError) AllErrors() []error { return m }
+
+// SinkConfig_DropActionValidationError is the validation error returned by
+// SinkConfig_DropAction.Validate if the designated constraints aren't met.
+type SinkConfig_DropActionValidationError struct {
+	field  string
+	reason string
+	cause  error
+	key    bool
+}
+
+// Field function returns field value.
+func (e SinkConfig_DropActionValidationError) Field() string { return e.field }
+
+// Reason function returns reason value.
+func (e SinkConfig_DropActionValidationError) Reason() string { return e.reason }
+
+// Cause function returns cause value.
+func (e SinkConfig_DropActionValidationError) Cause() error { return e.cause }
+
+// Key function returns key value.
+func (e SinkConfig_DropActionValidationError) Key() bool { return e.key }
+
+// ErrorName returns error name.
+func (e SinkConfig_DropActionValidationError) ErrorName() string {
+	return "SinkConfig_DropActionValidationError"
+}
+
+// Error satisfies the builtin error interface
+func (e SinkConfig_DropActionValidationError) Error() string {
+	cause := ""
+	if e.cause != nil {
+		cause = fmt.Sprintf(" | caused by: %v", e.cause)
+	}
+
+	key := ""
+	if e.key {
+		key = "key for "
+	}
+
+	return fmt.Sprintf(
+		"invalid %sSinkConfig_DropAction.%s: %s%s",
+		key,
+		e.field,
+		e.reason,
+		cause)
+}
+
+var _ error = SinkConfig_DropActionValidationError{}
+
+var _ interface {
+	Field() string
+	Reason() string
+	Key() bool
+	Cause() error
+	ErrorName() string
+} = SinkConfig_DropActionValidationError{}

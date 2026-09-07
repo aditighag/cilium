@@ -7,12 +7,12 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"path"
 	"sync/atomic"
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/allocator"
 	"github.com/cilium/cilium/pkg/clustermesh/common"
+	"github.com/cilium/cilium/pkg/clustermesh/endpointslice"
 	"github.com/cilium/cilium/pkg/clustermesh/observer"
 	serviceStore "github.com/cilium/cilium/pkg/clustermesh/store"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
@@ -42,11 +42,9 @@ type remoteCluster struct {
 	// clusterID is the clusterID advertized by the remote cluster
 	clusterID uint32
 
-	// clusterConfigValidator validates the cluster configuration advertised
-	// by remote clusters.
-	clusterConfigValidator func(cmtypes.CiliumClusterConfig) error
-
-	usedIDs ClusterIDsManager
+	// localClusterInfo is the local cluster configuration, used for local
+	// interpretation of remote identity layout
+	localClusterInfo cmtypes.ClusterInfo
 
 	// mutex protects the following variables:
 	// - remoteIdentityCache
@@ -55,6 +53,7 @@ type remoteCluster struct {
 	// store is the shared store representing all nodes in the remote cluster
 	remoteNodes store.WatchStore
 
+	serviceModeV2 cmtypes.ServiceModeV2
 	// remoteServices is the shared store representing services in remote
 	// clusters
 	remoteServices store.WatchStore
@@ -98,17 +97,7 @@ type remoteCluster struct {
 }
 
 func (rc *remoteCluster) Run(ctx context.Context, backend kvstore.BackendOperations, config cmtypes.CiliumClusterConfig, ready chan<- error) {
-	if err := rc.clusterConfigValidator(config); err != nil {
-		ready <- err
-		close(ready)
-		return
-	}
-
-	if err := rc.onUpdateConfig(config); err != nil {
-		ready <- err
-		close(ready)
-		return
-	}
+	rc.clusterID = config.ID
 
 	rc.featureMetrics.AddClusterMeshConfig(ClusterMeshMode(config, option.Config.IdentityAllocationMode), rc.featureMetricMaxClusters)
 
@@ -136,15 +125,26 @@ func (rc *remoteCluster) Run(ctx context.Context, backend kvstore.BackendOperati
 	if config.Capabilities.Cached {
 		adapter = kvstore.StateToCachePrefix
 	}
-
 	mgr.Register(adapter(nodeStore.NodeStorePrefix), func(ctx context.Context) {
-		rc.remoteNodes.Watch(ctx, backend, path.Join(adapter(nodeStore.NodeStorePrefix), rc.name))
+		rc.remoteNodes.Watch(ctx, backend, kvstore.JoinKey(adapter(nodeStore.NodeStorePrefix), rc.name))
 	})
 
-	mgr.Register(adapter(serviceStore.ServiceStorePrefix), func(ctx context.Context) {
-		rc.remoteServices.Watch(ctx, backend, path.Join(adapter(serviceStore.ServiceStorePrefix), rc.name))
-	})
-
+	if rc.serviceModeV2.ShouldWatchLegacyServices() &&
+		config.Capabilities.EndpointSlicesExportMode != cmtypes.EndpointSlicesExportModeEndpointSlicesOnly {
+		mgr.Register(adapter(serviceStore.ServiceStorePrefix), func(ctx context.Context) {
+			rc.remoteServices.Watch(ctx, backend, kvstore.JoinKey(adapter(serviceStore.ServiceStorePrefix), rc.name))
+		})
+	} else {
+		if rc.serviceModeV2.ShouldWatchLegacyServices() {
+			rc.log.Error("Remote cluster does not support legacy service resources while Cilium is configured to watch them. "+
+				"Global Services and MCS-API will not take into account any backends from this cluster!",
+				logfields.ClusterName, rc.name)
+		}
+		// Drain any existing services in case the remote cluster no longer supports them
+		rc.remoteServices.Drain()
+		// Mimic that services are synced if not enabled
+		rc.synced.services.Stop()
+	}
 	mgr.Register(adapter(ipcache.IPIdentitiesPath), func(ctx context.Context) {
 		rc.ipCacheWatcher.Watch(ctx, backend, rc.ipCacheWatcherOpts(&config)...)
 	})
@@ -193,12 +193,18 @@ func (rc *remoteCluster) Remove(context.Context) {
 	for _, obs := range rc.observers {
 		obs.Drain()
 	}
-
-	rc.usedIDs.ReleaseClusterID(rc.clusterID)
 }
 
 func (rc *remoteCluster) Status() *models.RemoteCluster {
 	status := rc.status()
+
+	get := func(name observer.Name) observer.Status {
+		obs, ok := rc.observers[name]
+		if ok {
+			return obs.Status()
+		}
+		return observer.Status{}
+	}
 
 	rc.mutex.RLock()
 	defer rc.mutex.RUnlock()
@@ -209,13 +215,16 @@ func (rc *remoteCluster) Status() *models.RemoteCluster {
 
 	status.Synced = &models.RemoteClusterSynced{
 		Nodes:     rc.remoteNodes.Synced(),
-		Services:  rc.remoteServices.Synced(),
+		Services:  !rc.serviceModeV2.ShouldWatchLegacyServices() || rc.remoteServices.Synced(),
 		Endpoints: rc.ipCacheWatcher.Synced(),
 	}
 
 	if rc.remoteIdentityCache != nil {
 		status.NumIdentities = int64(rc.remoteIdentityCache.NumEntries())
 		status.Synced.Identities = rc.remoteIdentityCache.Synced()
+	}
+	if get(endpointslice.Name).Enabled {
+		status.Synced.EndpointSlices = new(get(endpointslice.Name).Synced)
 	}
 
 	status.Ready = status.Ready &&
@@ -234,41 +243,22 @@ func (rc *remoteCluster) Status() *models.RemoteCluster {
 	return status
 }
 
-func (rc *remoteCluster) onUpdateConfig(newConfig cmtypes.CiliumClusterConfig) error {
-	if newConfig.ID == rc.clusterID {
-		return nil
-	}
-
-	// Let's fully drain all previously known entries if the remote cluster changed
-	// the cluster ID. Although synthetic deletion events would be generated in any
-	// case upon initial listing (as the entries with the incorrect ID would not pass
-	// validation), that would leave a window of time in which there would still be
-	// stale entries for a Cluster ID that has already been released, potentially
-	// leading to inconsistencies if the same ID is acquired again in the meanwhile.
+func (rc *remoteCluster) OnClusterIDChange(ctx context.Context, newID uint32) {
 	if rc.clusterID != cmtypes.ClusterIDUnset {
 		rc.log.Info(
 			"Remote Cluster ID changed: draining all known entries before reconnecting. "+
 				"Expect connectivity disruption towards this cluster",
-			logfields.ClusterID, newConfig.ID,
+			logfields.ClusterID, newID,
 		)
-		rc.remoteNodes.Drain()
-		rc.remoteServices.Drain()
-		rc.ipCacheWatcher.Drain()
-		rc.remoteIdentityWatcher.RemoveRemoteIdentities(rc.name)
-
-		for _, obs := range rc.observers {
-			obs.Drain()
-		}
+		// Let's fully drain all previously known entries by calling [Remove] if the
+		// remote cluster changed the cluster ID. Although synthetic deletion events
+		// would be generated in any case upon initial listing (as the entries with
+		// the incorrect ID would not pass validation), that would leave a window of
+		// time in which there would still be stale entries for a Cluster ID that has
+		// already been released, potentially leading to inconsistencies if the same
+		// ID is acquired again in the meanwhile.
+		rc.Remove(ctx)
 	}
-
-	if err := rc.usedIDs.ReserveClusterID(newConfig.ID); err != nil {
-		return err
-	}
-
-	rc.usedIDs.ReleaseClusterID(rc.clusterID)
-	rc.clusterID = newConfig.ID
-
-	return nil
 }
 
 func (rc *remoteCluster) ipCacheWatcherOpts(config *cmtypes.CiliumClusterConfig) []ipcache.IWOpt {
@@ -276,7 +266,7 @@ func (rc *remoteCluster) ipCacheWatcherOpts(config *cmtypes.CiliumClusterConfig)
 
 	if config != nil {
 		opts = append(opts, ipcache.WithCachedPrefix(config.Capabilities.Cached))
-		opts = append(opts, ipcache.WithIdentityValidator(config.ID))
+		opts = append(opts, ipcache.WithIdentityValidator(rc.localClusterInfo, config.ID))
 	}
 
 	if rc.ipCacheWatcherExtraOpts != nil {
@@ -288,7 +278,7 @@ func (rc *remoteCluster) ipCacheWatcherOpts(config *cmtypes.CiliumClusterConfig)
 
 type synced struct {
 	wait.SyncedCommon
-	services       chan struct{}
+	services       *lock.StoppableWaitGroup
 	nodes          chan struct{}
 	ipcache        chan struct{}
 	identities     *lock.StoppableWaitGroup
@@ -307,8 +297,11 @@ func newSynced() synced {
 	idswg.Stop()
 
 	return synced{
-		SyncedCommon:   wait.NewSyncedCommon(),
-		services:       make(chan struct{}),
+		SyncedCommon: wait.NewSyncedCommon(),
+		// Services can be disabled at runtime and will be immediately marked
+		// as sync if they are not watched. Thus, we use stoppable wait groups
+		// for similar reasons as for identities here.
+		services:       lock.NewStoppableWaitGroup(),
 		nodes:          make(chan struct{}),
 		ipcache:        make(chan struct{}),
 		identities:     idswg,
@@ -328,7 +321,7 @@ func (s *synced) Nodes(ctx context.Context) error {
 // received from the remote cluster, and synchronized with the BPF datapath,
 // the remote cluster is disconnected, or the given context is canceled.
 func (s *synced) Services(ctx context.Context) error {
-	return s.Wait(ctx, s.services)
+	return s.Wait(ctx, s.services.WaitChannel())
 }
 
 // IPIdentities returns after that the initial list of ipcache entries and

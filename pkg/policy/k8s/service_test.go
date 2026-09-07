@@ -5,7 +5,6 @@ package k8s
 
 import (
 	"cmp"
-	"maps"
 	"net/netip"
 	"slices"
 	"testing"
@@ -18,7 +17,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
-	k8sConst "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
 	cilium_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
@@ -29,6 +27,7 @@ import (
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy/api"
 	policytypes "github.com/cilium/cilium/pkg/policy/types"
+	"github.com/cilium/cilium/pkg/source"
 )
 
 type fakePolicyImporter struct {
@@ -94,7 +93,8 @@ func (sf *servicesFixture) upsertService(name loadbalancer.ServiceName, lbls, se
 		Selector: selectors,
 	})
 	// Clear any old associations.
-	for be := range sf.backends.List(wtxn, loadbalancer.BackendByServiceName(name)) {
+	bes, _ := loadbalancer.ListBackendsByServiceName(wtxn, sf.backends, name)
+	for be := range bes {
 		sf.backends.Delete(wtxn, be)
 	}
 	for _, addrCluster := range backendAddrs {
@@ -104,11 +104,10 @@ func (sf *servicesFixture) upsertService(name loadbalancer.ServiceName, lbls, se
 			0,
 			loadbalancer.ScopeExternal)
 		be := &loadbalancer.Backend{
-			Address: addr,
-		}
-		be.Instances = be.Instances.Set(loadbalancer.BackendInstanceKey{
 			ServiceName: name,
-		}, loadbalancer.BackendParams{Address: addr})
+			Address:     addr,
+			Source:      source.Kubernetes,
+		}
 		ev.backendRevisions = append(ev.backendRevisions, sf.backends.Revision(wtxn))
 		sf.backends.Insert(wtxn, be)
 	}
@@ -234,9 +233,8 @@ func TestPolicyWatcher_updateToServicesPolicies(t *testing.T) {
 	// baz is similar to bar, but not an external service (thus not selectable)
 	bazSvcID := loadbalancer.NewServiceName("baz-ns", "baz-svc")
 	bazSvcSelector := map[string]string{
-		"app": "baz",
+		"app.kubernetes.io/name": "baz",
 	}
-
 	bazEps := []cmtypes.AddrCluster{barEpAddr}
 
 	servicesFixture := newServicesFixture(t)
@@ -278,15 +276,14 @@ func TestPolicyWatcher_updateToServicesPolicies(t *testing.T) {
 
 	select {
 	case <-policyAdd:
-		t.Fatalf("what1")
+		t.Fatalf("Unknown policy imported")
 	default:
 	}
 
 	// Add foo-svc, which is selected by svcByNameCNP twice
 	fooEv := servicesFixture.upsertService(fooSvcID, nil, nil, fooEps, nil)
 
-	err = p.updateToServicesPolicies(fooEv)
-	assert.NoError(t, err)
+	p.updateToServicesPolicies(fooEv)
 	rules = <-policyAdd
 	assert.Len(t, rules, 2)
 
@@ -313,8 +310,7 @@ func TestPolicyWatcher_updateToServicesPolicies(t *testing.T) {
 
 	// Add bar-svc, which is selected by both policies
 	barEv := servicesFixture.upsertService(barSvcID, barSvcLabels, nil, barEps, nil)
-	err = p.updateToServicesPolicies(barEv)
-	assert.NoError(t, err)
+	p.updateToServicesPolicies(barEv)
 
 	// Expect two policies to be updated (in any order)
 	var policies [2]policytypes.PolicyEntries
@@ -361,9 +357,8 @@ func TestPolicyWatcher_updateToServicesPolicies(t *testing.T) {
 
 	// Change foo-svc endpoints, which is selected by svcByNameCNP twice
 	fooEv = servicesFixture.upsertService(fooSvcID, nil, nil, fooEps[:1], &fooEv)
-	err = p.updateToServicesPolicies(fooEv)
+	p.updateToServicesPolicies(fooEv)
 
-	assert.NoError(t, err)
 	byNameRules = <-policyAdd
 	assert.Len(t, byNameRules, 2)
 
@@ -382,8 +377,7 @@ func TestPolicyWatcher_updateToServicesPolicies(t *testing.T) {
 
 	// Delete bar-svc labels. This should remove all CIDRs from svcByLabelCNP
 	barEv = servicesFixture.upsertService(barSvcID, nil, nil, barEps, &barEv)
-	err = p.updateToServicesPolicies(barEv)
-	assert.NoError(t, err)
+	p.updateToServicesPolicies(barEv)
 
 	// Expect two policies to be updated (in any order)
 	oldByNameRules := make(policytypes.PolicyEntries, 0)
@@ -423,20 +417,14 @@ func TestPolicyWatcher_updateToServicesPolicies(t *testing.T) {
 
 	// Add baz-svc, which is selected by svcByLabelCNP
 	bazEv := servicesFixture.upsertService(bazSvcID, barSvcLabels, bazSvcSelector, bazEps, nil)
-	err = p.updateToServicesPolicies(bazEv)
-	assert.NoError(t, err)
+	p.updateToServicesPolicies(bazEv)
 	rules = <-policyAdd
 	assert.Len(t, rules, 1)
 	// Check that Spec was translated
 	assert.Contains(t, rules[0].Labels, svcByLabelLbl)
 	assert.Len(t, rules[0].L3, 1)
 
-	bazEndpointSelector := api.NewESFromMatchRequirements(bazSvcSelector, nil)
-	bazEndpointSelector.Generated = true
-	var podPrefixLbl = labels.LabelSourceK8sKeyPrefix + k8sConst.PodNamespaceLabel
-	bazEndpointSelector.AddMatch(podPrefixLbl, bazSvcID.Namespace())
-
-	// The endpointSelector should be copied from the Service's selector
+	bazEndpointSelector := newEndpointSelectorForServiceSelector(bazSvcID.Namespace(), bazSvcSelector)
 	assert.Equal(t, bazEndpointSelector.LabelSelector.String(), rules[0].L3[0].Key())
 
 	// Check that policy has been marked
@@ -534,8 +522,7 @@ func TestPolicyWatcher_updateToServicesPoliciesTransformToEndpoint(t *testing.T)
 	}
 
 	fooEv := servicesFixture.upsertService(fooSvcID, nil, fooSvcSelector, nil, nil)
-	err = p.updateToServicesPolicies(fooEv)
-	assert.NoError(t, err)
+	p.updateToServicesPolicies(fooEv)
 	rules = <-policyAdd
 	assert.Len(t, rules, 1)
 
@@ -543,12 +530,7 @@ func TestPolicyWatcher_updateToServicesPoliciesTransformToEndpoint(t *testing.T)
 	assert.Contains(t, rules[0].Labels, svcByNameLbl)
 	assert.Len(t, rules[0].L3, 1)
 
-	fooEndpointSelector := api.NewESFromMatchRequirements(maps.Clone(fooSvcSelector), nil)
-	fooEndpointSelector.Generated = true
-	var podPrefixLbl = labels.LabelSourceK8sKeyPrefix + k8sConst.PodNamespaceLabel
-	fooEndpointSelector.AddMatch(podPrefixLbl, fooSvcID.Namespace())
-
-	// The endpointSelector should be copied from the Service's selector
+	fooEndpointSelector := newEndpointSelectorForServiceSelector(fooSvcID.Namespace(), fooSvcSelector)
 	assert.Equal(t, fooEndpointSelector.LabelSelector.String(), rules[0].L3[0].Key())
 
 	// Check that policies have been marked
@@ -564,17 +546,11 @@ func TestPolicyWatcher_updateToServicesPoliciesTransformToEndpoint(t *testing.T)
 		"new": "label",
 	}
 	fooEv = servicesFixture.upsertService(fooSvcID, fooSvcLabels, fooSvcSelector, nil, &fooEv)
-	err = p.updateToServicesPolicies(fooEv)
-	assert.NoError(t, err)
+	p.updateToServicesPolicies(fooEv)
 	rules = <-policyAdd
 	assert.Len(t, rules, 1)
 	assert.Len(t, rules[0].L3, 1)
 
-	fooEndpointSelector = api.NewESFromMatchRequirements(maps.Clone(fooSvcSelector), nil)
-	fooEndpointSelector.Generated = true
-	fooEndpointSelector.AddMatch(podPrefixLbl, fooSvcID.Namespace())
-
-	// The endpointSelector should be copied from the Service's selector
 	assert.Equal(t, fooEndpointSelector.LabelSelector.String(), rules[0].L3[0].Key())
 
 	// bar-svc is selected by svcByLabelCNP
@@ -624,18 +600,13 @@ func TestPolicyWatcher_updateToServicesPoliciesTransformToEndpoint(t *testing.T)
 	assert.Empty(t, rules[0].L3)
 
 	barEv := servicesFixture.upsertService(barSvcID, barSvcLabels, barSvcLabels, nil, nil)
-	err = p.updateToServicesPolicies(barEv)
+	p.updateToServicesPolicies(barEv)
 
-	assert.NoError(t, err)
 	rules = <-policyAdd
 	assert.Len(t, rules, 1)
 	assert.Len(t, rules[0].L3, 1)
 
-	barEndpointSelector := api.NewESFromMatchRequirements(maps.Clone(barSvcLabels), nil)
-	barEndpointSelector.Generated = true
-	barEndpointSelector.AddMatch(podPrefixLbl, barSvcID.Namespace())
-
-	// The endpointSelector should be copied from the Service's selector
+	barEndpointSelector := newEndpointSelectorForServiceSelector(barSvcID.Namespace(), barSvcLabels)
 	assert.Equal(t, barEndpointSelector.LabelSelector.String(), rules[0].L3[0].Key())
 
 	// Check that policies have been marked
@@ -650,8 +621,7 @@ func TestPolicyWatcher_updateToServicesPoliciesTransformToEndpoint(t *testing.T)
 
 	// Delete bar-svc labels. This should remove all toEndpoints from svcByLabelCNP
 	barEv = servicesFixture.upsertService(barSvcID, nil, barSvcLabels, nil, &barEv)
-	err = p.updateToServicesPolicies(barEv)
-	assert.NoError(t, err)
+	p.updateToServicesPolicies(barEv)
 	rules = <-policyAdd
 	assert.Len(t, rules, 1)
 	assert.Empty(t, rules[0].L3)
@@ -674,18 +644,12 @@ func TestPolicyWatcher_updateToServicesPoliciesTransformToEndpoint(t *testing.T)
 
 	// Add foo-svc again, which should re-add the policy
 	fooEv.previous = nil // Bypass change checks
-	err = p.updateToServicesPolicies(fooEv)
+	p.updateToServicesPolicies(fooEv)
 	p.onUpsert(svcByNameCNP, svcByNameKey, k8sAPIGroupCiliumNetworkPolicyV2, svcByNameResourceID, nil)
-	assert.NoError(t, err)
 	rules = <-policyAdd
 	assert.Len(t, rules, 1)
 	assert.Len(t, rules[0].L3, 1)
 
-	fooEndpointSelector = api.NewESFromMatchRequirements(maps.Clone(fooSvcSelector), nil)
-	fooEndpointSelector.Generated = true
-	fooEndpointSelector.AddMatch(podPrefixLbl, fooSvcID.Namespace())
-
-	// The endpointSelector should be copied from the Service's selector
 	assert.Equal(t, fooEndpointSelector.LabelSelector.String(), rules[0].L3[0].Key())
 
 	// Check that policies have been marked
@@ -1075,5 +1039,153 @@ func TestServiceEventStream(t *testing.T) {
 			ev := <-serviceEvents
 			require.True(t, ev.Equal(testCase.expected), "expected %+v to equal %+v", ev, testCase.expected)
 		}
+	}
+}
+
+func TestServiceSelectorMatches(t *testing.T) {
+	testSvc := func(lbls map[string]string, source string) serviceDetailer {
+		return serviceEvent{
+			name:   loadbalancer.NewServiceName("test-ns", "test-svc"),
+			labels: labels.Map2Labels(lbls, source),
+		}
+	}
+
+	tests := []struct {
+		name       string
+		sel        *api.K8sServiceSelectorNamespace
+		matches    []serviceDetailer
+		notMatches []serviceDetailer
+	}{
+		{
+			name: "matchLabels",
+			sel: &api.K8sServiceSelectorNamespace{
+				Selector: api.ServiceSelector{
+					LabelSelector: &slim_metav1.LabelSelector{
+						MatchLabels: map[string]string{"app": "bar"},
+					},
+				},
+			},
+			matches: []serviceDetailer{
+				testSvc(map[string]string{"app": "bar"}, "k8s"),
+				testSvc(map[string]string{"app": "bar"}, "other"),
+			},
+			notMatches: []serviceDetailer{
+				testSvc(map[string]string{"app": "baz"}, "k8s"),
+				testSvc(map[string]string{"any.app": "bar"}, "k8s"),
+			},
+		},
+		{
+			name: "matchLabels - dotted key",
+			sel: &api.K8sServiceSelectorNamespace{
+				Selector: api.ServiceSelector{
+					LabelSelector: &slim_metav1.LabelSelector{
+						MatchLabels: map[string]string{"app.kubernetes.io/name": "my-app"},
+					},
+				},
+			},
+			matches: []serviceDetailer{
+				testSvc(map[string]string{"app.kubernetes.io/name": "my-app"}, "k8s"),
+				testSvc(map[string]string{"app.kubernetes.io/name": "my-app"}, "any"),
+			},
+			notMatches: []serviceDetailer{
+				testSvc(map[string]string{"app.kubernetes.io/name": "not-my-app"}, "k8s"),
+			},
+		},
+		{
+			name: "matchExpression",
+			sel: &api.K8sServiceSelectorNamespace{
+				Selector: api.ServiceSelector{
+					LabelSelector: &slim_metav1.LabelSelector{
+						MatchExpressions: []slim_metav1.LabelSelectorRequirement{
+							{Key: "app.kubernetes.io/name", Operator: slim_metav1.LabelSelectorOpExists},
+						},
+					},
+				},
+			},
+			matches: []serviceDetailer{
+				testSvc(map[string]string{"app.kubernetes.io/name": "my-app"}, "k8s"),
+				testSvc(map[string]string{"app.kubernetes.io/name": "my-app"}, "any"),
+			},
+			notMatches: []serviceDetailer{
+				testSvc(map[string]string{"apps.kubernetes.io/name": "not-my-app"}, "k8s"),
+			},
+		},
+		{
+			name: "matchLabels - k8s source prefix",
+			sel: &api.K8sServiceSelectorNamespace{
+				Selector: api.ServiceSelector{
+					LabelSelector: &slim_metav1.LabelSelector{
+						MatchLabels: map[string]string{"k8s:app": "my-app"},
+					},
+				},
+			},
+			matches: []serviceDetailer{
+				testSvc(map[string]string{"app": "my-app"}, "k8s"),
+			},
+			notMatches: []serviceDetailer{
+				testSvc(map[string]string{"app": "my-app"}, "other"),
+				testSvc(map[string]string{"app": "not-my-app"}, "k8s"),
+			},
+		},
+		{
+			name: "matchLabels - any source prefix",
+			sel: &api.K8sServiceSelectorNamespace{
+				Selector: api.ServiceSelector{
+					LabelSelector: &slim_metav1.LabelSelector{
+						MatchLabels: map[string]string{"any:app": "my-app"},
+					},
+				},
+			},
+			matches: []serviceDetailer{
+				testSvc(map[string]string{"app": "my-app"}, "k8s"),
+				testSvc(map[string]string{"app": "my-app"}, "other"),
+			},
+			notMatches: []serviceDetailer{
+				testSvc(map[string]string{"app": "not-my-app"}, "k8s"),
+			},
+		},
+		{
+			name: "matchLabels and matchExpressions",
+			sel: &api.K8sServiceSelectorNamespace{
+				Selector: api.ServiceSelector{
+					LabelSelector: &slim_metav1.LabelSelector{
+						MatchLabels: map[string]string{"app": "bar"},
+						MatchExpressions: []slim_metav1.LabelSelectorRequirement{
+							{Key: "app.kubernetes.io/name", Operator: slim_metav1.LabelSelectorOpIn, Values: []string{"my-app"}},
+							{Key: "k8s:env", Operator: slim_metav1.LabelSelectorOpExists},
+						},
+					},
+				},
+			},
+			matches: []serviceDetailer{
+				testSvc(map[string]string{
+					"app.kubernetes.io/name": "my-app",
+					"app":                    "bar",
+					"env":                    "prod",
+				}, "k8s"),
+			},
+			notMatches: []serviceDetailer{
+				testSvc(map[string]string{
+					"app.kubernetes.io/name": "my-app",
+					"env":                    "prod",
+				}, "k8s"),
+				testSvc(map[string]string{
+					"app.kubernetes.io/name": "my-app",
+					"app":                    "bar",
+					"env":                    "prod",
+				}, "other"),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, svc := range tt.matches {
+				require.True(t, serviceSelectorMatches(tt.sel, svc))
+			}
+			for _, svc := range tt.notMatches {
+				require.False(t, serviceSelectorMatches(tt.sel, svc))
+			}
+		})
 	}
 }

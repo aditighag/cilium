@@ -8,7 +8,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	gatewayv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/cilium/cilium/operator/pkg/gateway-api/helpers"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -16,9 +16,9 @@ import (
 
 // indexTLSRoutebyBackendService takes a single TLSRoute and  returns all referenced backend service full names (`namespace/name`)
 // to add to the relevant index.
-func GenerateIndexerTLSRoutebyBackendService(c client.Client, logger *slog.Logger) client.IndexerFunc {
+func GenerateIndexerTLSRoutebyBackendService(c helpers.ClientReader, logger *slog.Logger) client.IndexerFunc {
 	return func(rawObj client.Object) []string {
-		route := rawObj.(*gatewayv1alpha2.TLSRoute)
+		route := rawObj.(*gatewayv1.TLSRoute)
 		var backendServices []string
 
 		for _, rule := range route.Spec.Rules {
@@ -45,12 +45,38 @@ func GenerateIndexerTLSRoutebyBackendService(c client.Client, logger *slog.Logge
 	}
 }
 
+// IndexTLSRouteByBackendServiceImport is a client.IndexerFunc that takes a single TLSRoute and
+// returns all referenced backend ServiceImport full names (`namespace/name`) to add to the relevant index.
+func IndexTLSRouteByBackendServiceImport(rawObj client.Object) []string {
+	route, ok := rawObj.(*gatewayv1.TLSRoute)
+	if !ok {
+		return nil
+	}
+	var backendServiceImports []string
+
+	for _, rule := range route.Spec.Rules {
+		for _, backend := range rule.BackendRefs {
+			if !helpers.IsServiceImport(backend.BackendObjectReference) {
+				continue
+			}
+			backendServiceImports = append(backendServiceImports,
+				types.NamespacedName{
+					Namespace: helpers.NamespaceDerefOr(backend.Namespace, route.Namespace),
+					Name:      string(backend.Name),
+				}.String(),
+			)
+		}
+	}
+
+	return backendServiceImports
+}
+
 // IndexTLSRouteByGateway takes a single TLSRoute and returns all referenced Gateway object full names (`namespace/name`)
 // to add to the relevant index.
 //
 // Note that this does _not_ filter to only Cilium-relevant Gateways.
 func IndexTLSRouteByGateway(rawObj client.Object) []string {
-	route := rawObj.(*gatewayv1alpha2.TLSRoute)
+	route := rawObj.(*gatewayv1.TLSRoute)
 	var gateways []string
 	for _, parent := range route.Spec.ParentRefs {
 		if !helpers.IsGateway(parent) {
@@ -64,4 +90,23 @@ func IndexTLSRouteByGateway(rawObj client.Object) []string {
 		)
 	}
 	return gateways
+}
+
+// IndexTLSRouteByListenerSet indexes TLSRoutes by all ListenerSet parents
+// referenced in the object, returning ListenerSet full names (`namespace/name`).
+func IndexTLSRouteByListenerSet(rawObj client.Object) []string {
+	route := rawObj.(*gatewayv1.TLSRoute)
+	var listenerSets []string
+	for _, parent := range route.Spec.ParentRefs {
+		if !helpers.IsListenerSet(parent) {
+			continue
+		}
+		listenerSets = append(listenerSets,
+			types.NamespacedName{
+				Namespace: helpers.NamespaceDerefOr(parent.Namespace, route.Namespace),
+				Name:      string(parent.Name),
+			}.String(),
+		)
+	}
+	return listenerSets
 }

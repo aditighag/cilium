@@ -10,6 +10,8 @@ space := $(empty) $(empty)
 comma := ,
 join-with-comma = $(subst $(space),$(comma),$(strip $1))
 
+shellquote = '$(subst ','\'',$(1))'
+
 define newline
 
 
@@ -60,16 +62,16 @@ ifeq ($(DOCKER_IMAGE_TAG),)
 endif
 
 # renovate: datasource=docker depName=gcr.io/etcd-development/etcd
-ETCD_IMAGE_VERSION = v3.6.7
-ETCD_IMAGE_SHA = sha256:70cd5d29d2efcbc4c15f2a63183fd537aae77ddbc46b3b97a8a97bc8751ec3b4
+ETCD_IMAGE_VERSION = v3.7.1
+ETCD_IMAGE_SHA = sha256:a9983dd6d9283138ab926daa307c6c25623636703ecf5645d5df4d666ce9eba2
 ETCD_IMAGE=gcr.io/etcd-development/etcd:$(ETCD_IMAGE_VERSION)@$(ETCD_IMAGE_SHA)
 
 export CILIUM_CLI ?= cilium
 export KUBECTL ?= kubectl
 
 # renovate: datasource=docker depName=quay.io/goswagger/swagger
-SWAGGER_VERSION = 0.33.1
-SWAGGER_IMAGE_SHA = sha256:03e351c87e7bf5de41b120aec97f0a2255f90a1cd802162ad1947f9e2de9e778
+SWAGGER_VERSION = 0.36.5
+SWAGGER_IMAGE_SHA = sha256:a9d9d38e4306c5d8eae62efafdfbac7ab701e288a6cd788327c99e5ac6121b49
 SWAGGER := $(CONTAINER_ENGINE) run -u $(shell id -u):$(shell id -g) --rm -v $(ROOT_DIR):$(ROOT_DIR) -w $(ROOT_DIR) --entrypoint swagger quay.io/goswagger/swagger:$(SWAGGER_VERSION)@$(SWAGGER_IMAGE_SHA)
 
 # go build/test/clean flags
@@ -106,7 +108,7 @@ ifneq ($(shell command -v go-junit-report),)
 		>(go-junit-report -parser gojson \
 			-code-owners=$(CODEOWNERS_PATH) \
 			-code-owners-prefix github.com/cilium/cilium/ \
-			-out "$(JUNIT_PATH)") \
+			-out $(call shellquote,$(JUNIT_PATH))) \
 		>($(GO) run $(ROOT_DIR)/tools/testowners \
 			--code-owners=$(CODEOWNERS_PATH)) \
 		>(tparse $(GOTEST_FORMATTER_FLAGS)) \
@@ -129,14 +131,14 @@ ifneq ($(GOTEST_FORMATTER),cat)
 endif
 
 # renovate: datasource=docker depName=golangci/golangci-lint
-GOLANGCILINT_WANT_VERSION = v2.7.2
-GOLANGCILINT_IMAGE_SHA = sha256:5d6d5c70a61f1356adfd9dd6316ce286799fefc9d743421356ff1b00842368ba
+GOLANGCILINT_WANT_VERSION = v2.13.2
+GOLANGCILINT_IMAGE_SHA = sha256:ba07dffad130794ae79ebaa0056809d18c0168f3f846480ffd3eb6c04578b83d
 GOLANGCILINT_VERSION = $(shell golangci-lint version --short 2>/dev/null)
 
 VERSION = $(shell cat $(dir $(lastword $(MAKEFILE_LIST)))/VERSION)
 VERSION_MAJOR = $(shell cat $(dir $(lastword $(MAKEFILE_LIST)))/VERSION | cut -d. -f1)
 # Use git only if in a Git repo
-ifneq ($(wildcard $(dir $(lastword $(MAKEFILE_LIST)))/.git/HEAD),)
+ifneq ($(wildcard $(dir $(lastword $(MAKEFILE_LIST)))/.git),)
     GIT_VERSION = $(shell git show -s --format='format:%h %aI')
 else
     GIT_VERSION = $(shell cat 2>/dev/null $(ROOT_DIR)/GIT_VERSION)
@@ -202,9 +204,6 @@ GO_CLEAN_FLAGS += -mod=vendor
 
 CGO_ENABLED ?= 0
 
-# See https://pkg.go.dev/internal/goexperiment
-GOEXPERIMENT ?=
-
 # Support CGO cross-compiling for amd64 and arm64 targets
 GO_BUILD_ENV = CGO_ENABLED=$(CGO_ENABLED)
 CROSS_ARCH =
@@ -225,10 +224,6 @@ ifneq ($(GOOS),)
     GO_BUILD_ENV += GOOS=$(GOOS)
 endif
 
-ifneq ($(GOEXPERIMENT),)
-    GO_BUILD_ENV += GOEXPERIMENT=$(GOEXPERIMENT)
-endif
-
 ifneq ($(RACE),)
     GO_BUILD_FLAGS += -race
     GO_TEST_FLAGS += -race
@@ -245,11 +240,6 @@ endif
 
 ifneq ($(LOCKDEBUG),)
     GO_TAGS_FLAGS += lockdebug
-endif
-
-ifneq ($(findstring boringcrypto,$(GOEXPERIMENT)),)
-    CGO_ENABLED = 1
-    GO_BUILD_LDFLAGS += -linkmode external -extldflags "-static --enable-static-nss"
 endif
 
 GO_BUILD_FLAGS += -ldflags '$(GO_BUILD_LDFLAGS) $(EXTRA_GO_BUILD_LDFLAGS)' -tags=$(call join-with-comma,$(GO_TAGS_FLAGS)) $(EXTRA_GO_BUILD_FLAGS)
@@ -271,9 +261,8 @@ HELM_TOOLBOX_VERSION ?= "v1.1.0"
 HELM_TOOLBOX_SHA ?= "961693f182b9b456ed90e5274ac5df81e4af4343104e252666959cdf9570ce9e"
 HELM_TOOLBOX_IMAGE ?= "quay.io/cilium/helm-toolbox:$(HELM_TOOLBOX_VERSION)@sha256:$(HELM_TOOLBOX_SHA)"
 
-YQ_VERSION ?= "4.40.5"
-YQ_SHA ?= "32be61dc94d0acc44f513ba69d0fc05f1f92c2e760491f2a27e11fc13cde6327"
-YQ_IMAGE ?= "docker.io/mikefarah/yq:$(YQ_VERSION)@sha256:$(YQ_SHA)"
+# renovate: datasource=docker
+YQ_IMAGE ?= "docker.io/mikefarah/yq@sha256:32be61dc94d0acc44f513ba69d0fc05f1f92c2e760491f2a27e11fc13cde6327" # 4.40.5
 
 define print_help_line
   @printf "  \033[36m%-29s\033[0m %s.\n" $(1) $(2)

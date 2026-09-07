@@ -23,7 +23,10 @@ import (
 	"github.com/cilium/cilium/daemon/restapi"
 	"github.com/cilium/cilium/pkg/api"
 	"github.com/cilium/cilium/pkg/auth"
+	awsAgent "github.com/cilium/cilium/pkg/aws/agent"
 	"github.com/cilium/cilium/pkg/bgp"
+	bgpConfig "github.com/cilium/cilium/pkg/bgp/config"
+	"github.com/cilium/cilium/pkg/bpf/stats"
 	cgroup "github.com/cilium/cilium/pkg/cgroups/manager"
 	"github.com/cilium/cilium/pkg/ciliumenvoyconfig"
 	"github.com/cilium/cilium/pkg/clustermesh"
@@ -52,12 +55,14 @@ import (
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/k8s/hostfirewallbypass"
 	k8sSynced "github.com/cilium/cilium/pkg/k8s/synced"
+	k8sTables "github.com/cilium/cilium/pkg/k8s/tables"
 	"github.com/cilium/cilium/pkg/k8s/watchers"
 	"github.com/cilium/cilium/pkg/k8s/watchers/resources"
 	kpr "github.com/cilium/cilium/pkg/kpr/initializer"
 	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/kvstore/store"
 	"github.com/cilium/cilium/pkg/l2announcer"
+	"github.com/cilium/cilium/pkg/lbipamconfig"
 	loadbalancer_cell "github.com/cilium/cilium/pkg/loadbalancer/cell"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/maglev"
@@ -68,13 +73,25 @@ import (
 	"github.com/cilium/cilium/pkg/maps/ratelimitmap"
 	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/metrics/features"
+	"github.com/cilium/cilium/pkg/networkdriver"
 	"github.com/cilium/cilium/pkg/node"
 	nodeManager "github.com/cilium/cilium/pkg/node/manager"
 	"github.com/cilium/cilium/pkg/node/neighbordiscovery"
+	noderestapi "github.com/cilium/cilium/pkg/node/restapi"
 	nodesync "github.com/cilium/cilium/pkg/node/sync"
 	"github.com/cilium/cilium/pkg/nodediscovery"
+
+	// Side-effect import: registers the EC2 IMDS-based AWS metadata fetcher
+	// with pkg/nodediscovery so ENI IPAM works at runtime in the agent.
+	// Kept out of cilium-operator-generic (which does not import the daemon
+	// package) to avoid pulling the AWS SDK into non-AWS operator builds.
+	hiveHealth "github.com/cilium/cilium/pkg/hive/health"
+	_ "github.com/cilium/cilium/pkg/nodediscovery/eni"
+	"github.com/cilium/cilium/pkg/nodeipamconfig"
 	"github.com/cilium/cilium/pkg/option"
 	policy "github.com/cilium/cilium/pkg/policy/cell"
+	policycommands "github.com/cilium/cilium/pkg/policy/commands"
+	"github.com/cilium/cilium/pkg/policy/compute"
 	policyDirectory "github.com/cilium/cilium/pkg/policy/directory"
 	policyK8s "github.com/cilium/cilium/pkg/policy/k8s"
 	"github.com/cilium/cilium/pkg/pprof"
@@ -82,6 +99,7 @@ import (
 	"github.com/cilium/cilium/pkg/signal"
 	"github.com/cilium/cilium/pkg/source"
 	"github.com/cilium/cilium/pkg/status"
+	"github.com/cilium/cilium/pkg/subnet"
 	"github.com/cilium/cilium/pkg/svcrouteconfig"
 	"github.com/cilium/cilium/pkg/ztunnel"
 )
@@ -109,6 +127,13 @@ var (
 		// Runs the gops agent, a tool to diagnose Go processes.
 		gops.Cell(defaults.EnableGops, defaults.GopsPortAgent),
 
+		// Provides the 'health/history' command. The health history logs are stored
+		// in the state directory.
+		hiveHealth.HistoryCell,
+		cell.ProvidePrivate(func(cfg *option.DaemonConfig) hiveHealth.HistoryDir {
+			return hiveHealth.HistoryDir(cfg.StateDir)
+		}),
+
 		// Provides Clientset, API for accessing Kubernetes objects.
 		k8sClient.Cell,
 
@@ -124,7 +149,7 @@ var (
 
 		// Provides the Client to access the KVStore.
 		cell.Provide(kvstoreExtraOptions),
-		kvstore.Cell(kvstore.DisabledBackendName),
+		kvstore.Cell(kvstore.DisabledBackendName, kvstore.OptAsyncWaitForEstablished),
 		cell.Invoke(kvstoreLocksGC),
 
 		cni.Cell,
@@ -150,7 +175,9 @@ var (
 		store.Cell,
 
 		// Provide CRD resource names for 'k8sSynced.CRDSyncCell' below.
-		cell.Provide(func() k8sSynced.CRDSyncResourceNames { return k8sSynced.AgentCRDResourceNames() }),
+		cell.Provide(func(bgpCfg bgpConfig.BGPConfig) k8sSynced.CRDSyncResourceNamesOut {
+			return k8sSynced.NewCRDSyncResourceNamesOut(k8sSynced.AgentCRDResourceNames(bgpCfg)...)
+		}),
 
 		// CRDSyncCell provides a promise that is resolved as soon as CRDs used by the
 		// agent have k8sSynced.
@@ -160,6 +187,9 @@ var (
 
 		// Shell for inspecting the agent. Listens on the 'shell.sock' UNIX socket.
 		shell.ServerCell(defaults.ShellSockPath),
+
+		// BPF runtime stats commands for the hive shell.
+		stats.Cell,
 
 		// Cilium Agent Healthz endpoints (agent, kubeproxy, ...)
 		healthz.Cell,
@@ -197,7 +227,7 @@ var (
 		agentK8s.ResourcesCell,
 
 		// StateDB tables for Kubernetes objects.
-		agentK8s.TablesCell,
+		k8sTables.TablesCell,
 
 		// Shared synchronization structures for waiting on K8s resources to
 		// be synced
@@ -208,6 +238,9 @@ var (
 
 		// NodeManager maintains a collection of other nodes in the cluster.
 		nodeManager.Cell,
+
+		// Node REST API serves snapshots and changes from the node table.
+		noderestapi.Cell,
 
 		// NodeNeighborDiscovery is a node handler that subscribes to the NodeManager
 		// and ensures node IPs are "forwardable" by adding them to the forwardable IP table.
@@ -232,6 +265,12 @@ var (
 		// Maglev table computtations
 		maglev.Cell,
 
+		// LB-IPAM configuration
+		lbipamconfig.Cell,
+
+		// Node-IPAM configuration
+		nodeipamconfig.Cell,
+
 		// Control-plane for configuring service load-balancing
 		loadbalancer_cell.Cell,
 
@@ -254,6 +293,9 @@ var (
 		// The BGP Control Plane which enables various BGP related interop.
 		bgp.Cell,
 
+		// The Cilium Network Driver for exposing network devices to workloads via DRA.
+		networkdriver.Cell,
+
 		// Brokers datapath signals from signalmap
 		signal.Cell,
 
@@ -269,6 +311,9 @@ var (
 		// IPAM provides IP address management.
 		ipamcell.Cell,
 
+		// Provides the AWS ENI customization of the multi-pool IPAM allocator.
+		awsAgent.Cell,
+
 		// Egress Gateway allows originating traffic from specific IPv4 addresses.
 		egressgateway.Cell,
 
@@ -283,6 +328,10 @@ var (
 
 		// Provides PolicyRepository (List of policy rules)
 		policy.Cell,
+		policycommands.Cell,
+
+		// Provides PolicyRecomputer (policy computation).
+		compute.Cell,
 
 		// K8s policy resource watcher cell. It depends on the half-initialized daemon which is
 		// resolved by newDaemonPromise()
@@ -292,8 +341,8 @@ var (
 		policyDirectory.Cell,
 
 		// ClusterMesh is the Cilium's multicluster implementation.
-		cell.Config(cmtypes.DefaultClusterInfo),
-		cell.Config(cmtypes.DefaultPolicyConfig),
+		cmtypes.ClusterInfoCell,
+		cmtypes.PolicyConfigCell,
 		clustermesh.Cell,
 
 		// L2announcer resolves l2announcement policies, services, node labels and devices into a list of IPs+netdevs
@@ -312,7 +361,11 @@ var (
 		natStats.Cell,
 
 		// Provide resource groups to watch.
-		cell.Provide(func() watchers.ResourceGroupFunc { return allResourceGroups }),
+		cell.Provide(func(bgpCfg bgpConfig.BGPConfig) watchers.ResourceGroupFunc {
+			return func(logger *slog.Logger, cfg watchers.WatcherConfiguration) (resourceGroups, waitForCachesOnly []string) {
+				return allResourceGroups(logger, cfg, bgpCfg)
+			}
+		}),
 
 		// K8s Watcher provides the core k8s watchers
 		watchers.Cell,
@@ -358,6 +411,9 @@ var (
 
 		// Instantiates an xDS server used for zTunnel integration.
 		ztunnel.Cell,
+
+		// Subnet topology watcher and management.
+		subnet.Cell,
 	)
 )
 
@@ -406,7 +462,7 @@ var pprofConfig = pprof.Config{
 
 // resourceGroups are all of the core Kubernetes and Cilium resource groups
 // which the Cilium agent watches to implement CNI functionality.
-func allResourceGroups(logger *slog.Logger, cfg watchers.WatcherConfiguration) (resourceGroups, waitForCachesOnly []string) {
+func allResourceGroups(logger *slog.Logger, cfg watchers.WatcherConfiguration, bgpCfg bgpConfig.BGPConfig) (resourceGroups, waitForCachesOnly []string) {
 	k8sGroups := []string{
 		// Pods can contain labels which are essential for endpoints
 		// being restored to have the right identity.
@@ -421,7 +477,7 @@ func allResourceGroups(logger *slog.Logger, cfg watchers.WatcherConfiguration) (
 		waitForCachesOnly = append(waitForCachesOnly, resources.K8sAPIGroupNetworkingV1Core)
 	}
 
-	ciliumGroups, waitOnlyList := watchers.GetGroupsForCiliumResources(logger, k8sSynced.AgentCRDResourceNames())
+	ciliumGroups, waitOnlyList := watchers.GetGroupsForCiliumResources(logger, k8sSynced.AgentCRDResourceNames(bgpCfg))
 	waitForCachesOnly = append(waitForCachesOnly, waitOnlyList...)
 
 	return append(k8sGroups, ciliumGroups...), waitForCachesOnly
@@ -433,13 +489,13 @@ func kvstoreExtraOptions(in struct {
 
 	Logger *slog.Logger
 
-	NodeManager nodeManager.NodeManager
-	ClientSet   k8sClient.Clientset
-	Resolver    dial.Resolver
+	ClusterSizeDependantInterval node.ClusterSizeDependantIntervalFunc
+	ClientSet                    k8sClient.Clientset
+	Resolver                     dial.Resolver
 },
-) (kvstore.ExtraOptions, kvstore.BootstrapStat) {
+) kvstore.ExtraOptions {
 	goopts := kvstore.ExtraOptions{
-		ClusterSizeDependantInterval: in.NodeManager.ClusterSizeDependantInterval,
+		ClusterSizeDependantInterval: in.ClusterSizeDependantInterval,
 	}
 
 	// If K8s is enabled we can do the service translation automagically by
@@ -451,7 +507,7 @@ func kvstoreExtraOptions(in struct {
 		}
 	}
 
-	return goopts, &bootstrapStats.kvstore
+	return goopts
 }
 
 // kvstoreLocksGC registers the kvstore locks GC logic.

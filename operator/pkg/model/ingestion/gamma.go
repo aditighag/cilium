@@ -10,8 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
-	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
-	mcsapiv1alpha1 "sigs.k8s.io/mcs-api/pkg/apis/v1alpha1"
+	mcsapiv1beta1 "sigs.k8s.io/mcs-api/pkg/apis/v1beta1"
 
 	"github.com/cilium/cilium/operator/pkg/gateway-api/helpers"
 	"github.com/cilium/cilium/operator/pkg/model"
@@ -22,7 +21,7 @@ import (
 type GammaInput struct {
 	HTTPRoutes      []gatewayv1.HTTPRoute
 	GRPCRoutes      []gatewayv1.GRPCRoute
-	ReferenceGrants []gatewayv1beta1.ReferenceGrant
+	ReferenceGrants []gatewayv1.ReferenceGrant
 	Services        []corev1.Service
 }
 
@@ -59,7 +58,7 @@ func toGammaHTTPRoutes(
 	parentServices map[types.NamespacedName]model.FullyQualifiedResource,
 	input []gatewayv1.HTTPRoute,
 	services []corev1.Service,
-	grants []gatewayv1beta1.ReferenceGrant,
+	grants []gatewayv1.ReferenceGrant,
 ) []model.HTTPListener {
 	var resHTTP []model.HTTPListener
 
@@ -146,7 +145,7 @@ func toGammaHTTPRoutes(
 			} else {
 				// Otherwise, we find ones where appProtocol is http
 				for _, port := range parentSvc.Spec.Ports {
-					if port.Protocol == "" || port.Protocol == "TCP" {
+					if port.Protocol == "" || port.Protocol == corev1.ProtocolTCP {
 						// This is a little suspect, but we should only be using ones where AppProtocol is http
 						// _apparently_
 						if (port.AppProtocol == nil) || (port.AppProtocol != nil && *port.AppProtocol != "http") {
@@ -175,7 +174,8 @@ func toGammaHTTPRoutes(
 					Type: string(corev1.ServiceTypeClusterIP),
 				}
 				res.Gamma = true
-				res.Routes = append(res.Routes, extractRoutes(int32(portVal), []string{res.Hostname}, hr, services, []mcsapiv1alpha1.ServiceImport{}, grants)...)
+				emptyBackendTLSPolicyMap := make(helpers.BackendTLSPolicyServiceMap)
+				res.Routes = append(res.Routes, extractRoutes(log, int32(portVal), []string{res.Hostname}, hr, services, []mcsapiv1beta1.ServiceImport{}, grants, emptyBackendTLSPolicyMap)...)
 				resHTTP = append(resHTTP, res)
 			}
 
@@ -202,7 +202,7 @@ func toGammaGRPCRoutes(
 	parentServices map[types.NamespacedName]model.FullyQualifiedResource,
 	input []gatewayv1.GRPCRoute,
 	services []corev1.Service,
-	grants []gatewayv1beta1.ReferenceGrant,
+	grants []gatewayv1.ReferenceGrant,
 ) []model.HTTPListener {
 	var resGRPC []model.HTTPListener
 
@@ -289,7 +289,7 @@ func toGammaGRPCRoutes(
 			} else {
 				// Otherwise, we find ones where appProtocol is grpc
 				for _, port := range parentSvc.Spec.Ports {
-					if port.Protocol == "" || port.Protocol == "TCP" {
+					if port.Protocol == "" || port.Protocol == corev1.ProtocolTCP {
 						// This is a little suspect, but we should only be using ones where AppProtocol is grpc
 						// _apparently_
 						if (port.AppProtocol == nil) || (port.AppProtocol != nil && *port.AppProtocol != "grpc") {
@@ -318,7 +318,7 @@ func toGammaGRPCRoutes(
 					Type: string(corev1.ServiceTypeClusterIP),
 				}
 				res.Gamma = true
-				res.Routes = append(res.Routes, extractGRPCRoutes([]string{res.Hostname}, grpcr, services, []mcsapiv1alpha1.ServiceImport{}, grants)...)
+				res.Routes = append(res.Routes, extractGRPCRoutes([]string{res.Hostname}, grpcr, services, []mcsapiv1beta1.ServiceImport{}, grants)...)
 				resGRPC = append(resGRPC, res)
 			}
 

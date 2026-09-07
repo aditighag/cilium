@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path"
 	"path/filepath"
 	"testing"
 	"time"
@@ -34,10 +33,6 @@ import (
 )
 
 var (
-	fakeConfig = &option.DaemonConfig{
-		K8sNamespace: "kube-system",
-	}
-
 	testConfigs = []testConfig{
 		{
 			name:            "disable_operator_manages_identities",
@@ -52,6 +47,7 @@ var (
 
 func testAllocatorConfig(enableOperatorManageCIDs bool, maxAttempts int) AllocatorConfig {
 	return AllocatorConfig{
+		ClusterInfo:              cmtypes.DefaultClusterInfo,
 		EnableOperatorManageCIDs: enableOperatorManageCIDs,
 		Timeout:                  5 * time.Second,
 		SyncInterval:             1 * time.Hour,
@@ -272,7 +268,7 @@ func testAllocator(t *testing.T, client kvstore.Client) {
 	lbls3 := labels.NewLabelsFromSortedList("id=bar;user=susan")
 
 	owner := newDummyOwner(logger)
-	identity.InitWellKnownIdentities(fakeConfig, cmtypes.ClusterInfo{Name: "default", ID: 5})
+	identity.InitWellKnownIdentities("kube-system", cmtypes.ClusterInfo{Name: "default", ID: 5})
 	// The nils are only used by k8s CRD identities. We default to kvstore.
 	mgr := NewCachingIdentityAllocator(logger, owner, NewTestAllocatorConfig())
 	<-mgr.InitIdentityAllocator(nil, client)
@@ -405,7 +401,7 @@ func testAllocatorOperatorIDManagement(t *testing.T, cl kvstoreClient) {
 			_, kubeClient := k8sClient.NewFakeClientset(logger)
 
 			owner := newDummyOwner(logger)
-			identity.InitWellKnownIdentities(fakeConfig, cmtypes.ClusterInfo{Name: "default", ID: 5})
+			identity.InitWellKnownIdentities("kube-system", cmtypes.ClusterInfo{Name: "default", ID: 5})
 			mgr := NewCachingIdentityAllocator(logger, owner, testAllocatorConfig(true, 2))
 			<-mgr.InitIdentityAllocator(kubeClient, cl)
 			defer mgr.Close()
@@ -490,8 +486,8 @@ type kvstoreClient struct{ kvstore.Client }
 
 func (c *kvstoreClient) addIDKVStore(ctx context.Context, id string, lbls labels.Labels) error {
 	key := &cacheKey.GlobalIdentity{LabelArray: lbls.LabelArray()}
-	idPrefix := path.Join(IdentitiesPath, "id")
-	keyPath := path.Join(idPrefix, id)
+	idPrefix := kvstore.JoinKey(IdentitiesPath, "id")
+	keyPath := kvstore.JoinKey(idPrefix, id)
 	success, err := c.CreateOnly(ctx, keyPath, []byte(key.GetKey()), false)
 	if err != nil || !success {
 		return fmt.Errorf("unable to create master key '%s': %w", keyPath, err)
@@ -500,8 +496,8 @@ func (c *kvstoreClient) addIDKVStore(ctx context.Context, id string, lbls labels
 }
 
 func (c *kvstoreClient) removeIDKVStore(ctx context.Context, id string) error {
-	prefix := path.Join(IdentitiesPath, "id")
-	key := path.Join(prefix, id)
+	prefix := kvstore.JoinKey(IdentitiesPath, "id")
+	key := kvstore.JoinKey(prefix, id)
 	return c.Delete(ctx, key)
 }
 
@@ -520,7 +516,7 @@ func testLocalAllocation(t *testing.T, testConfig testConfig, client kvstore.Cli
 	logger := hivetest.Logger(t)
 
 	owner := newDummyOwner(logger)
-	identity.InitWellKnownIdentities(fakeConfig, cmtypes.ClusterInfo{Name: "default", ID: 5})
+	identity.InitWellKnownIdentities("kube-system", cmtypes.ClusterInfo{Name: "default", ID: 5})
 	// The nils are only used by k8s CRD identities. We default to kvstore.
 	mgr := NewCachingIdentityAllocator(logger, owner, testConfig.allocatorConfig)
 	<-mgr.InitIdentityAllocator(nil, client)
@@ -717,7 +713,7 @@ func TestClusterIDValidator(t *testing.T) {
 	)
 
 	var (
-		validator = clusterIDValidator(cid)
+		validator = clusterIDValidator(cmtypes.ClusterInfo{ID: cid, MaxConnectedClusters: 255}, cid)
 		key       = &cacheKey.GlobalIdentity{}
 	)
 

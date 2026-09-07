@@ -4,11 +4,15 @@
 package sockets
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
+	"os"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/cilium/hive/hivetest"
 
@@ -200,7 +204,7 @@ func BenchmarkSocketDeserialize(b *testing.B) {
 
 type socketDestroyerTester interface {
 	SocketDestroyer
-	PrepareAddress(network string, cookie uint64, addr any) error
+	PrepareAddress(cookie uint64, addr string) error
 	Reset() error
 }
 
@@ -216,7 +220,7 @@ func newTestNetlinkSocketDestroyer(tb testing.TB) socketDestroyerTester {
 	}
 }
 
-func (d *netlinkSocketDestroyer) PrepareAddress(network string, cookie uint64, addr any) error {
+func (d *netlinkSocketDestroyer) PrepareAddress(cookie uint64, addr string) error {
 	return nil
 }
 
@@ -241,7 +245,7 @@ func newTestBPFSocketDestroyer(tb testing.TB) socketDestroyerTester {
 		maps.MaxSockRevNat4MapEntries,
 		0,
 	)
-	require.NoError(tb, sockRevNat4Map.OpenOrCreate())
+	require.NoError(tb, sockRevNat4Map.CreateUnpinned())
 	sockRevNat6Map := bpf.NewMap(maps.SockRevNat6MapName,
 		ebpf.LRUHash,
 		&maps.SockRevNat6Key{},
@@ -249,7 +253,7 @@ func newTestBPFSocketDestroyer(tb testing.TB) socketDestroyerTester {
 		maps.MaxSockRevNat6MapEntries,
 		0,
 	)
-	require.NoError(tb, sockRevNat6Map.OpenOrCreate())
+	require.NoError(tb, sockRevNat6Map.CreateUnpinned())
 	progs, filterSetter, err := loader.LoadSockTerm(hivetest.Logger(tb), sockRevNat4Map, sockRevNat6Map)
 	require.NoError(tb, err)
 	tb.Cleanup(func() {
@@ -269,34 +273,24 @@ func newTestBPFSocketDestroyer(tb testing.TB) socketDestroyerTester {
 	}
 }
 
-func (d *testBPFSocketDestroyer) PrepareAddress(network string, cookie uint64, addr any) error {
+func (d *testBPFSocketDestroyer) PrepareAddress(cookie uint64, addr string) error {
 	var key bpf.MapKey
 	var value bpf.MapValue
 	var sockRevMap *bpf.Map
-	var ip net.IP
-	var port int
 
-	if udpAddr, ok := addr.(*net.UDPAddr); ok {
-		ip = udpAddr.IP
-		port = udpAddr.Port
-	} else if tcpAddr, ok := addr.(*net.TCPAddr); ok {
-		ip = tcpAddr.IP
-		port = tcpAddr.Port
-	} else {
-		return fmt.Errorf("unknown address type: %v", addr)
-	}
+	addrPort := netip.MustParseAddrPort(addr)
+	// v4-in-v6 connections are managed by the v4 map
+	a := addrPort.Addr().Unmap()
+	p := addrPort.Port()
 
-	switch network {
-	case "udp", "tcp":
-		key = maps.NewSockRevNat4Key(cookie, ip, uint16(port))
+	if a.Is4() {
+		key = maps.NewSockRevNat4Key(cookie, a.AsSlice(), p)
 		value = &maps.SockRevNat4Value{}
 		sockRevMap = d.sockRevNat4Map
-	case "udp6", "tcp6":
-		key = maps.NewSockRevNat6Key(cookie, ip, uint16(port))
+	} else {
+		key = maps.NewSockRevNat6Key(cookie, a.AsSlice(), p)
 		value = &maps.SockRevNat6Value{}
 		sockRevMap = d.sockRevNat6Map
-	default:
-		return fmt.Errorf("unknown network: %s", network)
 	}
 
 	return sockRevMap.Update(key, value)
@@ -320,7 +314,7 @@ func makeSocketDestroyers(tb testing.TB) map[string]socketDestroyerTester {
 	}
 }
 
-func startServer(tb testing.TB, network string, addr string) (any, error) {
+func startServer(tb testing.TB, network string, addr string) error {
 	var serverAddr any
 	var listener io.Closer
 	var err error
@@ -329,27 +323,89 @@ func startServer(tb testing.TB, network string, addr string) (any, error) {
 	case "udp", "udp6":
 		serverAddr, err = net.ResolveUDPAddr(network, addr)
 		if err != nil {
-			return nil, fmt.Errorf("resolving UDP address: %w", err)
+			return fmt.Errorf("resolving UDP address: %w", err)
 		}
 		listener, err = net.ListenUDP(network, serverAddr.(*net.UDPAddr))
 		if err != nil {
-			return nil, fmt.Errorf("start listening: %w", err)
+			return fmt.Errorf("start listening: %w", err)
 		}
 	case "tcp", "tcp6":
 		serverAddr, err = net.ResolveTCPAddr(network, addr)
 		if err != nil {
-			return nil, fmt.Errorf("resolving TCP address: %w", err)
+			return fmt.Errorf("resolving TCP address: %w", err)
 		}
 		listener, err = net.ListenTCP(network, serverAddr.(*net.TCPAddr))
 		if err != nil {
-			return nil, fmt.Errorf("start listening: %w", err)
+			return fmt.Errorf("start listening: %w", err)
 		}
 	}
 
 	tb.Cleanup(func() {
 		listener.Close()
 	})
-	return serverAddr, nil
+	return nil
+}
+
+func dial(tb testing.TB, network string, addr string) (net.Conn, error) {
+	var sockType, proto, fd int
+	var sa unix.Sockaddr
+	var err error
+
+	switch network {
+	case "tcp", "tcp6":
+		sockType = unix.SOCK_STREAM
+		proto = unix.IPPROTO_TCP
+	case "udp", "udp6":
+		sockType = unix.SOCK_DGRAM
+		proto = unix.IPPROTO_UDP
+	}
+
+	addrPort := netip.MustParseAddrPort(addr)
+	a := addrPort.Addr()
+	p := addrPort.Port()
+
+	// can't use net.Dial(), as it doesn't support AF_INET6 for a v4-in-v6 address
+	if a.Is4() {
+		fd, err = unix.Socket(unix.AF_INET, sockType, proto)
+		if err != nil {
+			return nil, fmt.Errorf("Failed to create AF_INET socket: %w", err)
+		}
+
+		sa4 := &unix.SockaddrInet4{
+			Addr: a.As4(),
+			Port: int(p),
+		}
+		sa = sa4
+	} else {
+		fd, err = unix.Socket(unix.AF_INET6, sockType, proto)
+		if err != nil {
+			return nil, fmt.Errorf("Failed to create AF_INET6 socket: %w", err)
+		}
+
+		sa6 := &unix.SockaddrInet6{
+			Addr: a.As16(),
+			Port: int(p),
+		}
+		sa = sa6
+	}
+
+	tb.Cleanup(func() {
+		unix.Close(fd)
+	})
+
+	if err := unix.Connect(fd, sa); err != nil {
+		return nil, fmt.Errorf("Failed to connect: %w", err)
+	}
+
+	file := os.NewFile(uintptr(fd), fmt.Sprintf("client-socket:%s/%s", network, addr))
+	defer file.Close()
+
+	conn, err := net.FileConn(file)
+	if err != nil {
+		return nil, fmt.Errorf("failed to bind file descriptor to net.Conn: %w", err)
+	}
+
+	return conn, nil
 }
 
 func prepareConnectionsAndMaps(t *testing.T, servers map[string][]string, sdt socketDestroyerTester) (map[string][]net.Conn, error) {
@@ -357,11 +413,11 @@ func prepareConnectionsAndMaps(t *testing.T, servers map[string][]string, sdt so
 
 	for addr, networks := range servers {
 		for _, network := range networks {
-			connectAddr, err := startServer(t, network, addr)
+			err := startServer(t, network, addr)
 			if err != nil {
 				return nil, fmt.Errorf("starting server: %w", err)
 			}
-			conn, err := net.Dial(network, addr)
+			conn, err := dial(t, network, addr)
 			if err != nil {
 				return nil, fmt.Errorf("dialing %s/%s: %w", network, addr, err)
 			}
@@ -383,7 +439,7 @@ func prepareConnectionsAndMaps(t *testing.T, servers map[string][]string, sdt so
 			if err != nil {
 				return nil, fmt.Errorf("getting socket cookie: %w", err)
 			}
-			if err := sdt.PrepareAddress(network, cookie, connectAddr); err != nil {
+			if err := sdt.PrepareAddress(cookie, addr); err != nil {
 				return nil, fmt.Errorf("preparing socket filter %s/%s %v: %w", network, addr, cookie, err)
 			}
 			conns[addr] = append(conns[addr], conn)
@@ -418,12 +474,16 @@ func TestPrivilegedSocketDestroyers(t *testing.T) {
 	testutils.PrivilegedTest(t)
 	log := hivetest.Logger(t)
 
+	bpf.CheckOrMountFS(log, "")
+
 	socketDestroyers := makeSocketDestroyers(t)
+	// network family is only relevant for the server. Client's socket type is based on the actual addr string.
 	servers := map[string][]string{
-		"127.0.0.1:8888": {"udp", "tcp"},
-		"[::1]:8888":     {"udp6", "tcp6"},
-		"127.0.0.1:8889": {"udp", "tcp"},
-		"[::1]:8889":     {"udp6", "tcp6"},
+		"127.0.0.1:8888":          {"udp", "tcp"},
+		"[::1]:8888":              {"udp6", "tcp6"},
+		"127.0.0.1:8889":          {"udp", "tcp"},
+		"[::1]:8889":              {"udp6", "tcp6"},
+		"[::ffff:127.0.0.1]:8890": {"udp", "tcp"},
 	}
 	testCases := map[string]struct {
 		filter         SocketFilter
@@ -432,7 +492,7 @@ func TestPrivilegedSocketDestroyers(t *testing.T) {
 	}{
 		"close 127.0.0.1:8888 (UDP)": {
 			filter: SocketFilter{
-				DestIp:   net.IP{127, 0, 0, 1},
+				DestIp:   netip.MustParseAddr("127.0.0.1"),
 				DestPort: 8888,
 				Family:   unix.AF_INET,
 				Protocol: unix.IPPROTO_UDP,
@@ -444,7 +504,7 @@ func TestPrivilegedSocketDestroyers(t *testing.T) {
 		},
 		"close 127.0.0.1:8888 (TCP)": {
 			filter: SocketFilter{
-				DestIp:   net.IP{127, 0, 0, 1},
+				DestIp:   netip.MustParseAddr("127.0.0.1"),
 				DestPort: 8888,
 				Family:   unix.AF_INET,
 				Protocol: unix.IPPROTO_TCP,
@@ -456,7 +516,7 @@ func TestPrivilegedSocketDestroyers(t *testing.T) {
 		},
 		"close [::1]:8888 (UDP)": {
 			filter: SocketFilter{
-				DestIp:   net.IPv6loopback,
+				DestIp:   netip.IPv6Loopback(),
 				DestPort: 8888,
 				Family:   unix.AF_INET6,
 				Protocol: unix.IPPROTO_UDP,
@@ -468,7 +528,7 @@ func TestPrivilegedSocketDestroyers(t *testing.T) {
 		},
 		"close [::1]:8888 (TCP)": {
 			filter: SocketFilter{
-				DestIp:   net.IPv6loopback,
+				DestIp:   netip.IPv6Loopback(),
 				DestPort: 8888,
 				Family:   unix.AF_INET6,
 				Protocol: unix.IPPROTO_TCP,
@@ -476,6 +536,30 @@ func TestPrivilegedSocketDestroyers(t *testing.T) {
 			},
 			expectTCPClose: []string{
 				"[::1]:8888",
+			},
+		},
+		"close [::ffff:127.0.0.1]:8890 (UDP)": {
+			filter: SocketFilter{
+				DestIp:   netip.MustParseAddr("127.0.0.1"),
+				DestPort: 8890,
+				Family:   unix.AF_INET,
+				Protocol: unix.IPPROTO_UDP,
+				States:   StateFilterUDP,
+			},
+			expectUDPClose: []string{
+				"[::ffff:127.0.0.1]:8890",
+			},
+		},
+		"close [::ffff:127.0.0.1]:8890 (TCP)": {
+			filter: SocketFilter{
+				DestIp:   netip.MustParseAddr("127.0.0.1"),
+				DestPort: 8890,
+				Family:   unix.AF_INET,
+				Protocol: unix.IPPROTO_TCP,
+				States:   StateFilterTCP,
+			},
+			expectTCPClose: []string{
+				"[::ffff:127.0.0.1]:8890",
 			},
 		},
 	}
@@ -548,12 +632,79 @@ func BenchmarkDestroyers(b *testing.B) {
 				defer conn.Close()
 
 				require.NoError(b, sockDestroyer.Destroy(log, SocketFilter{
-					DestIp:   net.IPv4(127, 0, 0, 1),
+					DestIp:   netip.MustParseAddr("127.0.0.1"),
 					DestPort: 8888,
 					Family:   unix.AF_INET,
 					Protocol: unix.IPPROTO_UDP,
 				}))
 			}
 		})
+	}
+}
+
+// TestPrivilegedIterateCallbackError verifies that an error returned while
+// visiting a real socket stops iteration and is returned to the caller.
+func TestPrivilegedIterateCallbackError(t *testing.T) {
+	testutils.PrivilegedTest(t)
+
+	sock, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer sock.Close()
+	port := uint16(sock.LocalAddr().(*net.UDPAddr).Port)
+
+	stopErr := errors.New("stop socket iteration")
+	found := false
+	err = Iterate(unix.IPPROTO_UDP, unix.AF_INET, StateFilterUDP, func(sock *netlink.Socket, err error) error {
+		if err != nil {
+			return err
+		}
+		if sock.ID.SourcePort == port && sock.ID.Source.Equal(net.IPv4(127, 0, 0, 1)) {
+			found = true
+			return stopErr
+		}
+		return nil
+	})
+
+	require.True(t, found, "failed to find the test UDP socket")
+	require.ErrorIs(t, err, stopErr)
+}
+
+// TestPrivilegedFilterAndDestroySocketsNetlinkError verifies that a real
+// NLMSG_ERROR is forwarded once and returned without blocking iteration.
+func TestPrivilegedFilterAndDestroySocketsNetlinkError(t *testing.T) {
+	testutils.PrivilegedTest(t)
+
+	// invalidFamily is an address family the kernel does not recognize
+	// (well above AF_MAX). sock_diag rejects a dump request for it with
+	// EINVAL before the dump starts, so the kernel deterministically
+	// replies with a non-zero NLMSG_ERROR and never sends NLMSG_DONE.
+	const invalidFamily = 0xff
+
+	type result struct {
+		err           error
+		callbackErr   error
+		socket        netlink.SocketID
+		callbackCalls int
+	}
+
+	done := make(chan result, 1)
+	go func() {
+		res := result{}
+		res.err = filterAndDestroySockets(invalidFamily, unix.IPPROTO_UDP, StateFilterUDP, func(socket netlink.SocketID, err error) {
+			res.callbackCalls++
+			res.socket = socket
+			res.callbackErr = err
+		})
+		done <- res
+	}()
+
+	select {
+	case res := <-done:
+		require.ErrorIs(t, res.err, unix.EINVAL)
+		require.ErrorIs(t, res.callbackErr, unix.EINVAL)
+		require.Equal(t, netlink.SocketID{}, res.socket)
+		require.Equal(t, 1, res.callbackCalls)
+	case <-time.After(5 * time.Second):
+		t.Fatal("socket iteration blocked after receiving NLMSG_ERROR")
 	}
 }

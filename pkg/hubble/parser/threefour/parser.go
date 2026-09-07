@@ -251,8 +251,7 @@ func (p *Parser) Decode(data []byte, decoded *pb.Flow) error {
 	ip := decoded.GetIP()
 	if tn != nil && ip != nil {
 		if !tn.OriginalIP().IsUnspecified() {
-			// Ignore invalid IP - getters will handle invalid value.
-			srcIP, _ = netipx.FromStdIP(tn.OriginalIP())
+			srcIP = tn.OriginalIP()
 			// On SNAT the trace notification has OrigIP set to the pre
 			// translation IP and the source IP parsed from the header is the
 			// post translation IP. The check is here because sometimes we get
@@ -287,6 +286,8 @@ func (p *Parser) Decode(data []byte, decoded *pb.Flow) error {
 	decoded.AuthType = authType
 	decoded.DropReason = decodeDropReason(dn, pvn)
 	decoded.DropReasonDesc = pb.DropReason(decoded.DropReason)
+	decoded.ExtError = decodeExtError(dn)
+	decoded.ExtDropReasonDesc = decodeExtDropReasonDesc(dn)
 	decoded.File = decodeFileInfo(dn)
 	decoded.Source = srcEndpoint
 	decoded.Destination = dstEndpoint
@@ -307,8 +308,8 @@ func (p *Parser) Decode(data []byte, decoded *pb.Flow) error {
 	decoded.Interface = p.decodeNetworkInterface(tn, dbg)
 	decoded.ProxyPort = decodeProxyPort(dbg, tn)
 
-	if p.correlateL3L4Policy && p.endpointGetter != nil {
-		correlation.CorrelatePolicy(p.log, p.endpointGetter, decoded)
+	if p.correlateL3L4Policy && p.endpointGetter != nil && pvn != nil {
+		correlation.CorrelatePolicy(p.log, p.endpointGetter, decoded, pvn.Source)
 	}
 
 	return nil
@@ -493,6 +494,23 @@ func decodeDropReason(dn *monitor.DropNotify, pvn *monitor.PolicyVerdictNotify) 
 	return 0
 }
 
+func decodeExtError(dn *monitor.DropNotify) int32 {
+	if dn != nil {
+		return int32(dn.ExtError)
+	}
+	return 0
+}
+
+func decodeExtDropReasonDesc(dn *monitor.DropNotify) string {
+	if dn == nil {
+		return ""
+	}
+	if dn.SubType == 0 && dn.ExtError == 0 {
+		return ""
+	}
+	return monitorAPI.DropReasonExt(dn.SubType, dn.ExtError)
+}
+
 func decodeFileInfo(dn *monitor.DropNotify) *pb.FileInfo {
 	switch {
 	case dn != nil:
@@ -565,9 +583,35 @@ func decodeSCTP(sctp *layers.SCTP) (l4 *pb.Layer4, src, dst uint16) {
 			SCTP: &pb.SCTP{
 				SourcePort:      uint32(sctp.SrcPort),
 				DestinationPort: uint32(sctp.DstPort),
+				ChunkType:       decodeSCTPChunkType(sctp.Payload),
 			},
 		},
 	}, uint16(sctp.SrcPort), uint16(sctp.DstPort)
+}
+
+func decodeSCTPChunkType(payload []byte) pb.SCTPChunkType {
+
+	var chunktype pb.SCTPChunkType
+
+	if len(payload) != 0 {
+		switch layers.SCTPChunkType(payload[0]) {
+		case layers.SCTPChunkTypeInit:
+			chunktype = pb.SCTPChunkType_INIT
+		case layers.SCTPChunkTypeInitAck:
+			chunktype = pb.SCTPChunkType_INIT_ACK
+		case layers.SCTPChunkTypeShutdown:
+			chunktype = pb.SCTPChunkType_SHUTDOWN
+		case layers.SCTPChunkTypeShutdownAck:
+			chunktype = pb.SCTPChunkType_SHUTDOWN_ACK
+		case layers.SCTPChunkTypeShutdownComplete:
+			chunktype = pb.SCTPChunkType_SHUTDOWN_COMPLETE
+		case layers.SCTPChunkTypeAbort:
+			chunktype = pb.SCTPChunkType_ABORT
+		default:
+			chunktype = pb.SCTPChunkType_UNSUPPORTED
+		}
+	}
+	return chunktype
 }
 
 func decodeUDP(udp *layers.UDP) (l4 *pb.Layer4, src, dst uint16) {

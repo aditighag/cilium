@@ -66,7 +66,7 @@ PodCIDRs are allocated:
 
 .. code-block:: yaml
 
-  apiVersion: cilium.io/v2alpha1
+  apiVersion: cilium.io/v2
   kind: CiliumPodIPPool
   metadata:
     name: green-pool
@@ -86,9 +86,12 @@ extended at run-time. In-use CIDRs must not be removed, and existing pools must 
 be deleted if they are still in use by a Cilium node. In case updating an in-use pool
 is needed, please follow this :ref:`procedure <update_existing_ciliumpodippools>` in order to
 minimize disruption during the update.
-The mask size of a pool is immutable and the same for all nodes. Neither restriction
-is enforced until :gh-issue:`26966` is resolved. The first and last address of a
-``CiliumPodIPPool`` are reserved and cannot be allocated. Pools with less than 3
+The mask size of a pool is immutable and the same for all nodes. The
+``spec.allowFirstIP`` and ``spec.allowLastIP`` fields are immutable as well.
+By default, the first and last address of each allocated CIDR from a
+``CiliumPodIPPool`` are reserved and cannot be allocated. Set
+``spec.allowFirstIP`` or ``spec.allowLastIP`` to ``true`` when creating the pool
+to make either address allocatable independently. Pools with less than 3
 addresses (/31, /32, /127, /128) do not have this limitation.
 
 
@@ -146,7 +149,7 @@ running nginx and a single ``CiliumPodIPPool`` resource that describes the ``def
 
 .. code-block:: yaml
 
-  apiVersion: cilium.io/v2alpha1
+  apiVersion: cilium.io/v2
   kind: CiliumPodIPPool
   metadata:
     name: default
@@ -173,7 +176,7 @@ In this example Node Group 1 is composed only of ``kind-worker``, while Node Gro
    .. code-block:: shell-session
    
      cat <<EOF | kubectl apply -f -
-     apiVersion: cilium.io/v2alpha1
+     apiVersion: cilium.io/v2
      kind: CiliumPodIPPool
      metadata:
        name: default
@@ -261,6 +264,62 @@ In this example Node Group 1 is composed only of ``kind-worker``, while Node Gro
 
 7. (Optional) Reschedule pods to ensure workload is evenly distributed across nodes in cluster.
 
+.. _update_existing_ciliumpodippools_with_reservedranges:
+
+Migrating Pods to a new IPAM range using reservedRanges
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When migrating Pods to a new IPAM range, nodes may continue using PodCIDRs
+from the old range until the migration is complete. Removing the old CIDR
+before all nodes have migrated can orphan existing allocations and trigger
+``CIDR from pool still in use by node`` warnings.
+
+Keep the old CIDR in ``cidrs`` and reserve it with ``reservedRanges``. Cilium
+preserves existing allocations from the old CIDR but does not allocate new
+PodCIDRs from it.
+
+#. Add the new CIDR and reserve the entire old CIDR, keeping both ranges in
+   ``cidrs``.
+
+   .. code-block:: yaml
+
+     apiVersion: cilium.io/v2
+     kind: CiliumPodIPPool
+     metadata:
+       name: default
+     spec:
+       ipv4:
+         cidrs:
+         - 10.10.0.0/16
+         - 10.20.0.0/16
+         maskSize: 24
+         pool:
+         - cidr: 10.10.0.0/16
+           reservedRanges:
+           - start: 10.10.0.0
+             end: 10.10.255.255
+
+   Cilium will now only allocate new PodCIDRs from ``10.20.0.0/16``.
+
+#. Follow steps 3 through 6 in :ref:`update_existing_ciliumpodippools` to
+   migrate each node group to the new range.
+
+#. Once no node uses the old CIDR, remove it from ``cidrs`` and remove
+   the matching ``pool`` entry.
+
+   .. code-block:: yaml
+
+     apiVersion: cilium.io/v2
+     kind: CiliumPodIPPool
+     metadata:
+       name: default
+     spec:
+       ipv4:
+         cidrs:
+         - 10.20.0.0/16
+         maskSize: 24
+         pool: []
+
 Per-Node Default Pool
 ---------------------
 
@@ -276,50 +335,55 @@ certain node labels.
 
 .. code-block:: yaml
 
-    ---
-    apiVersion: cilium.io/v2alpha1
-    kind: CiliumPodIPPool
-    metadata:
-      name: dc1-pool
-    spec:
-      ipv4:
-        cidrs:
-          - 10.1.0.0/16
-        maskSize: 24
-    ---
-    apiVersion: cilium.io/v2alpha1
-    kind: CiliumPodIPPool
-    metadata:
-      name: dc2-pool
-    spec:
-      ipv4:
-        cidrs:
-          - 10.2.0.0/16
-        maskSize: 24
-    ---
-    apiVersion: cilium.io/v2
-    kind: CiliumNodeConfig
-    metadata:
-      name: ip-pool-dc1
-      namespace: kube-system
-    spec:
-      defaults:
-        ipam-default-ip-pool: dc1-pool
-      nodeSelector:
-        matchLabels:
-          topology.kubernetes.io/zone: dc1
-    ---
-    apiVersion: cilium.io/v2
-    kind: CiliumNodeConfig
-    metadata:
-      name: ip-pool-dc2
-      namespace: kube-system
-    spec:
-      defaults:
-        ipam-default-ip-pool: dc2-pool
-      nodeSelector:
-        matchLabels:
-          topology.kubernetes.io/zone: dc2
+   apiVersion: cilium.io/v2
+   kind: CiliumPodIPPool
+   metadata:
+     name: dc1-pool
+   spec:
+     ipv4:
+       cidrs:
+         - 10.1.0.0/16
+       maskSize: 24
+
+.. code-block:: yaml
+
+   apiVersion: cilium.io/v2
+   kind: CiliumNodeConfig
+   metadata:
+     name: ip-pool-dc1
+     namespace: kube-system
+   spec:
+     defaults:
+       ipam-default-ip-pool: dc1-pool
+     nodeSelector:
+       matchLabels:
+         topology.kubernetes.io/zone: dc1
+
+.. code-block:: yaml
+
+   apiVersion: cilium.io/v2
+   kind: CiliumPodIPPool
+   metadata:
+     name: dc2-pool
+   spec:
+     ipv4:
+       cidrs:
+         - 10.2.0.0/16
+       maskSize: 24
+
+.. code-block:: yaml
+
+   apiVersion: cilium.io/v2
+   kind: CiliumNodeConfig
+   metadata:
+     name: ip-pool-dc2
+     namespace: kube-system
+   spec:
+     defaults:
+       ipam-default-ip-pool: dc2-pool
+     nodeSelector:
+       matchLabels:
+         topology.kubernetes.io/zone: dc2
 
 Allocation Parameters
 ---------------------

@@ -39,9 +39,10 @@ pool1
 -- expected.json --
 {
   "kind": "CiliumPodIPPool",
-  "apiVersion": "cilium.io/v2alpha1",
+  "apiVersion": "cilium.io/v2",
   "metadata": {
     "name": "pool1",
+    "uid": "7945af14-84a1-4822-9986-a009ce90f178",
     "resourceVersion": "1",
     "annotations": {
       "ipam.cilium.io/skip-masquerade": "true"
@@ -67,13 +68,13 @@ pool1
 ciliumpodippool:
     typemeta:
         kind: CiliumPodIPPool
-        apiversion: cilium.io/v2alpha1
+        apiversion: cilium.io/v2
     objectmeta:
         name: pool1
         generatename: ""
         namespace: ""
         selflink: ""
-        uid: ""
+        uid: 7945af14-84a1-4822-9986-a009ce90f178
         resourceversion: "1"
         generation: 0
         creationtimestamp: "0001-01-01T00:00:00Z"
@@ -90,20 +91,25 @@ ciliumpodippool:
             cidrs:
                 - 10.0.0.0/24
             masksize: 28
+            pool: []
         ipv6:
             cidrs:
                 - fd00::/112
             masksize: 120
+            pool: []
+        allowfirstip: false
+        allowlastip: false
         podselector: null
         namespaceselector: null
 updatedAt: 2000-01-01T10:30:00Z
 -- pool.yaml --
-apiVersion: cilium.io/v2alpha1
+apiVersion: cilium.io/v2
 kind: CiliumPodIPPool
 metadata:
   name: pool1
   annotations:
     ipam.cilium.io/skip-masquerade: "true"
+  uid: "7945af14-84a1-4822-9986-a009ce90f178"
 spec:
   ipv4:
     cidrs:

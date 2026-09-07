@@ -6,7 +6,7 @@ package clustermesh
 import (
 	"context"
 	"os"
-	"path"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -19,7 +19,6 @@ import (
 	"github.com/cilium/cilium/pkg/hive"
 	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/lock"
-	"github.com/cilium/cilium/pkg/testutils"
 )
 
 const (
@@ -56,10 +55,6 @@ func (f *fakeUserMgmtClient) UserEnforceAbsence(_ context.Context, name string) 
 }
 
 func TestUsersManagement(t *testing.T) {
-	// Catch any leaked goroutines. Ignoring goroutines possibly left by other tests.
-	leakOpts := testutils.GoleakIgnoreCurrent()
-	t.Cleanup(func() { testutils.GoleakVerifyNone(t, leakOpts) })
-
 	var client fakeUserMgmtClient
 	client.init()
 
@@ -67,7 +62,7 @@ func TestUsersManagement(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpdir)
 
-	cfgPath := path.Join(tmpdir, "users.yaml")
+	cfgPath := filepath.Join(tmpdir, "users.yaml")
 	require.NoError(t, os.WriteFile(cfgPath, []byte(users1), 0600))
 
 	hive := hive.New(
@@ -121,7 +116,7 @@ func TestUsersManagement(t *testing.T) {
 	// We first write to a different file and then rename it, to avoid the possible
 	// race condition caused by truncate + write if we detect the event sufficiently
 	// fast (i.e., we first read an empty file, and then the expected one).
-	cfgPath2 := path.Join(tmpdir, "users.yaml.2")
+	cfgPath2 := filepath.Join(tmpdir, "users.yaml.2")
 	require.NoError(t, os.WriteFile(cfgPath2, []byte(users2), 0600))
 	require.NoError(t, os.Rename(cfgPath2, cfgPath))
 

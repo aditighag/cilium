@@ -41,7 +41,7 @@ For Cilium to meet most of the common requirements for service-to-service authen
     to automatically create and maintain encrypted connections between Pods.
 
 To address the challenge of identity verification in dynamic and heterogeneous environments, 
-mutual authentication requires a framework secure identity verification for distributed systems.
+mutual authentication requires a framework for secure identity verification for distributed systems.
 
 .. Note::
 
@@ -128,7 +128,7 @@ Detailed Roadmap Status
 
 The following table shows the roadmap status of the mutual authentication feature.
 There are several work items outstanding before the feature is complete from a security model perspective.
-For details, see the [roadmap issue](https://github.com/cilium/cilium/issues/28986).
+For details, see :gh-issue:`28986`.
 
 
 +--------------------------------------------------+----------------------------------------------------------+

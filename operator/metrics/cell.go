@@ -28,8 +28,13 @@ var Cell = cell.Module(
 	// however the operator has a different flag name for this the
 	// server address flag so we configure this ourselves.
 	cell.Provide(func(conf Config) metrics.RegistryConfig {
+		// An empty address is what keeps the registry from serving.
+		addr := conf.OperatorPrometheusServeAddr
+		if !conf.EnableMetrics {
+			addr = ""
+		}
 		return metrics.RegistryConfig{
-			PrometheusServeAddr: conf.OperatorPrometheusServeAddr,
+			PrometheusServeAddr: addr,
 		}
 	}),
 	// Metrics cell provides a bare-bones registry that has not been initialized yet.
@@ -40,20 +45,16 @@ var Cell = cell.Module(
 // Config contains the configuration for the operator-metrics cell.
 type Config struct {
 	OperatorPrometheusServeAddr string
+	EnableMetrics               bool
 }
 
 var defaultConfig = Config{
 	// default server address for operator metrics
 	OperatorPrometheusServeAddr: ":9963",
+	EnableMetrics:               false,
 }
 
 func (def Config) Flags(flags *pflag.FlagSet) {
 	flags.String(OperatorPrometheusServeAddr, def.OperatorPrometheusServeAddr, "Address to serve Prometheus metrics")
-}
-
-// SharedConfig contains the configuration that is shared between
-// this module and others.
-type SharedConfig struct {
-	// EnableMetrics is set to true if operator metrics are enabled
-	EnableMetrics bool
+	flags.Bool("enable-metrics", def.EnableMetrics, "Enable Prometheus metrics")
 }

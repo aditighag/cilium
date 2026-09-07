@@ -11,9 +11,9 @@ on:
       - Documentation/Dockerfile
       - Documentation/requirements.txt
     branches-ignore:
+      - v1.20
+      - v1.19
       - v1.18
-      - v1.17
-      - v1.16
 
 permissions:
   # To be able to access the repository with `actions/checkout`
@@ -28,13 +28,15 @@ jobs:
     name: Build and Push Image
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    environment: docs-builder
+    environment:
+      name: docs-builder
+      deployment: false
     outputs:
       tag: ${{ steps.docs-builder-tag.outputs.tag }}
       digest: ${{ steps.docker-build-docs-builder.outputs.digest }}
     steps:
       - name: Checkout base branch (trusted)
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.base_ref }}
           persist-credentials: false
@@ -46,15 +48,17 @@ jobs:
         uses: ./.github/actions/set-env-variables
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       # Warning: since this is a privileged workflow, subsequent workflow job
       # steps must take care not to execute untrusted code.
       - name: Checkout pull request branch (NOT TRUSTED)
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha }}
+          # Required by checkout v7+ to fetch fork PR code; see the NOT TRUSTED warning above.
+          allow-unsafe-pr-checkout: true
 
       - name: Generate image tag for docs-builder
         id: docs-builder-tag
@@ -65,24 +69,24 @@ jobs:
         id: docs-builder-tag-in-repositories
         shell: bash
         run: |
-          if docker buildx imagetools inspect quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/docs-builder:${{ steps.docs-builder-tag.outputs.tag }} &>/dev/null; then
+          if docker buildx imagetools inspect ${{ env.REGISTRY_DEV }}/${{ env.ORGANIZATION_DEV }}/docs-builder:${{ steps.docs-builder-tag.outputs.tag }} &>/dev/null; then
             echo exists="true" >> $GITHUB_OUTPUT
           else
             echo exists="false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Login to quay.io
+      - name: Login to ${{ env.REGISTRY_DEV }}
         if: ${{ steps.docs-builder-tag-in-repositories.outputs.exists == 'false' }}
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: quay.io
+          registry: ${{ env.REGISTRY_DEV }}
           username: ${{ secrets.QUAY_DOCS_BUILDER_USERNAME }}
           password: ${{ secrets.QUAY_DOCS_BUILDER_PASSWORD }}
           logout: true
 
       - name: Build docs-builder image
         if: ${{ steps.docs-builder-tag-in-repositories.outputs.exists == 'false' }}
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         id: docker-build-docs-builder
         with:
           provenance: false
@@ -90,20 +94,22 @@ jobs:
           file: ./Documentation/Dockerfile
           push: true
           tags: |
-            quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/docs-builder:${{ steps.docs-builder-tag.outputs.tag }}
+            ${{ env.REGISTRY_DEV }}/${{ env.ORGANIZATION_DEV }}/docs-builder:${{ steps.docs-builder-tag.outputs.tag }}
 
   # Use a separate job for the steps below, to ensure we're no longer logged
   # into Quay.io.
-  update-pr:
-    name: Update Pull Request with new image reference
+  # This job runs the untrusted PR-built container to prepare the update.
+  # No environment/secrets are available here — the result is passed as a
+  # patch artifact to a clean privileged job for pushing.
+  prepare-update:
+    name: Prepare docs-builder image reference update
     needs: build-and-push
     if: needs.build-and-push.outputs.digest
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    environment: docs-builder
     steps:
       - name: Checkout base branch (trusted)
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.base_ref }}
           persist-credentials: false
@@ -114,10 +120,12 @@ jobs:
       # Warning: since this is a privileged workflow, subsequent workflow job
       # steps must take care not to execute untrusted code.
       - name: Checkout pull request branch (NOT TRUSTED)
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha }}
+          # Required by checkout v7+ to fetch fork PR code; see the NOT TRUSTED warning above.
+          allow-unsafe-pr-checkout: true
 
       - name: Set up git
         run: |
@@ -126,12 +134,56 @@ jobs:
 
       - name: Update docs-builder image reference in CI workflow
         run: |
-          NEW_IMAGE="quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/docs-builder:${{ needs.build-and-push.outputs.tag }}@${{ needs.build-and-push.outputs.digest }}"
+          NEW_IMAGE="${{ env.REGISTRY_DEV }}/${{ env.ORGANIZATION_DEV }}/docs-builder:${{ needs.build-and-push.outputs.tag }}@${{ needs.build-and-push.outputs.digest }}"
           # Run in Docker to prevent the script from accessing the environment.
           docker run --rm -v $PWD:/cilium -w /cilium "${NEW_IMAGE}" \
               bash -c "git config --global --add safe.directory /cilium && \
                        /cilium/Documentation/update-docs-builder-image.sh ${NEW_IMAGE}"
           git commit -sam "ci: update docs-builder"
+
+      - name: Generate patch from update commit
+        run: git format-patch HEAD~1 --stdout > /tmp/update.patch
+
+      - name: Upload patch artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docs-builder-update-patch
+          path: /tmp/update.patch
+          retention-days: 1
+
+  # Privileged job: applies the update on a fresh runner and pushes.
+  # This runs on a clean workspace that was never touched by the untrusted
+  # container, preventing hook injection or other workspace tampering attacks.
+  push-update:
+    name: Push docs-builder image reference update
+    needs: [build-and-push, prepare-update]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: docs-builder
+      deployment: false
+    steps:
+      - name: Checkout pull request branch (NOT TRUSTED)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+          # Required by checkout v7+ to fetch fork PR code; see the NOT TRUSTED warning above.
+          allow-unsafe-pr-checkout: true
+
+      - name: Set up git
+        run: |
+          git config user.name "Cilium Imagebot"
+          git config user.email "noreply@cilium.io"
+
+      - name: Download patch artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: docs-builder-update-patch
+          path: /tmp
+
+      - name: Apply update patch
+        run: git am /tmp/update.patch
 
       - name: Get token
         id: get_token
@@ -145,7 +197,7 @@ jobs:
           REF: ${{ github.event.pull_request.head.ref }}
         run: |
           git diff HEAD^
-          git push https://x-access-token:${{ steps.get_token.outputs.app_token }}@github.com/${{ github.event.pull_request.head.repo.full_name }}.git HEAD:"$REF"
+          git push --no-verify https://x-access-token:${{ steps.get_token.outputs.app_token }}@github.com/${{ github.event.pull_request.head.repo.full_name }}.git HEAD:"$REF"
 
   image-digest:
     name: Retrieve and display image digest
@@ -155,7 +207,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout base branch (trusted)
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.base_ref }}
           persist-credentials: false
@@ -166,7 +218,7 @@ jobs:
       - name: Retrieve image digest
         shell: bash
         run: |
-          NEW_IMAGE="quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/docs-builder:${{ needs.build-and-push.outputs.tag }}@${{ needs.build-and-push.outputs.digest }}"
+          NEW_IMAGE="${{ env.REGISTRY_DEV }}/${{ env.ORGANIZATION_DEV }}/docs-builder:${{ needs.build-and-push.outputs.tag }}@${{ needs.build-and-push.outputs.digest }}"
           mkdir -p image-digest/
           echo "## docs-builder" > image-digest/docs-builder.txt
           echo "" >> image-digest/docs-builder.txt
@@ -174,7 +226,7 @@ jobs:
           echo "" >> image-digest/docs-builder.txt
 
       - name: Upload artifact digests
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: image-digest docs-builder
           path: image-digest

@@ -15,6 +15,8 @@ import (
 
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/safeio"
+
+	util "github.com/cilium/cilium/pkg/envoy/util"
 )
 
 type EnvoyAdminClient struct {
@@ -31,7 +33,7 @@ func NewEnvoyAdminClientForSocket(logger *slog.Logger, envoySocketDir string, de
 
 		// Needs to be provided to envoy (received as ':authority') - even though we Dial to a Unix domain socket.
 		adminURL:        fmt.Sprintf("http://%s/", "envoy-admin"),
-		unixPath:        getAdminSocketPath(envoySocketDir),
+		unixPath:        util.GetAdminSocketPath(envoySocketDir),
 		defaultLogLevel: defaultLogLevel,
 	}
 }
@@ -70,7 +72,41 @@ func (a *EnvoyAdminClient) Post(query string) (string, error) {
 	return string(body), nil
 }
 
-// ChangeLogLevel changes Envoy log level to correspond to the logrus log level 'level'.
+// Get sends a GET request with the given query to the Envoy Admin API.
+func (a *EnvoyAdminClient) Get(query string) (string, error) {
+	// Use a custom dialer to use a Unix domain socket for an HTTP connection.
+	var conn net.Conn
+	var err error
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				conn, err = net.Dial("unix", a.unixPath)
+				return conn, err
+			},
+		},
+	}
+
+	resp, err := client.Get(a.adminURL + query)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	defer resp.Body.Close()
+	body, err := safeio.ReadAllLimit(resp.Body, safeio.MB)
+	if err != nil {
+		return "", err
+	}
+
+	ret := strings.ReplaceAll(string(body), "\r", "")
+	a.logger.Debug("Envoy: Admin response",
+		logfields.Request, query,
+		logfields.Response, ret,
+	)
+
+	return string(body), nil
+}
+
+// ChangeLogLevel changes Envoy log level to correspond to the specified 'level'.
 func (a *EnvoyAdminClient) ChangeLogLevel(agentLogLevel slog.Level) error {
 	envoyLevel := mapLogLevel(agentLogLevel, a.defaultLogLevel)
 

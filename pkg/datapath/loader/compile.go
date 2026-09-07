@@ -20,7 +20,7 @@ import (
 
 	"github.com/cilium/cilium/pkg/command/exec"
 	"github.com/cilium/cilium/pkg/datapath/linux/probes"
-	"github.com/cilium/cilium/pkg/datapath/types"
+	"github.com/cilium/cilium/pkg/datapath/loader/types"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/option"
@@ -38,27 +38,31 @@ const (
 	endpointPrefix = "bpf_lxc"
 	endpointProg   = endpointPrefix + "." + string(outputSource)
 	endpointObj    = endpointPrefix + ".o"
+	endpointConfig = endpointPrefix + ".json"
 
-	hostEndpointPrefix       = "bpf_host"
-	hostEndpointNetdevPrefix = "bpf_netdev_"
-	hostEndpointProg         = hostEndpointPrefix + "." + string(outputSource)
-	hostEndpointObj          = hostEndpointPrefix + ".o"
-
-	networkPrefix = "bpf_network"
-	networkProg   = networkPrefix + "." + string(outputSource)
-	networkObj    = networkPrefix + ".o"
+	hostEndpointPrefix = "bpf_host"
+	hostEndpointProg   = hostEndpointPrefix + "." + string(outputSource)
+	hostEndpointObj    = hostEndpointPrefix + ".o"
+	hostEndpointConfig = hostEndpointPrefix + ".json"
 
 	xdpPrefix = "bpf_xdp"
 	xdpProg   = xdpPrefix + "." + string(outputSource)
 	xdpObj    = xdpPrefix + ".o"
+	xdpConfig = xdpPrefix + ".json"
 
 	overlayPrefix = "bpf_overlay"
 	overlayProg   = overlayPrefix + "." + string(outputSource)
 	overlayObj    = overlayPrefix + ".o"
+	overlayConfig = overlayPrefix + ".json"
 
 	wireguardPrefix = "bpf_wireguard"
 	wireguardProg   = wireguardPrefix + "." + string(outputSource)
 	wireguardObj    = wireguardPrefix + ".o"
+	wireguardConfig = wireguardPrefix + ".json"
+
+	socketPrefix = "bpf_sock"
+	socketProg   = socketPrefix + "." + string(outputSource)
+	socketObj    = socketPrefix + ".o"
 )
 
 var (
@@ -120,11 +124,6 @@ var (
 	hostEpProg = &progInfo{
 		Source:     hostEndpointProg,
 		Output:     hostEndpointObj,
-		OutputType: outputObject,
-	}
-	networkTcProg = &progInfo{
-		Source:     networkProg,
-		Output:     networkObj,
 		OutputType: outputObject,
 	}
 )
@@ -330,40 +329,8 @@ func compileDefault(ctx context.Context, logger *slog.Logger, src string, out st
 	return compileWithOptions(ctx, logger, src, out, nil)
 }
 
-// compileNetwork compiles a BPF program attached to network
-func compileNetwork(ctx context.Context, logger *slog.Logger) error {
-	dirs := directoryInfo{
-		Library: option.Config.BpfDir,
-		Runtime: option.Config.StateDir,
-		Output:  option.Config.StateDir,
-		State:   option.Config.StateDir,
-	}
-	scopedLog := logger.With(logfields.Debug, true)
-
-	versionCmd := exec.CommandContext(ctx, compiler, "--version")
-	compilerVersion, err := versionCmd.CombinedOutput(scopedLog, true)
-	if err != nil {
-		return err
-	}
-	scopedLog.Debug(
-		"Compiling network programs",
-		compiler, string(compilerVersion),
-	)
-
-	// Write out assembly and preprocessing files for debugging purposes
-	if _, err := compile(ctx, logger, networkTcProg, &dirs); err != nil {
-		scopedLog.Warn(
-			"Failed to compile",
-			logfields.Error, err,
-			logfields.Params, networkTcProg,
-		)
-		return err
-	}
-	return nil
-}
-
 // compileOverlay compiles BPF programs in bpf_overlay.c.
-func compileOverlay(ctx context.Context, logger *slog.Logger, opts []string) error {
+func compileOverlay(ctx context.Context, logger *slog.Logger) error {
 	dirs := &directoryInfo{
 		Library: option.Config.BpfDir,
 		Runtime: option.Config.StateDir,
@@ -386,7 +353,6 @@ func compileOverlay(ctx context.Context, logger *slog.Logger, opts []string) err
 		Source:     overlayProg,
 		Output:     overlayObj,
 		OutputType: outputObject,
-		Options:    opts,
 	}
 	// Write out assembly and preprocessing files for debugging purposes
 	if _, err := compile(ctx, logger, prog, dirs); err != nil {

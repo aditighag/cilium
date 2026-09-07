@@ -5,14 +5,23 @@ package policy
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"maps"
+	"os"
+	"strconv"
+	"sync"
 	"sync/atomic"
 
+	"github.com/cilium/hive/script"
 	cilium "github.com/cilium/proxy/go/cilium/api"
+	"github.com/davecgh/go-spew/spew"
+	"github.com/spf13/pflag"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/cilium/cilium/api/v1/models"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/container/set"
 	"github.com/cilium/cilium/pkg/crypto/certificatemanager"
 	envoypolicy "github.com/cilium/cilium/pkg/envoy/policy"
@@ -20,6 +29,8 @@ import (
 	"github.com/cilium/cilium/pkg/identity/identitymanager"
 	ipcachetypes "github.com/cilium/cilium/pkg/ipcache/types"
 	k8sConst "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
+	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
+	"github.com/cilium/cilium/pkg/k8s/testutils"
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -28,41 +39,39 @@ import (
 	"github.com/cilium/cilium/pkg/policy/api"
 	"github.com/cilium/cilium/pkg/policy/types"
 	"github.com/cilium/cilium/pkg/policy/utils"
-	"github.com/cilium/cilium/pkg/spanstat"
 )
 
 type PolicyRepository interface {
 	BumpRevision() uint64
-	GetAuthTypes(localID identity.NumericIdentity, remoteID identity.NumericIdentity) AuthTypes
 	GetEnvoyHTTPRules(l7Rules *api.L7Rules, ns string) (*cilium.HttpNetworkPolicyRules, bool)
 
-	// GetSelectorPolicy computes the SelectorPolicy for a given identity.
-	//
-	// It returns nil if skipRevision is >= than the already calculated version.
-	// This is used to skip policy calculation when a certain revision delta is
-	// known to not affect the given identity. Pass a skipRevision of 0 to force
-	// calculation.
-	GetSelectorPolicy(id *identity.Identity, skipRevision uint64, stats GetPolicyStatistics, endpointID uint64) (SelectorPolicy, uint64, error)
+	// ComputeSelectorPolicy resolves the SelectorPolicy for the given
+	// identity at the repository's current revision. The returned policy is
+	// already attached to the SelectorCache. The caller must detach it when
+	// no longer needed.
+	ComputeSelectorPolicy(id *identity.Identity) (SelectorPolicy, uint64, error)
 
-	// GetPolicySnapshot returns a map of all the SelectorPolicies in the repository.
-	GetPolicySnapshot() map[identity.NumericIdentity]SelectorPolicy
 	GetRevision() uint64
 	GetRulesList() *models.Policy
+	GetClusterInfo() cmtypes.ClusterInfo
 	GetSelectorCache() *SelectorCache
+	GetSubjectSelectorCache() *SelectorCache
 	Iterate(f func(rule *types.PolicyEntry))
 	ReplaceByResource(rules types.PolicyEntries, resource ipcachetypes.ResourceID) (affectedIDs *set.Set[identity.NumericIdentity], rev uint64, oldRevCnt int)
 	Search() (types.PolicyEntries, uint64)
-}
 
-type GetPolicyStatistics interface {
-	WaitingForPolicyRepository() *spanstat.SpanStat
-	SelectorPolicyCalculation() *spanstat.SpanStat
+	// UpdateIdentities updates the set of identities in the subject
+	// selectorcache, which ComputeSelectorPolicy reads. Must be called before it.
+	UpdateIdentities(added, deleted identity.IdentityMap)
+
+	SetNamedPortsGetter(namedPortsGetter NamedPortsGetter)
 }
 
 // Repository is a list of policy rules which in combination form the security
 // policy. A policy repository can be
 type Repository struct {
-	logger *slog.Logger
+	logger      *slog.Logger
+	clusterInfo cmtypes.ClusterInfo
 	// mutex protects the whole policy tree
 	mutex lock.RWMutex
 
@@ -80,16 +89,20 @@ type Repository struct {
 	revision atomic.Uint64
 
 	// selectorCache tracks the selectors used in the policies
-	// resolved from the repository.
+	// resolved from the repository by alive endpoints.
 	selectorCache *SelectorCache
 
-	// policyCache tracks the selector policies created from this repo
-	policyCache *policyCache
+	// subjectSelectorCache tracks the selectors used by policies
+	// to select what endpoints they apply to
+	subjectSelectorCache *SelectorCache
 
 	certManager certificatemanager.CertificateManager
 
 	metricsManager    types.PolicyMetrics
 	l7RulesTranslator envoypolicy.EnvoyL7RulesTranslator
+
+	// Getter for egress named ports
+	namedPortsGetter NamedPortsGetter
 }
 
 func (p *Repository) GetEnvoyHTTPRules(l7Rules *api.L7Rules, ns string) (*cilium.HttpNetworkPolicyRules, bool) {
@@ -101,14 +114,20 @@ func (p *Repository) GetSelectorCache() *SelectorCache {
 	return p.selectorCache
 }
 
-// GetAuthTypes returns the AuthTypes required by the policy between the localID and remoteID
-func (p *Repository) GetAuthTypes(localID, remoteID identity.NumericIdentity) AuthTypes {
-	return p.policyCache.getAuthTypes(localID, remoteID)
+// GetClusterInfo returns the local cluster configuration used by the repository.
+func (p *Repository) GetClusterInfo() cmtypes.ClusterInfo {
+	return p.clusterInfo
+}
+
+// GetSubjectSelectorCache returns the selector cache used by the Repository for indexing policies
+func (p *Repository) GetSubjectSelectorCache() *SelectorCache {
+	return p.subjectSelectorCache
 }
 
 // NewPolicyRepository creates a new policy repository.
 func NewPolicyRepository(
 	logger *slog.Logger,
+	clusterInfo cmtypes.ClusterInfo,
 	initialIDs identity.IdentityMap,
 	certManager certificatemanager.CertificateManager,
 	l7RulesTranslator envoypolicy.EnvoyL7RulesTranslator,
@@ -116,19 +135,34 @@ func NewPolicyRepository(
 	metricsManager types.PolicyMetrics,
 ) *Repository {
 	selectorCache := NewSelectorCache(logger, initialIDs)
+	subjectSelectorCache := NewSelectorCache(logger, nil)
 	repo := &Repository{
-		logger:            logger,
-		rules:             make(map[ruleKey]*rule),
-		rulesByNamespace:  make(map[string]sets.Set[ruleKey]),
-		rulesByResource:   make(map[ipcachetypes.ResourceID]map[ruleKey]*rule),
-		selectorCache:     selectorCache,
-		certManager:       certManager,
-		metricsManager:    metricsManager,
-		l7RulesTranslator: l7RulesTranslator,
+		logger:               logger,
+		rules:                make(map[ruleKey]*rule),
+		clusterInfo:          clusterInfo,
+		rulesByNamespace:     make(map[string]sets.Set[ruleKey]),
+		rulesByResource:      make(map[ipcachetypes.ResourceID]map[ruleKey]*rule),
+		selectorCache:        selectorCache,
+		subjectSelectorCache: subjectSelectorCache,
+		certManager:          certManager,
+		metricsManager:       metricsManager,
+		l7RulesTranslator:    l7RulesTranslator,
 	}
 	repo.revision.Store(1)
-	repo.policyCache = newPolicyCache(repo, idmgr)
 	return repo
+}
+
+// SetNamedPortsGetter must be called after NewPolicyRepository and before the repository is used.
+// This is late-bound to avoid making policy/cell construct the repository with IPCache, as IPCache
+// depends on the repository for identity updates.
+func (p *Repository) SetNamedPortsGetter(namedPortsGetter NamedPortsGetter) {
+	p.namedPortsGetter = namedPortsGetter
+}
+
+// UpdateIdentities updates the set of identities in the subject
+// selectorcache, which ComputeSelectorPolicy reads. Must be called before it.
+func (p *Repository) UpdateIdentities(added, deleted identity.IdentityMap) {
+	p.subjectSelectorCache.UpdateIdentities(added, deleted, &sync.WaitGroup{})
 }
 
 func (p *Repository) Search() (types.PolicyEntries, uint64) {
@@ -168,7 +202,6 @@ func (p *Repository) addListLocked(entries types.PolicyEntries) (ruleSlice, uint
 
 func (p *Repository) insert(r *rule) {
 	p.rules[r.key] = r
-	p.metricsManager.AddRule(r.PolicyEntry)
 	namespace := r.key.resource.Namespace()
 	if _, ok := p.rulesByNamespace[namespace]; !ok {
 		p.rulesByNamespace[namespace] = sets.New[ruleKey]()
@@ -182,7 +215,10 @@ func (p *Repository) insert(r *rule) {
 		p.rulesByResource[rid][r.key] = r
 	}
 
-	metrics.Policy.Inc()
+	if p.metricsManager != nil {
+		p.metricsManager.AddRule(r.PolicyEntry)
+		metrics.Policy.Inc()
+	}
 }
 
 func (p *Repository) del(key ruleKey) {
@@ -190,7 +226,6 @@ func (p *Repository) del(key ruleKey) {
 	if r == nil {
 		return
 	}
-	p.metricsManager.DelRule(r.PolicyEntry)
 	delete(p.rules, key)
 	namespace := r.key.resource.Namespace()
 	p.rulesByNamespace[namespace].Delete(key)
@@ -205,7 +240,10 @@ func (p *Repository) del(key ruleKey) {
 			delete(p.rulesByResource, rid)
 		}
 	}
-	metrics.Policy.Dec()
+	if p.metricsManager != nil {
+		p.metricsManager.DelRule(r.PolicyEntry)
+		metrics.Policy.Dec()
+	}
 }
 
 // newRule allocates a CachedSelector for a given rule.
@@ -214,16 +252,15 @@ func (p *Repository) newRule(policyEntry types.PolicyEntry, key ruleKey) *rule {
 		PolicyEntry: policyEntry,
 		key:         key,
 	}
-	css, _ := p.selectorCache.AddSelectors(r, makeStringLabels(r.Labels), r.Subject)
+	css, _ := p.subjectSelectorCache.AddSelectors(r, r.Subject)
 	r.subjectSelector = css[0]
-
 	return r
 }
 
 // releaseRule releases the cached selector for a given rul
 func (p *Repository) releaseRule(r *rule) {
 	if r.subjectSelector != nil {
-		p.selectorCache.RemoveSelector(r.subjectSelector, r)
+		p.subjectSelectorCache.RemoveSelector(r.subjectSelector, r)
 	}
 }
 
@@ -231,8 +268,7 @@ func (p *Repository) releaseRule(r *rule) {
 // unit-testing purposes only. Panics if the rule is invalid
 func (p *Repository) MustAddList(rules api.Rules) (ruleSlice, uint64) {
 	for i := range rules {
-		err := rules[i].Sanitize()
-		if err != nil {
+		if err := rules[i].ValidateAndSanitize(); err != nil {
 			panic(err)
 		}
 	}
@@ -274,7 +310,9 @@ func (p *Repository) GetRevision() uint64 {
 
 // BumpRevision allows forcing policy regeneration
 func (p *Repository) BumpRevision() uint64 {
-	metrics.PolicyRevision.Inc()
+	if p.metricsManager != nil {
+		metrics.PolicyRevision.Inc()
+	}
 	return p.revision.Add(1)
 }
 
@@ -310,7 +348,9 @@ func (p *Repository) resolvePolicyLocked(securityIdentity *identity.Identity) (*
 
 	calculatedPolicy := &selectorPolicy{
 		Revision:             p.GetRevision(),
+		clusterInfo:          p.clusterInfo,
 		SelectorCache:        sc,
+		namedPortsGetter:     p.namedPortsGetter,
 		L4Policy:             NewL4Policy(p.GetRevision()),
 		IngressPolicyEnabled: ingressEnabled,
 		EgressPolicyEnabled:  egressEnabled,
@@ -331,7 +371,7 @@ func (p *Repository) resolvePolicyLocked(securityIdentity *identity.Identity) (*
 		if err != nil {
 			return nil, err
 		}
-		calculatedPolicy.L4Policy.Ingress.PortRules = newL4IngressPolicy
+		calculatedPolicy.L4Policy.Ingress = newL4IngressPolicy
 	}
 
 	if egressEnabled {
@@ -340,7 +380,7 @@ func (p *Repository) resolvePolicyLocked(securityIdentity *identity.Identity) (*
 		if err != nil {
 			return nil, err
 		}
-		calculatedPolicy.L4Policy.Egress.PortRules = newL4EgressPolicy
+		calculatedPolicy.L4Policy.Egress = newL4EgressPolicy
 	}
 
 	// Make the calculated policy ready for incremental updates
@@ -353,7 +393,7 @@ func (p *Repository) resolvePolicyLocked(securityIdentity *identity.Identity) (*
 }
 
 // computePolicyEnforcementAndRules returns whether policy applies at ingress or ingress
-// for the given security identity, as well as a list of any rules which select
+// for the given security identity, as well as a sorted list of any rules which select
 // the set of labels of the given security identity.
 //
 // Must be called with repo mutex held for reading.
@@ -379,129 +419,157 @@ func (p *Repository) computePolicyEnforcementAndRules(securityIdentity *identity
 
 	rulesIngress = []*rule{}
 	rulesEgress = []*rule{}
-	// Match cluster-wide rules
-	for rKey := range p.rulesByNamespace[""] {
+
+	var hasIngressPassVerdict, hasEgressPassVerdict bool
+
+	processKey := func(rKey ruleKey) {
 		r := p.rules[rKey]
 		if r.matchesSubject(securityIdentity) {
 			if r.Ingress {
+				if r.DefaultDeny {
+					hasIngressDefaultDeny = true
+				}
+				if r.Verdict == types.Pass {
+					hasIngressPassVerdict = true
+				}
 				rulesIngress = append(rulesIngress, r)
 			} else {
+				if r.DefaultDeny {
+					hasEgressDefaultDeny = true
+				}
+				if r.Verdict == types.Pass {
+					hasEgressPassVerdict = true
+				}
 				rulesEgress = append(rulesEgress, r)
 			}
 		}
 	}
-	// Match namespace-specific rules
-	namespace, _ := lbls.LookupLabel(&podNamespaceLabel)
-	if namespace != "" {
-		for rKey := range p.rulesByNamespace[namespace] {
-			r := p.rules[rKey]
-			if r.matchesSubject(securityIdentity) {
-				if r.Ingress {
-					rulesIngress = append(rulesIngress, r)
-				} else {
-					rulesEgress = append(rulesEgress, r)
-				}
-			}
-		}
+	// Match cluster-wide rules
+	for rKey := range p.rulesByNamespace[""] {
+		processKey(rKey)
 	}
 
-	// If policy enforcement is enabled for the daemon, then it has to be
-	// enabled for the endpoint.
-	// If the endpoint has the reserved:init label, i.e. if it has not yet
-	// received any labels, always enforce policy (default deny).
-	if policyMode == option.AlwaysEnforce || lbls.Has(labels.IDNameInit) {
-		return true, true, true, true, rulesIngress, rulesEgress
-	}
-
-	// Determine the default policy for each direction.
+	// Match namespace-specific rules and determine the default policy for each direction.
 	//
 	// By default, endpoints have no policy and all traffic is allowed.
 	// If any rules select the endpoint, then the endpoint switches to a
 	// default-deny mode (same as traffic being enabled), per-direction.
 	//
 	// Rules, however, can optionally be configured to not enable default deny mode.
-	// If no rules enable default-deny, then all traffic is allowed except that explicitly
-	// denied by a Deny rule.
+	// If no rules enable default-deny, then all traffic is allowed except that
+	// explicitly denied by a Deny rule.
 	//
 	// There are three possible cases _per direction_:
 	// 1: No rules are present,
 	// 2: At least one default-deny rule is present. Then, policy is enabled
-	// 3: Only non-default-deny rules are present. Then, policy is enabled, but we must insert
-	//    an additional allow-all rule. We must do this, even if all traffic is allowed, because
-	//    rules may have additional effects such as enabling L7 proxy.
-	for _, r := range rulesIngress {
-		hasIngress = true
-		if r.DefaultDeny {
-			hasIngressDefaultDeny = true
-			break
-		}
-	}
-	for _, r := range rulesEgress {
-		hasEgress = true
-		if r.DefaultDeny {
-			hasEgressDefaultDeny = true
-			break
+	// 3: Only non-default-deny rules are present. Then, policy is enabled, but we must
+	//    insert an additional allow-all rule. We must do this, even if all traffic is
+	//    allowed, because rules may have additional effects such as enabling L7 proxy.
+	//    The wildcard rule is inserted to the last tier and priority.
+	namespace, _ := lbls.LookupLabel(&podNamespaceLabel)
+	if namespace != "" {
+		for rKey := range p.rulesByNamespace[namespace] {
+			processKey(rKey)
 		}
 	}
 
-	// If there only ingress default-allow rules, then insert a wildcard rule
-	if !hasIngressDefaultDeny && hasIngress {
-		p.logger.Debug("Only default-allow policies, synthesizing ingress wildcard-allow rule", logfields.Identity, securityIdentity)
-		rulesIngress = append(rulesIngress, wildcardRule(securityIdentity.LabelArray, true /*ingress*/))
+	// sort rules (in place) by priority
+	rulesIngress.sort()
+	rulesEgress.sort()
+
+	hasIngress = len(rulesIngress) > 0
+	hasEgress = len(rulesEgress) > 0
+
+	// If policy enforcement is enabled for the daemon, then it has to be
+	// enabled for the endpoint.
+	// If the endpoint has the reserved:init label, i.e. if it has not yet
+	// received any labels, always enforce policy (default deny).
+	if policyMode == option.AlwaysEnforce || lbls.Has(labels.IDNameInit) {
+		hasIngress = true
+		hasEgress = true
+		hasIngressDefaultDeny = true
+		hasEgressDefaultDeny = true
+	}
+
+	// Insert a wildcard rule if there are any ingress rules
+	if len(rulesIngress) > 0 {
+		if !hasIngressDefaultDeny {
+			rulesIngress = rulesIngress.addDefaultRule(securityIdentity, types.WildcardSelectors, LabelsAllowAnyIngress, types.Allow)
+			p.logger.Debug("Only default-allow policies, synthesizing ingress wildcard-allow rule",
+				logfields.Identity, securityIdentity,
+			)
+		} else {
+			// insert localhost allow for k8s if the policy subject is not the host
+			if option.Config.AlwaysAllowLocalhost() && securityIdentity.ID != identity.ReservedIdentityHost {
+				rulesIngress = rulesIngress.addDefaultRule(securityIdentity, types.HostSelectors, LabelsLocalHostIngress, types.Allow)
+				p.logger.Debug("Localhost allowed for k8s, synthesizing ingress host-allow rule",
+					logfields.Identity, securityIdentity,
+				)
+			}
+			if hasIngressPassVerdict {
+				// Explicit default deny is only needed for PASS verdict compatibility
+				rulesIngress = rulesIngress.addDefaultRule(securityIdentity, types.WildcardSelectors, LabelsDenyAnyIngress, types.Deny)
+				p.logger.Debug("Only default-deny policies, synthesizing ingress wildcard-deny rule",
+					logfields.Identity, securityIdentity,
+				)
+			}
+		}
 	}
 
 	// Same for egress -- synthesize a wildcard rule
-	if !hasEgressDefaultDeny && hasEgress {
-		p.logger.Debug("Only default-allow policies, synthesizing egress wildcard-allow rule", logfields.Identity, securityIdentity)
-		rulesEgress = append(rulesEgress, wildcardRule(securityIdentity.LabelArray, false /*egress*/))
+	if len(rulesEgress) > 0 {
+		if !hasEgressDefaultDeny {
+			rulesEgress = rulesEgress.addDefaultRule(securityIdentity, types.WildcardSelectors, LabelsAllowAnyEgress, types.Allow)
+			p.logger.Debug("Only default-allow policies, synthesizing egress wildcard-allow rule",
+				logfields.Identity, securityIdentity,
+			)
+		} else if hasEgressPassVerdict {
+			// Explicit default deny is only needed for PASS verdict compatibility
+			rulesEgress = rulesEgress.addDefaultRule(securityIdentity, types.WildcardSelectors, LabelsDenyAnyEgress, types.Deny)
+			p.logger.Debug("Only default-deny policies, synthesizing egress wildcard-deny rule",
+				logfields.Identity, securityIdentity,
+			)
+		}
 	}
 
 	return
 }
 
-// wildcardRule generates a wildcard rule that only selects the given identity.
-func wildcardRule(lbls labels.LabelArray, ingress bool) *rule {
-	return &rule{
-		PolicyEntry: types.PolicyEntry{
-			Ingress: ingress,
-			Subject: types.NewLabelSelectorFromLabels(lbls...),
-			L3:      types.WildcardSelectors,
-		},
+// addDefaultRule appends a default policy tier wildcard rule that only selects the given subject
+// identity.
+func (rules ruleSlice) addDefaultRule(subject *identity.Identity, peers types.Selectors, lbls labels.LabelArray, verdict types.Verdict) ruleSlice {
+	var priority float64
+	lastRule := rules[len(rules)-1]
+	if lastRule.Tier == types.DefaultPolicy {
+		priority = lastRule.Priority + 1
 	}
+	ingress := lastRule.Ingress
+
+	return append(rules, &rule{
+		PolicyEntry: types.PolicyEntry{
+			Tier:     types.DefaultPolicy,
+			Priority: priority,
+			Verdict:  verdict,
+			Ingress:  ingress,
+			Subject:  types.NewLabelSelectorFromLabels(subject.LabelArray...),
+			L3:       peers,
+			Labels:   lbls,
+		},
+	})
 }
 
-// GetSelectorPolicy computes the SelectorPolicy for a given identity.
-//
-// It returns nil if skipRevision is >= than the already calculated version.
-// This is used to skip policy calculation when a certain revision delta is
-// known to not affect the given identity. Pass a skipRevision of 0 to force
-// calculation.
-func (r *Repository) GetSelectorPolicy(id *identity.Identity, skipRevision uint64, stats GetPolicyStatistics, endpointID uint64) (SelectorPolicy, uint64, error) {
-	stats.WaitingForPolicyRepository().Start()
+// ComputeSelectorPolicy resolves the SelectorPolicy for the given identity at
+// the repository's current revision. The returned policy is already attached
+// to the SelectorCache. The caller must detach it when no longer needed.
+func (r *Repository) ComputeSelectorPolicy(id *identity.Identity) (SelectorPolicy, uint64, error) {
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()
-	stats.WaitingForPolicyRepository().End(true)
 
-	rev := r.GetRevision()
-
-	// Do we already have a given revision?
-	// If so, skip calculation.
-	if skipRevision >= rev {
-		return nil, rev, nil
+	sp, err := r.resolvePolicyLocked(id)
+	if err != nil {
+		return nil, 0, err
 	}
-
-	stats.SelectorPolicyCalculation().Start()
-	// This may call back in to the (locked) repository to generate the
-	// selector policy
-	sp, updated, err := r.policyCache.updateSelectorPolicy(id, endpointID)
-	stats.SelectorPolicyCalculation().EndError(err)
-
-	// If we hit cache, reset the statistics.
-	if !updated {
-		stats.SelectorPolicyCalculation().Reset()
-	}
-
-	return sp, rev, err
+	return sp, r.GetRevision(), nil
 }
 
 // ReplaceByResource replaces all rules by resource, returning the complete set of affected endpoints.
@@ -547,10 +615,141 @@ func (p *Repository) ReplaceByResource(rules types.PolicyEntries, resource ipcac
 	return affectedIDs, p.BumpRevision(), len(oldRules)
 }
 
-// GetPolicySnapshot returns a map of all the SelectorPolicies in the repository.
-func (p *Repository) GetPolicySnapshot() map[identity.NumericIdentity]SelectorPolicy {
+func RepositoryScriptCmds(p *Repository) map[string]script.Cmd {
+	return map[string]script.Cmd{
+		"policyrepo/list": script.Command(
+			script.CmdUsage{
+				Summary: "List all policies in the policy repository",
+			},
+			func(s *script.State, args ...string) (script.WaitFunc, error) {
+				return func(s *script.State) (stdout string, stderr string, err error) {
+					policies := p.GetRulesList()
+					return string(policies.Policy), "", nil
+				}, nil
+			},
+		),
+		"policyrepo/selectorcache": script.Command(
+			script.CmdUsage{
+				Summary: "Dump the selector cache model",
+				Flags: func(fs *pflag.FlagSet) {
+					fs.Bool("subject", false, "Dump the subject selector cache instead of the peer selector cache")
+				},
+			},
+			func(s *script.State, args ...string) (script.WaitFunc, error) {
+				subject, err := s.Flags.GetBool("subject")
+				if err != nil {
+					return nil, err
+				}
+				return func(s *script.State) (stdout string, stderr string, err error) {
+					sc := p.GetSelectorCache()
+					if subject {
+						sc = p.GetSubjectSelectorCache()
+					}
+					return spew.Sprint(sc.GetModel()), "", nil
+				}, nil
+			},
+		),
+		"policyrepo/add": script.Command(
+			script.CmdUsage{
+				Summary: "Add a policy to the policy repository",
+				Args:    "'policy'",
+			},
+			func(s *script.State, args ...string) (script.WaitFunc, error) {
+				if len(args) != 1 {
+					return nil, fmt.Errorf("expected one arg but got %v, see usage details", len(args))
+				}
+				return func(s *script.State) (stdout string, stderr string, err error) {
+					file := args[0]
+
+					b, err := os.ReadFile(s.Path(file))
+					if err != nil {
+						b, err = os.ReadFile(file)
+					}
+					if err != nil {
+						return "", "", fmt.Errorf("failed to read %s: %w", file, err)
+					}
+					obj, _, err := testutils.DecodeObjectGVK(b)
+					if err != nil {
+						return "", "", fmt.Errorf("decode: %w", err)
+					}
+					robj, _ := testutils.DecodeObject(b)
+					objMeta, err := meta.Accessor(obj)
+					if err != nil {
+						return "", "", fmt.Errorf("accessor: %w", err)
+					}
+
+					var (
+						rules api.Rules
+						rev   uint64
+					)
+					if objMeta.GetNamespace() == "" {
+						ccnp := robj.(*v2.CiliumClusterwideNetworkPolicy)
+						rules, err = ccnp.Parse(p.logger, "")
+						if err != nil {
+							return "", "", fmt.Errorf("ccnp parse: %w", err)
+						}
+					} else {
+						cnp := robj.(*v2.CiliumNetworkPolicy)
+						rules, err = cnp.Parse(p.logger, "")
+						if err != nil {
+							return "", "", fmt.Errorf("cnp parse: %w", err)
+						}
+					}
+					_, rev = p.MustAddList(rules)
+					return fmt.Sprintf("Added rules, revision=%d\n", rev), "", nil
+				}, nil
+			},
+		),
+		"policyrepo/bump-revision": script.Command(
+			script.CmdUsage{
+				Summary: "Bump revision of the policy repository",
+			},
+			func(s *script.State, args ...string) (script.WaitFunc, error) {
+				return func(s *script.State) (stdout string, stderr string, err error) {
+					return "Bumped revision to " + strconv.FormatUint(p.BumpRevision(), 10) + "\n", "", nil
+				}, nil
+			},
+		),
+	}
+}
+
+// Snapshot returns a repository that is "disconnected" from the rest of the daemon.
+// It includes a static snapshot of the selectorcache and an empty policy cache.
+//
+// It has all existing rules and identities.
+func (p *Repository) Snapshot(logger *slog.Logger, cm certificatemanager.CertificateManager, rt envoypolicy.EnvoyL7RulesTranslator) (*Repository, identity.IdentityMap) {
 	p.mutex.RLock()
 	defer p.mutex.RUnlock()
 
-	return p.policyCache.GetPolicySnapshot()
+	ids := p.selectorCache.getIdentities()
+
+	out := NewPolicyRepository(
+		logger,
+		p.clusterInfo,
+		ids,
+		cm,
+		rt,
+		identitymanager.NewIDManager(logger),
+		nil, // disable metrics
+	)
+	out.namedPortsGetter = p.namedPortsGetter
+
+	// Insert all rules in to the new policy repository.
+	//
+	// These need to be inserted as if they were coming externally, so selectors
+	// will be allocated in the new selectorcache.
+	for k, r := range p.rules {
+		newRule := out.newRule(r.PolicyEntry, k)
+		out.insert(newRule)
+	}
+
+	return out, ids
+}
+
+// ResolvePolicy directly calculates policy. This should only used be for debug or test code.
+func (p *Repository) ResolvePolicy(securityIdentity *identity.Identity) (SelectorPolicy, error) {
+	p.mutex.RLock()
+	defer p.mutex.RUnlock()
+
+	return p.resolvePolicyLocked(securityIdentity)
 }

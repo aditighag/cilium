@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/cilium/hive/hivetest"
-	"github.com/osrg/gobgp/v3/pkg/packet/bgp"
+	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
 	"github.com/stretchr/testify/require"
 
 	"github.com/cilium/cilium/api/v1/models"
@@ -18,6 +18,7 @@ import (
 
 var (
 	neighbor64125 = &types.Neighbor{
+		Name:    "neighbor-64125",
 		ASN:     64125,
 		Address: netip.MustParseAddr("192.168.0.1"),
 		Transport: &types.NeighborTransport{
@@ -35,6 +36,7 @@ var (
 
 	// changed ConnectRetryTime
 	neighbor64125Update = &types.Neighbor{
+		Name:    "neighbor-64125",
 		ASN:     64125,
 		Address: netip.MustParseAddr("192.168.0.1"),
 		Transport: &types.NeighborTransport{
@@ -52,6 +54,7 @@ var (
 
 	// enabled graceful restart
 	neighbor64125UpdateGR = &types.Neighbor{
+		Name:    "neighbor-64125",
 		ASN:     64125,
 		Address: netip.MustParseAddr("192.168.0.1"),
 		Transport: &types.NeighborTransport{
@@ -73,6 +76,7 @@ var (
 
 	// enabled graceful restart - updated restart time
 	neighbor64125UpdateGRTimer = &types.Neighbor{
+		Name:    "neighbor-64125",
 		ASN:     64125,
 		Address: netip.MustParseAddr("192.168.0.1"),
 		Transport: &types.NeighborTransport{
@@ -93,6 +97,7 @@ var (
 	}
 
 	neighbor64126 = &types.Neighbor{
+		Name:    "neighbor-64126",
 		ASN:     64126,
 		Address: netip.MustParseAddr("192.168.66.1"),
 		Transport: &types.NeighborTransport{
@@ -110,6 +115,7 @@ var (
 
 	// changed HoldTime & KeepAliveTime
 	neighbor64126Update = &types.Neighbor{
+		Name:    "neighbor-64126",
 		ASN:     64126,
 		Address: netip.MustParseAddr("192.168.66.1"),
 		Transport: &types.NeighborTransport{
@@ -126,6 +132,7 @@ var (
 	}
 
 	neighbor64127 = &types.Neighbor{
+		Name:    "neighbor-64127",
 		ASN:     64127,
 		Address: netip.MustParseAddr("192.168.88.1"),
 		EbgpMultihop: &types.NeighborEbgpMultihop{
@@ -140,6 +147,7 @@ var (
 
 	// changed EBGPMultihopTTL
 	neighbor64127Update = &types.Neighbor{
+		Name:    "neighbor-64127",
 		ASN:     64127,
 		Address: netip.MustParseAddr("192.168.88.1"),
 		EbgpMultihop: &types.NeighborEbgpMultihop{
@@ -153,6 +161,7 @@ var (
 	}
 
 	neighbor64128 = &types.Neighbor{
+		Name:    "neighbor-64128",
 		ASN:     64128,
 		Address: netip.MustParseAddr("192.168.77.1"),
 		Transport: &types.NeighborTransport{
@@ -312,7 +321,7 @@ func TestGetPeerState(t *testing.T) {
 				}
 			}
 
-			res, err := testSC.GetPeerState(context.Background())
+			res, err := testSC.GetPeerStateLegacy(context.Background())
 			require.NoError(t, err)
 
 			// validate neighbors count
@@ -332,7 +341,7 @@ func TestGetPeerState(t *testing.T) {
 				}
 			}
 
-			res, err = testSC.GetPeerState(context.Background())
+			res, err = testSC.GetPeerStateLegacy(context.Background())
 			require.NoError(t, err)
 
 			// validate peers
@@ -344,7 +353,7 @@ func TestGetPeerState(t *testing.T) {
 // validatePeers validates that peers returned from GoBGP GetPeerState match expected list of CiliumBGPNeighbors
 func validatePeers(t *testing.T, localASN uint32, neighbors []*types.Neighbor, peers []*models.BgpPeer) {
 	for _, n := range neighbors {
-		p := findMatchingPeer(t, peers, n)
+		p := findMatchingPeer(peers, n)
 		require.NotNilf(t, p, "no matching peer for PeerASN %d and PeerAddress %s", n.ASN, n.Address.String())
 
 		// validate basic data is returned correctly
@@ -374,13 +383,10 @@ func validatePeers(t *testing.T, localASN uint32, neighbors []*types.Neighbor, p
 	}
 }
 
-// findMatchingPeer finds models.BgpPeer matching to the provided types.Neighbor based on the peer ASN and IP
-func findMatchingPeer(t *testing.T, peers []*models.BgpPeer, n *types.Neighbor) *models.BgpPeer {
+// findMatchingPeer finds models.BgpPeer matching to the provided types.Neighbor based on the name
+func findMatchingPeer(peers []*models.BgpPeer, n *types.Neighbor) *models.BgpPeer {
 	for _, p := range peers {
-		pIP, err := netip.ParseAddr(p.PeerAddress)
-		require.NoError(t, err)
-
-		if p.PeerAsn == int64(n.ASN) && pIP == n.Address {
+		if p.Name == n.Name {
 			return p
 		}
 	}
@@ -405,12 +411,12 @@ func TestGetRoutes(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = testSC.AdvertisePath(context.TODO(), types.PathRequest{
-		Path: types.NewPathForPrefix(netip.MustParsePrefix("10.0.0.0/24")),
+		Path: types.MustNewPathForPrefix(netip.MustParsePrefix("10.0.0.0/24")),
 	})
 	require.NoError(t, err)
 
 	_, err = testSC.AdvertisePath(context.TODO(), types.PathRequest{
-		Path: types.NewPathForPrefix(netip.MustParsePrefix("fd00::/64")),
+		Path: types.MustNewPathForPrefix(netip.MustParsePrefix("fd00::/64")),
 	})
 	require.NoError(t, err)
 
@@ -425,8 +431,8 @@ func TestGetRoutes(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, res.Routes, 1)
 	require.Len(t, res.Routes[0].Paths, 1)
-	require.Equal(t, uint16(bgp.AFI_IP), res.Routes[0].Paths[0].NLRI.AFI())
-	require.Equal(t, uint8(bgp.SAFI_UNICAST), res.Routes[0].Paths[0].NLRI.SAFI())
+	require.EqualValues(t, bgp.AFI_IP, res.Routes[0].Paths[0].Family.Afi)
+	require.EqualValues(t, bgp.SAFI_UNICAST, res.Routes[0].Paths[0].Family.Safi)
 	require.IsType(t, &bgp.IPAddrPrefix{}, res.Routes[0].Paths[0].NLRI)
 
 	// test IPv6 address family
@@ -440,9 +446,9 @@ func TestGetRoutes(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, res.Routes, 1)
 	require.Len(t, res.Routes[0].Paths, 1)
-	require.Equal(t, uint16(bgp.AFI_IP6), res.Routes[0].Paths[0].NLRI.AFI())
-	require.Equal(t, uint8(bgp.SAFI_UNICAST), res.Routes[0].Paths[0].NLRI.SAFI())
-	require.IsType(t, &bgp.IPv6AddrPrefix{}, res.Routes[0].Paths[0].NLRI)
+	require.EqualValues(t, bgp.AFI_IP6, res.Routes[0].Paths[0].Family.Afi)
+	require.EqualValues(t, bgp.SAFI_UNICAST, res.Routes[0].Paths[0].Family.Safi)
+	require.IsType(t, &bgp.IPAddrPrefix{}, res.Routes[0].Paths[0].NLRI)
 
 	// test adj-rib-out
 	res, err = testSC.GetRoutes(context.TODO(), &types.GetRoutesRequest{

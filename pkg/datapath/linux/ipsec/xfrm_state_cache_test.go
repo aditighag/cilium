@@ -1,5 +1,3 @@
-//go:build unparallel
-
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Cilium
 
@@ -28,7 +26,7 @@ func newTestableXfrmStateListCache(ttl time.Duration, enableCaching bool, clock 
 }
 
 func TestPrivilegedXfrmStateListCache(t *testing.T) {
-	setupIPSecSuitePrivileged(t, "ipv4")
+	setup(t, "ipv4")
 
 	fakeClock := baseclocktest.NewFakeClock(time.Now())
 	xfrmStateCache := newTestableXfrmStateListCache(
@@ -103,7 +101,7 @@ func TestPrivilegedXfrmStateListCache(t *testing.T) {
 }
 
 func TestPrivilegedXfrmStateListCacheDisabled(t *testing.T) {
-	setupIPSecSuitePrivileged(t, "ipv4")
+	setup(t, "ipv4")
 
 	xfrmStateCache := newTestableXfrmStateListCache(
 		time.Second,
@@ -132,6 +130,7 @@ func cleanIPSecStatesAndPolicies(t *testing.T) {
 	}
 
 	for _, s := range xfrmStateList {
+		//nolint:forbidigo
 		if err := netlink.XfrmStateDel(&s); err != nil {
 			t.Fatalf("Can't delete XFRM state: %v", err)
 		}

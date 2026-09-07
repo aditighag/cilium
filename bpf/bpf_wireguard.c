@@ -12,7 +12,8 @@
 #include <netdev_config.h>
 
 /* WORLD_IPV{4,6}_ID varies based on dualstack being enabled. Real values are
- * written into node_config.h at runtime. */
+ * written into node_config.h at runtime.
+ */
 #define SECLABEL WORLD_ID
 #define SECLABEL_IPV4 WORLD_IPV4_ID
 #define SECLABEL_IPV6 WORLD_IPV6_ID
@@ -28,6 +29,7 @@
 
 #include "lib/tailcall.h"
 #include "lib/common.h"
+#include "lib/encrypt.h"
 #include "lib/ipv6.h"
 #include "lib/ipv4.h"
 #include "lib/dbg.h"
@@ -40,85 +42,69 @@
 #include "lib/local_delivery.h"
 
 #ifdef ENABLE_IPV6
-static __always_inline __u32
-resolve_srcid_ipv6(struct __ctx_buff *ctx, struct ipv6hdr *ip6)
-{
-	__u32 srcid = WORLD_IPV6_ID;
-	const struct remote_endpoint_info *info = NULL;
-	const union v6addr *src;
-
-	src = (union v6addr *)&ip6->saddr;
-	info = lookup_ip6_remote_endpoint(src, 0);
-	if (info)
-		srcid = info->sec_identity;
-
-	cilium_dbg(ctx, info ? DBG_IP_ID_MAP_SUCCEED6 : DBG_IP_ID_MAP_FAILED6,
-		   ((__u32 *)src)[3], srcid);
-
-	return srcid;
-}
-
 /* See the equivalent v4 path for comments */
 static __always_inline int
-handle_ipv6(struct __ctx_buff *ctx, __u32 identity, __s8 *ext_err __maybe_unused)
+handle_ipv6(struct __ctx_buff *ctx, __u32 identity __maybe_unused, __s8 *ext_err __maybe_unused)
 {
 	void *data_end, *data;
 	struct ipv6hdr *ip6;
 	const struct endpoint_info *ep;
-	fraginfo_t __maybe_unused fraginfo;
+	int ret;
 
 	if (!revalidate_data_pull(ctx, &data, &data_end, &ip6))
 		return DROP_INVALID;
 
-#ifndef ENABLE_IPV6_FRAGMENTS
-	fraginfo = ipv6_get_fraginfo(ctx, ip6);
-	if (fraginfo < 0)
-		return (int)fraginfo;
-	if (ipfrag_is_fragment(fraginfo))
-		return DROP_FRAG_NOSUPPORT;
-#endif
+	if (!CONFIG(enable_ipv6_fragments)) {
+		fraginfo_t fraginfo = ipv6_get_fraginfo(ctx, ip6);
+
+		if (fraginfo < 0)
+			return (int)fraginfo;
+		if (ipfrag_is_fragment(fraginfo))
+			return DROP_FRAG_NOSUPPORT;
+	}
 
 #ifdef ENABLE_NODEPORT
 	if (!ctx_skip_nodeport(ctx)) {
 		bool punt_to_stack = false;
 		bool is_dsr = false;
-		int ret;
 
 		ret = nodeport_lb6(ctx, ip6, identity, &punt_to_stack, ext_err, &is_dsr);
 		if (ret < 0 || ret == TC_ACT_REDIRECT)
 			return ret;
 		if (punt_to_stack)
 			return ret;
+		if (!revalidate_data(ctx, &data, &data_end, &ip6))
+			return DROP_INVALID;
 	}
 #endif
-
-#ifndef ENABLE_HOST_ROUTING
-	return CTX_ACT_OK;
-#endif
-
-	if (!revalidate_data(ctx, &data, &data_end, &ip6))
-		return DROP_INVALID;
 
 	ep = lookup_ip6_endpoint(ip6);
 	if (ep && !(ep->flags & ENDPOINT_MASK_HOST_DELIVERY)) {
-		int l3_off = ETH_HLEN;
+		if (CONFIG(enable_bpf_host_routing)) {
+			int l3_off = ETH_HLEN;
+			bool l2_hdr_required = true;
 
-#ifdef ENABLE_HOST_ROUTING
-		bool l2_hdr_required = true;
-		int ret;
+			ret = maybe_add_l2_hdr(ctx, ep->ifindex, &l2_hdr_required);
+			if (ret != 0)
+				return ret;
+			if (l2_hdr_required)
+				l3_off += __ETH_HLEN;
 
-		ret = maybe_add_l2_hdr(ctx, ep->ifindex, &l2_hdr_required);
-		if (ret != 0)
-			return ret;
-		if (l2_hdr_required)
-			l3_off += __ETH_HLEN;
-#endif
-
-		return ipv6_local_delivery(ctx, l3_off, identity, MARK_MAGIC_IDENTITY, ep,
-					   METRIC_INGRESS, false, false);
+			return ipv6_local_delivery(ctx, l3_off, identity, MARK_MAGIC_IDENTITY, ep,
+						   METRIC_INGRESS, false, false);
+		} else {
+			return CTX_ACT_OK;
+		}
 	}
 
-	return CTX_ACT_OK;
+	ret = add_l2_hdr(ctx);
+	if (ret != 0)
+		return ret;
+
+	if (CONFIG(enable_identity_mark))
+		set_identity_mark(ctx, identity, MARK_MAGIC_DECRYPT);
+
+	return ipv6_host_delivery(ctx, __ETH_HLEN);
 }
 
 __declare_tail(CILIUM_CALL_IPV6_FROM_WIREGUARD)
@@ -137,50 +123,33 @@ int tail_handle_ipv6(struct __ctx_buff *ctx)
 #endif /* ENABLE_IPV6 */
 
 #ifdef ENABLE_IPV4
-static __always_inline __u32
-resolve_srcid_ipv4(struct __ctx_buff *ctx, struct iphdr *ip4)
-{
-	__u32 srcid = WORLD_IPV4_ID;
-	const struct remote_endpoint_info *info = NULL;
-
-	info = lookup_ip4_remote_endpoint(ip4->saddr, 0);
-	if (info)
-		srcid = info->sec_identity;
-
-	cilium_dbg(ctx, info ? DBG_IP_ID_MAP_SUCCEED4 : DBG_IP_ID_MAP_FAILED4,
-		   ip4->saddr, srcid);
-
-	return srcid;
-}
-
 static __always_inline int
-handle_ipv4(struct __ctx_buff *ctx, __u32 identity, __s8 *ext_err __maybe_unused)
+handle_ipv4(struct __ctx_buff *ctx, __u32 identity __maybe_unused, __s8 *ext_err __maybe_unused)
 {
 	void *data_end, *data;
 	struct iphdr *ip4;
 	const struct endpoint_info *ep;
 	fraginfo_t __maybe_unused fraginfo;
+	int ret;
 
 	if (!revalidate_data_pull(ctx, &data, &data_end, &ip4))
 		return DROP_INVALID;
 
-/* If IPv4 fragmentation is disabled
- * AND a IPv4 fragmented packet is received,
- * then drop the packet.
- */
-#ifndef ENABLE_IPV4_FRAGMENTS
-	fraginfo = ipfrag_encode_ipv4(ip4);
-	if (ipfrag_is_fragment(fraginfo))
-		return DROP_FRAG_NOSUPPORT;
-#endif
+	/* If IPv4 fragmentation is disabled and a IPv4 fragmented packet is
+	 * received, then drop the packet.
+	 */
+	if (!CONFIG(enable_ipv4_fragments)) {
+		fraginfo = ipfrag_encode_ipv4(ip4);
+		if (ipfrag_is_fragment(fraginfo))
+			return DROP_FRAG_NOSUPPORT;
+	}
 
 #ifdef ENABLE_NODEPORT
 	if (!ctx_skip_nodeport(ctx)) {
 		bool punt_to_stack = false;
 		bool is_dsr = false;
-		int ret;
 
-		ret = nodeport_lb4(ctx, ip4, ETH_HLEN, identity, &punt_to_stack,
+		ret = nodeport_lb4(ctx, ip4, identity, &punt_to_stack,
 				   ext_err, &is_dsr);
 		/* nodeport_lb4() returns with TC_ACT_REDIRECT for
 		 * traffic to L7 LB. Policy enforcement needs to take
@@ -192,11 +161,15 @@ handle_ipv4(struct __ctx_buff *ctx, __u32 identity, __s8 *ext_err __maybe_unused
 			return ret;
 		if (punt_to_stack)
 			return ret;
+		if (!revalidate_data(ctx, &data, &data_end, &ip4))
+			return DROP_INVALID;
 	}
 #endif
 
-#ifndef ENABLE_HOST_ROUTING
-	/* Without bpf_redirect_neigh() helper, we cannot redirect a
+	/* Lookup IPv4 address in the list of local endpoints and host IPs.
+	 *
+	 * Packet for local Endpoint:
+	 * Without bpf_redirect_neigh() helper, we cannot redirect a
 	 * packet to a local endpoint in the direct routing mode, as
 	 * the redirect bypasses nf_conntrack table. This makes a
 	 * second reply from the endpoint to be MASQUERADEd or to be
@@ -204,43 +177,60 @@ handle_ipv4(struct __ctx_buff *ctx, __u32 identity, __s8 *ext_err __maybe_unused
 	 * which interface it was inputed. With bpf_redirect_neigh()
 	 * we bypass request and reply path in the host namespace and
 	 * do not run into this issue.
+	 * Endpoint policies will be enforced as follows:
+	 * - with per-EP routes: the packet reaches the installed
+	 *   to-container program, where policies will be enforced.
+	 * - without per-EP routes: the packet reaches cilium_host,
+	 *   where policies will be enforced via tailcall.
+	 * With bpf_redirect_neigh() helper, we redirect to the pod
+	 * ingress BPF program to enforce policies and deliver the packet.
+	 *
+	 * Packet for local Host:
+	 * We always add a L2 header and redirect to cilium_host@ingress.
+	 * Host policies will be enforced in cilium_host@ingress (HostFw).
 	 */
-	return CTX_ACT_OK;
-#endif
-
-	if (!revalidate_data(ctx, &data, &data_end, &ip4))
-		return DROP_INVALID;
-
-	/* Lookup IPv4 address in list of local endpoints and host IPs */
 	ep = lookup_ip4_endpoint(ip4);
 	if (ep && !(ep->flags & ENDPOINT_MASK_HOST_DELIVERY)) {
-		int l3_off = ETH_HLEN;
+		if (CONFIG(enable_bpf_host_routing)) {
+			int l3_off = ETH_HLEN;
+			bool l2_hdr_required = true;
 
-#ifdef ENABLE_HOST_ROUTING
-		bool l2_hdr_required = true;
-		int ret;
+			ret = maybe_add_l2_hdr(ctx, ep->ifindex, &l2_hdr_required);
+			if (ret != 0)
+				return ret;
+			if (l2_hdr_required) {
+				/* l2 header is added */
+				l3_off += __ETH_HLEN;
+				if (!__revalidate_data_pull(ctx, &data, &data_end,
+							    (void **)&ip4, l3_off,
+							    sizeof(*ip4), false))
+					return DROP_INVALID;
+			}
 
-		ret = maybe_add_l2_hdr(ctx, ep->ifindex, &l2_hdr_required);
-		if (ret != 0)
-			return ret;
-		if (l2_hdr_required) {
-			/* l2 header is added */
-			l3_off += __ETH_HLEN;
-			if (!__revalidate_data_pull(ctx, &data, &data_end,
-						    (void **)&ip4, l3_off,
-						    sizeof(*ip4), false))
-				return DROP_INVALID;
+			return ipv4_local_delivery(ctx, l3_off, identity, MARK_MAGIC_IDENTITY,
+						   ip4, ep, METRIC_INGRESS, false, false, 0);
+		} else {
+			return CTX_ACT_OK;
 		}
-#endif
-
-		return ipv4_local_delivery(ctx, l3_off, identity, MARK_MAGIC_IDENTITY, ip4, ep,
-					   METRIC_INGRESS, false, false, 0);
 	}
 
-	/* A packet entering the node from wireguard and not going to a local endpoint
-	 * has to be going to the stack (ex. vxlan, encrypted node-to-node).
+	ret = add_l2_hdr(ctx);
+	if (ret != 0)
+		return ret;
+	if (!__revalidate_data_pull(ctx, &data, &data_end,
+				    (void **)&ip4, __ETH_HLEN,
+				    sizeof(*ip4), false))
+		return DROP_INVALID;
+
+	/* We must use the MARK_MAGIC_DECRYPT rather than MARK_MAGIC_IDENTITY though,
+	 * as at the beginning of the from-wireguard program we mark the packet as
+	 * decrypted. That has been introduced to support Ingress Strict Mode
+	 * (see https://github.com/cilium/cilium/pull/39239).
 	 */
-	return CTX_ACT_OK;
+	if (CONFIG(enable_identity_mark))
+		set_identity_mark(ctx, identity, MARK_MAGIC_DECRYPT);
+
+	return ipv4_host_delivery(ctx, __ETH_HLEN, ip4);
 }
 
 __declare_tail(CILIUM_CALL_IPV4_FROM_WIREGUARD)
@@ -266,14 +256,38 @@ int cil_from_wireguard(struct __ctx_buff *ctx)
 	struct ipv6hdr __maybe_unused *ip6;
 	struct iphdr __maybe_unused *ip4;
 	int __maybe_unused ret;
+	const struct remote_endpoint_info __maybe_unused *info;
 	__u32 __maybe_unused identity = UNKNOWN_ID;
 	__s8 __maybe_unused ext_err = 0;
-	__u16 proto = ctx_get_protocol(ctx);
+	__be16 proto = ctx_get_protocol(ctx);
 
 	ctx_skip_nodeport_clear(ctx);
 
 	bpf_clear_meta(ctx);
 	check_and_store_ip_trace_id(ctx);
+
+	/* mark packet as decrypted by wireguard */
+	if (CONFIG(enable_identity_mark))
+		set_decrypt_mark(ctx, 0);
+
+#if defined(TUNNEL_MODE) && !(defined(ENABLE_NODEPORT) && defined(ENABLE_NODE_ENCRYPTION))
+	/* In native routing mode we want to deliver packets to local endpoints
+	 * straight from BPF, without passing through the stack.
+	 * This matches overlay mode (where bpf_overlay would handle the delivery)
+	 * and native routing mode without encryption (where bpf_host at the native
+	 * device would handle the delivery).
+	 *
+	 * When WG & encrypt-node are on, a NodePort BPF to-be forwarded request
+	 * to a remote node running a selected service endpoint must be encrypted.
+	 * To make the NodePort's rev-{S,D}NAT translations to happen for a reply
+	 * from the remote node, we need to attach bpf_host to the Cilium's WG
+	 * netdev (otherwise, the WG netdev after decrypting the reply will pass
+	 * it to the stack which drops the packet).
+	 *
+	 * Since neither of these conditions are met, we can return CTX_ACT_OK.
+	 */
+	return CTX_ACT_OK;
+#endif
 
 	switch (proto) {
 #ifdef ENABLE_IPV6
@@ -281,7 +295,9 @@ int cil_from_wireguard(struct __ctx_buff *ctx)
 		if (!revalidate_data_pull(ctx, &data, &data_end, &ip6))
 			return send_drop_notify_error(ctx, identity, DROP_INVALID, METRIC_INGRESS);
 
-		identity = resolve_srcid_ipv6(ctx, ip6);
+		info = lookup_ip6_remote_endpoint((union v6addr *)&ip6->saddr, 0);
+		if (info)
+			identity = info->sec_identity;
 		ctx_store_meta(ctx, CB_SRC_LABEL, identity);
 
 		send_trace_notify(ctx, TRACE_FROM_CRYPTO, identity, UNKNOWN_ID,
@@ -299,7 +315,9 @@ int cil_from_wireguard(struct __ctx_buff *ctx)
 		if (!revalidate_data_pull(ctx, &data, &data_end, &ip4))
 			return send_drop_notify_error(ctx, identity, DROP_INVALID, METRIC_INGRESS);
 
-		identity = resolve_srcid_ipv4(ctx, ip4);
+		info = lookup_ip4_remote_endpoint(ip4->saddr, 0);
+		if (info)
+			identity = info->sec_identity;
 		ctx_store_meta(ctx, CB_SRC_LABEL, identity);
 
 		send_trace_notify(ctx, TRACE_FROM_CRYPTO, identity, UNKNOWN_ID,
@@ -332,8 +350,8 @@ int cil_to_wireguard(struct __ctx_buff *ctx)
 {
 	int __maybe_unused ret;
 	__s8 __maybe_unused ext_err = 0;
-	__u16 __maybe_unused proto = ctx_get_protocol(ctx);
-	__u32 __maybe_unused src_sec_identity = UNKNOWN_ID;
+	__be16 proto = ctx_get_protocol(ctx);
+	__u32 src_sec_identity = UNKNOWN_ID;
 	__u32 magic = ctx->mark & MARK_MAGIC_HOST_MASK;
 
 	struct trace_ctx __maybe_unused trace = {

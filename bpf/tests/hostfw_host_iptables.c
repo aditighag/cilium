@@ -23,6 +23,8 @@ static volatile const __u8 *server_mac = mac_two;
 
 #include "lib/bpf_host.h"
 
+ASSIGN_CONFIG(bool, enable_conntrack_accounting, true)
+
 #include "lib/endpoint.h"
 #include "lib/ipcache.h"
 #include "lib/policy.h"
@@ -36,7 +38,7 @@ static volatile const __u8 *server_mac = mac_two;
  * The egress path should create a CT entry, but apply no egress network policy.
  * The ingress path should apply no ingress network policy.
  */
-PKTGEN("tc", "hostfw_iptables_host_ipv4_01_pod")
+PKTGEN(PROG_TYPE, "hostfw_iptables_host_ipv4_01_pod")
 int hostfw_iptables_host_ipv4_01_pod_pktgen(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -58,7 +60,7 @@ int hostfw_iptables_host_ipv4_01_pod_pktgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("tc", "hostfw_iptables_host_ipv4_01_pod")
+SETUP(PROG_TYPE, "hostfw_iptables_host_ipv4_01_pod")
 int hostfw_iptables_host_ipv4_01_pod_setup(struct __ctx_buff *ctx)
 {
 	endpoint_v4_add_entry(NODE_IP, 0, 0, ENDPOINT_F_HOST, HOST_ID,
@@ -66,18 +68,22 @@ int hostfw_iptables_host_ipv4_01_pod_setup(struct __ctx_buff *ctx)
 	ipcache_v4_add_entry(NODE_IP, 0, HOST_ID, 0, 0);
 	ipcache_v4_add_world_entry();
 
+	policy_add_egress_deny_all_entry();
+
 	set_identity_mark(ctx, POD_SEC_IDENTITY, MARK_MAGIC_IDENTITY);
 
 	return netdev_send_packet(ctx);
 }
 
-CHECK("tc", "hostfw_iptables_host_ipv4_01_pod")
+CHECK(PROG_TYPE, "hostfw_iptables_host_ipv4_01_pod")
 int hostfw_iptables_host_ipv4_01_pod_check(const struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
 	__u32 *status_code;
 
 	test_init();
+
+	endpoint_v4_del_entry(NODE_IP);
 
 	data = (void *)(long)ctx_data(ctx);
 	data_end = (void *)(long)ctx->data_end;
@@ -105,10 +111,12 @@ int hostfw_iptables_host_ipv4_01_pod_check(const struct __ctx_buff *ctx)
 
 	assert(ct_entry->packets == 1);
 
+	policy_delete_egress_all_entry();
+
 	test_finish();
 }
 
-PKTGEN("tc", "hostfw_iptables_host_ipv4_02_pod")
+PKTGEN(PROG_TYPE, "hostfw_iptables_host_ipv4_02_pod")
 int hostfw_iptables_host_ipv4_02_pod_pktgen(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -130,13 +138,15 @@ int hostfw_iptables_host_ipv4_02_pod_pktgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("tc", "hostfw_iptables_host_ipv4_02_pod")
+SETUP(PROG_TYPE, "hostfw_iptables_host_ipv4_02_pod")
 int hostfw_iptables_host_ipv4_02_pod_setup(struct __ctx_buff *ctx)
 {
+	policy_add_ingress_deny_all_entry();
+
 	return netdev_receive_packet(ctx);
 }
 
-CHECK("tc", "hostfw_iptables_host_ipv4_02_pod")
+CHECK(PROG_TYPE, "hostfw_iptables_host_ipv4_02_pod")
 int hostfw_iptables_host_ipv4_02_pod_check(const struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -170,6 +180,8 @@ int hostfw_iptables_host_ipv4_02_pod_check(const struct __ctx_buff *ctx)
 
 	assert(ct_entry->packets == 2);
 
+	policy_delete_ingress_all_entry();
+
 	test_finish();
 }
 
@@ -177,7 +189,7 @@ int hostfw_iptables_host_ipv4_02_pod_check(const struct __ctx_buff *ctx)
  *
  * The egress path should apply egress network policy and drop the packet.
  */
-PKTGEN("tc", "hostfw_iptables_host_ipv4_03_host")
+PKTGEN(PROG_TYPE, "hostfw_iptables_host_ipv4_03_host")
 int hostfw_iptables_host_ipv4_03_host_pktgen(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -199,15 +211,17 @@ int hostfw_iptables_host_ipv4_03_host_pktgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("tc", "hostfw_iptables_host_ipv4_03_host")
+SETUP(PROG_TYPE, "hostfw_iptables_host_ipv4_03_host")
 int hostfw_iptables_host_ipv4_03_host_setup(struct __ctx_buff *ctx)
 {
+	policy_add_egress_deny_all_entry();
+
 	set_identity_mark(ctx, 0, MARK_MAGIC_HOST);
 
 	return netdev_send_packet(ctx);
 }
 
-CHECK("tc", "hostfw_iptables_host_ipv4_03_host")
+CHECK(PROG_TYPE, "hostfw_iptables_host_ipv4_03_host")
 int hostfw_iptables_host_ipv4_03_host_check(const struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -225,6 +239,8 @@ int hostfw_iptables_host_ipv4_03_host_check(const struct __ctx_buff *ctx)
 
 	assert(*status_code == CTX_ACT_DROP);
 
+	policy_delete_egress_all_entry();
+
 	test_finish();
 }
 
@@ -233,7 +249,7 @@ int hostfw_iptables_host_ipv4_03_host_check(const struct __ctx_buff *ctx)
  * The egress path should apply egress network policy, and let the packet pass.
  * The ingress path should skip ingress network policy.
  */
-PKTGEN("tc", "hostfw_iptables_host_ipv4_04_host")
+PKTGEN(PROG_TYPE, "hostfw_iptables_host_ipv4_04_host")
 int hostfw_iptables_host_ipv4_04_host_pktgen(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -255,7 +271,7 @@ int hostfw_iptables_host_ipv4_04_host_pktgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("tc", "hostfw_iptables_host_ipv4_04_host")
+SETUP(PROG_TYPE, "hostfw_iptables_host_ipv4_04_host")
 int hostfw_iptables_host_ipv4_04_host_setup(struct __ctx_buff *ctx)
 {
 	set_identity_mark(ctx, 0, MARK_MAGIC_HOST);
@@ -265,7 +281,7 @@ int hostfw_iptables_host_ipv4_04_host_setup(struct __ctx_buff *ctx)
 	return netdev_send_packet(ctx);
 }
 
-CHECK("tc", "hostfw_iptables_host_ipv4_04_host")
+CHECK(PROG_TYPE, "hostfw_iptables_host_ipv4_04_host")
 int hostfw_iptables_host_ipv4_04_host_check(const struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -299,10 +315,12 @@ int hostfw_iptables_host_ipv4_04_host_check(const struct __ctx_buff *ctx)
 
 	assert(ct_entry->packets == 1);
 
+	policy_delete_egress_all_entry();
+
 	test_finish();
 }
 
-PKTGEN("tc", "hostfw_iptables_host_ipv4_05_host")
+PKTGEN(PROG_TYPE, "hostfw_iptables_host_ipv4_05_host")
 int hostfw_iptables_host_ipv4_05_host_pktgen(struct __ctx_buff *ctx)
 {
 	struct pktgen builder;
@@ -324,13 +342,15 @@ int hostfw_iptables_host_ipv4_05_host_pktgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("tc", "hostfw_iptables_host_ipv4_05_host")
+SETUP(PROG_TYPE, "hostfw_iptables_host_ipv4_05_host")
 int hostfw_iptables_host_ipv4_05_host_setup(struct __ctx_buff *ctx)
 {
+	policy_add_ingress_deny_all_entry();
+
 	return netdev_receive_packet(ctx);
 }
 
-CHECK("tc", "hostfw_iptables_host_ipv4_05_host")
+CHECK(PROG_TYPE, "hostfw_iptables_host_ipv4_05_host")
 int hostfw_iptables_host_ipv4_05_host_check(const struct __ctx_buff *ctx)
 {
 	void *data, *data_end;
@@ -364,7 +384,7 @@ int hostfw_iptables_host_ipv4_05_host_check(const struct __ctx_buff *ctx)
 
 	assert(ct_entry->packets == 2);
 
-	policy_delete_egress_all_entry();
+	policy_delete_ingress_all_entry();
 
 	test_finish();
 }

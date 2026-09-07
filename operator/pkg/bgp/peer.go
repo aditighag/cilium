@@ -16,11 +16,11 @@ import (
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 
+	"github.com/cilium/cilium/pkg/bgp/config"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	k8s_client "github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	slim_core_v1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
-	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/resiliency"
 )
 
@@ -38,27 +38,27 @@ type peerConfigStatusReconciler struct {
 type peerConfigStatusReconcilerIn struct {
 	cell.In
 
-	Clientset    k8s_client.Clientset
-	DaemonConfig *option.DaemonConfig
-	JobGroup     job.Group
+	Clientset k8s_client.Clientset
+	BGPConfig config.BGPConfig
+	JobGroup  job.Group
 
 	SecretResource     resource.Resource[*slim_core_v1.Secret]
 	PeerConfigResource resource.Resource[*v2.CiliumBGPPeerConfig]
 }
 
 func registerPeerConfigStatusReconciler(in peerConfigStatusReconcilerIn) {
-	if !in.DaemonConfig.BGPControlPlaneEnabled() {
+	if !in.BGPConfig.BGPControlPlaneEnabled() {
 		return
 	}
 
 	u := &peerConfigStatusReconciler{
 		cs:                 in.Clientset,
-		secretNamespace:    in.DaemonConfig.BGPSecretsNamespace,
+		secretNamespace:    in.BGPConfig.SecretsNamespace,
 		secretResource:     in.SecretResource,
 		peerConfigResource: in.PeerConfigResource,
 	}
 
-	if !in.DaemonConfig.EnableBGPControlPlaneStatusReport {
+	if !in.BGPConfig.EnableStatusReport {
 		// Register a job to cleanup the conditions from the existing
 		// PeerConfig resources. This is needed for the case that the
 		// status report was enabled previously and some conditions
@@ -156,24 +156,29 @@ func (u *peerConfigStatusReconciler) cleanupStatus(ctx context.Context, health c
 
 			// The resource doesn't exist anymore which is fine.
 			if !exists {
+				removed.Insert(k)
 				continue
 			}
 
 			updateStatus := false
 			for _, cond := range v2.AllBGPPeerConfigConditions {
-				if removed := meta.RemoveStatusCondition(&pc.Status.Conditions, cond); removed {
+				if meta.RemoveStatusCondition(&pc.Status.Conditions, cond) {
 					updateStatus = true
 				}
 			}
 
-			if updateStatus {
-				if _, err := u.cs.CiliumV2().CiliumBGPPeerConfigs().UpdateStatus(ctx, pc, meta_v1.UpdateOptions{}); err != nil {
-					// Failed to update status. Skip and retry.
-					continue
-				} else {
-					removed.Insert(k)
-				}
+			if !updateStatus {
+				// No managed conditions are present on this resource,
+				// so there is nothing to clean up.
+				removed.Insert(k)
+				continue
 			}
+
+			if _, err := u.cs.CiliumV2().CiliumBGPPeerConfigs().UpdateStatus(ctx, pc, meta_v1.UpdateOptions{}); err != nil {
+				// Failed to update status. Skip and retry.
+				continue
+			}
+			removed.Insert(k)
 		}
 
 		remaining = remaining.Difference(removed)
@@ -192,9 +197,9 @@ func (u *peerConfigStatusReconciler) cleanupStatus(ctx context.Context, health c
 func (u *peerConfigStatusReconciler) reconcilePeerConfig(ctx context.Context, config *v2.CiliumBGPPeerConfig) error {
 	updateStatus := false
 
-	authSecretMissing := u.authSecretMissing(config)
+	authSecretConfigured, authSecretMissing := u.authSecretMissing(config)
 
-	if changed := u.updateMissingAuthSecretCondition(config, authSecretMissing); changed {
+	if changed := u.updateMissingAuthSecretCondition(config, authSecretConfigured, authSecretMissing); changed {
 		updateStatus = true
 	}
 
@@ -211,27 +216,34 @@ func (u *peerConfigStatusReconciler) reconcilePeerConfig(ctx context.Context, co
 	return nil
 }
 
-func (u *peerConfigStatusReconciler) authSecretMissing(c *v2.CiliumBGPPeerConfig) bool {
+func (u *peerConfigStatusReconciler) authSecretMissing(c *v2.CiliumBGPPeerConfig) (isConfigured bool, isMissing bool) {
 	if c.Spec.AuthSecretRef == nil {
-		return false
+		return false, false
 	}
 	if _, exists, _ := u.secretStore.GetByKey(resource.Key{Namespace: u.secretNamespace, Name: *c.Spec.AuthSecretRef}); !exists {
-		return true
+		return true, true
 	}
-	return false
+	return true, false
 }
 
-func (u *peerConfigStatusReconciler) updateMissingAuthSecretCondition(config *v2.CiliumBGPPeerConfig, missing bool) bool {
+func (u *peerConfigStatusReconciler) updateMissingAuthSecretCondition(config *v2.CiliumBGPPeerConfig, configured, missing bool) bool {
 	cond := meta_v1.Condition{
 		Type:               v2.BGPPeerConfigConditionMissingAuthSecret,
 		Status:             meta_v1.ConditionFalse,
 		ObservedGeneration: config.Generation,
 		LastTransitionTime: meta_v1.Now(),
-		Reason:             "MissingAuthSecret",
+		Message:            "",
+		Reason:             "AuthSecretValidated",
 	}
-	if missing {
+	if !configured {
+		cond.Status = meta_v1.ConditionFalse
+		cond.Message = "Auth Secret is not configured"
+		cond.Reason = "AuthSecretNotConfigured"
+	}
+	if missing && configured {
 		cond.Status = meta_v1.ConditionTrue
 		cond.Message = fmt.Sprintf("Referenced Auth Secret %q is missing", *config.Spec.AuthSecretRef)
+		cond.Reason = "AuthSecretMissing"
 	}
 	return meta.SetStatusCondition(&config.Status.Conditions, cond)
 }

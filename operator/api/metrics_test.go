@@ -11,11 +11,11 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"maps"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"reflect"
 	"testing"
 	"time"
 
@@ -56,11 +56,6 @@ func TestMetricsHandlerWithoutMetrics(t *testing.T) {
 		cell.Provide(ciliumMetrics.NewRegistry),
 		cell.Provide(func() (*option.DaemonConfig, ciliumMetrics.RegistryConfig) {
 			return option.Config, ciliumMetrics.RegistryConfig{}
-		}),
-		cell.Provide(func() operatorMetrics.SharedConfig {
-			return operatorMetrics.SharedConfig{
-				EnableMetrics: false,
-			}
 		}),
 
 		MetricsHandlerCell,
@@ -120,11 +115,6 @@ func TestMetricsHandlerWithMetrics(t *testing.T) {
 
 	hive := hive.New(
 		operatorMetrics.Cell,
-		cell.Provide(func() operatorMetrics.SharedConfig {
-			return operatorMetrics.SharedConfig{
-				EnableMetrics: true,
-			}
-		}),
 		cell.Provide(func() *option.DaemonConfig {
 			return option.Config
 		}),
@@ -215,11 +205,6 @@ func TestMetricsHandlermTLS(t *testing.T) {
 
 	hive := hive.New(
 		operatorMetrics.Cell,
-		cell.Provide(func() operatorMetrics.SharedConfig {
-			return operatorMetrics.SharedConfig{
-				EnableMetrics: true,
-			}
-		}),
 		cell.Provide(func() *option.DaemonConfig {
 			return option.Config
 		}),
@@ -308,7 +293,7 @@ func testMetric(metrics []models.Metric, name string, value float64, labels map[
 			if metric.Value != value {
 				return fmt.Errorf("expected value %f for %q, got %f", value, name, metric.Value)
 			}
-			if !reflect.DeepEqual(metric.Labels, labels) {
+			if !maps.Equal(metric.Labels, labels) {
 				return fmt.Errorf("expected labels map %v for %q, got %v", labels, name, metric.Labels)
 			}
 			return nil

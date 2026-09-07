@@ -34,7 +34,16 @@ const (
 	// MapName is the prefix for endpoint-specific policy maps which map
 	// identity+ports+direction to whether the policy allows communication
 	// with that identity on that port for that direction.
-	MapName = "cilium_policy_v2_"
+	//
+	// This MUST be changed each time there is a bpf format change OR semantic change with the
+	// existing map layout in the policy map as interpreted by the bpf programs. Renaming leads
+	// to clean separation with the old map and program vs. the new map and program.
+	//
+	// Whenever this is changed, leave a comment here:
+	// "_v2_": removal of policy accounting fields and addition of the precedence field
+	//         to the policy map value.
+	// "_v3_": semantic change due to policy identity aggregation.
+	MapName = "cilium_policy_v3_"
 
 	// PolicyCallMaxEntries is the upper limit of entries in the program
 	// array for the tail calls to jump into the endpoint specific policy
@@ -84,10 +93,23 @@ func (pef policyEntryFlags) String() string {
 	return strings.Join(str, ", ")
 }
 
-type PolicyMap struct {
+type policyMap struct {
 	*bpf.Map
 	stats *StatsMap // shared stats map
 	epID  uint16
+}
+
+type PolicyMap interface {
+	Update(key *PolicyKey, entry *PolicyEntry) error
+	DeleteKey(key PolicyKey) error
+	DeleteEntry(entry *PolicyEntryDump) error
+	String() string
+	Dump() (string, error)
+	DumpToSlice() (PolicyEntriesDump, error)
+	DumpToMapStateMap() (policyTypes.MapStateMap, error)
+
+	MaxEntries() uint32
+	Close() error
 }
 
 func (pe PolicyEntry) IsDeny() bool {
@@ -319,7 +341,7 @@ func NewEntryFromPolicyEntry(key PolicyKey, pe policyTypes.MapStateEntry) Policy
 // Update pushes an 'entry' into the PolicyMap for the given PolicyKey 'key'.
 // Clears the associated policy stat entry, if in debug mode.
 // Returns an error if the update of the PolicyMap fails.
-func (pm *PolicyMap) Update(key *PolicyKey, entry *PolicyEntry) error {
+func (pm *policyMap) Update(key *PolicyKey, entry *PolicyEntry) error {
 	if option.Config.Debug {
 		pm.stats.ZeroStat(pm.epID, *key)
 	}
@@ -328,18 +350,18 @@ func (pm *PolicyMap) Update(key *PolicyKey, entry *PolicyEntry) error {
 
 // DeleteKey deletes the key-value pair from the given PolicyMap with PolicyKey
 // k. Returns an error if deletion from the PolicyMap fails.
-func (pm *PolicyMap) DeleteKey(key PolicyKey) error {
+func (pm *policyMap) DeleteKey(key PolicyKey) error {
 	return pm.Map.Delete(&key)
 }
 
 // DeleteEntry removes an entry from the PolicyMap. It can be used in
 // conjunction with DumpToSlice() to inspect and delete map entries.
-func (pm *PolicyMap) DeleteEntry(entry *PolicyEntryDump) error {
+func (pm *policyMap) DeleteEntry(entry *PolicyEntryDump) error {
 	return pm.Map.Delete(&entry.Key)
 }
 
 // String returns a human-readable string representing the policy map.
-func (pm *PolicyMap) String() string {
+func (pm *policyMap) String() string {
 	path, err := pm.Path()
 	if err != nil {
 		return err.Error()
@@ -347,7 +369,7 @@ func (pm *PolicyMap) String() string {
 	return path
 }
 
-func (pm *PolicyMap) Dump() (string, error) {
+func (pm *policyMap) Dump() (string, error) {
 	entries, err := pm.DumpToSlice()
 	if err != nil {
 		return "", err
@@ -355,7 +377,7 @@ func (pm *PolicyMap) Dump() (string, error) {
 	return entries.String(), nil
 }
 
-func (pm *PolicyMap) DumpToSlice() (PolicyEntriesDump, error) {
+func (pm *policyMap) DumpToSlice() (PolicyEntriesDump, error) {
 	entries := PolicyEntriesDump{}
 
 	cb := func(key bpf.MapKey, value bpf.MapValue) {
@@ -379,7 +401,7 @@ func (pm *PolicyMap) DumpToSlice() (PolicyEntriesDump, error) {
 	return entries, err
 }
 
-func (pm *PolicyMap) DumpToMapStateMap() (policyTypes.MapStateMap, error) {
+func (pm *policyMap) DumpToMapStateMap() (policyTypes.MapStateMap, error) {
 	out := make(policyTypes.MapStateMap)
 
 	cb := func(bpfKey bpf.MapKey, bpfVal bpf.MapValue) {
@@ -401,7 +423,7 @@ func (pm *PolicyMap) DumpToMapStateMap() (policyTypes.MapStateMap, error) {
 		// if policymapEntry has invalid prefix length, force update by storing as an
 		// invalid MapStateEntry
 		if !val.IsValid(key) {
-			policyVal.Invalid = true
+			policyVal.Invalidate()
 		}
 		out[policyKey] = policyVal
 	}
@@ -425,13 +447,13 @@ func parseEndpointID(mapPath string) (uint16, error) {
 	return 0, fmt.Errorf("malformed policy map name %q (missing '_')", mapPath)
 }
 
-func newPolicyMap(logger *slog.Logger, id uint16, maxEntries int, stats *StatsMap) (*PolicyMap, error) {
+func newPolicyMap(logger *slog.Logger, id uint16, maxEntries int, stats *StatsMap) (*policyMap, error) {
 	path := bpf.LocalMapPath(logger, MapName, id)
 	mapType := ebpf.LPMTrie
 	flags := bpf.GetMapMemoryFlags(mapType)
 	flags |= unix.BPF_F_RDONLY_PROG
 
-	return &PolicyMap{
+	return &policyMap{
 		Map: bpf.NewMap(
 			path,
 			mapType,
@@ -447,7 +469,7 @@ func newPolicyMap(logger *slog.Logger, id uint16, maxEntries int, stats *StatsMa
 
 // OpenPolicyMap opens the policymap at the specified path.
 // This is only used from the 'cilium-dbg bpf policy' tool.
-func OpenPolicyMap(logger *slog.Logger, path string) (*PolicyMap, error) {
+func OpenPolicyMap(logger *slog.Logger, path string) (*policyMap, error) {
 	// Extract endpoint ID from the given path
 	id, err := parseEndpointID(path)
 	if err != nil {
@@ -464,7 +486,7 @@ func OpenPolicyMap(logger *slog.Logger, path string) (*PolicyMap, error) {
 		return nil, err
 	}
 
-	return &PolicyMap{
+	return &policyMap{
 		Map:   m,
 		stats: stats,
 		epID:  id,

@@ -14,10 +14,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
-	gatewayv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
-	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
-	mcsapiv1alpha1 "sigs.k8s.io/mcs-api/pkg/apis/v1alpha1"
+	mcsapiv1beta1 "sigs.k8s.io/mcs-api/pkg/apis/v1beta1"
 	k8syaml "sigs.k8s.io/yaml"
+
+	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 )
 
 func fromYaml(t *testing.T, yamlText string, obj any) {
@@ -68,7 +68,7 @@ func readInput(t *testing.T, file string) []client.Object {
 	require.NoError(t, err)
 
 	var res []client.Object
-	for o := range strings.SplitSeq(string(inputYaml), "---") {
+	for o := range strings.SplitSeq(string(inputYaml), "\n---\n") {
 		o = strings.TrimSpace(o)
 		if o == "" {
 			continue
@@ -76,8 +76,16 @@ func readInput(t *testing.T, file string) []client.Object {
 		_, kind, err := getResourceKind(o)
 		require.NoError(t, err, "failed to get resource kind from input YAML")
 		switch kind {
+		case "Namespace":
+			obj := &corev1.Namespace{}
+			fromYaml(t, o, obj)
+			res = append(res, obj)
 		case "Service":
 			obj := &corev1.Service{}
+			fromYaml(t, o, obj)
+			res = append(res, obj)
+		case "ConfigMap":
+			obj := &corev1.ConfigMap{}
 			fromYaml(t, o, obj)
 			res = append(res, obj)
 		case "Secret":
@@ -89,7 +97,15 @@ func readInput(t *testing.T, file string) []client.Object {
 			fromYaml(t, o, obj)
 			res = append(res, obj)
 		case "TLSRoute":
-			obj := &gatewayv1alpha2.TLSRoute{}
+			obj := &gatewayv1.TLSRoute{}
+			fromYaml(t, o, obj)
+			res = append(res, obj)
+		case "TCPRoute":
+			obj := &gatewayv1.TCPRoute{}
+			fromYaml(t, o, obj)
+			res = append(res, obj)
+		case "UDPRoute":
+			obj := &gatewayv1.UDPRoute{}
 			fromYaml(t, o, obj)
 			res = append(res, obj)
 		case "GRPCRoute":
@@ -104,12 +120,28 @@ func readInput(t *testing.T, file string) []client.Object {
 			obj := &gatewayv1.GatewayClass{}
 			fromYaml(t, o, obj)
 			res = append(res, obj)
+		case "CiliumGatewayClassConfig":
+			obj := &v2alpha1.CiliumGatewayClassConfig{}
+			fromYaml(t, o, obj)
+			res = append(res, obj)
 		case "ReferenceGrant":
-			obj := &gatewayv1beta1.ReferenceGrant{}
+			obj := &gatewayv1.ReferenceGrant{}
 			fromYaml(t, o, obj)
 			res = append(res, obj)
 		case "ServiceImport":
-			obj := &mcsapiv1alpha1.ServiceImport{}
+			obj := &mcsapiv1beta1.ServiceImport{}
+			fromYaml(t, o, obj)
+			res = append(res, obj)
+		case "BackendTLSPolicy":
+			obj := &gatewayv1.BackendTLSPolicy{}
+			fromYaml(t, o, obj)
+			res = append(res, obj)
+		case "Node":
+			obj := &corev1.Node{}
+			fromYaml(t, o, obj)
+			res = append(res, obj)
+		case "ListenerSet":
+			obj := &gatewayv1.ListenerSet{}
 			fromYaml(t, o, obj)
 			res = append(res, obj)
 		}

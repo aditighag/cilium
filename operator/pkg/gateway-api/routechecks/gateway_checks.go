@@ -5,6 +5,7 @@ package routechecks
 
 import (
 	"fmt"
+	"slices"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -13,7 +14,7 @@ import (
 )
 
 func CheckGatewayAllowedForNamespace(input Input, parentRef gatewayv1.ParentReference) (bool, error) {
-	gw, err := input.GetGateway(parentRef)
+	owner, err := input.GetListenerOwner(parentRef)
 	if err != nil {
 		input.SetParentCondition(parentRef, metav1.Condition{
 			Type:    "Accepted",
@@ -25,9 +26,10 @@ func CheckGatewayAllowedForNamespace(input Input, parentRef gatewayv1.ParentRefe
 		return false, nil
 	}
 
-	allListenerHostNames := GetAllListenerHostNames(gw.Spec.Listeners)
+	listeners := owner.GetListeners()
+	allListenerHostNames := GetAllListenerHostNames(listeners)
 	hasNamespaceRestriction := false
-	for _, listener := range gw.Spec.Listeners {
+	for _, listener := range listeners {
 		if parentRef.SectionName != nil && listener.Name != *parentRef.SectionName {
 			continue
 		}
@@ -48,7 +50,7 @@ func CheckGatewayAllowedForNamespace(input Input, parentRef gatewayv1.ParentRefe
 		case gatewayv1.NamespacesFromAll:
 			return true, nil
 		case gatewayv1.NamespacesFromSame:
-			if input.GetNamespace() == gw.GetNamespace() {
+			if input.GetNamespace() == owner.GetNamespace() {
 				return true, nil
 			}
 		case gatewayv1.NamespacesFromSelector:
@@ -58,22 +60,11 @@ func CheckGatewayAllowedForNamespace(input Input, parentRef gatewayv1.ParentRefe
 				return false, fmt.Errorf("unable to list namespaces: %w", err)
 			}
 
-			allowed := false
 			for _, ns := range nsList.Items {
 				if ns.Name == input.GetNamespace() {
-					allowed = true
+					return true, nil
 				}
 			}
-			if !allowed {
-				input.SetParentCondition(parentRef, metav1.Condition{
-					Type:    "Accepted",
-					Status:  metav1.ConditionFalse,
-					Reason:  string(gatewayv1.RouteReasonNotAllowedByListeners),
-					Message: input.GetGVK().Kind + " is not allowed to attach to this Gateway due to namespace selector restrictions",
-				})
-				return false, nil
-			}
-			return true, nil
 		}
 	}
 	if hasNamespaceRestriction {
@@ -88,10 +79,10 @@ func CheckGatewayAllowedForNamespace(input Input, parentRef gatewayv1.ParentRefe
 }
 
 func CheckGatewayRouteKindAllowed(input Input, parentRef gatewayv1.ParentReference) (bool, error) {
-	gw, err := input.GetGateway(parentRef)
+	owner, err := input.GetListenerOwner(parentRef)
 	if err != nil {
 		input.SetParentCondition(parentRef, metav1.Condition{
-			Type:    "Accepted",
+			Type:    string(gatewayv1.RouteConditionAccepted),
 			Status:  metav1.ConditionFalse,
 			Reason:  "Invalid" + input.GetGVK().Kind,
 			Message: err.Error(),
@@ -100,38 +91,44 @@ func CheckGatewayRouteKindAllowed(input Input, parentRef gatewayv1.ParentReferen
 		return false, nil
 	}
 
-	for _, listener := range gw.Spec.Listeners {
-		if listener.AllowedRoutes == nil || len(listener.AllowedRoutes.Kinds) == 0 {
+	routeGVK := input.GetGVK()
+	matchedListeners := 0
+	for _, listener := range owner.GetListeners() {
+		if parentRef.SectionName != nil && listener.Name != *parentRef.SectionName {
+			continue
+		}
+		if parentRef.Port != nil && listener.Port != *parentRef.Port {
 			continue
 		}
 
-		allowed := false
-		routeGVK := input.GetGVK()
+		if listener.AllowedRoutes == nil || len(listener.AllowedRoutes.Kinds) == 0 {
+			return true, nil
+		}
+
+		matchedListeners++
 		for _, kind := range listener.AllowedRoutes.Kinds {
 			if (kind.Group == nil || (kind.Group != nil && *kind.Group == gatewayv1.Group(routeGVK.Group))) &&
 				kind.Kind == gatewayv1.Kind(routeGVK.Kind) {
-				allowed = true
-				break
+				return true, nil
 			}
 		}
+	}
 
-		if !allowed {
-			input.SetParentCondition(parentRef, metav1.Condition{
-				Type:    string(gatewayv1.RouteConditionAccepted),
-				Status:  metav1.ConditionFalse,
-				Reason:  string(gatewayv1.RouteReasonNotAllowedByListeners),
-				Message: routeGVK.Kind + " is not allowed to attach to this Gateway due to route kind restrictions",
-			})
-
-			return false, nil
-		}
+	if matchedListeners > 0 {
+		input.SetParentCondition(parentRef, metav1.Condition{
+			Type:    string(gatewayv1.RouteConditionAccepted),
+			Status:  metav1.ConditionFalse,
+			Reason:  string(gatewayv1.RouteReasonNotAllowedByListeners),
+			Message: routeGVK.Kind + " is not allowed to attach to this Gateway due to route kind restrictions",
+		})
+		return false, nil
 	}
 
 	return true, nil
 }
 
 func CheckGatewayMatchingHostnames(input Input, parentRef gatewayv1.ParentReference) (bool, error) {
-	gw, err := input.GetGateway(parentRef)
+	owner, err := input.GetListenerOwner(parentRef)
 	if err != nil {
 		input.SetParentCondition(parentRef, metav1.Condition{
 			Type:    "Accepted",
@@ -143,7 +140,7 @@ func CheckGatewayMatchingHostnames(input Input, parentRef gatewayv1.ParentRefere
 		return false, nil
 	}
 
-	if len(computeHosts(gw, input.GetHostnames(), nil)) == 0 {
+	if len(computeHosts(owner.GetListeners(), input.GetHostnames(), nil)) == 0 {
 
 		input.SetParentCondition(parentRef, metav1.Condition{
 			Type:    string(gatewayv1.RouteConditionAccepted),
@@ -159,7 +156,7 @@ func CheckGatewayMatchingHostnames(input Input, parentRef gatewayv1.ParentRefere
 }
 
 func CheckGatewayMatchingPorts(input Input, parentRef gatewayv1.ParentReference) (bool, error) {
-	gw, err := input.GetGateway(parentRef)
+	owner, err := input.GetListenerOwner(parentRef)
 	if err != nil {
 		input.SetParentCondition(parentRef, metav1.Condition{
 			Type:    "Accepted",
@@ -172,7 +169,7 @@ func CheckGatewayMatchingPorts(input Input, parentRef gatewayv1.ParentReference)
 	}
 
 	if parentRef.Port != nil {
-		for _, listener := range gw.Spec.Listeners {
+		for _, listener := range owner.GetListeners() {
 			if listener.Port == *parentRef.Port {
 				return true, nil
 			}
@@ -180,7 +177,7 @@ func CheckGatewayMatchingPorts(input Input, parentRef gatewayv1.ParentReference)
 		input.SetParentCondition(parentRef, metav1.Condition{
 			Type:    string(gatewayv1.RouteConditionAccepted),
 			Status:  metav1.ConditionFalse,
-			Reason:  "NoMatchingParent",
+			Reason:  string(gatewayv1.RouteReasonNoMatchingParent),
 			Message: fmt.Sprintf("No matching listener with port %d", *parentRef.Port),
 		})
 
@@ -191,7 +188,7 @@ func CheckGatewayMatchingPorts(input Input, parentRef gatewayv1.ParentReference)
 }
 
 func CheckGatewayMatchingSection(input Input, parentRef gatewayv1.ParentReference) (bool, error) {
-	gw, err := input.GetGateway(parentRef)
+	owner, err := input.GetListenerOwner(parentRef)
 	if err != nil {
 		input.SetParentCondition(parentRef, metav1.Condition{
 			Type:    "Accepted",
@@ -205,7 +202,7 @@ func CheckGatewayMatchingSection(input Input, parentRef gatewayv1.ParentReferenc
 
 	if parentRef.SectionName != nil {
 		found := false
-		for _, listener := range gw.Spec.Listeners {
+		for _, listener := range owner.GetListeners() {
 			if listener.Name == *parentRef.SectionName {
 				found = true
 				break
@@ -215,7 +212,7 @@ func CheckGatewayMatchingSection(input Input, parentRef gatewayv1.ParentReferenc
 			input.SetParentCondition(parentRef, metav1.Condition{
 				Type:    string(gatewayv1.RouteConditionAccepted),
 				Status:  metav1.ConditionFalse,
-				Reason:  "NoMatchingParent",
+				Reason:  string(gatewayv1.RouteReasonNoMatchingParent),
 				Message: fmt.Sprintf("No matching listener with sectionName %s", *parentRef.SectionName),
 			})
 
@@ -234,4 +231,34 @@ func GetAllListenerHostNames(listeners []gatewayv1.Listener) []gatewayv1.Hostnam
 		}
 	}
 	return hosts
+}
+
+func CheckGatewayMatchingProtocol(input Input, parentRef gatewayv1.ParentReference) (bool, error) {
+	owner, err := input.GetListenerOwner(parentRef)
+	if err != nil {
+		input.SetParentCondition(parentRef, metav1.Condition{
+			Type:    string(gatewayv1.RouteConditionAccepted),
+			Status:  metav1.ConditionFalse,
+			Reason:  "Invalid" + input.GetGVK().Kind,
+			Message: err.Error(),
+		})
+
+		return false, nil
+	}
+
+	routeProtocols := input.GetValidProtocols()
+	for _, listener := range owner.GetListeners() {
+		if slices.Contains(routeProtocols, listener.Protocol) {
+			return true, nil
+		}
+	}
+
+	input.SetParentCondition(parentRef, metav1.Condition{
+		Type:    string(gatewayv1.RouteConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(gatewayv1.RouteReasonNotAllowedByListeners),
+		Message: fmt.Sprintf("No matching listener protocol; route requires one of: %v", routeProtocols),
+	})
+
+	return false, nil
 }

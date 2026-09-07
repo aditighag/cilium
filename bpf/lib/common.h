@@ -13,6 +13,7 @@
 
 #include "endian.h"
 #include "eth.h"
+#include "ipv4_core.h"
 #include "ipv6_core.h"
 #include "map_defs.h"
 #include "config.h"
@@ -60,22 +61,15 @@ enum {
 /* FIB errors from BPF neighbor map. */
 #define BPF_FIB_MAP_NO_NEIGH	100
 
-typedef __u64 mac_t;
-
-union v4addr {
-	__be32 be32;
-	__u8 addr[4];
-};
-
 #define THIS_IS_L3_DEV		(ETH_HLEN == 0)
 
-static __always_inline bool validate_ethertype_l2_off(struct __ctx_buff *ctx,
-						      int l2_off, __u16 *proto)
+static __always_inline bool validate_ethertype(const struct __ctx_buff *ctx,
+					       __be16 *proto)
 {
-	const __u64 tot_len = l2_off + ETH_HLEN;
 	void *data_end = ctx_data_end(ctx);
+	const __u64 tot_len = ETH_HLEN;
 	void *data = ctx_data(ctx);
-	struct ethhdr *eth;
+	struct ethhdr *eth = data;
 
 	if (THIS_IS_L3_DEV) {
 		/* The packet is received on L2-less device. Determine L3
@@ -88,21 +82,13 @@ static __always_inline bool validate_ethertype_l2_off(struct __ctx_buff *ctx,
 	if (data + tot_len > data_end)
 		return false;
 
-	eth = data + l2_off;
-
 	*proto = eth->h_proto;
 
 	return eth_is_supported_ethertype(*proto);
 }
 
-static __always_inline bool validate_ethertype(struct __ctx_buff *ctx,
-					       __u16 *proto)
-{
-	return validate_ethertype_l2_off(ctx, 0, proto);
-}
-
 static __always_inline __maybe_unused bool
-__revalidate_data_pull(struct __ctx_buff *ctx, void **data_, void **data_end_,
+__revalidate_data_pull(const struct __ctx_buff *ctx, void **data_, void **data_end_,
 		       void **l3, const __u32 l3_off, const __u32 l3_len,
 		       const bool pull)
 {
@@ -126,30 +112,6 @@ __revalidate_data_pull(struct __ctx_buff *ctx, void **data_, void **data_end_,
 	return true;
 }
 
-static __always_inline __u32 get_tunnel_id(__u32 identity)
-{
-#if defined ENABLE_IPV4 && defined ENABLE_IPV6
-	if (identity == WORLD_IPV4_ID || identity == WORLD_IPV6_ID)
-		return WORLD_ID;
-#endif
-	return identity;
-}
-
-static __always_inline __u32 get_id_from_tunnel_id(__u32 tunnel_id, __u16 proto  __maybe_unused)
-{
-#if defined ENABLE_IPV4 && defined ENABLE_IPV6
-	if (tunnel_id == WORLD_ID) {
-		switch (proto) {
-		case bpf_htons(ETH_P_IP):
-			return WORLD_IPV4_ID;
-		case bpf_htons(ETH_P_IPV6):
-			return WORLD_IPV6_ID;
-		}
-	}
-#endif
-	return tunnel_id;
-}
-
 /* revalidate_data_pull() initializes the provided pointers from the ctx and
  * ensures that the data is pulled in for access. Should be used the first
  * time that the ctx data is accessed, subsequent calls can be made to
@@ -160,15 +122,12 @@ static __always_inline __u32 get_id_from_tunnel_id(__u32 tunnel_id, __u16 proto 
 #define revalidate_data_pull(ctx, data, data_end, ip)			\
 	__revalidate_data_pull(ctx, data, data_end, (void **)ip, ETH_HLEN, sizeof(**ip), true)
 
-#define revalidate_data_l3_off(ctx, data, data_end, ip, l3_off)		\
-	__revalidate_data_pull(ctx, data, data_end, (void **)ip, l3_off, sizeof(**ip), false)
-
 /* revalidate_data() initializes the provided pointers from the ctx.
  * Returns true if 'ctx' is long enough for an IP header of the provided type,
  * false otherwise.
  */
 #define revalidate_data(ctx, data, data_end, ip)			\
-	revalidate_data_l3_off(ctx, data, data_end, ip, ETH_HLEN)
+	__revalidate_data_pull(ctx, data, data_end, (void **)ip, ETH_HLEN, sizeof(**ip), false)
 
 /* arp is different from the above as we also want to pull in the payload.
  * Returns true if 'ctx' is long enough to be valid ARP packet, false otherwise.
@@ -190,30 +149,6 @@ struct auth_info {
 	__u64       expiration;
 };
 
-struct srv6_vrf_key4 {
-	struct bpf_lpm_trie_key lpm;
-	__u32 src_ip;
-	__u32 dst_cidr;
-};
-
-struct srv6_vrf_key6 {
-	struct bpf_lpm_trie_key lpm;
-	union v6addr src_ip;
-	union v6addr dst_cidr;
-};
-
-struct srv6_policy_key4 {
-	struct bpf_lpm_trie_key lpm;
-	__u32 vrf_id;
-	__u32 dst_cidr;
-};
-
-struct srv6_policy_key6 {
-	struct bpf_lpm_trie_key lpm;
-	__u32 vrf_id;
-	union v6addr dst_cidr;
-};
-
 #ifndef BPF_F_PSEUDO_HDR
 # define BPF_F_PSEUDO_HDR                (1ULL << 4)
 #endif
@@ -226,7 +161,6 @@ struct srv6_policy_key6 {
 #define NAT_PUNT_TO_STACK	DROP_NAT_NOT_NEEDED
 
 #define NAT_NEEDED		CTX_ACT_OK
-#define NAT_46X64_RECIRC	100
 
 /* Cilium metrics reasons for forwarding packets and other stats.
  * If reason is larger than below then this is a drop reason and
@@ -281,7 +215,9 @@ enum metric_dir {
 #define MARK_MAGIC_PROXY_INGRESS	0x0A00 /* source identity (upstream traffic only) */
 #define MARK_MAGIC_PROXY_EGRESS		0x0B00 /* source identity (upstream traffic only) */
 #define MARK_MAGIC_HOST			0x0C00
-#define MARK_MAGIC_DECRYPT		0x0D00
+#define MARK_MAGIC_DECRYPT		0x0D00 /* IPSec: source node ID (ingress encrypted traffic)
+						* WireGuard: source identity (ingress decrypted traffic)
+						*/
 #define MARK_MAGIC_ENCRYPT		0x0E00
 #define MARK_MAGIC_IDENTITY		0x0F00 /* source identity */
 #define MARK_MAGIC_TO_PROXY		0x0200
@@ -291,16 +227,10 @@ enum metric_dir {
 
 #define MARK_MAGIC_KEY_MASK		0xFF00
 
-/* MARK_MAGIC_HEALTH_IPIP_DONE can overlap with MARK_MAGIC_SNAT_DONE with both
- * being mutual exclusive given former is only under DSR. Used to push health
- * probe packets to ipip tunnel device & to avoid looping back.
+/* Note, MARK_MAGIC_HEALTH is user-facing UAPI for LB! The tcx datapath will
+ * not see the MARK_MAGIC_HEALTH value given sock_lb is going to reset it.
  */
-#define MARK_MAGIC_HEALTH_IPIP_DONE	MARK_MAGIC_SNAT_DONE
-
-/* MARK_MAGIC_HEALTH can overlap with MARK_MAGIC_DECRYPT with both being
- * mutual exclusive. Note, MARK_MAGIC_HEALTH is user-facing UAPI for LB!
- */
-#define MARK_MAGIC_HEALTH		MARK_MAGIC_DECRYPT
+#define MARK_MAGIC_HEALTH		0x0D00
 
 /* MARK_MAGIC_CLUSTER_ID shouldn't interfere with MARK_MAGIC_TO_PROXY. Lower
  * 8bits carries cluster_id, and when extended via the 'max-connected-clusters'
@@ -318,8 +248,14 @@ enum metric_dir {
 #define TC_INDEX_F_FROM_INGRESS_PROXY	1
 #define TC_INDEX_F_FROM_EGRESS_PROXY	2
 #define TC_INDEX_F_SKIP_NODEPORT	4
-#define TC_INDEX_F_UNUSED		8
-#define TC_INDEX_F_SKIP_HOST_FIREWALL	16
+#define TC_INDEX_F_SKIP_HEALTH_CHECK	8
+
+#define CB_DELIVERY_FLAGS_REDIRECT		(1 << 0)
+#define CB_DELIVERY_FLAGS_FROM_HOST		(1 << 1)
+#define CB_DELIVERY_FLAGS_FROM_TUNNEL		(1 << 2)
+#define CB_DELIVERY_FLAGS_USE_REDIRECT_PEER	(1 << 3)
+#define CB_DELIVERY_FLAGS_FROM_INGRESS_PROXY	(1 << 4)
+#define CB_DELIVERY_FLAGS_FROM_EGRESS_PROXY	(1 << 5)
 
 #define CB_NAT_FLAGS_REVDNAT_ONLY	(1 << 0)
 
@@ -343,7 +279,7 @@ enum {
 #define CB_SRV6_SID_1		CB_SRC_LABEL	/* Alias, non-overlapping */
 #define CB_VERDICT		CB_SRC_LABEL	/* Alias, non-overlapping */
 	CB_1,
-#define	CB_DELIVERY_REDIRECT	CB_1		/* Alias, non-overlapping */
+#define	CB_DELIVERY_FLAGS	CB_1		/* Alias, non-overlapping */
 #define	CB_NAT_46X64		CB_1		/* Alias, non-overlapping */
 #define	CB_ADDR_V4		CB_1		/* Alias, non-overlapping */
 #define	CB_ADDR_V6_1		CB_1		/* Alias, non-overlapping */
@@ -351,6 +287,8 @@ enum {
 #define	CB_SRV6_SID_2		CB_1		/* Alias, non-overlapping */
 #define	CB_CLUSTER_ID_EGRESS	CB_1		/* Alias, non-overlapping */
 #define	CB_TRACED		CB_1		/* Alias, non-overlapping */
+#define	CB_FORCED_BACKEND_V4	CB_1		/* Alias, non-overlapping */
+#define	CB_FORCED_BACKEND_V6_1	CB_1		/* Alias, non-overlapping */
 	CB_2,
 #define	CB_ADDR_V6_2		CB_2		/* Alias, non-overlapping */
 #define CB_SRV6_SID_3		CB_2		/* Alias, non-overlapping */
@@ -360,14 +298,12 @@ enum {
 #define	CB_ADDR_V6_3		CB_3		/* Alias, non-overlapping */
 #define	CB_FROM_HOST		CB_3		/* Alias, non-overlapping */
 #define CB_SRV6_SID_4		CB_3		/* Alias, non-overlapping */
-#define CB_DSR_L3_OFF		CB_3		/* Alias, non-overlapping */
 	CB_CT_STATE,
 #define	CB_ADDR_V6_4		CB_CT_STATE	/* Alias, non-overlapping */
 #define	CB_ENCRYPT_IDENTITY	CB_CT_STATE	/* Alias, non-overlapping,
 						 * Not used by xfrm.
 						 */
 #define	CB_SRV6_VRF_ID		CB_CT_STATE	/* Alias, non-overlapping */
-#define	CB_FROM_TUNNEL		CB_CT_STATE	/* Alias, non-overlapping */
 };
 
 /* Magic values for CB_FROM_HOST.
@@ -433,11 +369,6 @@ struct lb4_reverse_nat {
 	__be32 address;
 	__be16 port;
 } __packed;
-
-static __always_inline __u64 ctx_adjust_hroom_flags(void)
-{
-	return BPF_F_ADJ_ROOM_NO_CSUM_RESET;
-}
 
 struct lpm_v4_key {
 	struct bpf_lpm_trie_key lpm;

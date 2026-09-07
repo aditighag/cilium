@@ -5,6 +5,7 @@ package reconciler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"slices"
@@ -14,7 +15,6 @@ import (
 
 	"github.com/cilium/hive/hivetest"
 	"github.com/cilium/statedb"
-	"github.com/cilium/statedb/part"
 	"github.com/cilium/statedb/reconciler"
 	"github.com/stretchr/testify/require"
 
@@ -114,7 +114,6 @@ func parseAddrPort(s string) loadbalancer.L3n4Addr {
 		loadbalancer.TCP,
 		addr, uint16(port), loadbalancer.ScopeExternal,
 	)
-
 }
 
 func dumpLBMapsWithReplace(lbmaps maps.LBMaps, feAddr loadbalancer.L3n4Addr, sanitizeIDs bool) (out []maps.MapDump) {
@@ -149,10 +148,39 @@ type testCase struct {
 
 	delete bool
 
+	// kubeProxyReplacement overrides the default enabled setting for this case.
+	kubeProxyReplacement *bool
+	expectIDCleared      bool
+
+	// expectErr when true causes UpdateService to fail on backend slots
+	// and expects Update to return an error.
+	expectErr bool
+
 	// maps and maglev are the dumped BPF maps. These should not be hand-written but rather
 	// pasted in from the failing test case when a new test-case is added.
 	// Sorted.
 	maps, maglev []maps.MapDump
+}
+
+// faultyLBMaps wraps an LBMaps and can inject errors on map operations.
+type faultyLBMaps struct {
+	maps.LBMaps
+	fail              bool
+	failDeleteService bool
+}
+
+func (m *faultyLBMaps) UpdateService(key maps.ServiceKey, value maps.ServiceValue) error {
+	if m.fail && key.GetBackendSlot() > 0 {
+		return errors.New("update service failed")
+	}
+	return m.LBMaps.UpdateService(key, value)
+}
+
+func (m *faultyLBMaps) DeleteService(key maps.ServiceKey) error {
+	if m.failDeleteService {
+		return errors.New("delete service failed")
+	}
+	return m.LBMaps.DeleteService(key)
 }
 
 var testServiceName = loadbalancer.NewServiceName("test", "test")
@@ -166,7 +194,7 @@ var baseService = loadbalancer.Service{
 	IntTrafficPolicy:       loadbalancer.SVCTrafficPolicyLocal,
 	SessionAffinity:        false,
 	SessionAffinityTimeout: 0,
-	ProxyRedirect:          nil,
+	ProxyRedirects:         nil,
 	LoopbackHostPort:       false,
 }
 
@@ -175,21 +203,18 @@ var baseFrontend = loadbalancer.Frontend{
 		ServiceName: testServiceName,
 		PortName:    "", // Ignored, backends already resolved.
 	},
-	Backends: func(yield func(loadbalancer.BackendParams, statedb.Revision) bool) {},
+	Backends: func(yield func(*loadbalancer.Backend, statedb.Revision) bool) {},
 	Status:   reconciler.StatusPending(),
 }
 
-var emptyInstances = func() part.Map[loadbalancer.BackendInstanceKey, loadbalancer.BackendParams] {
-	part.RegisterKeyType(loadbalancer.BackendInstanceKey.Key)
-	return part.Map[loadbalancer.BackendInstanceKey, loadbalancer.BackendParams]{}
-}()
+var (
+	baseBackend         = newTestBackend(backend1, loadbalancer.BackendStateActive)
+	nextBackendRevision = statedb.Revision(1)
+)
 
-var baseBackend = newTestBackend(backend1, loadbalancer.BackendStateActive)
-var nextBackendRevision = statedb.Revision(1)
-
-func concatBe(bes loadbalancer.BackendsSeq2, be loadbalancer.BackendParams, rev statedb.Revision) loadbalancer.BackendsSeq2 {
-	return func(yield func(loadbalancer.BackendParams, statedb.Revision) bool) {
-		if !yield(be, rev) {
+func concatBe(bes loadbalancer.BackendsSeq2, be loadbalancer.Backend, rev statedb.Revision) loadbalancer.BackendsSeq2 {
+	return func(yield func(*loadbalancer.Backend, statedb.Revision) bool) {
+		if !yield(&be, rev) {
 			return
 		}
 		bes(yield)
@@ -197,38 +222,50 @@ func concatBe(bes loadbalancer.BackendsSeq2, be loadbalancer.BackendParams, rev 
 }
 
 func newTestBackend(addr loadbalancer.L3n4Addr, state loadbalancer.BackendState) loadbalancer.Backend {
-	return loadbalancer.Backend{
-		Address: addr,
-		Instances: emptyInstances.Set(
-			loadbalancer.BackendInstanceKey{ServiceName: testServiceName, SourcePriority: 0},
-			loadbalancer.BackendParams{
-				Address:   addr,
-				NodeName:  "",
-				PortNames: nil,
-				Weight:    0,
-				State:     state,
-			},
-		),
+	be := loadbalancer.Backend{
+		ServiceName: testServiceName,
+		Address:     addr,
+		NodeName:    "",
+		PortNames:   nil,
+		Weight:      0,
+		State:       state,
+		Source:      source.Kubernetes,
 	}
+	be.SetSourcePriority(0)
+	return be
 }
 
 // newTestCase creates a testCase from a function that manipulates the base service and frontends.
-func newTestCase(name string, mod func(*loadbalancer.Service, *loadbalancer.Frontend) (delete bool, bes []loadbalancer.Backend), maps []maps.MapDump, maglev []maps.MapDump) testCase {
+func newTestCase(name string, mod func(*loadbalancer.Service, *loadbalancer.Frontend) (delete bool, bes []loadbalancer.Backend), maps []maps.MapDump, maglev []maps.MapDump, expectErr bool) testCase {
 	svc := baseService
 	fe := baseFrontend
 	delete, bes := mod(&svc, &fe)
 	fe.Service = &svc
 	for _, be := range bes {
-		fe.Backends = concatBe(fe.Backends, *be.GetInstance(svc.Name), nextBackendRevision)
+		be.ServiceName = loadbalancer.ServiceName{}
+		be.SetSourcePriority(0)
+		fe.Backends = concatBe(fe.Backends, be, nextBackendRevision)
 		nextBackendRevision++
 	}
 	return testCase{
-		name:     name,
-		frontend: fe,
-		delete:   delete,
-		maps:     maps,
-		maglev:   maglev,
+		name:      name,
+		frontend:  fe,
+		delete:    delete,
+		expectErr: expectErr,
+		maps:      maps,
+		maglev:    maglev,
 	}
+}
+
+func withKubeProxyReplacement(enabled bool, tc testCase) testCase {
+	tc.kubeProxyReplacement = &enabled
+	return tc
+}
+
+func withStaleFrontendID(tc testCase) testCase {
+	tc.frontend.ID = 123
+	tc.expectIDCleared = true
+	return tc
 }
 
 func deleteFrontend(addr loadbalancer.L3n4Addr, typ loadbalancer.SVCType) func(*loadbalancer.Service, *loadbalancer.Frontend) (bool, []loadbalancer.Backend) {
@@ -255,6 +292,7 @@ var clusterIPTestCases = []testCase{
 			"SVC: ID=1 ADDR=<auto>/TCP SLOT=0 LBALG=undef AFFTimeout=0 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable",
 		},
 		nil,
+		false,
 	),
 
 	newTestCase(
@@ -272,6 +310,7 @@ var clusterIPTestCases = []testCase{
 			"SVC: ID=1 ADDR=<auto>/TCP SLOT=1 BEID=1 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable",
 		},
 		nil,
+		false,
 	),
 
 	newTestCase(
@@ -279,8 +318,7 @@ var clusterIPTestCases = []testCase{
 		func(svc *loadbalancer.Service, fe *loadbalancer.Frontend) (delete bool, bes []loadbalancer.Backend) {
 			fe.Type = ClusterIP
 			fe.Address = autoAddr
-			be1, be2 :=
-				newTestBackend(backend1, loadbalancer.BackendStateActive),
+			be1, be2 := newTestBackend(backend1, loadbalancer.BackendStateActive),
 				newTestBackend(backend2, loadbalancer.BackendStateActive)
 			return false, []loadbalancer.Backend{be1, be2}
 		},
@@ -294,6 +332,7 @@ var clusterIPTestCases = []testCase{
 			"SVC: ID=1 ADDR=<auto>/TCP SLOT=2 BEID=2 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable",
 		},
 		nil,
+		false,
 	),
 
 	newTestCase(
@@ -301,8 +340,7 @@ var clusterIPTestCases = []testCase{
 		func(svc *loadbalancer.Service, fe *loadbalancer.Frontend) (delete bool, bes []loadbalancer.Backend) {
 			fe.Type = ClusterIP
 			fe.Address = autoAddr
-			be1, be2, be3, be4 :=
-				newTestBackend(backend1, loadbalancer.BackendStateActive),
+			be1, be2, be3, be4 := newTestBackend(backend1, loadbalancer.BackendStateActive),
 				newTestBackend(backend2, loadbalancer.BackendStateActive),
 				newTestBackend(withClusterID(backend2, 10), loadbalancer.BackendStateActive),
 				newTestBackend(withClusterID(backend2, 20), loadbalancer.BackendStateActive)
@@ -322,6 +360,7 @@ var clusterIPTestCases = []testCase{
 			"SVC: ID=1 ADDR=<auto>/TCP SLOT=4 BEID=4 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable",
 		},
 		nil,
+		false,
 	),
 
 	newTestCase(
@@ -337,6 +376,7 @@ var clusterIPTestCases = []testCase{
 			"SVC: ID=1 ADDR=<auto>/TCP SLOT=0 LBALG=undef AFFTimeout=0 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable",
 		},
 		nil,
+		false,
 	),
 
 	// Test that adding another frontend allocates new IDs correctly.
@@ -356,6 +396,7 @@ var clusterIPTestCases = []testCase{
 			"SVC: ID=2 ADDR=10.0.0.2:80/TCP SLOT=0 LBALG=undef AFFTimeout=0 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable",
 		},
 		nil,
+		false,
 	),
 
 	newTestCase(
@@ -367,6 +408,7 @@ var clusterIPTestCases = []testCase{
 			"SVC: ID=1 ADDR=<auto>/TCP SLOT=0 LBALG=undef AFFTimeout=0 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable",
 		},
 		nil,
+		false,
 	),
 
 	// Adding the same frontend again won't reuse the ID as it should have been released.
@@ -386,6 +428,7 @@ var clusterIPTestCases = []testCase{
 			"SVC: ID=3 ADDR=10.0.0.2:80/TCP SLOT=0 LBALG=undef AFFTimeout=0 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable",
 		},
 		nil,
+		false,
 	),
 
 	newTestCase(
@@ -397,6 +440,7 @@ var clusterIPTestCases = []testCase{
 			"SVC: ID=1 ADDR=<auto>/TCP SLOT=0 LBALG=undef AFFTimeout=0 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable",
 		},
 		nil,
+		false,
 	),
 
 	newTestCase(
@@ -404,6 +448,7 @@ var clusterIPTestCases = []testCase{
 		deleteFrontend(autoAddr, ClusterIP),
 		[]maps.MapDump{},
 		nil,
+		false,
 	),
 }
 
@@ -413,8 +458,7 @@ var quarantineTestCases = []testCase{
 		func(svc *loadbalancer.Service, fe *loadbalancer.Frontend) (delete bool, bes []loadbalancer.Backend) {
 			fe.Type = ClusterIP
 			fe.Address = autoAddr
-			be1, be2 :=
-				newTestBackend(backend1, loadbalancer.BackendStateActive),
+			be1, be2 := newTestBackend(backend1, loadbalancer.BackendStateActive),
 				newTestBackend(backend2, loadbalancer.BackendStateActive)
 			return false, []loadbalancer.Backend{be1, be2}
 		},
@@ -428,6 +472,7 @@ var quarantineTestCases = []testCase{
 			"SVC: ID=1 ADDR=<auto>/TCP SLOT=2 BEID=2 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable",
 		},
 		nil,
+		false,
 	),
 
 	newTestCase(
@@ -435,8 +480,7 @@ var quarantineTestCases = []testCase{
 		func(svc *loadbalancer.Service, fe *loadbalancer.Frontend) (delete bool, bes []loadbalancer.Backend) {
 			fe.Type = ClusterIP
 			fe.Address = autoAddr
-			be1, be2 :=
-				newTestBackend(backend1, loadbalancer.BackendStateQuarantined),
+			be1, be2 := newTestBackend(backend1, loadbalancer.BackendStateQuarantined),
 				newTestBackend(backend2, loadbalancer.BackendStateActive)
 			return false, []loadbalancer.Backend{be1, be2}
 		},
@@ -450,6 +494,7 @@ var quarantineTestCases = []testCase{
 			"SVC: ID=1 ADDR=<auto>/TCP SLOT=2 BEID=1 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable",
 		},
 		nil,
+		false,
 	),
 
 	newTestCase(
@@ -457,6 +502,7 @@ var quarantineTestCases = []testCase{
 		deleteFrontend(autoAddr, ClusterIP),
 		[]maps.MapDump{},
 		nil,
+		false,
 	),
 }
 
@@ -471,8 +517,7 @@ var nodePortTestCases = []testCase{
 		func(svc *loadbalancer.Service, fe *loadbalancer.Frontend) (delete bool, bes []loadbalancer.Backend) {
 			fe.Type = NodePort
 			fe.Address = zeroAddr
-			be1, be2 :=
-				newTestBackend(backend1, loadbalancer.BackendStateActive),
+			be1, be2 := newTestBackend(backend1, loadbalancer.BackendStateActive),
 				newTestBackend(backend2, loadbalancer.BackendStateActive)
 			return false, []loadbalancer.Backend{be1, be2}
 		},
@@ -492,14 +537,20 @@ var nodePortTestCases = []testCase{
 		[]maps.MapDump{
 			"MAGLEV: ID=2 INNER=[1(511), 2(510)]",
 		},
+		false,
 	),
 
-	newTestCase(
-		"NodePort_cleanup",
-		deleteFrontend(zeroAddr, NodePort),
+	withStaleFrontendID(withKubeProxyReplacement(false, newTestCase(
+		"NodePort_non_candidate_cleanup",
+		func(svc *loadbalancer.Service, fe *loadbalancer.Frontend) (delete bool, bes []loadbalancer.Backend) {
+			fe.Type = NodePort
+			fe.Address = zeroAddr
+			return false, nil
+		},
 		[]maps.MapDump{},
 		nil,
-	),
+		false,
+	))),
 }
 
 var hostPortTestCases = []testCase{
@@ -525,14 +576,20 @@ var hostPortTestCases = []testCase{
 		[]maps.MapDump{
 			"MAGLEV: ID=2 INNER=[1(1021)]",
 		},
+		false,
 	),
 
-	newTestCase(
-		"HostPort_zero_cleanup",
-		deleteFrontend(zeroAddr, HostPort),
+	withKubeProxyReplacement(false, newTestCase(
+		"HostPort_zero_non_candidate_cleanup",
+		func(svc *loadbalancer.Service, fe *loadbalancer.Frontend) (delete bool, bes []loadbalancer.Backend) {
+			fe.Type = HostPort
+			fe.Address = zeroAddr
+			return false, nil
+		},
 		[]maps.MapDump{},
 		nil,
-	),
+		false,
+	)),
 
 	// HostPort with fixed address.
 	newTestCase(
@@ -552,14 +609,20 @@ var hostPortTestCases = []testCase{
 		[]maps.MapDump{
 			"MAGLEV: ID=3 INNER=[2(1021)]",
 		},
+		false,
 	),
 
-	newTestCase(
-		"HostPort_fixed_cleanup",
-		deleteFrontend(autoAddr, HostPort),
+	withKubeProxyReplacement(false, newTestCase(
+		"HostPort_fixed_non_candidate_cleanup",
+		func(svc *loadbalancer.Service, fe *loadbalancer.Frontend) (delete bool, bes []loadbalancer.Backend) {
+			fe.Type = HostPort
+			fe.Address = autoAddr
+			return false, nil
+		},
 		[]maps.MapDump{},
 		nil,
-	),
+		false,
+	)),
 }
 
 var proxyTestCases = []testCase{
@@ -574,9 +637,9 @@ var proxyTestCases = []testCase{
 			// from how the backend ID is normally stored (host byte-order). Hence to make this
 			// work on both little and big-endian machine's the port is set to a value that's the
 			// same in both byte orders.
-			svc.ProxyRedirect = &loadbalancer.ProxyRedirect{
+			svc.ProxyRedirects = loadbalancer.ProxyRedirects{{
 				ProxyPort: 0x0a0a, // 2570
-			}
+			}}
 			return false, []loadbalancer.Backend{baseBackend}
 		},
 		[]maps.MapDump{
@@ -587,12 +650,89 @@ var proxyTestCases = []testCase{
 			"SVC: ID=1 ADDR=<auto>/TCP SLOT=1 BEID=1 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable+l7-load-balancer",
 		},
 		nil,
+		false,
 	),
 	newTestCase(
 		"L7Proxy_cleanup",
 		deleteFrontend(autoAddr, ClusterIP),
 		[]maps.MapDump{},
 		nil,
+		false,
+	),
+	newTestCase(
+		"L7Proxy_distinct_port80",
+
+		func(svc *loadbalancer.Service, fe *loadbalancer.Frontend) (delete bool, bes []loadbalancer.Backend) {
+			fe.Type = ClusterIP
+			fe.Address = autoAddr
+			fe.ServicePort = 80
+
+			svc.ProxyRedirects = loadbalancer.ProxyRedirects{
+				{ProxyPort: 0x0a0a, Ports: []uint16{80}},
+				{ProxyPort: 0x0b0b, Ports: []uint16{443}},
+			}
+			return false, []loadbalancer.Backend{baseBackend}
+		},
+		[]maps.MapDump{
+			"BE: ID=2 ADDR=10.1.0.1:80/TCP STATE=active",
+			"REV: ID=2 ADDR=<auto>",
+			"SVC: ID=0 ADDR=<auto>/ANY SLOT=0 LBALG=undef AFFTimeout=0 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+non-routable",
+			"SVC: ID=2 ADDR=<auto>/TCP SLOT=0 L7Proxy=2570 COUNT=1 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable+l7-load-balancer",
+			"SVC: ID=2 ADDR=<auto>/TCP SLOT=1 BEID=2 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable+l7-load-balancer",
+		},
+		nil,
+		false,
+	),
+	newTestCase(
+		"L7Proxy_distinct_port443",
+
+		func(svc *loadbalancer.Service, fe *loadbalancer.Frontend) (delete bool, bes []loadbalancer.Backend) {
+			fe.Type = ClusterIP
+			fe.Address = loadbalancer.NewL3n4Addr(loadbalancer.TCP, types.MustParseAddrCluster("10.0.0.2"), 443, loadbalancer.ScopeExternal)
+			fe.ServicePort = 443
+
+			svc.ProxyRedirects = loadbalancer.ProxyRedirects{
+				{ProxyPort: 0x0a0a, Ports: []uint16{80}},
+				{ProxyPort: 0x0b0b, Ports: []uint16{443}},
+			}
+			return false, []loadbalancer.Backend{baseBackend}
+		},
+		[]maps.MapDump{
+			"BE: ID=2 ADDR=10.1.0.1:80/TCP STATE=active",
+			"REV: ID=2 ADDR=<auto>",
+			"REV: ID=3 ADDR=10.0.0.2:443",
+			"SVC: ID=0 ADDR=10.0.0.2:0/ANY SLOT=0 LBALG=undef AFFTimeout=0 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+non-routable",
+			"SVC: ID=0 ADDR=<auto>/ANY SLOT=0 LBALG=undef AFFTimeout=0 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+non-routable",
+			"SVC: ID=2 ADDR=<auto>/TCP SLOT=0 L7Proxy=2570 COUNT=1 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable+l7-load-balancer",
+			"SVC: ID=2 ADDR=<auto>/TCP SLOT=1 BEID=2 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable+l7-load-balancer",
+			"SVC: ID=3 ADDR=10.0.0.2:443/TCP SLOT=0 L7Proxy=2827 COUNT=1 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable+l7-load-balancer",
+			"SVC: ID=3 ADDR=10.0.0.2:443/TCP SLOT=1 BEID=2 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable+l7-load-balancer",
+		},
+		nil,
+		false,
+	),
+	newTestCase(
+		"L7Proxy_distinct_cleanup",
+		deleteFrontend(autoAddr, ClusterIP),
+		[]maps.MapDump{
+			"BE: ID=2 ADDR=10.1.0.1:80/TCP STATE=active",
+			"REV: ID=3 ADDR=10.0.0.2:443",
+			"SVC: ID=0 ADDR=10.0.0.2:0/ANY SLOT=0 LBALG=undef AFFTimeout=0 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+non-routable",
+			"SVC: ID=3 ADDR=10.0.0.2:443/TCP SLOT=0 L7Proxy=2827 COUNT=1 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable+l7-load-balancer",
+			"SVC: ID=3 ADDR=10.0.0.2:443/TCP SLOT=1 BEID=2 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable+l7-load-balancer",
+		},
+		nil,
+		false,
+	),
+	newTestCase(
+		"L7Proxy_distinct_cleanup_2",
+		deleteFrontend(
+			loadbalancer.NewL3n4Addr(loadbalancer.TCP, types.MustParseAddrCluster("10.0.0.2"), 443, loadbalancer.ScopeExternal),
+			ClusterIP,
+		),
+		[]maps.MapDump{},
+		nil,
+		false,
 	),
 }
 
@@ -618,6 +758,7 @@ var miscFlagsTestCases = []testCase{
 			"SVC: ID=1 ADDR=<auto>/TCP SLOT=0 LBALG=undef AFFTimeout=0 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable+46x64",
 		},
 		nil,
+		false,
 	),
 
 	newTestCase(
@@ -634,6 +775,7 @@ var miscFlagsTestCases = []testCase{
 			"SVC: ID=1 ADDR=<auto>/TCP SLOT=0 LBALG=undef AFFTimeout=0 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+InternalLocal+non-routable",
 		},
 		nil,
+		false,
 	),
 
 	newTestCase(
@@ -650,6 +792,7 @@ var miscFlagsTestCases = []testCase{
 			"SVC: ID=1 ADDR=<auto>/TCP SLOT=0 LBALG=undef AFFTimeout=0 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+non-routable",
 		},
 		nil,
+		false,
 	),
 
 	newTestCase(
@@ -668,6 +811,7 @@ var miscFlagsTestCases = []testCase{
 			"SVC: ID=1 ADDR=<auto>/TCP SLOT=0 LBALG=undef AFFTimeout=0 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+non-routable",
 		},
 		nil,
+		false,
 	),
 
 	newTestCase(
@@ -675,6 +819,7 @@ var miscFlagsTestCases = []testCase{
 		deleteFrontend(autoAddr, ClusterIP),
 		[]maps.MapDump{},
 		nil,
+		false,
 	),
 
 	newTestCase(
@@ -690,6 +835,7 @@ var miscFlagsTestCases = []testCase{
 			"SVC: ID=2 ADDR=10.0.0.2:80/TCP/i SLOT=0 LBALG=undef AFFTimeout=0 COUNT=0 QCOUNT=0 FLAGS=HostPort+Local+InternalLocal",
 		},
 		nil,
+		false,
 	),
 
 	newTestCase(
@@ -708,6 +854,7 @@ var miscFlagsTestCases = []testCase{
 			"SVC: ID=2 ADDR=10.0.0.2:80/TCP/i SLOT=0 LBALG=undef AFFTimeout=0 COUNT=0 QCOUNT=0 FLAGS=HostPort+Local+two-scopes",
 		},
 		nil,
+		false,
 	),
 
 	newTestCase(
@@ -715,6 +862,7 @@ var miscFlagsTestCases = []testCase{
 		deleteFrontend(extraFrontendInternal, ClusterIP),
 		[]maps.MapDump{},
 		nil,
+		false,
 	),
 }
 
@@ -737,6 +885,7 @@ var loadBalancerTestCases = []testCase{
 			"SVC: ID=1 ADDR=<auto>/TCP SLOT=0 LBALG=undef AFFTimeout=0 COUNT=0 QCOUNT=0 FLAGS=LoadBalancer+Local+InternalLocal",
 		},
 		nil,
+		false,
 	),
 
 	newTestCase(
@@ -744,6 +893,7 @@ var loadBalancerTestCases = []testCase{
 		deleteFrontend(autoAddr, LoadBalancer),
 		[]maps.MapDump{},
 		nil,
+		false,
 	),
 }
 
@@ -760,6 +910,7 @@ var externalIPTestCases = []testCase{
 			"SVC: ID=1 ADDR=<auto>/TCP SLOT=0 LBALG=undef AFFTimeout=0 COUNT=0 QCOUNT=0 FLAGS=ExternalIPs+Local+InternalLocal",
 		},
 		nil,
+		false,
 	),
 
 	newTestCase(
@@ -767,12 +918,13 @@ var externalIPTestCases = []testCase{
 		deleteFrontend(autoAddr, ExternalIPs),
 		[]maps.MapDump{},
 		nil,
+		false,
 	),
 }
 
 var localRedirectTestCases = []testCase{
 	// If a frontend has a redirect set to another service it will have the "LocalRedirect" flag.
-	newTestCase(
+	withKubeProxyReplacement(false, newTestCase(
 		"LocalRedirect",
 		func(svc *loadbalancer.Service, fe *loadbalancer.Frontend) (delete bool, bes []loadbalancer.Backend) {
 			fe.Type = LocalRedirect
@@ -786,13 +938,15 @@ var localRedirectTestCases = []testCase{
 			"SVC: ID=1 ADDR=<auto>/TCP SLOT=0 LBALG=undef AFFTimeout=0 COUNT=0 QCOUNT=0 FLAGS=LocalRedirect+Local+InternalLocal",
 		},
 		nil,
-	),
+		false,
+	)),
 
 	newTestCase(
 		"LocalRedirect_cleanup",
 		deleteFrontend(autoAddr, LocalRedirect),
 		[]maps.MapDump{},
 		nil,
+		false,
 	),
 }
 
@@ -804,8 +958,7 @@ var sessionAffinityTestCases = []testCase{
 			fe.Address = zeroAddr
 			svc.SessionAffinity = true
 			svc.SessionAffinityTimeout = time.Second
-			be1, be2 :=
-				newTestBackend(backend1, loadbalancer.BackendStateActive),
+			be1, be2 := newTestBackend(backend1, loadbalancer.BackendStateActive),
 				newTestBackend(backend2, loadbalancer.BackendStateActive)
 			return false, []loadbalancer.Backend{be1, be2}
 		},
@@ -829,6 +982,7 @@ var sessionAffinityTestCases = []testCase{
 		[]maps.MapDump{
 			"MAGLEV: ID=2 INNER=[1(511), 2(510)]",
 		},
+		false,
 	),
 
 	newTestCase(
@@ -838,8 +992,7 @@ var sessionAffinityTestCases = []testCase{
 			fe.Address = zeroAddr
 			svc.SessionAffinity = true
 			svc.SessionAffinityTimeout = time.Second
-			be1, be2 :=
-				newTestBackend(backend1, loadbalancer.BackendStateQuarantined),
+			be1, be2 := newTestBackend(backend1, loadbalancer.BackendStateQuarantined),
 				newTestBackend(backend2, loadbalancer.BackendStateActive)
 			return false, []loadbalancer.Backend{be1, be2}
 		},
@@ -861,6 +1014,7 @@ var sessionAffinityTestCases = []testCase{
 		[]maps.MapDump{
 			"MAGLEV: ID=2 INNER=[2(1021)]",
 		},
+		false,
 	),
 	newTestCase(
 		"SessionAffinity_cleanup_1",
@@ -873,6 +1027,7 @@ var sessionAffinityTestCases = []testCase{
 		},
 		[]maps.MapDump{},
 		nil,
+		false,
 	),
 
 	newTestCase(
@@ -897,6 +1052,7 @@ var sessionAffinityTestCases = []testCase{
 		[]maps.MapDump{
 			"MAGLEV: ID=4 INNER=[3(1021)]",
 		},
+		false,
 	),
 
 	// Disable session affinity to verify that the affinity match maps are cleaned up.
@@ -920,6 +1076,7 @@ var sessionAffinityTestCases = []testCase{
 		[]maps.MapDump{
 			"MAGLEV: ID=4 INNER=[3(1021)]",
 		},
+		false,
 	),
 
 	newTestCase(
@@ -934,6 +1091,80 @@ var sessionAffinityTestCases = []testCase{
 		},
 		[]maps.MapDump{},
 		nil,
+		false,
+	),
+}
+
+// mapErrorTestCases exercises the UpdateService error path.
+var mapErrorTestCases = []testCase{
+	// Step 1: Create a ClusterIP with one backend. This succeeds and establishes
+	// backendReferences[fe] = {backend1}.
+	newTestCase(
+		"MapError_setup_1_backend",
+		func(svc *loadbalancer.Service, fe *loadbalancer.Frontend) (bool, []loadbalancer.Backend) {
+			fe.Type = ClusterIP
+			fe.Address = autoAddr
+			return false, []loadbalancer.Backend{
+				newTestBackend(backend1, loadbalancer.BackendStateActive),
+			}
+		},
+		[]maps.MapDump{
+			"BE: ID=1 ADDR=10.1.0.1:80/TCP STATE=active",
+			"REV: ID=1 ADDR=<auto>",
+			"SVC: ID=0 ADDR=<auto>/ANY SLOT=0 LBALG=undef AFFTimeout=0 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+non-routable",
+			"SVC: ID=1 ADDR=<auto>/TCP SLOT=0 LBALG=undef AFFTimeout=0 COUNT=1 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable",
+			"SVC: ID=1 ADDR=<auto>/TCP SLOT=1 BEID=1 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable",
+		},
+		nil,
+		false,
+	),
+
+	// Step 2: Switch to backend2 with an error injected. updateBackendRevision
+	// runs for backend2 (creating backendStates[backend2]) but upsertService
+	// fails on the slot, so updateReferences is skipped. The invariant check
+	// in runTests verifies that backendStates[backend2].addr is still set.
+	newTestCase(
+		"MapError_update_service_fails",
+		func(svc *loadbalancer.Service, fe *loadbalancer.Frontend) (bool, []loadbalancer.Backend) {
+			fe.Type = ClusterIP
+			fe.Address = autoAddr
+			return false, []loadbalancer.Backend{
+				newTestBackend(backend2, loadbalancer.BackendStateActive),
+			}
+		},
+		nil, // maps not checked on error
+		nil,
+		true,
+	),
+
+	// Step 3: Retry without the error. The reconciler recovers and proceeds normally.
+	newTestCase(
+		"MapError_retry_succeeds",
+		func(svc *loadbalancer.Service, fe *loadbalancer.Frontend) (bool, []loadbalancer.Backend) {
+			fe.Type = ClusterIP
+			fe.Address = autoAddr
+			return false, []loadbalancer.Backend{
+				newTestBackend(backend2, loadbalancer.BackendStateActive),
+			}
+		},
+		[]maps.MapDump{
+			"BE: ID=2 ADDR=10.1.0.2:80/TCP STATE=active",
+			"REV: ID=1 ADDR=<auto>",
+			"SVC: ID=0 ADDR=<auto>/ANY SLOT=0 LBALG=undef AFFTimeout=0 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+non-routable",
+			"SVC: ID=1 ADDR=<auto>/TCP SLOT=0 LBALG=undef AFFTimeout=0 COUNT=1 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable",
+			"SVC: ID=1 ADDR=<auto>/TCP SLOT=1 BEID=2 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable",
+		},
+		nil,
+		false,
+	),
+
+	// Step 4: Clean up.
+	newTestCase(
+		"MapError_cleanup",
+		deleteFrontend(autoAddr, ClusterIP),
+		[]maps.MapDump{},
+		nil,
+		false,
 	),
 }
 
@@ -948,6 +1179,7 @@ var testCases = [][]testCase{
 	externalIPTestCases,
 	localRedirectTestCases,
 	sessionAffinityTestCases,
+	mapErrorTestCases,
 }
 
 type setWithAlgo struct {
@@ -981,12 +1213,14 @@ var perServiceAlgorithmCases = []setWithAlgo{
 				[]maps.MapDump{
 					"MAGLEV: ID=2 INNER=[1(1021)]",
 				},
+				false,
 			),
 			newTestCase(
 				"NodePorts_explicitMaglev_cleanup",
 				deleteFrontend(zeroAddr, NodePort),
 				[]maps.MapDump{},
 				nil,
+				false,
 			),
 		},
 		algo: loadbalancer.LBAlgorithmRandom,
@@ -1010,12 +1244,14 @@ var perServiceAlgorithmCases = []setWithAlgo{
 					"SVC: ID=2 ADDR=<nodePort>/TCP SLOT=1 BEID=1 COUNT=0 QCOUNT=0 FLAGS=NodePort+Local+InternalLocal",
 				},
 				nil,
+				false,
 			),
 			newTestCase(
 				"NodePorts_noExplicitMaglev_cleanup",
 				deleteFrontend(zeroAddr, NodePort),
 				[]maps.MapDump{},
 				nil,
+				false,
 			),
 		},
 		algo: loadbalancer.LBAlgorithmRandom,
@@ -1043,12 +1279,14 @@ var perServiceAlgorithmCases = []setWithAlgo{
 					"SVC: ID=2 ADDR=<nodePort>/TCP SLOT=1 BEID=1 COUNT=0 QCOUNT=0 FLAGS=NodePort+Local+InternalLocal",
 				},
 				nil,
+				false,
 			),
 			newTestCase(
 				"NodePorts_explicitRandom_cleanup",
 				deleteFrontend(zeroAddr, NodePort),
 				[]maps.MapDump{},
 				nil,
+				false,
 			),
 		},
 		algo: loadbalancer.LBAlgorithmMaglev,
@@ -1074,12 +1312,14 @@ var perServiceAlgorithmCases = []setWithAlgo{
 				[]maps.MapDump{
 					"MAGLEV: ID=2 INNER=[1(1021)]",
 				},
+				false,
 			),
 			newTestCase(
 				"NodePorts_noExplicitMaglev_cleanup",
 				deleteFrontend(zeroAddr, NodePort),
 				[]maps.MapDump{},
 				nil,
+				false,
 			),
 		},
 		algo: loadbalancer.LBAlgorithmMaglev,
@@ -1103,9 +1343,12 @@ func TestBPFOps(t *testing.T) {
 		EnableIPv4:           true,
 		EnableIPv6:           true,
 		KubeProxyReplacement: true,
+		DefaultLBServiceIPAM: "lbipam",
+		EnableLBIPAM:         true,
+		EnableNodeIPAM:       false,
 	}
 
-	cfg, _ := loadbalancer.NewConfig(log, loadbalancer.DefaultUserConfig, loadbalancer.DeprecatedConfig{}, &option.DaemonConfig{})
+	cfg, _ := loadbalancer.NewConfig(log, loadbalancer.DefaultUserConfig, &option.DaemonConfig{})
 
 	var lbmaps maps.LBMaps
 	if testutils.IsPrivileged() {
@@ -1126,6 +1369,8 @@ func TestBPFOps(t *testing.T) {
 	db := statedb.New()
 	nodeAddrs, err := tables.NewNodeAddressTable(db)
 	require.NoError(t, err)
+	frontends, err := loadbalancer.NewFrontendsTable(cfg, db)
+	require.NoError(t, err)
 	wtxn := db.WriteTxn(nodeAddrs)
 	for _, n := range nodePortAddrs {
 		na := tables.NodeAddress{
@@ -1139,9 +1384,71 @@ func TestBPFOps(t *testing.T) {
 	}
 	wtxn.Commit()
 
+	faultMaps := &faultyLBMaps{LBMaps: lbmaps}
+
+	t.Run("Update_withdraws_non_candidate_without_prune", func(t *testing.T) {
+		// The table-driven cases below invoke Prune before validating the maps,
+		// which could hide an incomplete deletion in Update. This test checks the
+		// maps and BPFOps bookkeeping immediately after a frontend becomes a
+		// non-candidate, without giving Prune an opportunity to clean up for it.
+		external := extCfg
+		localCfg := cfg
+		localCfg.LBAlgorithm = loadbalancer.LBAlgorithmRandom
+		ops := newBPFOps(bpfOpsParams{
+			Lifecycle:      lc,
+			Log:            log,
+			Config:         localCfg,
+			ExternalConfig: external,
+			LBMaps:         faultMaps,
+			Maglev:         maglev,
+			DB:             db,
+			NodeAddresses:  nodeAddrs,
+			Frontends:      frontends,
+			Metrics:        newReconcilerMetrics(),
+		})
+
+		svc := baseService
+		frontend := baseFrontend
+		frontend.Type = LoadBalancer
+		frontend.Address = extraFrontend
+		frontend.Service = &svc
+		frontend.Backends = concatBe(frontend.Backends, baseBackend, 1)
+
+		require.NoError(t, ops.Update(context.TODO(), db.ReadTxn(), 0, &frontend))
+		require.NotZero(t, frontend.ID, "programmed Frontend ID")
+		require.False(t, lbmaps.IsEmpty(), "programmed BPF maps")
+
+		ops.extCfg.KubeProxyReplacement = false
+		// Withdrawing a frontend performs multiple map operations. A failed
+		// operation must leave the ID intact so the reconciler can retry the
+		// partially completed deletion.
+		faultMaps.failDeleteService = true
+		err := ops.Update(context.TODO(), db.ReadTxn(), 0, &frontend)
+		faultMaps.failDeleteService = false
+		require.Error(t, err)
+		require.NotZero(t, frontend.ID, "Frontend ID after failed withdrawal")
+		require.Equal(t, frontend.Address, ops.serviceIDAlloc.idToAddr[frontend.ID],
+			"Frontend ID allocation after failed withdrawal")
+
+		require.NoError(t, ops.Update(context.TODO(), db.ReadTxn(), 0, &frontend))
+
+		require.Zero(t, frontend.ID, "withdrawn Frontend ID")
+		require.True(t, lbmaps.IsEmpty(), "BPF maps after Update")
+		require.Empty(t, ops.serviceIDAlloc.idToAddr, "Frontend ID allocations remain")
+		require.Empty(t, ops.backendIDAlloc.idToAddr, "Backend ID allocations remain")
+		require.Empty(t, ops.backendStates, "Backend state remains")
+		require.Empty(t, ops.backendReferences, "Backend references remain")
+		require.Empty(t, ops.wildcardReferences, "Wildcard references remain")
+	})
+
 	runTests := func(ops *BPFOps, testCaseSet []testCase, algo string, addr loadbalancer.L3n4Addr, validateMaglev bool) {
 		for _, testCase := range testCaseSet {
 			t.Run(fmt.Sprintf("%s/%s/ipv6:%v", testCase.name, algo, addr.IsIPv6()), func(t *testing.T) {
+				ops.extCfg.KubeProxyReplacement = true
+				if testCase.kubeProxyReplacement != nil {
+					ops.extCfg.KubeProxyReplacement = *testCase.kubeProxyReplacement
+				}
+
 				frontend := testCase.frontend
 
 				switch frontend.Address.String() {
@@ -1165,6 +1472,11 @@ func TestBPFOps(t *testing.T) {
 					}
 				}
 
+				if testCase.expectErr {
+					faultMaps.fail = true
+					defer func() { faultMaps.fail = false }()
+				}
+
 				if !testCase.delete {
 					err := ops.Update(
 						context.TODO(),
@@ -1172,15 +1484,34 @@ func TestBPFOps(t *testing.T) {
 						0,
 						&frontend,
 					)
-					require.NoError(t, err, "Update")
+					if testCase.expectErr {
+						require.Error(t, err, "Update")
+					} else {
+						require.NoError(t, err, "Update")
+					}
+					if testCase.expectIDCleared {
+						require.Zero(t, frontend.ID, "non-candidate Frontend ID")
+					}
+
+					// Invariant: every backendStates entry must have a non-zero addr.
+					for beAddr, state := range ops.backendStates {
+						require.NotEqual(t, loadbalancer.L3n4Addr{}, state.addr,
+							"backendStates[%s] has zero-value addr; would panic in orphan cleanup", beAddr)
+					}
 				} else {
 					err := ops.Delete(
 						context.TODO(),
-						nil, // ReadTxn (unused)
+						db.ReadTxn(),
 						0,
 						&frontend,
 					)
 					require.NoError(t, err, "Delete")
+				}
+
+				// Skip map validation and prune for error cases since the BPF maps
+				// are in a partially inconsistent state after a failed Update.
+				if testCase.expectErr {
+					return
 				}
 
 				// Prune to catch unexpected deletions.
@@ -1251,10 +1582,12 @@ func TestBPFOps(t *testing.T) {
 					Log:            log,
 					Config:         cfg,
 					ExternalConfig: external,
-					LBMaps:         lbmaps,
+					LBMaps:         faultMaps,
 					Maglev:         maglev,
 					DB:             db,
 					NodeAddresses:  nodeAddrs,
+					Frontends:      frontends,
+					Metrics:        newReconcilerMetrics(),
 				}
 
 				ops := newBPFOps(p)
@@ -1277,15 +1610,40 @@ func TestBPFOps(t *testing.T) {
 				Log:            log,
 				Config:         cfg,
 				ExternalConfig: external,
-				LBMaps:         lbmaps,
+				LBMaps:         faultMaps,
 				Maglev:         maglev,
 				DB:             db,
 				NodeAddresses:  nodeAddrs,
+				Frontends:      frontends,
+				Metrics:        newReconcilerMetrics(),
 			}
 			ops := newBPFOps(p)
 			runTests(ops, setWithAlgo.testCaseSet, setWithAlgo.algo, addr, true)
 		}
 	}
+}
+
+func TestIDMappingsPendingRestoreMetric(t *testing.T) {
+	metrics := newReconcilerMetrics()
+	ops := &BPFOps{
+		metrics: metrics,
+		restoredServiceIDs: map[loadbalancer.L3n4Addr]loadbalancer.ServiceID{
+			frontendAddrs[0]: 1,
+		},
+		restoredBackendIDs: map[loadbalancer.L3n4Addr]loadbalancer.BackendID{
+			backend1: 1,
+			backend2: 2,
+		},
+	}
+
+	metrics.setIDMappingsPendingRestore(idAllocTypeService, len(ops.restoredServiceIDs))
+	metrics.setIDMappingsPendingRestore(idAllocTypeBackend, len(ops.restoredBackendIDs))
+	require.Equal(t, float64(1), metrics.IDMappingsPendingRestore.WithLabelValues(idAllocTypeService).Get())
+	require.Equal(t, float64(2), metrics.IDMappingsPendingRestore.WithLabelValues(idAllocTypeBackend).Get())
+
+	require.NoError(t, ops.pruneRestoredIDs())
+	require.Zero(t, metrics.IDMappingsPendingRestore.WithLabelValues(idAllocTypeService).Get())
+	require.Zero(t, metrics.IDMappingsPendingRestore.WithLabelValues(idAllocTypeBackend).Get())
 }
 
 // showMaps formats the map dumps as the Go code expected in the test cases.

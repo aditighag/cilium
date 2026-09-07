@@ -31,11 +31,6 @@ enum {
 	TRACE_SOCK_AGGREGATE_CONNECT	= 3, /* Only trace connect syscalls */
 };
 
-/* Default monitor aggregation value when not provided by build defines. */
-#ifndef MONITOR_AGGREGATION
-#define MONITOR_AGGREGATION TRACE_SOCK_AGGREGATE_NONE
-#endif
-
 #ifndef TRACE_SOCK_EXTENSION
 #define TRACE_SOCK_EXTENSION
 #define trace_sock_extension_hook(ctx, msg) do {} while (0)
@@ -59,12 +54,7 @@ enum xlate_point {
 
 struct ip {
 	union {
-		struct {
-			__be32 ip4;
-			__u32 pad1;
-			__u32 pad2;
-			__u32 pad3;
-		};
+		union v4addr ip4;
 		union v6addr ip6;
 	} __packed;
 };
@@ -80,6 +70,7 @@ struct trace_sock_notify {
 	__u64 sock_cookie;
 	__u64 cgroup_id;
 	struct ip dst_ip;
+
 	TRACE_SOCK_EXTENSION
 };
 
@@ -108,7 +99,7 @@ static __always_inline bool
 emit_trace_sock_notify(enum xlate_point xlate_point, bool is_connect)
 {
 	/* Hide reverse-direction traces starting at RX-level aggregation. */
-	if (MONITOR_AGGREGATION >= TRACE_SOCK_AGGREGATE_RECV) {
+	if (CONFIG(monitor_aggregation) >= TRACE_SOCK_AGGREGATE_RECV) {
 		switch (xlate_point) {
 		case XLATE_PRE_DIRECTION_REV:
 		case XLATE_POST_DIRECTION_REV:
@@ -119,7 +110,7 @@ emit_trace_sock_notify(enum xlate_point xlate_point, bool is_connect)
 	}
 
 	/* At ACTIVE_CT (3) and up, only emit for connect syscalls. */
-	if (MONITOR_AGGREGATION >= TRACE_SOCK_AGGREGATE_CONNECT)
+	if (CONFIG(monitor_aggregation) >= TRACE_SOCK_AGGREGATE_CONNECT)
 		if (!is_connect)
 			return false;
 
@@ -132,7 +123,7 @@ send_trace_sock_notify4(struct __ctx_sock *ctx,
 			__u32 dst_ip, __u16 dst_port,
 			bool is_connect)
 {
-	struct trace_sock_notify msg __align_stack_8;
+	struct trace_sock_notify msg __align_stack_8 = {};
 	struct ratelimit_key rkey = {
 		.usage = RATELIMIT_USAGE_SOCKET_EVENTS_MAP,
 	};
@@ -147,7 +138,7 @@ send_trace_sock_notify4(struct __ctx_sock *ctx,
 	 * Uses CT_REPORT_INTERVAL as the time bucket for aggregation to
 	 * align with monitor aggregation timing.
 	 */
-	if (MONITOR_AGGREGATION != TRACE_SOCK_AGGREGATE_NONE) {
+	if (CONFIG(monitor_aggregation) != TRACE_SOCK_AGGREGATE_NONE) {
 		/* One token per CT_REPORT_INTERVAL with no burst to align with
 		 * monitor aggregation semantics ("~1 per interval").
 		 */
@@ -157,16 +148,13 @@ send_trace_sock_notify4(struct __ctx_sock *ctx,
 			return;
 	}
 
-	msg = (typeof(msg)){
-		.type		= CILIUM_NOTIFY_TRACE_SOCK,
-		.xlate_point	= xlate_point,
-		.dst_ip.ip4	= dst_ip,
-		.dst_port	= dst_port,
-		.sock_cookie	= sock_local_cookie(ctx),
-		.cgroup_id	= get_current_cgroup_id(),
-		.l4_proto	= parse_protocol(ctx->protocol),
-		.ipv6		= 0,
-	};
+	msg.type = CILIUM_NOTIFY_TRACE_SOCK;
+	msg.xlate_point = xlate_point;
+	msg.dst_ip.ip4.be32 = dst_ip;
+	msg.dst_port = dst_port;
+	msg.sock_cookie = sock_local_cookie(ctx);
+	msg.cgroup_id = get_current_cgroup_id();
+	msg.l4_proto = parse_protocol(ctx->protocol);
 
 	trace_sock_extension_hook(ctx, msg);
 	ctx_event_output(ctx, &cilium_events, BPF_F_CURRENT_CPU, &msg, sizeof(msg));
@@ -194,7 +182,7 @@ send_trace_sock_notify6(struct __ctx_sock *ctx,
 	 * Uses CT_REPORT_INTERVAL as the time bucket for aggregation to
 	 * align with monitor aggregation timing.
 	 */
-	if (MONITOR_AGGREGATION != TRACE_SOCK_AGGREGATE_NONE) {
+	if (CONFIG(monitor_aggregation) != TRACE_SOCK_AGGREGATE_NONE) {
 		/* One token per CT_REPORT_INTERVAL with no burst to align with
 		 * monitor aggregation semantics ("~1 per interval").
 		 */

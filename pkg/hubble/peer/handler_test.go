@@ -195,12 +195,10 @@ func TestNodeAdd(t *testing.T) {
 
 			var got *peerpb.ChangeNotification
 			var wg sync.WaitGroup
-			wg.Add(1)
-			go func() {
+			wg.Go(func() {
 				got = <-h.C
-				wg.Done()
-			}()
-			h.NodeAdd(tt.arg)
+			})
+			h.nodeAdded(tt.arg)
 			wg.Wait()
 			assert.Equal(t, tt.want, got)
 		})
@@ -477,14 +475,12 @@ func TestNodeUpdate(t *testing.T) {
 
 			var got []*peerpb.ChangeNotification
 			var wg sync.WaitGroup
-			wg.Add(1)
-			go func() {
+			wg.Go(func() {
 				for range tt.want {
 					got = append(got, <-h.C)
 				}
-				wg.Done()
-			}()
-			h.NodeUpdate(tt.args.old, tt.args.updated)
+			})
+			h.nodeUpdated(tt.args.old, tt.args.updated)
 			wg.Wait()
 			assert.Equal(t, tt.want, got)
 		})
@@ -642,12 +638,10 @@ func TestNodeDelete(t *testing.T) {
 
 			var got *peerpb.ChangeNotification
 			var wg sync.WaitGroup
-			wg.Add(1)
-			go func() {
+			wg.Go(func() {
 				got = <-h.C
-				wg.Done()
-			}()
-			h.NodeDelete(tt.arg)
+			})
+			h.nodeDeleted(tt.arg)
 			wg.Wait()
 			assert.Equal(t, tt.want, got)
 		})
@@ -698,12 +692,10 @@ func TestHubblePort(t *testing.T) {
 
 			var got *peerpb.ChangeNotification
 			var wg sync.WaitGroup
-			wg.Add(1)
-			go func() {
+			wg.Go(func() {
 				got = <-h.C
-				wg.Done()
-			}()
-			h.NodeAdd(tt.arg)
+			})
+			h.nodeAdded(tt.arg)
 
 			want := &peerpb.ChangeNotification{
 				Address: tt.want,

@@ -38,6 +38,7 @@ Label                                               Description
 ``!annotation.*``                                   Ignore all ``annotation`` labels
 ``!controller-uid``                                 Ignore all ``controller-uid`` labels
 ``!etcd_node``                                      Ignore all ``etcd_node`` labels
+``!topology\.kubernetes\.io``                       Ignore all ``topology.kubernetes.io`` labels
 =================================================== =========================================================
 
 The above label patterns are all *exclusive label patterns*, that is to say
@@ -76,12 +77,12 @@ this attribute can also be set via helm option ``--set labels=<values>``.
 
     apiVersion: v1
     data:
-    ...
+    # ...
       kube-proxy-replacement: "true"
       labels:  "io\\.kubernetes\\.pod\\.namespace k8s-app app name"
       enable-ipv4-masquerade: "true"
       monitor-aggregation: medium
-    ...
+    # ...
 
 .. note:: The double backslash in ``\\.`` is required to escape the slash in
           the YAML string so that the regular expression contains ``\.``.

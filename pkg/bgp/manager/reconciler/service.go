@@ -5,7 +5,6 @@ package reconciler
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -18,15 +17,16 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/cilium/cilium/pkg/bgp/agent/signaler"
+	"github.com/cilium/cilium/pkg/bgp/config"
 	"github.com/cilium/cilium/pkg/bgp/manager/instance"
-	"github.com/cilium/cilium/pkg/bgp/option"
+	bgpTables "github.com/cilium/cilium/pkg/bgp/manager/tables"
 	"github.com/cilium/cilium/pkg/bgp/types"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	"github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/labels"
 	slimmetav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
 	"github.com/cilium/cilium/pkg/loadbalancer"
-	ciliumoption "github.com/cilium/cilium/pkg/option"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/rate"
 	"github.com/cilium/cilium/pkg/svcrouteconfig"
 	"github.com/cilium/cilium/pkg/time"
@@ -43,14 +43,14 @@ type ServiceReconcilerIn struct {
 	Logger   *slog.Logger
 	JobGroup job.Group
 
-	PeerAdvert   *CiliumPeerAdvertisement
-	Config       option.BGPConfig
-	DaemonConfig *ciliumoption.DaemonConfig
-	Signaler     *signaler.BGPCPSignaler
+	PeerAdvert *CiliumPeerAdvertisement
+	Config     config.BGPConfig
+	Signaler   *signaler.BGPCPSignaler
 
-	DB           *statedb.DB
-	Frontends    statedb.Table[*loadbalancer.Frontend]
-	RoutesConfig svcrouteconfig.RoutesConfig
+	DB                      *statedb.DB
+	Frontends               statedb.Table[*loadbalancer.Frontend]
+	DesiredRoutePolicyTable statedb.RWTable[*bgpTables.DesiredRoutePolicy]
+	RoutesConfig            svcrouteconfig.RoutesConfig
 }
 
 type ServiceReconciler struct {
@@ -60,30 +60,35 @@ type ServiceReconciler struct {
 	signaler                     *signaler.BGPCPSignaler
 	db                           *statedb.DB
 	frontends                    statedb.Table[*loadbalancer.Frontend]
+	desiredRoutePolicyTable      statedb.RWTable[*bgpTables.DesiredRoutePolicy]
 	metadata                     map[string]ServiceReconcilerMetadata
 	routesConfig                 svcrouteconfig.RoutesConfig
 }
 
 // ServiceReconcilerMetadata holds per-instance reconciler state.
 type ServiceReconcilerMetadata struct {
-	ServicePaths               ResourceAFPathsMap
+	// ServicePaths holds actual router state and must be updated upon unsuccessful
+	// partial reconciliation as well.
+	ServicePaths ResourceAFPathsMap
+
+	// The below reconciler metadata needs to be updated only upon successful reconciliation.
 	ServiceAdvertisements      PeerAdvertisements
-	ServiceRoutePolicies       ResourceRoutePolicyMap
 	FrontendChanges            statedb.ChangeIterator[*loadbalancer.Frontend]
 	FrontendChangesInitialized bool
 }
 
 func NewServiceReconciler(in ServiceReconcilerIn) ServiceReconcilerOut {
-	if !in.DaemonConfig.BGPControlPlaneEnabled() {
+	if !in.Config.BGPControlPlaneEnabled() {
 		return ServiceReconcilerOut{}
 	}
 	r := &ServiceReconciler{
 		logger:                       in.Logger,
 		peerAdvert:                   in.PeerAdvert,
-		legacyOriginAttributeEnabled: in.Config.EnableBGPLegacyOriginAttribute,
+		legacyOriginAttributeEnabled: in.Config.EnableLegacyOriginAttribute,
 		signaler:                     in.Signaler,
 		db:                           in.DB,
 		frontends:                    in.Frontends,
+		desiredRoutePolicyTable:      in.DesiredRoutePolicyTable,
 		metadata:                     make(map[string]ServiceReconcilerMetadata),
 		routesConfig:                 in.RoutesConfig,
 	}
@@ -151,13 +156,19 @@ func (r *ServiceReconciler) Init(i *instance.BGPInstance) error {
 	r.metadata[i.Name] = ServiceReconcilerMetadata{
 		ServicePaths:          make(ResourceAFPathsMap),
 		ServiceAdvertisements: make(PeerAdvertisements),
-		ServiceRoutePolicies:  make(ResourceRoutePolicyMap),
 	}
 	return nil
 }
 
 func (r *ServiceReconciler) Cleanup(i *instance.BGPInstance) {
 	if i != nil {
+		if err := cleanupDesiredRoutePolicyStatements(r.db, r.desiredRoutePolicyTable, i.Name, r.Name()); err != nil {
+			r.logger.Warn("Failed to clean up desired route policies",
+				logfields.Error, err,
+				types.InstanceLogField, i.Name,
+				logfields.Owner, r.Name(),
+			)
+		}
 		delete(r.metadata, i.Name)
 	}
 }
@@ -172,29 +183,46 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, p ReconcileParams) er
 		return err
 	}
 
-	reqFullReconcile := r.modifiedServiceAdvertisements(p, desiredPeerAdverts)
+	metadata := r.getMetadata(p.BGPInstance)
+	reqFullReconcile := r.modifiedServiceAdvertisements(&metadata, desiredPeerAdverts)
 
-	// if frontend changes iterator has not been initialized yet (first reconcile), perform full reconciliation
-	if !r.getMetadata(p.BGPInstance).FrontendChangesInitialized {
+	// if frontend changes iterator has not been initialized (first reconcile or a retry), perform full reconciliation
+	if !metadata.FrontendChangesInitialized {
 		reqFullReconcile = true
 	}
 
-	err = r.reconcileServices(ctx, p, desiredPeerAdverts, reqFullReconcile)
+	err = r.reconcileServices(ctx, p, &metadata, desiredPeerAdverts, reqFullReconcile)
+	if err != nil {
+		// Preserve partial router state without committing desired advertisements or other metadata.
+		currentMetadata := r.getMetadata(p.BGPInstance)
+		currentMetadata.ServicePaths = metadata.ServicePaths
 
-	if err == nil && reqFullReconcile {
-		// update svc advertisements in metadata only if the reconciliation was successful
-		r.updateServiceAdvertisementsMetadata(p, desiredPeerAdverts)
+		// As the frontend change iterator may have advanced before the failure, force full reconciliation
+		// for the next retry, as otherwise we may miss some events.
+		currentMetadata.FrontendChangesInitialized = false
+		r.setMetadata(p.BGPInstance, currentMetadata)
+		return err
 	}
-	return err
+
+	// update svc advertisements in metadata only if the reconciliation was successful
+	metadata.ServiceAdvertisements = desiredPeerAdverts
+	r.setMetadata(p.BGPInstance, metadata)
+	return nil
 }
 
-func (r *ServiceReconciler) reconcileServices(ctx context.Context, p ReconcileParams, desiredPeerAdverts PeerAdvertisements, fullReconcile bool) error {
+func (r *ServiceReconciler) reconcileServices(
+	ctx context.Context,
+	p ReconcileParams,
+	metadata *ServiceReconcilerMetadata,
+	desiredPeerAdverts PeerAdvertisements,
+	fullReconcile bool,
+) error {
 	var (
 		toReconcile []*loadbalancer.Service
 		toWithdraw  []loadbalancer.ServiceName
 
-		desiredSvcRoutePolicies ResourceRoutePolicyMap
-		desiredSvcPaths         ResourceAFPathsMap
+		desiredSvcRoutePolicyStatements ResourceDesiredRoutePolicyMap
+		desiredSvcPaths                 ResourceAFPathsMap
 
 		rx  statedb.ReadTxn
 		err error
@@ -204,7 +232,7 @@ func (r *ServiceReconciler) reconcileServices(ctx context.Context, p ReconcilePa
 		r.logger.Debug("performing all services reconciliation")
 
 		// get all services to reconcile and to withdraw.
-		toReconcile, toWithdraw, rx, err = r.fullReconciliationServiceList(p)
+		toReconcile, toWithdraw, rx, err = r.fullReconciliationServiceList(metadata)
 		if err != nil {
 			return err
 		}
@@ -213,20 +241,20 @@ func (r *ServiceReconciler) reconcileServices(ctx context.Context, p ReconcilePa
 
 		// get modified services to reconcile and to withdraw.
 		// Note: we should call svc diff only once in a reconcile loop.
-		toReconcile, rx, err = r.diffReconciliationServiceList(p)
+		toReconcile, rx, err = r.diffReconciliationServiceList(metadata)
 		if err != nil {
 			return err
 		}
 	}
 
 	// get desired service route policies
-	desiredSvcRoutePolicies, err = r.getDesiredRoutePolicies(p, desiredPeerAdverts, toReconcile, toWithdraw, rx)
+	desiredSvcRoutePolicyStatements, err = r.getDesiredRoutePolicyStatements(p, desiredPeerAdverts, toReconcile, toWithdraw, rx)
 	if err != nil {
 		return err
 	}
 
 	// reconcile service route policies
-	err = r.reconcileSvcRoutePolicies(ctx, p, desiredSvcRoutePolicies)
+	err = r.reconcileSvcRoutePolicyStatements(ctx, p, desiredSvcRoutePolicyStatements)
 	if err != nil {
 		return fmt.Errorf("failed to reconcile service route policies: %w", err)
 	}
@@ -238,7 +266,7 @@ func (r *ServiceReconciler) reconcileServices(ctx context.Context, p ReconcilePa
 	}
 
 	// reconcile service paths
-	err = r.reconcilePaths(ctx, p, desiredSvcPaths)
+	err = r.reconcilePaths(ctx, p, metadata, desiredSvcPaths)
 	if err != nil {
 		return fmt.Errorf("failed to reconcile service paths: %w", err)
 	}
@@ -246,61 +274,48 @@ func (r *ServiceReconciler) reconcileServices(ctx context.Context, p ReconcilePa
 	return nil
 }
 
-func (r *ServiceReconciler) reconcileSvcRoutePolicies(ctx context.Context, p ReconcileParams, desiredSvcRoutePolicies ResourceRoutePolicyMap) error {
-	var err error
-	metadata := r.getMetadata(p.BGPInstance)
-	for svcKey, desiredSvcRoutePolicies := range desiredSvcRoutePolicies {
-		currentSvcRoutePolicies, exists := metadata.ServiceRoutePolicies[svcKey]
-		if !exists && len(desiredSvcRoutePolicies) == 0 {
-			continue
-		}
-
-		updatedSvcRoutePolicies, rErr := ReconcileRoutePolicies(&ReconcileRoutePoliciesParams{
-			Logger:          r.logger.With(types.InstanceLogField, p.DesiredConfig.Name),
-			Ctx:             ctx,
-			Router:          p.BGPInstance.Router,
-			DesiredPolicies: desiredSvcRoutePolicies,
-			CurrentPolicies: currentSvcRoutePolicies,
-		})
-
-		if rErr == nil && len(desiredSvcRoutePolicies) == 0 {
-			delete(metadata.ServiceRoutePolicies, svcKey)
-		} else {
-			metadata.ServiceRoutePolicies[svcKey] = updatedSvcRoutePolicies
-		}
-		err = errors.Join(err, rErr)
+func (r *ServiceReconciler) reconcileSvcRoutePolicyStatements(_ context.Context, p ReconcileParams, desiredSvcRoutePolicyStatements ResourceDesiredRoutePolicyMap) error {
+	if len(desiredSvcRoutePolicyStatements) == 0 {
+		return nil
 	}
-	r.setMetadata(p.BGPInstance, metadata)
+	tx := r.db.WriteTxn(r.desiredRoutePolicyTable)
+	defer tx.Abort()
 
-	return err
+	for svcKey, desiredStatements := range desiredSvcRoutePolicyStatements {
+		err := reconcileDesiredRoutePolicyStatements(tx, r.desiredRoutePolicyTable, p.BGPInstance.Name, r.Name(), svcKey, desiredStatements)
+		if err != nil {
+			return err
+		}
+	}
+	tx.Commit()
+	return nil
 }
 
-func (r *ServiceReconciler) getDesiredRoutePolicies(p ReconcileParams, desiredPeerAdverts PeerAdvertisements, toUpdate []*loadbalancer.Service, toRemove []loadbalancer.ServiceName, rx statedb.ReadTxn) (ResourceRoutePolicyMap, error) {
-	desiredSvcRoutePolicies := make(ResourceRoutePolicyMap)
+func (r *ServiceReconciler) getDesiredRoutePolicyStatements(p ReconcileParams, desiredPeerAdverts PeerAdvertisements, toUpdate []*loadbalancer.Service, toRemove []loadbalancer.ServiceName, rx statedb.ReadTxn) (ResourceDesiredRoutePolicyMap, error) {
+	desiredSvcRoutePolicyStatements := make(ResourceDesiredRoutePolicyMap)
 
 	for _, svc := range toUpdate {
 		key := resource.Key{Name: svc.Name.Name(), Namespace: svc.Name.Namespace()}
 
-		// get desired route policies for the service
-		svcRoutePolicies, err := r.getDesiredSvcRoutePolicies(p, desiredPeerAdverts, svc, rx)
+		desiredStatements, err := r.getDesiredSvcRoutePolicyStatements(p, key, desiredPeerAdverts, svc, rx)
 		if err != nil {
 			return nil, err
 		}
 
-		desiredSvcRoutePolicies[key] = svcRoutePolicies
+		desiredSvcRoutePolicyStatements[key] = desiredStatements
 	}
 
 	for _, svcName := range toRemove {
 		// for withdrawn services, we need to set route policies to nil.
 		key := resource.Key{Name: svcName.Name(), Namespace: svcName.Namespace()}
-		desiredSvcRoutePolicies[key] = nil
+		desiredSvcRoutePolicyStatements[key] = nil
 	}
 
-	return desiredSvcRoutePolicies, nil
+	return desiredSvcRoutePolicyStatements, nil
 }
 
-func (r *ServiceReconciler) getDesiredSvcRoutePolicies(p ReconcileParams, desiredPeerAdverts PeerAdvertisements, svc *loadbalancer.Service, rx statedb.ReadTxn) (RoutePolicyMap, error) {
-	desiredSvcRoutePolicies := make(RoutePolicyMap)
+func (r *ServiceReconciler) getDesiredSvcRoutePolicyStatements(p ReconcileParams, resourceKey resource.Key, desiredPeerAdverts PeerAdvertisements, svc *loadbalancer.Service, rx statedb.ReadTxn) ([]*bgpTables.DesiredRoutePolicy, error) {
+	desiredSvcPolicies := make(map[bgpTables.DesiredRoutePolicyKey]*bgpTables.DesiredRoutePolicy)
 
 	for peer, afAdverts := range desiredPeerAdverts {
 		for fam, adverts := range afAdverts {
@@ -320,32 +335,43 @@ func (r *ServiceReconciler) getDesiredSvcRoutePolicies(p ReconcileParams, desire
 					slices.SortFunc(prefixesArr, func(a, b netip.Prefix) int {
 						return a.Addr().Compare(b.Addr()) // NOTE: Compare for netip.Prefix us unexported as of Go 1.22 (see go.dev/issue/61642), address compare is good enough here
 					})
-					policy, err := r.getServiceRoutePolicy(peer, agentFamily, svc, prefixesArr, advert, advertType)
+					statements, err := r.getServiceRoutePolicyStatements(peer, agentFamily, svc, prefixesArr, advert, advertType)
 					if err != nil {
 						return nil, fmt.Errorf("failed to get desired %s route policy: %w", advertType, err)
 					}
-					if policy != nil {
-						existingPolicy := desiredSvcRoutePolicies[policy.Name]
-						if existingPolicy != nil {
-							policy, err = MergeRoutePolicies(existingPolicy, policy)
-							if err != nil {
-								return nil, fmt.Errorf("failed to merge %s route policies: %w", advertType, err)
-							}
+					for _, statement := range statements {
+						desiredPolicy := &bgpTables.DesiredRoutePolicy{
+							Instance:   p.BGPInstance.Name,
+							Peer:       peer.Name,
+							PolicyType: types.RoutePolicyTypeExport,
+							Priority:   servicePolicyStatementPriority(statement, r.Priority()),
+							Owner:      r.Name(),
+							Resource:   resourceKey,
+							Statement:  statement,
 						}
-						desiredSvcRoutePolicies[policy.Name] = policy
+						key := desiredPolicy.GetKey()
+						existingPolicy := desiredSvcPolicies[key]
+						if existingPolicy != nil {
+							// Statement with the same key already exists. This happens if the same service
+							// is selected by multiple advertisements. In that case, merge the statements into one.
+							mergedStatement, err := mergeRoutePolicyStatements(existingPolicy.Statement, statement)
+							if err != nil {
+								return nil, fmt.Errorf("failed to merge service route policy statement %q for service %q: %w", statement.Name, svc.Name, err)
+							}
+							existingPolicy.Statement = mergedStatement
+						} else {
+							desiredSvcPolicies[key] = desiredPolicy
+						}
 					}
 				}
 			}
 		}
 	}
-
-	return desiredSvcRoutePolicies, nil
+	return slices.Collect(maps.Values(desiredSvcPolicies)), nil
 }
 
-func (r *ServiceReconciler) reconcilePaths(ctx context.Context, p ReconcileParams, desiredSvcPaths ResourceAFPathsMap) error {
+func (r *ServiceReconciler) reconcilePaths(ctx context.Context, p ReconcileParams, metadata *ServiceReconcilerMetadata, desiredSvcPaths ResourceAFPathsMap) error {
 	var err error
-	metadata := r.getMetadata(p.BGPInstance)
-
 	metadata.ServicePaths, err = ReconcileResourceAFPaths(ReconcileResourceAFPathsParams{
 		Logger:                 r.logger.With(types.InstanceLogField, p.DesiredConfig.Name),
 		Ctx:                    ctx,
@@ -353,42 +379,27 @@ func (r *ServiceReconciler) reconcilePaths(ctx context.Context, p ReconcileParam
 		DesiredResourceAFPaths: desiredSvcPaths,
 		CurrentResourceAFPaths: metadata.ServicePaths,
 	})
-
-	r.setMetadata(p.BGPInstance, metadata)
 	return err
 }
 
 // modifiedServiceAdvertisements compares local advertisement state with desiredPeerAdverts, if they differ,
 // returns true signaling that full reconciliation is required.
-func (r *ServiceReconciler) modifiedServiceAdvertisements(p ReconcileParams, desiredPeerAdverts PeerAdvertisements) bool {
-	// current metadata
-	serviceMetadata := r.getMetadata(p.BGPInstance)
-
+func (r *ServiceReconciler) modifiedServiceAdvertisements(metadata *ServiceReconcilerMetadata, desiredPeerAdverts PeerAdvertisements) bool {
 	// check if BGP advertisement configuration modified
-	modified := !PeerAdvertisementsEqual(serviceMetadata.ServiceAdvertisements, desiredPeerAdverts)
-
-	return modified
-}
-
-// updateServiceAdvertisementsMetadata updates the provided ServiceAdvertisements in the reconciler metadata.
-func (r *ServiceReconciler) updateServiceAdvertisementsMetadata(p ReconcileParams, peerAdverts PeerAdvertisements) {
-	// current metadata
-	serviceMetadata := r.getMetadata(p.BGPInstance)
-
-	serviceMetadata.ServiceAdvertisements = peerAdverts
-
-	// update ServiceAdvertisements in the metadata
-	r.setMetadata(p.BGPInstance, serviceMetadata)
+	return !PeerAdvertisementsEqual(metadata.ServiceAdvertisements, desiredPeerAdverts)
 }
 
 // hasBackends loops through Frontend backends and returns:
-// 1) true, false - backends > 0, no local backend
-// 2) true, true - backends > 0, at least 1 local backend
-// 3) false, false - no backends, no local backend
+// 1) true, false - active backends > 0, no local backend
+// 2) true, true - active backends > 0, at least 1 local backend
+// 3) false, false - no active backends, no local backend
 func hasBackends(p ReconcileParams, fe *loadbalancer.Frontend) (hasBackends, hasLocalBackends bool) {
 	for backend := range fe.Backends {
+		if backend.State != loadbalancer.BackendStateActive {
+			continue
+		}
 		hasBackends = true
-		if backend.NodeName == p.CiliumNode.Name && backend.State == loadbalancer.BackendStateActive {
+		if backend.NodeName == p.CiliumNode.Name {
 			hasLocalBackends = true
 			return
 		}
@@ -396,9 +407,7 @@ func hasBackends(p ReconcileParams, fe *loadbalancer.Frontend) (hasBackends, has
 	return
 }
 
-func (r *ServiceReconciler) fullReconciliationServiceList(p ReconcileParams) (toReconcile []*loadbalancer.Service, toWithdraw []loadbalancer.ServiceName, rx statedb.ReadTxn, err error) {
-	metadata := r.getMetadata(p.BGPInstance)
-
+func (r *ServiceReconciler) fullReconciliationServiceList(metadata *ServiceReconcilerMetadata) (toReconcile []*loadbalancer.Service, toWithdraw []loadbalancer.ServiceName, rx statedb.ReadTxn, err error) {
 	// re-init changes interator, so that it contains changes since the last full reconciliation
 	tx := r.db.WriteTxn(r.frontends)
 	metadata.FrontendChanges, err = r.frontends.Changes(tx)
@@ -408,7 +417,6 @@ func (r *ServiceReconciler) fullReconciliationServiceList(p ReconcileParams) (to
 	}
 	rx = tx.Commit()
 	metadata.FrontendChangesInitialized = true
-	r.setMetadata(p.BGPInstance, metadata)
 
 	// the initial set of changes emits all existing frontends
 	events, _ := metadata.FrontendChanges.Next(rx)
@@ -434,8 +442,7 @@ func (r *ServiceReconciler) fullReconciliationServiceList(p ReconcileParams) (to
 
 // diffReconciliationServiceList returns a list of services to reconcile and to withdraw when
 // performing partial (diff) service reconciliation.
-func (r *ServiceReconciler) diffReconciliationServiceList(p ReconcileParams) (toReconcile []*loadbalancer.Service, rx statedb.ReadTxn, err error) {
-	metadata := r.getMetadata(p.BGPInstance)
+func (r *ServiceReconciler) diffReconciliationServiceList(metadata *ServiceReconcilerMetadata) (toReconcile []*loadbalancer.Service, rx statedb.ReadTxn, err error) {
 	rx = r.db.ReadTxn()
 
 	// list frontends which changed since the last reconciliation (includes frontends with just backend changed)
@@ -494,7 +501,10 @@ func (r *ServiceReconciler) getServiceAFPaths(p ReconcileParams, desiredPeerAdve
 					for _, prefix := range prefixes.UnsortedList() {
 						// we only add path corresponding to the family of the prefix.
 						if agentFamily.Afi == types.AfiIPv4 && prefix.Addr().Is4() {
-							path := types.NewPathForPrefix(prefix)
+							path, err := types.NewPathForPrefix(prefix)
+							if err != nil {
+								return nil, fmt.Errorf("failed to create path for prefix %s: %w", prefix, err)
+							}
 							// For LoadBalancer IP prefixes, set origin to INCOMPLETE for legacy compatibility.
 							if r.legacyOriginAttributeEnabled && advertType == v2.BGPLoadBalancerIPAddr {
 								path = types.SetPathOriginAttrIncomplete(path)
@@ -503,7 +513,10 @@ func (r *ServiceReconciler) getServiceAFPaths(p ReconcileParams, desiredPeerAdve
 							addPathToAFPathsMap(desiredFamilyAdverts, agentFamily, path)
 						}
 						if agentFamily.Afi == types.AfiIPv6 && prefix.Addr().Is6() {
-							path := types.NewPathForPrefix(prefix)
+							path, err := types.NewPathForPrefix(prefix)
+							if err != nil {
+								return nil, fmt.Errorf("failed to create path for prefix %s: %w", prefix, err)
+							}
 							// For LoadBalancer IP prefixes, set origin to INCOMPLETE for legacy compatibility.
 							if r.legacyOriginAttributeEnabled && advertType == v2.BGPLoadBalancerIPAddr {
 								path = types.SetPathOriginAttrIncomplete(path)
@@ -613,15 +626,36 @@ func (r *ServiceReconciler) getLoadBalancerIPPaths(p ReconcileParams, svc *loadb
 		return desiredRoutes
 	}
 
+	// Check if this service has a local proxy (Envoy) handling its traffic.
+	// ProxyRedirects is non-empty when the local Envoy proxy is running and configured
+	// to handle this service (e.g., Gateway API or Ingress services).
+	// This handles deployments where cilium-envoy has a nodeSelector that excludes some nodes.
+	hasLocalProxy := !svc.ProxyRedirects.Empty()
+
 	for _, fe := range frontends {
 		if fe.Type != loadbalancer.SVCTypeLoadBalancer {
 			continue
 		}
 
 		hasBackends, hasLocalBackends := hasBackends(p, fe)
-		// Ignore externalTrafficPolicy == Local && no local EPs or ignore when there are no backends and EnableNoServiceEndpointsRoutable == false.
-		if (fe.Service.ExtTrafficPolicy == loadbalancer.SVCTrafficPolicyLocal && !hasLocalBackends) || (!r.routesConfig.EnableNoServiceEndpointsRoutable && !hasBackends) {
-			continue
+
+		// For services with real backends, respect externalTrafficPolicy: Local by skipping
+		// advertisement when there are no local endpoints.
+		// For proxy-redirected services (Gateway API/Ingress), advertise if the local
+		// proxy is handling traffic, since backends are managed by the proxy.
+		if fe.Service.ExtTrafficPolicy == loadbalancer.SVCTrafficPolicyLocal && !hasLocalBackends {
+			if !hasLocalProxy {
+				continue
+			}
+		}
+
+		// Respect EnableNoServiceEndpointsRoutable for services with zero backends.
+		// However, proxy-redirected services should be advertised even with zero
+		// backends, as traffic is handled by the local proxy.
+		if !r.routesConfig.EnableNoServiceEndpointsRoutable && !hasBackends {
+			if !hasLocalProxy {
+				continue
+			}
 		}
 
 		addr := fe.Address.Addr()
@@ -635,7 +669,7 @@ func (r *ServiceReconciler) getLoadBalancerIPPaths(p ReconcileParams, svc *loadb
 	return desiredRoutes
 }
 
-func (r *ServiceReconciler) getServiceRoutePolicy(peer PeerID, family types.Family, svc *loadbalancer.Service, svcPrefixes []netip.Prefix, advert v2.BGPAdvertisement, advertType v2.BGPServiceAddressType) (*types.RoutePolicy, error) {
+func (r *ServiceReconciler) getServiceRoutePolicyStatements(peer PeerID, family types.Family, svc *loadbalancer.Service, svcPrefixes []netip.Prefix, advert v2.BGPAdvertisement, advertType v2.BGPServiceAddressType) ([]*types.RoutePolicyStatement, error) {
 	if peer.Address == "" {
 		return nil, nil
 	}
@@ -662,13 +696,19 @@ func (r *ServiceReconciler) getServiceRoutePolicy(peer PeerID, family types.Fami
 		return nil, nil
 	}
 
-	policyName := PolicyName(peer.Name, family.Afi.String(), advert.AdvertisementType, fmt.Sprintf("%s-%s-%s", svc.Name.Name(), svc.Name.Namespace(), advertType))
-	policy, err := CreatePolicy(policyName, peerAddr, v4Prefixes, v6Prefixes, advert)
+	name := PolicyStatementName(advert.AdvertisementType, fmt.Sprintf("%s-%s-%s", svc.Name.Name(), svc.Name.Namespace(), advertType))
+	statements, err := CreatePolicyStatements(name, peerAddr, v4Prefixes, v6Prefixes, advert)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create %s IP route policy: %w", advertType, err)
 	}
+	for _, statement := range statements {
+		if sumLen, isSummary := routePolicyStatementSummaryPrefix(statement); isSummary {
+			// apply a suffix to summary route statement names to allow rendering them along with exact route statements
+			statement.Name = fmt.Sprintf("%s-agg-%d", statement.Name, sumLen)
+		}
+	}
 
-	return policy, nil
+	return statements, nil
 }
 
 func serviceLabelSet(svc *loadbalancer.Service) labels.Labels {
@@ -705,4 +745,21 @@ func getServicePrefixLength(fe *loadbalancer.Frontend, advert v2.BGPAdvertisemen
 		length = int(*advert.Service.AggregationLengthIPv6)
 	}
 	return length
+}
+
+// servicePolicyStatementPriority ensures that summary routes have lower priority than exact routes
+func servicePolicyStatementPriority(statement *types.RoutePolicyStatement, basePriority int) int {
+	if _, isSummary := routePolicyStatementSummaryPrefix(statement); isSummary {
+		return basePriority + 1
+	}
+	return basePriority
+}
+
+func routePolicyStatementSummaryPrefix(statement *types.RoutePolicyStatement) (int, bool) {
+	for _, prefix := range statement.Conditions.MatchPrefixes.Prefixes {
+		if prefix.CIDR.Bits() < prefix.CIDR.Addr().BitLen() {
+			return prefix.CIDR.Bits(), true
+		}
+	}
+	return 0, false
 }

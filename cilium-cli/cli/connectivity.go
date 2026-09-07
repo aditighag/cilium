@@ -40,7 +40,7 @@ func newCmdConnectivity(hooks api.Hooks) *cobra.Command {
 }
 
 var params = check.Parameters{
-	ExternalDeploymentPort: 8080,
+	ExternalDeploymentPort: 8190,
 	EchoServerHostPort:     4000,
 	Writer:                 os.Stdout,
 	SysdumpOptions: sysdump.Options{
@@ -137,6 +137,7 @@ func newCmdConnectivityTest(hooks api.Hooks) *cobra.Command {
 	cmd.Flags().BoolVar(&params.PrintFlows, "print-flows", false, "Print flow logs for each test")
 	cmd.Flags().DurationVar(&params.PostTestSleepDuration, "post-test-sleep", 0, "Wait time after each test before next test starts")
 	cmd.Flags().BoolVar(&params.ForceDeploy, "force-deploy", false, "Force re-deploying test artifacts")
+	cmd.Flags().BoolVar(&params.CleanupOnly, "cleanup", false, "Cleanup all connectivity test artifacts (namespaces, deployments, services) without running tests")
 	cmd.Flags().BoolVar(&params.Hubble, "hubble", true, "Automatically use Hubble for flow validation & troubleshooting")
 	cmd.Flags().StringVar(&params.HubbleServer, "hubble-server", "localhost:4245", "Address of the Hubble endpoint for flow validation")
 	cmd.Flags().StringVar(&params.AgentDaemonSetName, "agent-daemonset-name", defaults.AgentDaemonSetName, "Name of cilium agent daemonset")
@@ -152,6 +153,7 @@ func newCmdConnectivityTest(hooks api.Hooks) *cobra.Command {
 	cmd.Flags().BoolVarP(&params.Timestamp, "timestamp", "t", false, "Show timestamp in messages")
 	cmd.Flags().BoolVarP(&params.PauseOnFail, "pause-on-fail", "p", false, "Pause execution on test failure")
 	cmd.Flags().BoolVar(&params.ExternalTargetIPv6Capable, "external-target-ipv6-capable", false, "External target is IPv6 capable")
+	cmd.Flags().BoolVar(&params.ExternalTargetFakeDNS, "external-target-fake-dns", false, "Use DNS override for external targets in wildcard tests")
 	cmd.Flags().StringVar(&params.ExternalTarget, "external-target", "one.one.one.one.", "Domain name to use as external target in connectivity tests")
 	cmd.Flags().StringVar(&params.ExternalOtherTarget, "external-other-target", "k8s.io.", "Domain name to use as a second external target in connectivity tests")
 	cmd.Flags().StringVar(&params.ExternalTargetCANamespace, "external-target-ca-namespace", "", "Namespace of the CA secret for the external target.")
@@ -191,6 +193,7 @@ func newCmdConnectivityTest(hooks api.Hooks) *cobra.Command {
 	cmd.Flags().BoolVar(&params.CurlInsecure, "curl-insecure", false, "Pass --insecure to curl")
 	cmd.Flags().UintVar(&params.CurlParallel, "curl-parallel", defaults.CurlParallel, "Number of parallel requests in curl commands (0 to disable)")
 
+	cmd.Flags().BoolVar(&params.ExitZeroOnFailure, "exit-zero-on-failure", false, "Exit with zero return code even when test failures are detected")
 	cmd.Flags().BoolVar(&params.CollectSysdumpOnFailure, "collect-sysdump-on-failure", false, "Collect sysdump after a test fails")
 
 	sysdump.InitSysdumpFlags(cmd, &params.SysdumpOptions, "sysdump-", hooks)
@@ -203,6 +206,7 @@ func newCmdConnectivityTest(hooks api.Hooks) *cobra.Command {
 	cmd.Flags().StringVar(&params.ConnDisruptTestRestartsPath, "conn-disrupt-test-restarts-path", "/tmp/cilium-conn-disrupt-restarts", "Conn disrupt test temporary result file (used internally)")
 	cmd.Flags().StringVar(&params.ConnDisruptTestXfrmErrorsPath, "conn-disrupt-test-xfrm-errors-path", "/tmp/cilium-conn-disrupt-xfrm-errors", "Conn disrupt test temporary result file (used internally)")
 	cmd.Flags().DurationVar(&params.ConnDisruptDispatchInterval, "conn-disrupt-dispatch-interval", 0, "TCP packet dispatch interval")
+	cmd.Flags().DurationVar(&params.ConnDisruptClientTimeout, "conn-disrupt-client-timeout", 0, "Conn disrupt client per-request timeout, after which it exits (0 leaves the client default)")
 
 	cmd.Flags().StringSliceVar(&params.ExpectedDropReasons, "expected-drop-reasons", defaults.ExpectedDropReasons, "List of expected drop reasons")
 	cmd.Flags().MarkHidden("expected-drop-reasons")
@@ -217,6 +221,9 @@ func newCmdConnectivityTest(hooks api.Hooks) *cobra.Command {
 	cmd.Flags().MarkHidden("exclude-code-owners")
 	cmd.Flags().StringSliceVar(&params.LogCheckLevels, "log-check-levels", defaults.LogCheckLevels, "Log levels to check for in log messages")
 	cmd.Flags().MarkHidden("log-check-levels")
+	cmd.Flags().StringSliceVar(&params.LogCheckExtraExceptions, "log-check-extra-exceptions", []string{}, "Additional log message substrings to ignore in check-log-errors")
+	cmd.Flags().MarkHidden("log-check-extra-exceptions")
+	cmd.Flags().BoolVar(&params.LogCheckOnlyTestTime, "log-check-only-test-time", false, "Whether logs should only get checked for the duration of the tests")
 
 	cmd.Flags().BoolVar(&params.FlushCT, "flush-ct", false, "Flush conntrack of Cilium on each node")
 	cmd.Flags().MarkHidden("flush-ct")
@@ -284,10 +291,16 @@ func newCmdConnectivityPerf(hooks api.Hooks) *cobra.Command {
 	cmd.Flags().BoolVar(&params.PerfParameters.KernelProfiles, "unsafe-capture-kernel-profiles", false,
 		"Capture kernel profiles during test execution. Warning: run on disposable nodes only, as it installs additional software and modifies their configuration")
 
-	cmd.Flags().Var(option.NewMapOptions(&params.PerfParameters.NodeSelectorServer),
-		"node-selector-server", "Node selector for the server pod (and client same-node)")
-	cmd.Flags().Var(option.NewMapOptions(&params.PerfParameters.NodeSelectorClient),
-		"node-selector-client", "Node selector for the other-node client pod")
+	// The default excludes non-Cilium nodes (labeled with CiliumNoScheduleLabel,
+	// e.g. via `cilium install --nodes-without-cilium`): perf pods pinned there
+	// never become ready, as the agent-not-ready NoExecute taint is only removed
+	// once a Cilium pod runs on the node. Callers that intentionally target such
+	// nodes (e.g. scale-egw) can override this with their own selector.
+	defaultPerfNodeSelector := defaults.CiliumNoScheduleLabel + "!=true"
+	cmd.Flags().StringVar(&params.PerfParameters.NodeSelectorServer, "node-selector-server", defaultPerfNodeSelector,
+		"Node selector (label query) for the server pod (and client same-node)")
+	cmd.Flags().StringVar(&params.PerfParameters.NodeSelectorClient, "node-selector-client", defaultPerfNodeSelector,
+		"Node selector (label query) for the other-node client pod")
 
 	cmd.Flags().StringVar(&params.PerfParameters.Image, "performance-image", defaults.ConnectivityCheckImagesPerf["ConnectivityPerformanceImage"], "Image path to use for performance")
 	cmd.Flags().StringVar(&params.PerfParameters.ReportDir, "report-dir", "", "Directory to save perf results in json format")
@@ -320,9 +333,14 @@ func newConnectivityTests(
 	}
 
 	connTests := make([]*check.ConnectivityTest, 0, params.TestConcurrency)
+	sharedNamespace := ""
 	for i := range params.TestConcurrency {
 		params := params
 		params.TestNamespace = fmt.Sprintf("%s-%d", params.TestNamespace, i+1)
+		if sharedNamespace == "" {
+			sharedNamespace = params.TestNamespace // use the first test ns for shared resources
+		}
+		params.SharedTestNamespace = sharedNamespace
 		params.TestNamespaceIndex = i
 		if params.ExternalTargetCANamespace == "" {
 			params.ExternalTargetCANamespace = params.TestNamespace

@@ -10,7 +10,7 @@
 #define ENABLE_NODEPORT_ACCELERATION
 
 /* Make sure we always pick backend slot 1 if we end up in backend selection. */
-#define LB_SELECTION LB_SELECTION_FIRST
+#define LB_DEFAULT_ALG LB_SELECTION_FIRST
 
 #define fib_lookup mock_fib_lookup
 
@@ -102,7 +102,7 @@ static __always_inline int craft_packet(struct __ctx_buff *ctx)
 			  .proto = SERVICE_PROTO },\
 	}
 
-SETUP("xdp", "session_affinity")
+SETUP(PROG_TYPE, "session_affinity")
 int test1_setup(struct __ctx_buff *ctx)
 {
 	struct {
@@ -161,7 +161,7 @@ int test1_setup(struct __ctx_buff *ctx)
 	return xdp_receive_packet(ctx);
 }
 
-CHECK("xdp", "session_affinity")
+CHECK(PROG_TYPE, "session_affinity")
 int test1_check(__maybe_unused const struct __ctx_buff *ctx)
 {
 	test_init();

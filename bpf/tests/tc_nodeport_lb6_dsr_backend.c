@@ -10,7 +10,6 @@
 #define ENABLE_NODEPORT
 #define ENABLE_DSR		1
 #define DSR_ENCAP_GENEVE	3
-#define ENABLE_HOST_ROUTING
 
 #define CLIENT_IP	{ .addr = { 0x1, 0x0, 0x0, 0x0, 0x0, 0x0 } }
 #define CLIENT_PORT	__bpf_htons(111)
@@ -70,6 +69,7 @@ mock_ctx_redirect(const struct __sk_buff *ctx __maybe_unused,
 #include "lib/endpoint.h"
 #include "lib/ipcache.h"
 
+ASSIGN_CONFIG(bool, enable_bpf_host_routing, true)
 ASSIGN_CONFIG(__u32, interface_ifindex, DEFAULT_IFACE)
 
 long mock_fib_lookup(__maybe_unused void *ctx, struct bpf_fib_lookup *params,
@@ -92,10 +92,10 @@ mock_ctx_redirect(const struct __sk_buff *ctx __maybe_unused,
 
 /* Test that a remote node
  * - doesn't touch a DSR request,
- * - redirects it to the pod (as ENABLE_HOST_ROUTING is set)
+ * - redirects it to the pod (as BPF Host Routing is enabled)
  * - creates a matching CT entry, and SNAT entry from the DSR info
  */
-PKTGEN("tc", "tc_nodeport_dsr_backend")
+PKTGEN(PROG_TYPE, "tc_nodeport_dsr_backend")
 int nodeport_dsr_backend_pktgen(struct __ctx_buff *ctx)
 {
 	union v6addr frontend_ip = FRONTEND_IP;
@@ -147,7 +147,7 @@ int nodeport_dsr_backend_pktgen(struct __ctx_buff *ctx)
 	return 0;
 }
 
-SETUP("tc", "tc_nodeport_dsr_backend")
+SETUP(PROG_TYPE, "tc_nodeport_dsr_backend")
 int nodeport_dsr_backend_setup(struct __ctx_buff *ctx)
 {
 	union v6addr backend_ip = BACKEND_IP;
@@ -161,7 +161,7 @@ int nodeport_dsr_backend_setup(struct __ctx_buff *ctx)
 	return netdev_receive_packet(ctx);
 }
 
-CHECK("tc", "tc_nodeport_dsr_backend")
+CHECK(PROG_TYPE, "tc_nodeport_dsr_backend")
 int nodeport_dsr_backend_check(struct __ctx_buff *ctx)
 {
 	union v6addr frontend_ip = FRONTEND_IP;
@@ -261,19 +261,10 @@ int nodeport_dsr_backend_check(struct __ctx_buff *ctx)
 		test_fatal("no CT entry for DSR found");
 	if (!ct_entry->dsr_internal)
 		test_fatal("CT entry doesn't have the .dsr_internal flag set");
-
-	struct ipv6_nat_entry *nat_entry;
-
-	tuple.sport = BACKEND_PORT;
-	tuple.dport = CLIENT_PORT;
-
-	nat_entry = snat_v6_lookup(&tuple);
-	if (!nat_entry)
-		test_fatal("no SNAT entry for DSR found");
-	if (!ipv6_addr_equals((union v6addr *)&nat_entry->to_saddr, &frontend_ip))
-		test_fatal("SNAT entry has wrong address");
-	if (nat_entry->to_sport != FRONTEND_PORT)
-		test_fatal("SNAT entry has wrong port");
+	if (!ipv6_addr_equals(&ct_entry->nat_addr, &frontend_ip))
+		test_fatal("CT entry has wrong RevDNAT address");
+	if (ct_entry->nat_port != FRONTEND_PORT)
+		test_fatal("CT entry has wrong RevDNAT port");
 
 	test_finish();
 }
@@ -359,8 +350,8 @@ int check_reply(const struct __ctx_buff *ctx)
 	if (l4->dest != CLIENT_PORT)
 		test_fatal("dst port has changed");
 
-	if (l4->check != bpf_htons(0x2dbc))
-		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+	if (l4->check != bpf_htons(0x8d5c))
+		test_fatal("L4 checksum is invalid: %x != %x", l4->check, bpf_ntohs(0x8d5c));
 
 	test_finish();
 }
@@ -368,55 +359,20 @@ int check_reply(const struct __ctx_buff *ctx)
 /* Test that the backend node revDNATs a reply from the
  * DSR backend, and sends the reply back to the client.
  */
-PKTGEN("tc", "tc_nodeport_dsr_backend_reply")
+PKTGEN(PROG_TYPE, "tc_nodeport_dsr_backend_reply")
 int nodeport_dsr_backend_reply_pktgen(struct __ctx_buff *ctx)
 {
 	return build_reply(ctx);
 }
 
-SETUP("tc", "tc_nodeport_dsr_backend_reply")
+SETUP(PROG_TYPE, "tc_nodeport_dsr_backend_reply")
 int nodeport_dsr_backend_reply_reply_setup(struct __ctx_buff *ctx)
 {
 	return netdev_send_packet(ctx);
 }
 
-CHECK("tc", "tc_nodeport_dsr_backend_reply")
+CHECK(PROG_TYPE, "tc_nodeport_dsr_backend_reply")
 int nodeport_dsr_backend_reply_reply_check(const struct __ctx_buff *ctx)
-{
-	return check_reply(ctx);
-}
-
-/* Test that the backend node revDNATs a reply from the
- * DSR backend, and sends the reply back to the client.
- * Even without the NAT entry.
- */
-PKTGEN("tc", "tc_nodeport_dsr_backend_reply2_no_nat_entry")
-int nodeport_dsr_backend_reply2_no_nat_entry_pktgen(struct __ctx_buff *ctx)
-{
-	return build_reply(ctx);
-}
-
-SETUP("tc", "tc_nodeport_dsr_backend_reply2_no_nat_entry")
-int nodeport_dsr_backend_reply2_no_nat_entry_setup(struct __ctx_buff *ctx)
-{
-	struct ipv6_ct_tuple tuple = {
-		.daddr = CLIENT_IP,
-		.saddr = BACKEND_IP,
-		.dport = CLIENT_PORT,
-		.sport = BACKEND_PORT,
-		.nexthdr = IPPROTO_TCP,
-		.flags = CT_EGRESS,
-	};
-
-	/* Delete the NAT entry, fall back to the NAT info in the CT entry. */
-	if (map_delete_elem(&cilium_snat_v6_external, &tuple))
-		return TEST_ERROR;
-
-	return netdev_send_packet(ctx);
-}
-
-CHECK("tc", "tc_nodeport_dsr_backend_reply2_no_nat_entry")
-int nodeport_dsr_backend_reply2_no_nat_entry_check(const struct __ctx_buff *ctx)
 {
 	return check_reply(ctx);
 }

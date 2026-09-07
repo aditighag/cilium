@@ -80,37 +80,37 @@ var (
 
 	allIDs = []*identity.Identity{idA, idB, idC, idOther}
 
-	flowAToB = policy.Flow{
+	flowAToB = policytypes.Flow{
 		From:  idA,
 		To:    idB,
 		Proto: u8proto.TCP,
 		Dport: 80,
 	}
-	flowBToA = policy.Flow{
+	flowBToA = policytypes.Flow{
 		From:  idB,
 		To:    idA,
 		Proto: u8proto.TCP,
 		Dport: 80,
 	}
-	flowAToOther = policy.Flow{
+	flowAToOther = policytypes.Flow{
 		From:  idA,
 		To:    idOther,
 		Proto: u8proto.TCP,
 		Dport: 80,
 	}
-	flowOtherToA = policy.Flow{
+	flowOtherToA = policytypes.Flow{
 		From:  idOther,
 		To:    idA,
 		Proto: u8proto.TCP,
 		Dport: 80,
 	}
-	flowAToC = policy.Flow{
+	flowAToC = policytypes.Flow{
 		From:  idA,
 		To:    idC,
 		Proto: u8proto.TCP,
 		Dport: 80,
 	}
-	flowCToA = policy.Flow{
+	flowCToA = policytypes.Flow{
 		From:  idC,
 		To:    idA,
 		Proto: u8proto.TCP,
@@ -140,27 +140,28 @@ func testNewPolicyRepository(t *testing.T, initialIDs []*identity.Identity) (ide
 	}
 	logger := hivetest.Logger(t)
 	idManager := identitymanager.NewIDManager(logger)
-	repo := policy.NewPolicyRepository(logger, idmap, nil, nil, idManager, testpolicy.NewPolicyMetricsNoop())
+	repo := policy.NewPolicyRepository(logger, cmtypes.DefaultClusterInfo, idmap, nil, nil, idManager, testpolicy.NewPolicyMetricsNoop())
 	repo.GetSelectorCache().SetLocalIdentityNotifier(testidentity.NewDummyIdentityNotifier())
+	idManager.Subscribe(testpolicy.SelectorCacheObserver{Cache: repo.GetSubjectSelectorCache()})
 	return idManager, repo
 }
 
 // validateNetworkPolicy takes a repository and validates
 // that the set of flows are allowed and denied as expected.
-func validateNetworkPolicy(t *testing.T, repo *policy.Repository, identityManager identitymanager.IDManager, allowFlows, denyFlows []policy.Flow) {
+func validateNetworkPolicy(t *testing.T, repo *policy.Repository, identityManager identitymanager.IDManager, allowFlows, denyFlows []policytypes.Flow) {
 	t.Helper()
 	logger := hivetest.Logger(t)
 
 	for i, allow := range allowFlows {
-		verdict, _, _, err := policy.LookupFlow(logger, repo, identityManager, allow, nil, nil)
+		verdict, _, _, err := policy.LookupFlow(logger, repo, identityManager, allow)
 		require.NoError(t, err, "Looking up allow flow %i failed", i)
-		require.Equal(t, api.Allowed, verdict, "Verdict for allow flow %d must match", i)
+		require.True(t, verdict.Allowed(), "Verdict for allow flow %d must match", i)
 	}
 
 	for i, allow := range denyFlows {
-		verdict, _, _, err := policy.LookupFlow(logger, repo, identityManager, allow, nil, nil)
+		verdict, _, _, err := policy.LookupFlow(logger, repo, identityManager, allow)
 		require.NoError(t, err, "Looking up deny flow %i failed", i)
-		require.Equal(t, api.Denied, verdict, "Verdict for deny flow %d must match", i)
+		require.False(t, verdict.Allowed(), "Verdict for deny flow %d must match", i)
 	}
 }
 
@@ -204,6 +205,8 @@ func TestParseNetworkPolicy(t *testing.T) {
 			out: policytypes.PolicyEntry{
 				Ingress:     true,
 				DefaultDeny: true,
+				Verdict:     policytypes.Allow,
+				Tier:        policytypes.Normal,
 				L3: policytypes.ToSelectors(api.NewESFromLabels(
 					labels.NewLabel(k8sConst.PodNamespaceLabel, slim_metav1.NamespaceDefault, labels.LabelSourceK8s),
 					labels.NewLabel("foo3", "bar3", labels.LabelSourceK8s),
@@ -236,6 +239,8 @@ func TestParseNetworkPolicy(t *testing.T) {
 			out: policytypes.PolicyEntry{
 				Ingress:     true,
 				DefaultDeny: true,
+				Verdict:     policytypes.Allow,
+				Tier:        policytypes.Normal,
 				L3:          policytypes.ToSelectors(api.NewESFromLabels()),
 				L4: api.PortRules{{
 					Ports: []api.PortProtocol{{
@@ -279,6 +284,8 @@ func TestParseNetworkPolicy(t *testing.T) {
 			out: policytypes.PolicyEntry{
 				Ingress:     true,
 				DefaultDeny: true,
+				Verdict:     policytypes.Allow,
+				Tier:        policytypes.Normal,
 				L3: policytypes.ToSelectors(api.NewESFromLabels(
 					labels.NewLabel("foo3", "bar3", labels.LabelSourceK8s),
 					labels.NewLabel("foo4", "bar4", labels.LabelSourceK8s),
@@ -300,6 +307,8 @@ func TestParseNetworkPolicy(t *testing.T) {
 			out: policytypes.PolicyEntry{
 				Ingress:     true,
 				DefaultDeny: true,
+				Verdict:     policytypes.Allow,
+				Tier:        policytypes.Normal,
 			},
 		},
 		{
@@ -310,7 +319,30 @@ func TestParseNetworkPolicy(t *testing.T) {
 			out: policytypes.PolicyEntry{
 				Ingress:     true,
 				DefaultDeny: true,
+				Verdict:     policytypes.Allow,
+				Tier:        policytypes.Normal,
 				L3:          policytypes.ToSelectors(api.NewESFromLabels()),
+			},
+		},
+		{
+			name: "ingress empty peer",
+			in: slim_networkingv1.NetworkPolicySpec{
+				Ingress: []slim_networkingv1.NetworkPolicyIngressRule{
+					{
+						From: []slim_networkingv1.NetworkPolicyPeer{
+							{},
+						},
+					},
+				},
+			},
+			out: policytypes.PolicyEntry{
+				Ingress:     true,
+				DefaultDeny: true,
+				Verdict:     policytypes.Allow,
+				Tier:        policytypes.Normal,
+				L3: policytypes.ToSelectors(api.NewESFromLabels(
+					labels.NewLabel(k8sConst.PodNamespaceLabel, slim_metav1.NamespaceDefault, labels.LabelSourceK8s),
+				)),
 			},
 		},
 	} {
@@ -430,14 +462,14 @@ func TestParseNetworkPolicyMultipleSelectors(t *testing.T) {
 	require.NoError(t, err)
 	idManager, repo := parseAndAddRules(t, &np)
 
-	allowedFlows := []policy.Flow{
+	allowedFlows := []policytypes.Flow{
 		flowAToB,
 		flowAToC,
 		flowCToA,
 		flowOtherToA,
 	}
 
-	deniedFlows := []policy.Flow{
+	deniedFlows := []policytypes.Flow{
 		flowBToA,
 		flowAToOther,
 	}
@@ -499,6 +531,8 @@ func TestParseNetworkPolicyNoSelectors(t *testing.T) {
 	expectedRule := &policytypes.PolicyEntry{
 		Ingress:     true,
 		DefaultDeny: true,
+		Verdict:     policytypes.Allow,
+		Tier:        policytypes.Normal,
 		Subject:     epSelector,
 		L3:          l3,
 		Labels: labels.ParseLabelArray(
@@ -510,10 +544,12 @@ func TestParseNetworkPolicyNoSelectors(t *testing.T) {
 	}
 	expectedRules := policytypes.PolicyEntries{expectedRule}
 
-	rules, err := ParseNetworkPolicy(hivetest.Logger(t), cmtypes.PolicyAnyCluster, &np)
-	require.NoError(t, err)
-	require.NotNil(t, rules)
-	require.Equal(t, expectedRules, rules)
+	for _, clusterName := range []string{cmtypes.PolicyAnyCluster, "my-cluster"} {
+		rules, err := ParseNetworkPolicy(hivetest.Logger(t), clusterName, &np)
+		require.NoError(t, err)
+		require.NotNil(t, rules)
+		require.Equal(t, expectedRules, rules)
+	}
 }
 
 func TestParseNetworkPolicyEgress(t *testing.T) {
@@ -554,9 +590,9 @@ func TestParseNetworkPolicyEgress(t *testing.T) {
 	idManager, repo := parseAndAddRules(t, netPolicy)
 	validateNetworkPolicy(t, repo,
 		idManager,
-		[]policy.Flow{
+		[]policytypes.Flow{
 			flowAToB,
-		}, []policy.Flow{
+		}, []policytypes.Flow{
 			flowAToB81,
 			flowAToC,
 			flowAToOther,
@@ -602,10 +638,10 @@ func TestParseNetworkPolicyEgressAllowAll(t *testing.T) {
 	)
 
 	validateNetworkPolicy(t, repo, idManager,
-		[]policy.Flow{
+		[]policytypes.Flow{
 			flowAToB,
 			flowAToC,
-		}, []policy.Flow{
+		}, []policytypes.Flow{
 			flowBToA,
 			flowOtherToA,
 		})
@@ -627,8 +663,8 @@ func TestParseNetworkPolicyEgressL4AllowAll(t *testing.T) {
 	flowAToC90.Dport = 90
 
 	validateNetworkPolicy(t, repo, idManager,
-		[]policy.Flow{flowAToC},
-		[]policy.Flow{flowAToC90})
+		[]policytypes.Flow{flowAToC},
+		[]policytypes.Flow{flowAToC90})
 
 }
 
@@ -645,18 +681,18 @@ func TestParseNetworkPolicyEgressL4PortRangeAllowAll(t *testing.T) {
 		},
 	})
 
-	for port, expected := range map[uint16]api.Decision{
-		8080: api.Allowed,
-		8085: api.Allowed,
-		8090: api.Allowed,
-		8091: api.Denied,
+	for port, expected := range map[uint16]bool{
+		8080: true,
+		8085: true,
+		8090: true,
+		8091: false,
 	} {
 		flow := flowAToC
 		flow.Dport = port
 
-		verdict, _, _, err := policy.LookupFlow(hivetest.Logger(t), repo, idManager, flow, nil, nil)
+		verdict, _, _, err := policy.LookupFlow(hivetest.Logger(t), repo, idManager, flow)
 		require.NoError(t, err)
-		require.Equal(t, expected, verdict, "Port %d", port)
+		require.Equal(t, expected, verdict.Allowed(), "Port %d", port)
 	}
 }
 
@@ -684,10 +720,10 @@ func TestParseNetworkPolicyIngressAllowAll(t *testing.T) {
 			},
 		}})
 
-	validateNetworkPolicy(t, repo, idManager, []policy.Flow{
+	validateNetworkPolicy(t, repo, idManager, []policytypes.Flow{
 		flowAToB,
 		flowAToC,
-	}, []policy.Flow{
+	}, []policytypes.Flow{
 		flowBToA,
 	})
 }
@@ -708,9 +744,9 @@ func TestParseNetworkPolicyIngressL4AllowAll(t *testing.T) {
 	flowAToC90.Dport = 90
 
 	validateNetworkPolicy(t, repo, idManager,
-		[]policy.Flow{
+		[]policytypes.Flow{
 			flowAToC,
-		}, []policy.Flow{
+		}, []policytypes.Flow{
 			flowAToC90,
 		})
 }
@@ -813,7 +849,7 @@ func TestParseNetworkPolicyEmptyFrom(t *testing.T) {
 	}
 
 	idManager, repo := parseAndAddRules(t, netPolicy1)
-	validateNetworkPolicy(t, repo, idManager, []policy.Flow{
+	validateNetworkPolicy(t, repo, idManager, []policytypes.Flow{
 		flowBToA,
 		flowCToA,
 		flowOtherToA,
@@ -833,10 +869,10 @@ func TestParseNetworkPolicyDenyAll(t *testing.T) {
 
 	idManager, repo := parseAndAddRules(t, netPolicy1)
 	validateNetworkPolicy(t, repo, idManager,
-		[]policy.Flow{
+		[]policytypes.Flow{
 			flowAToOther,
 		},
-		[]policy.Flow{
+		[]policytypes.Flow{
 			flowAToB,
 			flowBToA,
 			flowAToC,
@@ -886,16 +922,16 @@ func TestNetworkPolicyExamples(t *testing.T) {
 		return id
 	}
 
-	tcpFlow := func(src, dst *identity.Identity, port uint16) policy.Flow {
-		return policy.Flow{
+	tcpFlow := func(src, dst *identity.Identity, port uint16) policytypes.Flow {
+		return policytypes.Flow{
 			From:  src,
 			To:    dst,
 			Proto: u8proto.TCP,
 			Dport: port,
 		}
 	}
-	udpFlow := func(src, dst *identity.Identity, port uint16) policy.Flow {
-		return policy.Flow{
+	udpFlow := func(src, dst *identity.Identity, port uint16) policytypes.Flow {
+		return policytypes.Flow{
 			From:  src,
 			To:    dst,
 			Proto: u8proto.UDP,
@@ -965,9 +1001,9 @@ func TestNetworkPolicyExamples(t *testing.T) {
 
 	idManager, repo := makeRepo(ex1)
 	validateNetworkPolicy(t, repo, idManager,
-		[]policy.Flow{
+		[]policytypes.Flow{
 			tcpFlow(frontend, backend, 6379),
-		}, []policy.Flow{
+		}, []policytypes.Flow{
 			// different proto and port
 			udpFlow(frontend, backend, 6379),
 			tcpFlow(frontend, backend, 6378),
@@ -1020,7 +1056,7 @@ func TestNetworkPolicyExamples(t *testing.T) {
 
 	idManager, repo = makeRepo(ex1b)
 	validateNetworkPolicy(t, repo, idManager,
-		[]policy.Flow{
+		[]policytypes.Flow{
 			// allows all from frontend
 			tcpFlow(frontend, backend, 6379),
 			tcpFlow(frontend, backend, 1),
@@ -1030,7 +1066,7 @@ func TestNetworkPolicyExamples(t *testing.T) {
 			tcpFlow(nsBob, backend, 6379),
 			tcpFlow(nsSally, backend, 6379),
 			tcpFlow(db, backend, 6379),
-		}, []policy.Flow{
+		}, []policytypes.Flow{
 			// denies in-namespace except tcp 6379
 			udpFlow(db, backend, 6379),
 			tcpFlow(db, backend, 1),
@@ -1078,10 +1114,10 @@ func TestNetworkPolicyExamples(t *testing.T) {
 
 	idManager, repo = makeRepo(ex2)
 	validateNetworkPolicy(t, repo, idManager,
-		[]policy.Flow{
+		[]policytypes.Flow{
 			// allows nsbob 443, rejects everything else
 			tcpFlow(nsBob, frontend, 443),
-		}, []policy.Flow{
+		}, []policytypes.Flow{
 			tcpFlow(nsBob, frontend, 80),
 			udpFlow(nsBob, frontend, 443),
 			tcpFlow(nsSally, frontend, 443),
@@ -1107,14 +1143,14 @@ func TestNetworkPolicyExamples(t *testing.T) {
 		}`)
 	idManager, repo = makeRepo(ex3)
 	validateNetworkPolicy(t, repo, idManager,
-		[]policy.Flow{
+		[]policytypes.Flow{
 			// allows all
 			tcpFlow(nsBob, frontend, 443),
 			tcpFlow(nsBob, backend, 443),
 			tcpFlow(nsBob, db, 443),
 			tcpFlow(frontend, backend, 443),
 			tcpFlow(db, backend, 443),
-		}, []policy.Flow{})
+		}, []policytypes.Flow{})
 
 	// Example 4a: Example 4 is similar to example 2 but we will add both network
 	// policies to see if the rules are additive for the same podSelector.
@@ -1194,7 +1230,7 @@ func TestNetworkPolicyExamples(t *testing.T) {
 	idManager, repo = makeRepo(ex4a, ex4b)
 
 	validateNetworkPolicy(t, repo, idManager,
-		[]policy.Flow{
+		[]policytypes.Flow{
 			// allows all from bob
 			udpFlow(nsBob, frontend, 8080),
 			udpFlow(nsBob, frontend, 8081),
@@ -1203,7 +1239,7 @@ func TestNetworkPolicyExamples(t *testing.T) {
 			udpFlow(nsSally, frontend, 8080),
 			udpFlow(backend, frontend, 8080),
 			udpFlow(db, frontend, 8080),
-		}, []policy.Flow{
+		}, []policytypes.Flow{
 
 			// denies udp 8081 from all except bob
 			udpFlow(nsSally, frontend, 8081),
@@ -1327,9 +1363,9 @@ func TestNetworkPolicyExamples(t *testing.T) {
 
 	// Policy allows FROM all namespaces with the desired labels
 	// TO pods with the desired labels
-	validateNetworkPolicy(t, repo, idManager, []policy.Flow{
+	validateNetworkPolicy(t, repo, idManager, []policytypes.Flow{
 		udpFlow(redisCacheProdOther, redisCacheProd, 8080),
-	}, []policy.Flow{
+	}, []policytypes.Flow{
 		udpFlow(redisCacheDevOther, redisCacheProd, 8080),
 		udpFlow(redisCacheDev, redisCacheProd, 8080),
 
@@ -1500,9 +1536,11 @@ func TestParseNetworkPolicyClusterLabel(t *testing.T) {
 
 	expectedRules := policytypes.PolicyEntries{
 		{
+			Verdict:     policytypes.Allow,
 			Subject:     epSelector,
 			Ingress:     true,
 			DefaultDeny: true,
+			Tier:        policytypes.Normal,
 			L3: policytypes.ToSelectors(api.NewESFromK8sLabelSelector(
 				labels.LabelSourceK8sKeyPrefix,
 				&slim_metav1.LabelSelector{
@@ -1519,9 +1557,11 @@ func TestParseNetworkPolicyClusterLabel(t *testing.T) {
 				"k8s:"+k8sConst.PolicyLabelDerivedFrom+"="+resourceTypeNetworkPolicy,
 			),
 		}, {
+			Verdict:     policytypes.Allow,
 			Subject:     epSelector,
 			Ingress:     false,
 			DefaultDeny: true,
+			Tier:        policytypes.Normal,
 			L3: policytypes.ToSelectors(api.NewESFromK8sLabelSelector(
 				labels.LabelSourceK8sKeyPrefix,
 				&slim_metav1.LabelSelector{
@@ -1555,7 +1595,7 @@ func Test_parseNetworkPolicyPeer(t *testing.T) {
 	tests := []struct {
 		name string
 		args args
-		want policytypes.Selector
+		want policytypes.Selectors
 	}{
 		{
 			name: "peer-with-pod-selector",
@@ -1577,22 +1617,22 @@ func Test_parseNetworkPolicyPeer(t *testing.T) {
 					},
 				},
 			},
-			want: getSelectorPointer(
+			want: policytypes.Selectors{getSelectorPointer(
 				api.NewESFromMatchRequirements(
 					map[string]string{
-						"k8s.foo":                          "bar",
-						"k8s.io.kubernetes.pod.namespace":  "foo-namespace",
-						"k8s.io.cilium.k8s.policy.cluster": "cluster1",
+						"k8s:foo":                          "bar",
+						"k8s:io.kubernetes.pod.namespace":  "foo-namespace",
+						"k8s:io.cilium.k8s.policy.cluster": "cluster1",
 					},
 					[]slim_metav1.LabelSelectorRequirement{
 						{
-							Key:      "k8s.foo",
+							Key:      "k8s:foo",
 							Operator: slim_metav1.LabelSelectorOpIn,
 							Values:   []string{"bar", "baz"},
 						},
 					},
 				),
-			),
+			)},
 		},
 		{
 			name: "peer-nil",
@@ -1631,25 +1671,25 @@ func Test_parseNetworkPolicyPeer(t *testing.T) {
 					},
 				},
 			},
-			want: getSelectorPointer(
+			want: policytypes.Selectors{getSelectorPointer(
 				api.NewESFromMatchRequirements(
 					map[string]string{
-						"k8s.foo": "bar",
-						"k8s.io.cilium.k8s.namespace.labels.ns-foo": "ns-bar",
+						"k8s:foo": "bar",
+						"k8s:io.cilium.k8s.namespace.labels.ns-foo": "ns-bar",
 					},
 					[]slim_metav1.LabelSelectorRequirement{
 						{
-							Key:      "k8s.io.cilium.k8s.namespace.labels.ns-foo-expression",
+							Key:      "k8s:io.cilium.k8s.namespace.labels.ns-foo-expression",
 							Operator: slim_metav1.LabelSelectorOpExists,
 						},
 						{
-							Key:      "k8s.foo",
+							Key:      "k8s:foo",
 							Operator: slim_metav1.LabelSelectorOpIn,
 							Values:   []string{"bar", "baz"},
 						},
 					},
 				),
-			),
+			)},
 		},
 		{
 			name: "peer-with-ns-selector",
@@ -1669,19 +1709,19 @@ func Test_parseNetworkPolicyPeer(t *testing.T) {
 					},
 				},
 			},
-			want: getSelectorPointer(
+			want: policytypes.Selectors{getSelectorPointer(
 				api.NewESFromMatchRequirements(
 					map[string]string{
-						"k8s.io.cilium.k8s.namespace.labels.ns-foo": "ns-bar",
+						"k8s:io.cilium.k8s.namespace.labels.ns-foo": "ns-bar",
 					},
 					[]slim_metav1.LabelSelectorRequirement{
 						{
-							Key:      "k8s.io.cilium.k8s.namespace.labels.ns-foo-expression",
+							Key:      "k8s:io.cilium.k8s.namespace.labels.ns-foo-expression",
 							Operator: slim_metav1.LabelSelectorOpExists,
 						},
 					},
 				),
-			),
+			)},
 		},
 		{
 			name: "peer-with-allow-all-ns-selector",
@@ -1691,17 +1731,17 @@ func Test_parseNetworkPolicyPeer(t *testing.T) {
 					NamespaceSelector: &slim_metav1.LabelSelector{},
 				},
 			},
-			want: getSelectorPointer(
+			want: policytypes.Selectors{getSelectorPointer(
 				api.NewESFromMatchRequirements(
 					map[string]string{},
 					[]slim_metav1.LabelSelectorRequirement{
 						{
-							Key:      fmt.Sprintf("%s.%s", labels.LabelSourceK8s, k8sConst.PodNamespaceLabel),
+							Key:      fmt.Sprintf("%s:%s", labels.LabelSourceK8s, k8sConst.PodNamespaceLabel),
 							Operator: slim_metav1.LabelSelectorOpExists,
 						},
 					},
 				),
-			),
+			)},
 		},
 		{
 			name: "peer-with-defaut-cluster",
@@ -1723,22 +1763,22 @@ func Test_parseNetworkPolicyPeer(t *testing.T) {
 					},
 				},
 			},
-			want: getSelectorPointer(
+			want: policytypes.Selectors{getSelectorPointer(
 				api.NewESFromMatchRequirements(
 					map[string]string{
-						"k8s.foo":                          "bar",
-						"k8s.io.cilium.k8s.policy.cluster": "cluster1",
-						"k8s.io.kubernetes.pod.namespace":  "foo-namespace",
+						"k8s:foo":                          "bar",
+						"k8s:io.cilium.k8s.policy.cluster": "cluster1",
+						"k8s:io.kubernetes.pod.namespace":  "foo-namespace",
 					},
 					[]slim_metav1.LabelSelectorRequirement{
 						{
-							Key:      "k8s.foo",
+							Key:      "k8s:foo",
 							Operator: slim_metav1.LabelSelectorOpIn,
 							Values:   []string{"bar", "baz"},
 						},
 					},
 				),
-			),
+			)},
 		},
 		{
 			name: "peer-with-cluster-selector",
@@ -1754,16 +1794,16 @@ func Test_parseNetworkPolicyPeer(t *testing.T) {
 					},
 				},
 			},
-			want: getSelectorPointer(
+			want: policytypes.Selectors{getSelectorPointer(
 				api.NewESFromMatchRequirements(
 					map[string]string{
-						"k8s.foo":                          "bar",
-						"k8s.io.kubernetes.pod.namespace":  "foo-namespace",
-						"k8s.io.cilium.k8s.policy.cluster": "cluster2",
+						"k8s:foo":                          "bar",
+						"k8s:io.kubernetes.pod.namespace":  "foo-namespace",
+						"k8s:io.cilium.k8s.policy.cluster": "cluster2",
 					},
 					nil,
 				),
-			),
+			)},
 		},
 		{
 			name: "peer-with-cluster-selector-expr",
@@ -1782,20 +1822,39 @@ func Test_parseNetworkPolicyPeer(t *testing.T) {
 					},
 				},
 			},
-			want: getSelectorPointer(
+			want: policytypes.Selectors{getSelectorPointer(
 				api.NewESFromMatchRequirements(
 					map[string]string{
-						"k8s.io.kubernetes.pod.namespace": "foo-namespace",
+						"k8s:io.kubernetes.pod.namespace": "foo-namespace",
 					},
 					[]slim_metav1.LabelSelectorRequirement{
 						{
-							Key:      "k8s.io.cilium.k8s.policy.cluster",
+							Key:      "k8s:io.cilium.k8s.policy.cluster",
 							Operator: slim_metav1.LabelSelectorOpIn,
 							Values:   []string{"bar", "baz"},
 						},
 					},
 				),
-			),
+			)},
+		},
+		{
+			name: "peer-with-ipblock",
+			args: args{
+				namespace:   "foo-namespace",
+				clusterName: "cluster1",
+				peer: &slim_networkingv1.NetworkPolicyPeer{
+					IPBlock: &slim_networkingv1.IPBlock{
+						CIDR:   "10.0.0.0/8",
+						Except: []string{"10.96.0.0/12"},
+					},
+				},
+			},
+			want: policytypes.Selectors{
+				policytypes.ToSelector(api.CIDRRule{
+					Cidr:        "10.0.0.0/8",
+					ExceptCIDRs: []api.CIDR{"10.96.0.0/12"},
+				}),
+			},
 		},
 	}
 	for _, tt := range tests {

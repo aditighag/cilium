@@ -8,16 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
-	"path"
 
 	"k8s.io/apimachinery/pkg/types"
 
-	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/kvstore/store"
 	"github.com/cilium/cilium/pkg/loadbalancer"
 	"github.com/cilium/cilium/pkg/lock"
-	"github.com/cilium/cilium/pkg/option"
 )
 
 var (
@@ -25,7 +22,7 @@ var (
 	//
 	// WARNING - STABLE API: Changing the structure or values of this will
 	// break backwards compatibility
-	ServiceStorePrefix = path.Join(kvstore.BaseKeyPrefix, "state", "services", "v1")
+	ServiceStorePrefix = kvstore.JoinKey(kvstore.BaseKeyPrefix, "state", "services", "v1")
 )
 
 // ServiceMerger is the interface to be implemented by the owner of local
@@ -102,12 +99,7 @@ func (s *ClusterService) NamespaceServiceName() types.NamespacedName {
 func (s *ClusterService) GetKeyName() string {
 	// WARNING - STABLE API: Changing the structure of the key may break
 	// backwards compatibility
-	return path.Join(s.Cluster, s.Namespace, s.Name)
-}
-
-// DeepKeyCopy creates a deep copy of the LocalKey
-func (s *ClusterService) DeepKeyCopy() store.LocalKey {
-	return s.DeepCopy()
+	return kvstore.JoinKey(s.Cluster, s.Namespace, s.Name)
 }
 
 // Marshal returns the global service object as JSON byte slice
@@ -142,23 +134,19 @@ func (s *ClusterService) validate() error {
 		return errors.New("name is unset")
 	}
 
-	// Skip the ClusterID check if it matches the local one, as we assume that
-	// it has already been validated, and to allow it to be zero.
-	if s.ClusterID != option.Config.ClusterID {
-		if err := cmtypes.ValidateClusterID(s.ClusterID); err != nil {
-			return err
-		}
-	}
-
 	for address := range s.Frontends {
-		if _, err := netip.ParseAddr(address); err != nil {
+		if parsed, err := netip.ParseAddr(address); err != nil {
 			return err
+		} else if parsed.Zone() != "" {
+			return fmt.Errorf("unsupported IPv6 zone in address %s", address)
 		}
 	}
 
 	for address := range s.Backends {
-		if _, err := netip.ParseAddr(address); err != nil {
+		if parsed, err := netip.ParseAddr(address); err != nil {
 			return err
+		} else if parsed.Zone() != "" {
+			return fmt.Errorf("unsupported IPv6 zone in address %s", address)
 		}
 	}
 

@@ -17,6 +17,7 @@ import (
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/rate"
 	"github.com/cilium/cilium/pkg/time"
@@ -43,7 +44,7 @@ func newNetlinkFuncsGetter(lifecycle cell.Lifecycle) *netlinkFuncsGetter {
 				// Get a netlink handle in the current namespace.
 				// Otherwise we default to the namespace at startup. Which is not what we want
 				// during testing where we might currently be in a sub-namespace.
-				handle, err := netlink.NewHandle()
+				handle, err := safenetlink.NewHandle(nil)
 				if err != nil {
 					return fmt.Errorf("creating netlink handle: %w", err)
 				}
@@ -91,7 +92,7 @@ type ops struct {
 func (ops *ops) Update(ctx context.Context, rx statedb.ReadTxn, _ statedb.Revision, neighbor *DesiredNeighbor) error {
 	ops.metrics.NeighborEntryInsertCount.Inc()
 
-	_, _, isNew := ops.neighbors.Get(rx, tables.NeighborIDIndex.Query(tables.NeighborID{
+	_, _, isNew := ops.neighbors.Get(rx, tables.NeighborByID(tables.NeighborID{
 		IPAddr:    neighbor.IP,
 		LinkIndex: neighbor.IfIndex,
 	}))
@@ -157,7 +158,7 @@ func (ops *ops) Update(ctx context.Context, rx statedb.ReadTxn, _ statedb.Revisi
 
 // Delete gets called with a deleted desired neighbor.
 func (ops *ops) Delete(ctx context.Context, rx statedb.ReadTxn, _ statedb.Revision, neighbor *DesiredNeighbor) error {
-	neigh, _, found := ops.neighbors.Get(rx, tables.NeighborIDIndex.Query(tables.NeighborID{
+	neigh, _, found := ops.neighbors.Get(rx, tables.NeighborByID(tables.NeighborID{
 		IPAddr:    neighbor.IP,
 		LinkIndex: neighbor.IfIndex,
 	}))
@@ -331,9 +332,7 @@ func newNeighborRefresher(
 				// reconciler to refresh them.
 				tx := db.WriteTxn(desiredNeighbors)
 				for _, neighbor := range toRefresh {
-					_, _, err := desiredNeighbors.Modify(tx, neighbor, func(old, new *DesiredNeighbor) *DesiredNeighbor {
-						return new.SetStatus(reconciler.StatusRefreshing())
-					})
+					_, _, err := desiredNeighbors.Insert(tx, neighbor.SetStatus(reconciler.StatusRefreshing()))
 					errs = errors.Join(errs, err)
 				}
 				tx.Commit()

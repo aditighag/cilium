@@ -12,26 +12,43 @@
 #include <linux/ipv6.h>
 
 #include "bpf/compiler.h"
+
+#include "auxvars.h"
 #include "common.h"
-#include "signal.h"
 #include "conntrack.h"
 #include "conntrack_map.h"
 #include "csum.h"
+#include "drop_reasons.h"
 #include "egress_gateway.h"
 #include "eps.h"
+#include "icmp.h"
 #include "icmp6.h"
 #include "nat_46x64.h"
-#include "stubs.h"
+#include "signal.h"
 #include "trace.h"
+
+/* Nodeport NAT minimum port value */
+#define NODEPORT_PORT_MIN_NAT CONFIG(nodeport_port_max) + 1
+/* Nodeport NAT maximum port value */
+#ifndef NODEPORT_PORT_MAX_NAT
+#define NODEPORT_PORT_MAX_NAT 65535
+#endif
 
 DECLARE_CONFIG(union v4addr, nat_ipv4_masquerade, "Masquerade address for IPv4 traffic")
 DECLARE_CONFIG(union v6addr, nat_ipv6_masquerade, "Masquerade address for IPv6 traffic")
 DECLARE_CONFIG(bool, enable_remote_node_masquerade, "Masquerade traffic to remote nodes")
+DECLARE_CONFIG(__u16, ephemeral_min, "Ephemeral port range minimum")
 
-#ifdef ENABLE_NODEPORT
-#define NAT_MIN_EGRESS		NODEPORT_PORT_MIN_NAT
-#else
-#define NAT_MIN_EGRESS		EPHEMERAL_MIN
+/* We only need to SNAT ICMPv4 traffic if BPF masquerading or inter-cluster
+ * SNAT are enabled. If they are disabled, we only SNAT replies from service
+ * backends and we do not currently support ICMP replies from service backends.
+ */
+#if defined(ENABLE_MASQUERADE_IPV4) || defined(ENABLE_INTER_CLUSTER_SNAT)
+# define ENABLE_SNAT_ICMPV4 1
+#endif
+
+#if defined(ENABLE_MASQUERADE_IPV6)
+# define ENABLE_SNAT_ICMPV6 1
 #endif
 
 enum  nat_dir {
@@ -41,6 +58,10 @@ enum  nat_dir {
 
 struct nat_entry {
 	__u64 created;
+	/* needs_ct is set whenever we want to NAT a connection that may not be
+	 * tracked, for example in the egress gateway case with a non-local pod
+	 * or in the case of host-local connections.
+	 */
 	__u64 needs_ct;		/* Only single bit used. */
 	__u64 pad1;		/* Future use. */
 	__u64 pad2;		/* Future use. */
@@ -48,7 +69,27 @@ struct nat_entry {
 
 #define SNAT_SIGNAL_THRES		(SNAT_COLLISION_RETRIES / 2)
 
-#define snat_v4_needs_masquerade_hook(ctx, target) 0
+static __always_inline __u16
+nat_min_egress()
+{
+#ifdef ENABLE_NODEPORT
+	return NODEPORT_PORT_MIN_NAT;
+#endif
+	return CONFIG(ephemeral_min);
+}
+
+static __always_inline bool
+is_port_in_nat_range(__u16 sport)
+{
+	bool in_nat_range = sport >= NODEPORT_PORT_MIN_NAT &&
+			    sport <= NODEPORT_PORT_MAX_NAT;
+
+	if (CONFIG(nodeport_port_max_nat_ext))
+		in_nat_range |= sport >= CONFIG(nodeport_port_min_nat_ext) &&
+				sport <= CONFIG(nodeport_port_max_nat_ext);
+
+	return in_nat_range;
+}
 
 /* Clamp a port to the range [start, end].
  *
@@ -119,7 +160,20 @@ struct ipv4_nat_target {
 	__u32 cluster_id;
 	bool needs_ct;
 	__u32 ifindex; /* Obtained from EGW policy */
+	__u32 tbid;
 };
+
+static __always_inline void
+swap_nat_port_range_ipv4(struct ipv4_nat_target *target)
+{
+	if (target->min_port == NODEPORT_PORT_MIN_NAT) {
+		target->min_port = CONFIG(nodeport_port_min_nat_ext);
+		target->max_port = CONFIG(nodeport_port_max_nat_ext);
+	} else {
+		target->min_port = NODEPORT_PORT_MIN_NAT;
+		target->max_port = NODEPORT_PORT_MAX_NAT;
+	}
+}
 
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -183,7 +237,7 @@ static __always_inline void *
 get_cluster_snat_map_v4(__u32 cluster_id __maybe_unused)
 {
 #if defined(ENABLE_CLUSTER_AWARE_ADDRESSING) && defined(ENABLE_INTER_CLUSTER_SNAT)
-	if (cluster_id != 0 && cluster_id != CLUSTER_ID)
+	if (cluster_id != 0 && cluster_id != CONFIG(cluster_id))
 		return map_lookup_elem(&cilium_per_cluster_snat_v4_external, &cluster_id);
 #endif
 	return &cilium_snat_v4_external;
@@ -208,8 +262,9 @@ set_v4_rtuple(const struct ipv4_ct_tuple *otuple,
 	rtuple->dport = ostate->to_sport;
 }
 
-static __always_inline int snat_v4_new_mapping(struct __ctx_buff *ctx, void *map,
-					       struct ipv4_ct_tuple *otuple,
+static __always_inline int snat_v4_new_mapping(const struct __ctx_buff *ctx,
+					       const void *map,
+					       const struct ipv4_ct_tuple *otuple,
 					       struct ipv4_nat_entry *ostate,
 					       const struct ipv4_nat_target *target,
 					       bool needs_ct, __s8 *ext_err)
@@ -292,8 +347,8 @@ out:
 }
 
 static __always_inline int
-snat_v4_nat_handle_mapping(struct __ctx_buff *ctx,
-			   struct ipv4_ct_tuple *tuple,
+snat_v4_nat_handle_mapping(const struct __ctx_buff *ctx,
+			   const struct ipv4_ct_tuple *tuple,
 			   fraginfo_t fraginfo,
 			   struct ipv4_nat_entry **state,
 			   struct ipv4_nat_entry *tmp,
@@ -387,8 +442,8 @@ snat_v4_nat_handle_mapping(struct __ctx_buff *ctx,
 }
 
 static __always_inline int
-snat_v4_rev_nat_handle_mapping(struct __ctx_buff *ctx,
-			       struct ipv4_ct_tuple *tuple,
+snat_v4_rev_nat_handle_mapping(const struct __ctx_buff *ctx,
+			       const struct ipv4_ct_tuple *tuple,
 			       fraginfo_t fraginfo,
 			       struct ipv4_nat_entry **state,
 			       __u32 off,
@@ -434,7 +489,7 @@ snat_v4_rev_nat_handle_mapping(struct __ctx_buff *ctx,
 	}
 
 	if (*state && (*state)->common.needs_ct) {
-		struct ipv4_ct_tuple tuple_revsnat;
+		struct ipv4_ct_tuple tuple_revsnat __align_stack_8;
 		int ret;
 
 		memcpy(&tuple_revsnat, tuple, sizeof(tuple_revsnat));
@@ -465,67 +520,57 @@ static __always_inline int
 snat_v4_rewrite_headers(struct __ctx_buff *ctx, __u8 nexthdr, int l3_off,
 			bool has_l4_header, int l4_off,
 			__be32 old_addr, __be32 new_addr, __u16 addr_off,
-			__be16 old_port, __be16 new_port, __u16 port_off)
+			__be16 old_port, __be16 new_port, __u16 port_off,
+			__wsum l4_csum_diff_from_inner)
 {
 	__wsum sum;
 	int err;
 
 	/* No change needed: */
-	if (old_addr == new_addr && old_port == new_port)
+	if (old_addr == new_addr && old_port == new_port && !l4_csum_diff_from_inner)
 		return 0;
 
-	sum = csum_diff(&old_addr, 4, &new_addr, 4, 0);
-	if (ctx_store_bytes(ctx, l3_off + addr_off, &new_addr, 4, 0) < 0)
-		return DROP_WRITE_ERROR;
+	err = ipv4_l3_rewrite_addr(ctx, l3_off, addr_off, old_addr, new_addr, &sum);
+	if (err < 0)
+		return err;
 
-	/* Amend the L3 checksum due to changing the addresses. */
-	if (ipv4_csum_update_by_diff(ctx, l3_off, sum) < 0)
-		return DROP_CSUM_L3;
-
-	if (has_l4_header) {
-		int flags = BPF_F_PSEUDO_HDR;
-		struct csum_offset csum = {};
-
-		csum_l4_offset_and_flags(nexthdr, &csum);
-
-		if (old_port != new_port) {
-			switch (nexthdr) {
-			case IPPROTO_TCP:
-			case IPPROTO_UDP:
-				break;
-#ifdef ENABLE_SCTP
-			case IPPROTO_SCTP:
-				return DROP_CSUM_L4;
-#endif  /* ENABLE_SCTP */
-			case IPPROTO_ICMP:
-				/* Not initialized by csum_l4_offset_and_flags(), because ICMPv4
-				 * doesn't use a pseudo-header, and the change in IP addresses is
-				 * not supposed to change the L4 checksum.
-				 * Set it temporarily to amend the checksum after changing ports.
-				 */
-				csum.offset = offsetof(struct icmphdr, checksum);
-				break;
-			default:
-				return DROP_UNKNOWN_L4;
-			}
-
-			/* Amend the L4 checksum due to changing the ports. */
-			err = l4_modify_port(ctx, l4_off, port_off, &csum, new_port, old_port);
-			if (err < 0)
-				return err;
-
-			/* Restore the original offset. */
-			if (nexthdr == IPPROTO_ICMP)
-				csum.offset = 0;
-		}
-
-		/* Amend the L4 checksum due to changing the addresses. */
-		if (csum.offset &&
-		    csum_l4_replace(ctx, l4_off, &csum, 0, sum, flags) < 0)
-			return DROP_CSUM_L4;
-	}
+	if (has_l4_header)
+		return l4_rewrite_port_and_csum(ctx, nexthdr, l4_off, port_off,
+						old_port, new_port, sum,
+						l4_csum_diff_from_inner);
 
 	return 0;
+}
+
+static __always_inline __wsum
+snat_v4_calc_icmp_error_csum_diff(__be32 old_addr, __be32 new_addr,
+				  __be16 old_port, __be16 new_port,
+				  bool inner_has_l4_csum)
+{
+	__wsum sum = 0;
+
+	if (inner_has_l4_csum) {
+		/* Calculate diff value for checksum.
+		 * Reflect the change in the inner L4 checksum caused by the pseudo-address update
+		 * into diff_for_csum.
+		 * All the other changes in inner packet cancel each other out.
+		 */
+		if (old_addr != new_addr)
+			sum = csum_diff(&new_addr, 4, &old_addr, 4, 0);
+	} else {
+		/* Calculate diff value for checksum.
+		 * If the inner L4 header does not include the L4 checksum,
+		 * only the port is modified within the inner L4 header.
+		 */
+		if (old_port != new_port) {
+			__be32 old_port32 = (__be32)old_port;
+			__be32 new_port32 = (__be32)new_port;
+
+			sum = csum_diff(&old_port32, 4, &new_port32, 4, 0);
+		}
+	}
+
+	return sum;
 }
 
 static __always_inline bool
@@ -539,7 +584,7 @@ snat_v4_nat_can_skip(const struct ipv4_nat_target *target,
 		return false;
 #endif
 
-	return (!target->from_local_endpoint && sport < NAT_MIN_EGRESS);
+	return (!target->from_local_endpoint && !is_port_in_nat_range(sport));
 }
 
 static __always_inline bool
@@ -548,37 +593,6 @@ snat_v4_rev_nat_can_skip(const struct ipv4_nat_target *target, const struct ipv4
 	__u16 dport = bpf_ntohs(tuple->dport);
 
 	return dport < target->min_port || dport > target->max_port;
-}
-
-/* Expects to be called with a nodeport-level CT tuple (ie. CT_EGRESS):
- * - extracted from a request packet,
- * - on CT_NEW (ie. the tuple is reversed)
- */
-static __always_inline __maybe_unused int
-snat_v4_create_dsr(const struct ipv4_ct_tuple *tuple,
-		   __be32 to_saddr, __be16 to_sport, __s8 *ext_err)
-{
-	struct ipv4_ct_tuple tmp = *tuple;
-	struct ipv4_nat_entry state = {};
-	int ret;
-
-	build_bug_on(sizeof(struct ipv4_nat_entry) > 64);
-
-	tmp.flags = TUPLE_F_OUT;
-	tmp.sport = tuple->dport;
-	tmp.dport = tuple->sport;
-
-	state.common.created = bpf_mono_now();
-	state.to_saddr = to_saddr;
-	state.to_sport = to_sport;
-
-	ret = map_update_elem(&cilium_snat_v4_external, &tmp, &state, 0);
-	if (ret) {
-		*ext_err = (__s8)ret;
-		return DROP_NAT_NO_MAPPING;
-	}
-
-	return CTX_ACT_OK;
 }
 
 static __always_inline void snat_v4_init_tuple(const struct iphdr *ip4,
@@ -606,36 +620,13 @@ static __always_inline void snat_v4_init_tuple(const struct iphdr *ip4,
  * error code (distinct from NAT_PUNT_TO_STACK).
  */
 static __always_inline int
-snat_v4_needs_masquerade(struct __ctx_buff *ctx __maybe_unused,
-			 struct ipv4_ct_tuple *tuple __maybe_unused,
-			 struct iphdr *ip4 __maybe_unused,
-			 fraginfo_t fraginfo __maybe_unused,
-			 int l4_off __maybe_unused,
-			 struct ipv4_nat_target *target __maybe_unused)
+__snat_v4_needs_masquerade(struct __ctx_buff *ctx, struct ipv4_ct_tuple *tuple,
+			   struct iphdr *ip4, fraginfo_t fraginfo, int l4_off,
+			   struct ipv4_nat_target *target)
 {
-	const struct endpoint_info *local_ep __maybe_unused;
-	const struct remote_endpoint_info *remote_ep __maybe_unused;
-	int ret;
+	const struct endpoint_info *local_ep;
+	const struct remote_endpoint_info *remote_ep;
 
-	ret = snat_v4_needs_masquerade_hook(ctx, target);
-	if (IS_ERR(ret))
-		return ret;
-	if (ret)
-		return NAT_NEEDED;
-
-#if defined(TUNNEL_MODE) && defined(IS_BPF_OVERLAY)
-# if defined(ENABLE_CLUSTER_AWARE_ADDRESSING) && defined(ENABLE_INTER_CLUSTER_SNAT)
-	if (target->cluster_id != 0 &&
-	    target->cluster_id != CLUSTER_ID) {
-		target->addr = IPV4_INTER_CLUSTER_SNAT;
-		target->from_local_endpoint = true;
-
-		return NAT_NEEDED;
-	}
-# endif
-#endif /* TUNNEL_MODE && IS_BPF_OVERLAY */
-
-#if defined(ENABLE_MASQUERADE_IPV4) && defined(IS_BPF_HOST)
 	/* To prevent aliasing with masqueraded connections,
 	 * we need to track all host connections that use config
 	 * nat_ipv4_masquerade.
@@ -691,9 +682,9 @@ snat_v4_needs_masquerade(struct __ctx_buff *ctx __maybe_unused,
 
 	/* Check if the packet matches an egress NAT policy and so needs to be SNAT'ed.
 	 *
-	 * This check must happen before the IPV4_SNAT_EXCLUSION_DST_CIDR check below as
-	 * the destination may be in the SNAT exclusion CIDR but regardless of that we
-	 * always want to SNAT a packet if it's matched by an egress NAT policy.
+	 * This check must happen before the IPv4 SNAT exclusion check below.
+	 * The destination may be in the SNAT exclusion CIDR but regardless of
+	 * that we always want to SNAT a packet if it's matched by an egress NAT policy.
 	 */
 #if defined(ENABLE_EGRESS_GATEWAY_COMMON)
 	if (egress_gw_snat_needed_hook(tuple->saddr, tuple->daddr, &target->addr,
@@ -706,6 +697,9 @@ snat_v4_needs_masquerade(struct __ctx_buff *ctx __maybe_unused,
 		if (!local_ep)
 			target->needs_ct = true;
 
+		if (local_ep && local_ep->rt_info)
+			target->tbid = local_ep->rt_info;
+
 		return NAT_NEEDED;
 	}
 #endif
@@ -713,11 +707,11 @@ snat_v4_needs_masquerade(struct __ctx_buff *ctx __maybe_unused,
 	/* Do not MASQ if a dst IP belongs to a pods CIDR
 	 * (ipv4-native-routing-cidr if specified, otherwise local pod CIDR).
 	 */
-#ifdef IPV4_SNAT_EXCLUSION_DST_CIDR
-	if (ipv4_is_in_subnet(tuple->daddr, IPV4_SNAT_EXCLUSION_DST_CIDR,
-			      IPV4_SNAT_EXCLUSION_DST_CIDR_LEN))
+	if (CONFIG(ipv4_snat_exclusion).enabled &&
+	    ipv4_is_in_subnet(tuple->daddr,
+			      CONFIG(ipv4_snat_exclusion).dst_addr.be32,
+			      CONFIG(ipv4_snat_exclusion).bits))
 		return NAT_PUNT_TO_STACK;
-#endif
 
 	/* Do not SNAT if this is a localhost endpoint or
 	 * endpoint explicitly disallows it (normally multi-pool IPAM endpoints)
@@ -742,8 +736,9 @@ snat_v4_needs_masquerade(struct __ctx_buff *ctx __maybe_unused,
 	 */
 	remote_ep = lookup_ip4_remote_endpoint(tuple->daddr, 0);
 	if (remote_ep && identity_is_remote_node(remote_ep->sec_identity)) {
-		/* SNAT the packet to remote node if enable-remote-node-masquerade flag is set to true.
-		 * This is a feature flag that can be enabled in BPF masquerading mode.
+		/* SNAT the packet to remote node if enable-remote-node-masquerade
+		 * flag is set to true. This is a feature flag that can be enabled
+		 * in BPF masquerading mode.
 		 */
 		if (CONFIG(enable_remote_node_masquerade) == true) {
 			target->addr = CONFIG(nat_ipv4_masquerade).be32;
@@ -773,23 +768,49 @@ snat_v4_needs_masquerade(struct __ctx_buff *ctx __maybe_unused,
 		target->addr = CONFIG(nat_ipv4_masquerade).be32;
 		return NAT_NEEDED;
 	}
-#endif /*ENABLE_MASQUERADE_IPV4 && IS_BPF_HOST */
 
 	return NAT_PUNT_TO_STACK;
 }
 
+/* Store struct ipv6_ct_tuple and struct ipv6_nat_target objects in maps to
+ * optimize stack usage.
+ */
+struct snat_v4_args {
+	struct ipv4_ct_tuple tuple;
+	struct ipv4_nat_target target;
+};
+
+DEFINE_AUX(struct snat_v4_args, snat_v4_args);
+
+__noinline __weak int
+snat_v4_needs_masquerade(struct __ctx_buff *ctx, fraginfo_t fraginfo, int l4_off)
+{
+	struct snat_v4_args *args = AUX_REUSE(snat_v4_args);
+	void *data, *data_end;
+	struct iphdr *ip4;
+
+	if (!revalidate_data(ctx, &data, &data_end, &ip4))
+		return DROP_INVALID;
+
+	return __snat_v4_needs_masquerade(ctx, &args->tuple, ip4, fraginfo,
+					  l4_off, &args->target);
+}
+
+#ifdef ENABLE_SNAT_ICMPV4
 static __always_inline __maybe_unused int
 snat_v4_nat_handle_icmp_error(struct __ctx_buff *ctx, __u64 off,
-			      struct ipv4_nat_entry **state)
+			      struct ipv4_nat_entry **state,
+			      __wsum *outer_csum_diff)
 {
 	__u32 inner_l3_off = (__u32)(off + sizeof(struct icmphdr));
 	struct ipv4_ct_tuple tuple = {};
 	struct iphdr iphdr;
 	__u16 port_off;
-	__u32 icmpoff;
+	__u32 inner_l4_off;
 	__u8 type;
 	int ret;
 	bool icmp_has_inner_l4_csum = true;
+	bool is_inner_l4_csum_enabled = true;
 	__u32 total_inner_len = (__u32)ctx_full_len(ctx) - inner_l3_off;
 
 	/* According to the RFC 5508, any networking equipment that is
@@ -807,23 +828,21 @@ snat_v4_nat_handle_icmp_error(struct __ctx_buff *ctx, __u64 off,
 	tuple.daddr = iphdr.saddr;
 	tuple.flags = NAT_DIR_EGRESS;
 
-	icmpoff = inner_l3_off + ipv4_hdrlen(&iphdr);
+	inner_l4_off = inner_l3_off + ipv4_hdrlen(&iphdr);
 	switch (tuple.nexthdr) {
 	case IPPROTO_TCP:
 	case IPPROTO_UDP:
-#ifdef ENABLE_SCTP
+# ifdef ENABLE_SCTP
 	case IPPROTO_SCTP:
-#endif /* ENABLE_SCTP */
-		/* No reasons to handle IP fragmentation for this case as it is
-		 * expected that DF isn't set for this particular context.
-		 */
-		if (l4_load_ports(ctx, icmpoff, &tuple.dport) < 0)
+# endif /* ENABLE_SCTP */
+		if (!ipfrag_has_l4_header(ipfrag_encode_ipv4(&iphdr)) ||
+		    l4_load_ports(ctx, inner_l4_off, &tuple.dport) < 0)
 			return DROP_INVALID;
 
 		port_off = TCP_DPORT_OFF;
 		break;
 	case IPPROTO_ICMP:
-		if (ctx_load_bytes(ctx, icmpoff, &type, sizeof(type)) < 0)
+		if (icmp_load_type(ctx, inner_l4_off, &type) < 0)
 			return DROP_INVALID;
 
 		switch (type) {
@@ -836,8 +855,7 @@ snat_v4_nat_handle_icmp_error(struct __ctx_buff *ctx, __u64 off,
 			return DROP_UNKNOWN_ICMP4_CODE;
 		}
 
-		if (ctx_load_bytes(ctx, icmpoff + port_off,
-				   &tuple.sport, sizeof(tuple.sport)) < 0)
+		if (l4_load_port(ctx, inner_l4_off + port_off, &tuple.sport) < 0)
 			return DROP_INVALID;
 		break;
 	default:
@@ -850,15 +868,31 @@ snat_v4_nat_handle_icmp_error(struct __ctx_buff *ctx, __u64 off,
 
 	/* Check if the inner L4 header has checksum */
 	if (tuple.nexthdr == IPPROTO_TCP &&
-	    total_inner_len < iphdr.ihl + TCP_CSUM_OFF + sizeof(__u16))
+	    total_inner_len < ipv4_hdrlen(&iphdr) + TCP_CSUM_OFF + TCP_CSUM_SIZE)
 		icmp_has_inner_l4_csum = false;
+
+	/* For UDP, a checksum value of zero means that no checksum */
+	if (tuple.nexthdr == IPPROTO_UDP) {
+		__be16 l4_csum_be = 0;
+
+		if (udp_load_csum(ctx, inner_l4_off, &l4_csum_be) < 0)
+			return DROP_INVALID;
+		if (l4_csum_be == 0)
+			is_inner_l4_csum_enabled = false;
+	}
+
+	/* Calculate the diff for the outer ICMP checksum. */
+	*outer_csum_diff = snat_v4_calc_icmp_error_csum_diff(tuple.saddr, (*state)->to_saddr,
+							     tuple.sport, (*state)->to_sport,
+							     icmp_has_inner_l4_csum &&
+							     is_inner_l4_csum_enabled);
 
 	/* We found SNAT entry to NAT embedded packet. The destination addr
 	 * should be NATed according to the entry.
 	 */
-	ret = snat_v4_rewrite_headers(ctx, tuple.nexthdr, inner_l3_off, true, icmpoff,
+	ret = snat_v4_rewrite_headers(ctx, tuple.nexthdr, inner_l3_off, true, inner_l4_off,
 				      tuple.saddr, (*state)->to_saddr, IPV4_DADDR_OFF,
-				      tuple.sport, (*state)->to_sport, port_off);
+				      tuple.sport, (*state)->to_sport, port_off, 0);
 	/* Failing to update the inner L4 checksum is not fatal if the header
 	 * is incomplete.
 	 */
@@ -867,12 +901,14 @@ snat_v4_nat_handle_icmp_error(struct __ctx_buff *ctx, __u64 off,
 
 	return ret;
 }
+#endif /* ENABLE_SNAT_ICMPV4 */
 
 static __always_inline int
 __snat_v4_nat(struct __ctx_buff *ctx, struct ipv4_ct_tuple *tuple,
 	      struct ipv4_nat_entry *state, fraginfo_t fraginfo,
 	      int l4_off, bool update_tuple, const struct ipv4_nat_target *target,
-	      __u16 port_off, struct trace_ctx *trace, __s8 *ext_err)
+	      __u16 port_off, __wsum outer_csum_diff,
+	      struct trace_ctx *trace, __s8 *ext_err)
 {
 	struct ipv4_nat_entry tmp;
 	__be16 to_sport = 0;
@@ -893,7 +929,7 @@ __snat_v4_nat(struct __ctx_buff *ctx, struct ipv4_ct_tuple *tuple,
 	ret = snat_v4_rewrite_headers(ctx, tuple->nexthdr, ETH_HLEN,
 				      ipfrag_has_l4_header(fraginfo), l4_off,
 				      tuple->saddr, state->to_saddr, IPV4_SADDR_OFF,
-				      tuple->sport, to_sport, port_off);
+				      tuple->sport, to_sport, port_off, outer_csum_diff);
 
 	if (update_tuple) {
 		tuple->saddr = state->to_saddr;
@@ -909,8 +945,8 @@ snat_v4_nat(struct __ctx_buff *ctx, struct ipv4_ct_tuple *tuple,
 	    int off, struct ipv4_nat_target *target,
 	    struct trace_ctx *trace, __s8 *ext_err)
 {
-	struct icmphdr icmphdr __align_stack_8;
 	struct ipv4_nat_entry *state = NULL;
+	__wsum outer_csum_diff = 0;
 	__u16 port_off = 0;
 	int ret;
 
@@ -927,7 +963,7 @@ snat_v4_nat(struct __ctx_buff *ctx, struct ipv4_ct_tuple *tuple,
 		 * L4 header, NATing it in this situation is useless, because
 		 * the following fragments won't be able to pass the NAT.
 		 */
-		if (!is_defined(ENABLE_IPV4_FRAGMENTS) && ipfrag_is_fragment(fraginfo))
+		if (!CONFIG(enable_ipv4_fragments) && ipfrag_is_fragment(fraginfo))
 			return DROP_FRAG_NOSUPPORT;
 
 		ret = ipv4_load_l4_ports(ctx, ip4, fraginfo, off,
@@ -942,7 +978,10 @@ snat_v4_nat(struct __ctx_buff *ctx, struct ipv4_ct_tuple *tuple,
 			return NAT_PUNT_TO_STACK;
 
 		break;
-	case IPPROTO_ICMP:
+#ifdef ENABLE_SNAT_ICMPV4
+	case IPPROTO_ICMP: {
+		struct icmphdr icmphdr __align_stack_8;
+
 		/* Fragmented ECHO packets are not supported currently. Drop all
 		 * fragments, because letting the first fragment pass would be
 		 * useless anyway.
@@ -981,7 +1020,8 @@ snat_v4_nat(struct __ctx_buff *ctx, struct ipv4_ct_tuple *tuple,
 			}
 
 nat_icmp_v4:
-			ret = snat_v4_nat_handle_icmp_error(ctx, off, &state);
+			ret = snat_v4_nat_handle_icmp_error(ctx, off, &state,
+							    &outer_csum_diff);
 			if (IS_ERR(ret))
 				return ret;
 
@@ -990,28 +1030,32 @@ nat_icmp_v4:
 			return DROP_NAT_UNSUPP_PROTO;
 		}
 		break;
+	}
+#endif /* ENABLE_SNAT_ICMPV4 */
 	default:
 		return NAT_PUNT_TO_STACK;
 	};
 
 	return __snat_v4_nat(ctx, tuple, state, fraginfo, off, false, target,
-			     port_off, trace, ext_err);
+			     port_off, outer_csum_diff, trace, ext_err);
 }
 
+#ifdef ENABLE_SNAT_ICMPV4
 static __always_inline __maybe_unused int
 snat_v4_rev_nat_handle_icmp_error(struct __ctx_buff *ctx,
 				  __u64 inner_l3_off,
-				  struct ipv4_nat_entry **state)
+				  struct ipv4_nat_entry **state,
+				  __wsum *outer_csum_diff)
 {
 	struct ipv4_ct_tuple tuple = {};
 	struct iphdr iphdr;
 	__u16 port_off;
-	__u32 icmpoff;
+	__u32 inner_l4_off;
 	__u8 type;
 	bool icmp_has_inner_l4_csum = true;
+	bool is_inner_l4_csum_enabled = true;
 	int ret;
 	__u32 total_inner_len = (__u32)(ctx_full_len(ctx) - inner_l3_off);
-
 
 	/* According to the RFC 5508, any networking equipment that is
 	 * responding with an ICMP Error packet should embed the original
@@ -1030,23 +1074,21 @@ snat_v4_rev_nat_handle_icmp_error(struct __ctx_buff *ctx,
 	tuple.daddr = iphdr.saddr;
 	tuple.flags = NAT_DIR_INGRESS;
 
-	icmpoff = (__u32)(inner_l3_off + ipv4_hdrlen(&iphdr));
+	inner_l4_off = (__u32)(inner_l3_off + ipv4_hdrlen(&iphdr));
 	switch (tuple.nexthdr) {
 	case IPPROTO_TCP:
 	case IPPROTO_UDP:
 #ifdef ENABLE_SCTP
 	case IPPROTO_SCTP:
 #endif  /* ENABLE_SCTP */
-		/* No reasons to handle IP fragmentation for this case as it is
-		 * expected that DF isn't set for this particular context.
-		 */
-		if (l4_load_ports(ctx, icmpoff, &tuple.dport) < 0)
+		if (!ipfrag_has_l4_header(ipfrag_encode_ipv4(&iphdr)) ||
+		    l4_load_ports(ctx, inner_l4_off, &tuple.dport) < 0)
 			return DROP_INVALID;
 
 		port_off = TCP_SPORT_OFF;
 		break;
 	case IPPROTO_ICMP:
-		if (ctx_load_bytes(ctx, icmpoff, &type, sizeof(type)) < 0)
+		if (icmp_load_type(ctx, inner_l4_off, &type) < 0)
 			return DROP_INVALID;
 
 		switch (type) {
@@ -1059,8 +1101,7 @@ snat_v4_rev_nat_handle_icmp_error(struct __ctx_buff *ctx,
 			return DROP_UNKNOWN_ICMP4_CODE;
 		}
 
-		if (ctx_load_bytes(ctx, icmpoff + port_off,
-				   &tuple.dport, sizeof(tuple.dport)) < 0)
+		if (l4_load_port(ctx, inner_l4_off + port_off, &tuple.dport) < 0)
 			return DROP_INVALID;
 		break;
 	default:
@@ -1073,13 +1114,30 @@ snat_v4_rev_nat_handle_icmp_error(struct __ctx_buff *ctx,
 
 	/* Check if the inner L4 header has checksum */
 	if (tuple.nexthdr == IPPROTO_TCP &&
-	    total_inner_len < iphdr.ihl + TCP_CSUM_OFF + sizeof(__u16))
+	    total_inner_len < ipv4_hdrlen(&iphdr) + TCP_CSUM_OFF + TCP_CSUM_SIZE)
 		icmp_has_inner_l4_csum = false;
 
+	/* For UDP, a checksum value of zero means that no checksum */
+	if (tuple.nexthdr == IPPROTO_UDP) {
+		__be16 l4_csum_be = 0;
+
+		if (udp_load_csum(ctx, inner_l4_off, &l4_csum_be) < 0)
+			return DROP_INVALID;
+		if (l4_csum_be == 0)
+			is_inner_l4_csum_enabled = false;
+	}
+
+	/* Calculate the diff for the outer ICMP checksum. */
+	*outer_csum_diff = snat_v4_calc_icmp_error_csum_diff(tuple.daddr, (*state)->to_daddr,
+							     tuple.dport, (*state)->to_dport,
+							     icmp_has_inner_l4_csum &&
+							     is_inner_l4_csum_enabled);
+
 	/* The embedded packet was SNATed on egress. Reverse it again: */
-	ret = snat_v4_rewrite_headers(ctx, tuple.nexthdr, (int)inner_l3_off, true, icmpoff,
+	ret = snat_v4_rewrite_headers(ctx, tuple.nexthdr, (int)inner_l3_off,
+				      true, inner_l4_off,
 				      tuple.daddr, (*state)->to_daddr, IPV4_SADDR_OFF,
-				      tuple.dport, (*state)->to_dport, port_off);
+				      tuple.dport, (*state)->to_dport, port_off, 0);
 	/* Failing to update the inner L4 checksum is not fatal if the header
 	 * is incomplete.
 	 */
@@ -1087,20 +1145,21 @@ snat_v4_rev_nat_handle_icmp_error(struct __ctx_buff *ctx,
 		ret = 0;
 	return ret;
 }
+#endif /* ENABLE_SNAT_ICMPV4 */
 
 static __always_inline __maybe_unused int
 snat_v4_rev_nat(struct __ctx_buff *ctx, const struct ipv4_nat_target *target,
-		struct trace_ctx *trace, __s8 *ext_err __maybe_unused)
+		struct trace_ctx *trace)
 {
-	struct icmphdr icmphdr __align_stack_8;
 	struct ipv4_nat_entry *state = NULL;
-	struct ipv4_ct_tuple tuple = {};
+	struct ipv4_ct_tuple tuple __align_stack_8 = {};
 	void *data, *data_end;
 	struct iphdr *ip4;
 	fraginfo_t fraginfo;
-	__u64 off, inner_l3_off;
 	__be16 to_dport = 0;
 	__u16 port_off = 0;
+	__wsum outer_csum_diff = 0;
+	__u64 off;
 	int ret;
 
 	build_bug_on(sizeof(struct ipv4_nat_entry) > 64);
@@ -1131,7 +1190,11 @@ snat_v4_rev_nat(struct __ctx_buff *ctx, const struct ipv4_nat_target *target,
 			return NAT_PUNT_TO_STACK;
 
 		break;
-	case IPPROTO_ICMP:
+#ifdef ENABLE_SNAT_ICMPV4
+	case IPPROTO_ICMP: {
+		struct icmphdr icmphdr __align_stack_8;
+		__u64 inner_l3_off;
+
 		/* Fragmented ECHOREPLY packets are not supported currently.
 		 * Drop all fragments, because letting the first fragment pass
 		 * would be useless anyway.
@@ -1165,7 +1228,8 @@ snat_v4_rev_nat(struct __ctx_buff *ctx, const struct ipv4_nat_target *target,
 rev_nat_icmp_v4:
 			inner_l3_off = off + sizeof(struct icmphdr);
 
-			ret = snat_v4_rev_nat_handle_icmp_error(ctx, inner_l3_off, &state);
+			ret = snat_v4_rev_nat_handle_icmp_error(ctx, inner_l3_off, &state,
+								&outer_csum_diff);
 			if (IS_ERR(ret))
 				return ret;
 
@@ -1174,6 +1238,8 @@ rev_nat_icmp_v4:
 			return NAT_PUNT_TO_STACK;
 		}
 		break;
+	}
+#endif /* ENABLE_SNAT_ICMPV4 */
 	default:
 		return NAT_PUNT_TO_STACK;
 	};
@@ -1186,25 +1252,12 @@ rev_nat_icmp_v4:
 	/* Skip port rewrite for ICMP_DEST_UNREACH by passing old_port == new_port == 0. */
 	to_dport = state->to_dport;
 
-rewrite:
+rewrite: __maybe_unused
 	return snat_v4_rewrite_headers(ctx, tuple.nexthdr, ETH_HLEN,
 				       ipfrag_has_l4_header(fraginfo), (int)off,
 				       tuple.daddr, state->to_daddr, IPV4_DADDR_OFF,
-				       tuple.dport, to_dport, port_off);
-}
-#else /* defined(ENABLE_IPV4) && defined(ENABLE_NODEPORT) */
-static __always_inline __maybe_unused
-int snat_v4_nat(struct __ctx_buff *ctx __maybe_unused,
-		const struct ipv4_nat_target *target __maybe_unused)
-{
-	return CTX_ACT_OK;
-}
-
-static __always_inline __maybe_unused
-int snat_v4_rev_nat(struct __ctx_buff *ctx __maybe_unused,
-		    const struct ipv4_nat_target *target __maybe_unused)
-{
-	return CTX_ACT_OK;
+				       tuple.dport, to_dport, port_off,
+				       outer_csum_diff);
 }
 #endif /* defined(ENABLE_IPV4) && defined(ENABLE_NODEPORT) */
 
@@ -1231,7 +1284,20 @@ struct ipv6_nat_target {
 	bool needs_ct;
 	bool egress_gateway; /* NAT is needed because of an egress gateway policy */
 	__u32 ifindex; /* Obtained from EGW policy */
+	__u32 tbid;
 };
+
+static __always_inline void
+swap_nat_port_range_ipv6(struct ipv6_nat_target *target)
+{
+	if (target->min_port == NODEPORT_PORT_MIN_NAT) {
+		target->min_port = CONFIG(nodeport_port_min_nat_ext);
+		target->max_port = CONFIG(nodeport_port_max_nat_ext);
+	} else {
+		target->min_port = NODEPORT_PORT_MIN_NAT;
+		target->max_port = NODEPORT_PORT_MAX_NAT;
+	}
+}
 
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -1278,7 +1344,7 @@ static __always_inline void *
 get_cluster_snat_map_v6(__u32 cluster_id __maybe_unused)
 {
 #if defined(ENABLE_CLUSTER_AWARE_ADDRESSING) && defined(ENABLE_INTER_CLUSTER_SNAT)
-	if (cluster_id != 0 && cluster_id != CLUSTER_ID)
+	if (cluster_id != 0 && cluster_id != CONFIG(cluster_id))
 		return map_lookup_elem(&cilium_per_cluster_snat_v6_external, &cluster_id);
 #endif
 	return &cilium_snat_v6_external;
@@ -1303,29 +1369,31 @@ set_v6_rtuple(const struct ipv6_ct_tuple *otuple,
 	rtuple->dport = ostate->to_sport;
 }
 
-static __always_inline int snat_v6_new_mapping(struct __ctx_buff *ctx,
-					       struct ipv6_ct_tuple *otuple,
+DEFINE_AUX(struct ipv6_ct_tuple, new_mapping_tuple);
+DEFINE_AUX(struct ipv6_nat_entry, new_mapping_rstate);
+
+static __always_inline int snat_v6_new_mapping(const struct __ctx_buff *ctx,
+					       const struct ipv6_ct_tuple *otuple,
 					       struct ipv6_nat_entry *ostate,
 					       const struct ipv6_nat_target *target,
 					       bool needs_ct, __s8 *ext_err)
 {
-	struct ipv6_ct_tuple rtuple = {};
-	struct ipv6_nat_entry rstate;
+	struct ipv6_ct_tuple *rtuple = AUX(new_mapping_tuple);
+	struct ipv6_nat_entry *rstate = AUX(new_mapping_rstate);
 	__u32 *retries_hist;
 	__u32 retries;
 	int ret;
 	__u16 port;
 
-	memset(&rstate, 0, sizeof(rstate));
 	memset(ostate, 0, sizeof(*ostate));
 
-	rstate.to_daddr = otuple->saddr;
-	rstate.to_dport = otuple->sport;
+	rstate->to_daddr = otuple->saddr;
+	rstate->to_dport = otuple->sport;
 
 	ostate->to_saddr = target->addr;
 	/* .to_sport is selected below */
 
-	set_v6_rtuple(otuple, ostate, &rtuple);
+	set_v6_rtuple(otuple, ostate, rtuple);
 	/* .dport is selected below */
 
 	port = __snat_try_keep_port(target->min_port,
@@ -1333,14 +1401,14 @@ static __always_inline int snat_v6_new_mapping(struct __ctx_buff *ctx,
 				    bpf_ntohs(otuple->sport));
 
 	ostate->common.needs_ct = needs_ct;
-	rstate.common.needs_ct = needs_ct;
-	rstate.common.created = bpf_mono_now();
+	rstate->common.needs_ct = needs_ct;
+	rstate->common.created = bpf_mono_now();
 
 #pragma unroll
 	for (retries = 0; retries < SNAT_COLLISION_RETRIES; retries++) {
-		rtuple.dport = bpf_htons(port);
+		rtuple->dport = bpf_htons(port);
 
-		if (__snat_create(&cilium_snat_v6_external, &rtuple, &rstate, true) == 0)
+		if (__snat_create(&cilium_snat_v6_external, rtuple, rstate, true) == 0)
 			goto create_nat_entry;
 
 		port = __snat_clamp_port_range(target->min_port,
@@ -1361,12 +1429,12 @@ create_nat_entry:
 	if (retries_hist)
 		++*retries_hist;
 
-	ostate->to_sport = rtuple.dport;
-	ostate->common.created = rstate.common.created;
+	ostate->to_sport = rtuple->dport;
+	ostate->common.created = rstate->common.created;
 
 	ret = __snat_create(&cilium_snat_v6_external, otuple, ostate, false);
 	if (ret < 0) {
-		map_delete_elem(&cilium_snat_v6_external, &rtuple); /* rollback */
+		map_delete_elem(&cilium_snat_v6_external, rtuple); /* rollback */
 		if (ext_err)
 			*ext_err = (__s8)ret;
 		ret = DROP_NAT_NO_MAPPING;
@@ -1379,17 +1447,12 @@ out:
 	return ret;
 }
 
-/* Store struct ipv6_nat_entry objects in map to optimize stack usage. */
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, int);
-	__type(value, struct ipv6_nat_entry);
-} ipv6_nat_entry_storage __section_maps_btf;
+DEFINE_AUX(struct ipv6_nat_entry, snat_v6_nhm_nat_entry);
+DEFINE_AUX(struct ipv6_ct_tuple, snat_v6_nhm_tuple);
 
 static __always_inline int
-snat_v6_nat_handle_mapping(struct __ctx_buff *ctx,
-			   struct ipv6_ct_tuple *tuple,
+snat_v6_nat_handle_mapping(const struct __ctx_buff *ctx,
+			   const struct ipv6_ct_tuple *tuple,
 			   fraginfo_t fraginfo,
 			   struct ipv6_nat_entry **state,
 			   __u32 off,
@@ -1398,19 +1461,18 @@ snat_v6_nat_handle_mapping(struct __ctx_buff *ctx,
 			   __s8 *ext_err)
 {
 	bool needs_ct = target->needs_ct;
-	int zero = 0;
 
 	*state = snat_v6_lookup(tuple);
 
 	if (needs_ct) {
-		struct ipv6_ct_tuple tuple_snat;
+		struct ipv6_ct_tuple *tuple_snat = AUX(snat_v6_nhm_tuple);
 		int ret;
 
-		memcpy(&tuple_snat, tuple, sizeof(tuple_snat));
+		memcpy(tuple_snat, tuple, sizeof(*tuple_snat));
 		/* Lookup with SCOPE_FORWARD. Ports are already in correct layout: */
-		ipv6_ct_tuple_swap_addrs(&tuple_snat);
+		ipv6_ct_tuple_swap_addrs(tuple_snat);
 
-		ret = ct_lazy_lookup6(get_ct_map6(&tuple_snat), &tuple_snat, ctx,
+		ret = ct_lazy_lookup6(get_ct_map6(tuple_snat), tuple_snat, ctx,
 				      fraginfo, off, CT_EGRESS, SCOPE_FORWARD,
 				      CT_ENTRY_ANY, NULL, &trace->monitor);
 		if (ret < 0)
@@ -1418,8 +1480,8 @@ snat_v6_nat_handle_mapping(struct __ctx_buff *ctx,
 
 		trace->reason = (enum trace_reason)ret;
 		if (ret == CT_NEW) {
-			ret = ct_create6(get_ct_map6(&tuple_snat), NULL,
-					 &tuple_snat, ctx, CT_EGRESS,
+			ret = ct_create6(get_ct_map6(tuple_snat), NULL,
+					 tuple_snat, ctx, CT_EGRESS,
 					 NULL, ext_err);
 			if (IS_ERR(ret))
 				return ret;
@@ -1428,29 +1490,25 @@ snat_v6_nat_handle_mapping(struct __ctx_buff *ctx,
 
 	if (*state) {
 		int ret;
-		struct ipv6_ct_tuple rtuple = {};
+		struct ipv6_ct_tuple *rtuple = AUX(snat_v6_nhm_tuple);
 
-		set_v6_rtuple(tuple, *state, &rtuple);
+		set_v6_rtuple(tuple, *state, rtuple);
 		if (ipv6_addr_equals(&target->addr, &(*state)->to_saddr) &&
 		    needs_ct == (*state)->common.needs_ct) {
 			/* Check for the reverse SNAT entry. If it is missing (e.g. due to LRU
 			 * eviction), it must be restored before returning.
 			 */
-			struct ipv6_nat_entry *rstate;
 			struct ipv6_nat_entry *lookup_result;
 
-			lookup_result = snat_v6_lookup(&rtuple);
+			lookup_result = snat_v6_lookup(rtuple);
 			if (!lookup_result) {
-				rstate = map_lookup_elem(&ipv6_nat_entry_storage, &zero);
-				if (!rstate)
-					return DROP_INVALID;
+				struct ipv6_nat_entry *rstate = AUX(snat_v6_nhm_nat_entry);
 
-				memset(rstate, 0, sizeof(*rstate));
 				rstate->to_daddr = tuple->saddr;
 				rstate->to_dport = tuple->sport;
 				rstate->common.needs_ct = needs_ct;
 				rstate->common.created = bpf_mono_now();
-				ret = __snat_create(&cilium_snat_v6_external, &rtuple, rstate,
+				ret = __snat_create(&cilium_snat_v6_external, rtuple, rstate,
 						    false);
 				if (ret < 0) {
 					if (ext_err)
@@ -1467,20 +1525,18 @@ snat_v6_nat_handle_mapping(struct __ctx_buff *ctx,
 		if (IS_ERR(ret))
 			return ret;
 
-		*state = snat_v6_lookup(&rtuple);
+		*state = snat_v6_lookup(rtuple);
 		if (*state)
-			__snat_delete(&cilium_snat_v6_external, &rtuple);
+			__snat_delete(&cilium_snat_v6_external, rtuple);
 	}
 
-	*state = map_lookup_elem(&ipv6_nat_entry_storage, &zero);
-	if (!*state)
-		return DROP_INVALID;
+	*state = AUX_REUSE(snat_v6_nhm_nat_entry);
 	return snat_v6_new_mapping(ctx, tuple, *state, target, needs_ct, ext_err);
 }
 
 static __always_inline int
-snat_v6_rev_nat_handle_mapping(struct __ctx_buff *ctx,
-			       struct ipv6_ct_tuple *tuple,
+snat_v6_rev_nat_handle_mapping(const struct __ctx_buff *ctx,
+			       const struct ipv6_ct_tuple *tuple,
 			       fraginfo_t fraginfo,
 			       struct ipv6_nat_entry **state,
 			       __u32 off,
@@ -1549,50 +1605,24 @@ snat_v6_rev_nat_handle_mapping(struct __ctx_buff *ctx,
 static __always_inline int
 snat_v6_rewrite_headers(struct __ctx_buff *ctx, __u8 nexthdr, int l3_off,
 			bool has_l4_header, int l4_off,
-			union v6addr *old_addr, union v6addr *new_addr, __u16 addr_off,
+			const union v6addr *old_addr,
+			const union v6addr *new_addr, __u16 addr_off,
 			__be16 old_port, __be16 new_port, __u16 port_off)
 {
-	struct csum_offset csum = {};
 	__wsum sum;
+	int err;
 
 	/* No change needed: */
 	if (ipv6_addr_equals(old_addr, new_addr) && old_port == new_port)
 		return 0;
 
-	sum = csum_diff(old_addr, 16, new_addr, 16, 0);
-	if (ctx_store_bytes(ctx, l3_off + addr_off, new_addr, 16, 0) < 0)
-		return DROP_WRITE_ERROR;
+	err = ipv6_l3_rewrite_addr(ctx, l3_off, addr_off, old_addr, new_addr, &sum);
+	if (err < 0)
+		return err;
 
-	if (!has_l4_header)
-		return 0;
-
-	csum_l4_offset_and_flags(nexthdr, &csum);
-
-	if (old_port != new_port) {
-		int err;
-
-		switch (nexthdr) {
-		case IPPROTO_TCP:
-		case IPPROTO_UDP:
-		case IPPROTO_ICMPV6:
-			break;
-#ifdef ENABLE_SCTP
-		case IPPROTO_SCTP:
-			return DROP_CSUM_L4;
-#endif  /* ENABLE_SCTP */
-		default:
-			return DROP_UNKNOWN_L4;
-		}
-
-		/* Amend the L4 checksum due to changing the ports. */
-		err = l4_modify_port(ctx, l4_off, port_off, &csum, new_port, old_port);
-		if (err < 0)
-			return err;
-	}
-
-	if (csum.offset &&
-	    csum_l4_replace(ctx, l4_off, &csum, 0, sum, BPF_F_PSEUDO_HDR) < 0)
-		return DROP_CSUM_L4;
+	if (has_l4_header)
+		return l4_rewrite_port_and_csum(ctx, nexthdr, l4_off, port_off,
+						old_port, new_port, sum, 0);
 
 	return 0;
 }
@@ -1608,7 +1638,7 @@ snat_v6_nat_can_skip(const struct ipv6_nat_target *target,
 		return false;
 #endif
 
-	return (!target->from_local_endpoint && sport < NAT_MIN_EGRESS);
+	return (!target->from_local_endpoint && !is_port_in_nat_range(sport));
 }
 
 static __always_inline bool
@@ -1617,33 +1647,6 @@ snat_v6_rev_nat_can_skip(const struct ipv6_nat_target *target, const struct ipv6
 	__u16 dport = bpf_ntohs(tuple->dport);
 
 	return dport < target->min_port || dport > target->max_port;
-}
-
-static __always_inline __maybe_unused int
-snat_v6_create_dsr(const struct ipv6_ct_tuple *tuple, union v6addr *to_saddr,
-		   __be16 to_sport, __s8 *ext_err)
-{
-	struct ipv6_ct_tuple tmp = *tuple;
-	struct ipv6_nat_entry state = {};
-	int ret;
-
-	build_bug_on(sizeof(struct ipv6_nat_entry) > 64);
-
-	tmp.flags = TUPLE_F_OUT;
-	tmp.sport = tuple->dport;
-	tmp.dport = tuple->sport;
-
-	state.common.created = bpf_mono_now();
-	ipv6_addr_copy(&state.to_saddr, to_saddr);
-	state.to_sport = to_sport;
-
-	ret = map_update_elem(&cilium_snat_v6_external, &tmp, &state, 0);
-	if (ret) {
-		*ext_err = (__s8)ret;
-		return DROP_NAT_NO_MAPPING;
-	}
-
-	return CTX_ACT_OK;
 }
 
 static __always_inline void snat_v6_init_tuple(const struct ipv6hdr *ip6,
@@ -1656,25 +1659,25 @@ static __always_inline void snat_v6_init_tuple(const struct ipv6hdr *ip6,
 }
 
 static __always_inline int
-snat_v6_needs_masquerade(struct __ctx_buff *ctx __maybe_unused,
-			 struct ipv6_ct_tuple *tuple __maybe_unused,
-			 struct ipv6hdr *ip6 __maybe_unused,
-			 fraginfo_t fraginfo __maybe_unused,
-			 int l4_off __maybe_unused,
-			 struct ipv6_nat_target *target __maybe_unused)
+__snat_v6_needs_masquerade(struct __ctx_buff *ctx, struct ipv6_ct_tuple *tuple,
+			   fraginfo_t fraginfo, int l4_off,
+			   struct ipv6_nat_target *target)
 {
-	union v6addr masq_addr __maybe_unused = CONFIG(nat_ipv6_masquerade);
-	const struct remote_endpoint_info *remote_ep __maybe_unused;
-	const struct endpoint_info *local_ep __maybe_unused;
+	union v6addr masq_addr = CONFIG(nat_ipv6_masquerade);
+	const struct remote_endpoint_info *remote_ep;
+	const struct endpoint_info *local_ep;
+	void *data, *data_end;
+	struct ipv6hdr *ip6;
 
-	/* See comments in snat_v4_needs_masquerade(). */
-#if defined(ENABLE_MASQUERADE_IPV6) && defined(IS_BPF_HOST)
 	if (ipv6_addr_equals(&tuple->saddr, &masq_addr)) {
 		ipv6_addr_copy(&target->addr, &masq_addr);
 		target->needs_ct = true;
 
 		return NAT_NEEDED;
 	}
+
+	if (!revalidate_data(ctx, &data, &data_end, &ip6))
+		return DROP_INVALID;
 
 	local_ep = __lookup_ip6_endpoint(&tuple->saddr);
 
@@ -1715,24 +1718,24 @@ snat_v6_needs_masquerade(struct __ctx_buff *ctx __maybe_unused,
 		if (!local_ep)
 			target->needs_ct = true;
 
+		if (local_ep && local_ep->rt_info)
+			target->tbid = local_ep->rt_info;
+
 		return NAT_NEEDED;
 	}
 #endif
 
-# ifdef IPV6_SNAT_EXCLUSION_DST_CIDR
-	{
-		union v6addr excl_cidr_mask = IPV6_SNAT_EXCLUSION_DST_CIDR_MASK;
-		union v6addr excl_cidr = IPV6_SNAT_EXCLUSION_DST_CIDR;
+	if (CONFIG(ipv6_snat_exclusion).enabled) {
+		union v6addr excl_cidr = CONFIG(ipv6_snat_exclusion).dst_addr;
+		union v6addr excl_cidr_mask = CONFIG(ipv6_snat_exclusion).dst_mask;
 
 		if (ipv6_addr_in_net(&tuple->daddr, &excl_cidr, &excl_cidr_mask))
 			return NAT_PUNT_TO_STACK;
 	}
-# endif /* IPV6_SNAT_EXCLUSION_DST_CIDR */
 
 	/* Do not SNAT if this is a localhost endpoint or
 	 * endpoint explicitly disallows it (normally multi-pool IPAM endpoints)
 	 */
-	 /*if (local_ep && (local_ep->flags & ENDPOINT_MASK_SKIP_MASQ_V6))*/
 	if (local_ep && (local_ep->flags & ENDPOINT_MASK_SKIP_MASQ_V6))
 		return NAT_PUNT_TO_STACK;
 
@@ -1771,44 +1774,63 @@ snat_v6_needs_masquerade(struct __ctx_buff *ctx __maybe_unused,
 		ipv6_addr_copy(&target->addr, &masq_addr);
 		return NAT_NEEDED;
 	}
-#endif /* ENABLE_MASQUERADE_IPV6 && IS_BPF_HOST */
 
 	return NAT_PUNT_TO_STACK;
 }
 
+/* Store struct ipv6_ct_tuple and struct ipv6_nat_target objects in maps to
+ * optimize stack usage.
+ */
+struct snat_v6_args {
+	struct ipv6_ct_tuple tuple;
+	struct ipv6_nat_target target;
+	struct trace_ctx trace;
+};
+
+DEFINE_AUX(struct snat_v6_args, snat_v6_args);
+
+__noinline __weak int
+snat_v6_needs_masquerade(struct __ctx_buff *ctx __maybe_unused,
+			 fraginfo_t fraginfo __maybe_unused,
+			 int l4_off __maybe_unused)
+{
+	struct snat_v6_args *args = AUX_REUSE(snat_v6_args);
+
+	return __snat_v6_needs_masquerade(ctx, &args->tuple, fraginfo, l4_off, &args->target);
+}
+
+#ifdef ENABLE_SNAT_ICMPV6
 static __always_inline __maybe_unused int
 snat_v6_nat_handle_icmp_error(struct __ctx_buff *ctx, __u64 off,
 			      struct ipv6_nat_entry **state)
 {
 	__u32 inner_l3_off = (__u32)(off + sizeof(struct icmp6hdr));
 	struct ipv6_ct_tuple tuple = {};
-	struct ipv6hdr ip6;
+	fraginfo_t fraginfo = 0;
 	__u16 port_off;
-	__u32 icmpoff;
+	__u32 inner_l4_off;
 	int hdrlen;
 	__u8 type;
-
-	/* According to the RFC 5508, any networking equipment that is
-	 * responding with an ICMP Error packet should embed the original
-	 * packet in its response.
-	 */
-	if (ctx_load_bytes(ctx, inner_l3_off, &ip6, sizeof(ip6)) < 0)
-		return DROP_INVALID;
 
 	/* From the embedded IP headers we should be able to determine
 	 * corresponding protocol, IP src/dst of the packet sent to resolve
 	 * the NAT session.
 	 */
-	tuple.nexthdr = ip6.nexthdr;
-	ipv6_addr_copy(&tuple.saddr, (union v6addr *)&ip6.daddr);
-	ipv6_addr_copy(&tuple.daddr, (union v6addr *)&ip6.saddr);
+	if (ctx_load_bytes(ctx, inner_l3_off + offsetof(struct ipv6hdr, nexthdr),
+			   &tuple.nexthdr, sizeof(tuple.nexthdr)) < 0)
+		return DROP_INVALID;
+
+	if (ctx_load_bytes(ctx, inner_l3_off + offsetof(struct ipv6hdr, saddr),
+			   &tuple.daddr, 2 * sizeof(tuple.saddr)) < 0)
+		return DROP_INVALID;
+
 	tuple.flags = NAT_DIR_EGRESS;
 
-	hdrlen = ipv6_hdrlen_offset(ctx, inner_l3_off, &tuple.nexthdr, NULL);
+	hdrlen = ipv6_hdrlen_offset(ctx, inner_l3_off, &tuple.nexthdr, &fraginfo);
 	if (hdrlen < 0)
 		return hdrlen;
 
-	icmpoff = inner_l3_off + hdrlen;
+	inner_l4_off = inner_l3_off + hdrlen;
 
 	switch (tuple.nexthdr) {
 	case IPPROTO_TCP:
@@ -1816,16 +1838,14 @@ snat_v6_nat_handle_icmp_error(struct __ctx_buff *ctx, __u64 off,
 #ifdef ENABLE_SCTP
 	case IPPROTO_SCTP:
 #endif /* ENABLE_SCTP */
-		/* No reasons to handle IP fragmentation for this case as it is
-		 * expected that DF isn't set for this particular context.
-		 */
-		if (l4_load_ports(ctx, icmpoff, &tuple.dport) < 0)
+		if (!ipfrag_has_l4_header(fraginfo) ||
+		    l4_load_ports(ctx, inner_l4_off, &tuple.dport) < 0)
 			return DROP_INVALID;
 
 		port_off = TCP_DPORT_OFF;
 		break;
 	case IPPROTO_ICMPV6:
-		if (icmp6_load_type(ctx, icmpoff, &type) < 0)
+		if (icmp6_load_type(ctx, inner_l4_off, &type) < 0)
 			return DROP_INVALID;
 
 		switch (type) {
@@ -1838,8 +1858,7 @@ snat_v6_nat_handle_icmp_error(struct __ctx_buff *ctx, __u64 off,
 			return DROP_UNKNOWN_ICMP6_CODE;
 		}
 
-		if (ctx_load_bytes(ctx, icmpoff + port_off,
-				   &tuple.sport, sizeof(tuple.sport)) < 0)
+		if (l4_load_port(ctx, inner_l4_off + port_off, &tuple.sport) < 0)
 			return DROP_INVALID;
 		break;
 	default:
@@ -1851,10 +1870,11 @@ snat_v6_nat_handle_icmp_error(struct __ctx_buff *ctx, __u64 off,
 		return NAT_PUNT_TO_STACK;
 
 	/* The embedded packet was RevSNATed on ingress. Reverse it again: */
-	return snat_v6_rewrite_headers(ctx, tuple.nexthdr, inner_l3_off, true, icmpoff,
+	return snat_v6_rewrite_headers(ctx, tuple.nexthdr, inner_l3_off, true, inner_l4_off,
 				       &tuple.saddr, &(*state)->to_saddr, IPV6_DADDR_OFF,
 				       tuple.sport, (*state)->to_sport, port_off);
 }
+#endif /* ENABLE_SNAT_ICMPV6 */
 
 static __always_inline int
 __snat_v6_nat(struct __ctx_buff *ctx, struct ipv6_ct_tuple *tuple,
@@ -1893,20 +1913,22 @@ __snat_v6_nat(struct __ctx_buff *ctx, struct ipv6_ct_tuple *tuple,
 	return ret;
 }
 
-static __always_inline __maybe_unused int
-snat_v6_nat(struct __ctx_buff *ctx, struct ipv6_ct_tuple *tuple,
-	    struct ipv6hdr *ip6, fraginfo_t fraginfo,
-	    int off, struct ipv6_nat_target *target,
-	    struct trace_ctx *trace, __s8 *ext_err)
+__noinline __weak int
+snat_v6_nat(struct __ctx_buff *ctx, fraginfo_t fraginfo, int off, __s8 *ext_err)
 {
-	struct icmp6hdr icmp6hdr __align_stack_8;
 	struct ipv6_nat_entry *state = NULL;
+	struct snat_v6_args *args = AUX_REUSE(snat_v6_args);
+	void *data, *data_end;
+	struct ipv6hdr *ip6;
 	__u16 port_off = 0;
 	int ret;
 
 	build_bug_on(sizeof(struct ipv6_nat_entry) > 64);
 
-	switch (tuple->nexthdr) {
+	if (!revalidate_data(ctx, &data, &data_end, &ip6))
+		return DROP_INVALID;
+
+	switch (args->tuple.nexthdr) {
 	case IPPROTO_TCP:
 	case IPPROTO_UDP:
 #ifdef ENABLE_SCTP
@@ -1917,41 +1939,47 @@ snat_v6_nat(struct __ctx_buff *ctx, struct ipv6_ct_tuple *tuple,
 		 * L4 header, NATing it in this situation is useless, because
 		 * the following fragments won't be able to pass the NAT.
 		 */
-		if (!is_defined(ENABLE_IPV6_FRAGMENTS) && ipfrag_is_fragment(fraginfo))
+		if (!CONFIG(enable_ipv6_fragments) && ipfrag_is_fragment(fraginfo))
 			return DROP_FRAG_NOSUPPORT;
 
 		ret = ipv6_load_l4_ports(ctx, ip6, fraginfo, off,
-					 CT_EGRESS, &tuple->dport);
+					 CT_EGRESS, &args->tuple.dport);
 		if (ret < 0)
 			return ret;
 
-		ipv6_ct_tuple_swap_ports(tuple);
+		ipv6_ct_tuple_swap_ports(&args->tuple);
 		port_off = TCP_SPORT_OFF;
 
-		if (snat_v6_nat_can_skip(target, tuple))
+		if (snat_v6_nat_can_skip(&args->target, &args->tuple))
 			return NAT_PUNT_TO_STACK;
 
 		break;
-	case IPPROTO_ICMPV6:
+#ifdef ENABLE_SNAT_ICMPV6
+	case IPPROTO_ICMPV6: {
+		struct icmp6hdr icmp6hdr __align_stack_8;
+
 		if (ipfrag_is_fragment(fraginfo))
 			return DROP_INVALID;
+
 		if (ctx_load_bytes(ctx, off, &icmp6hdr, sizeof(icmp6hdr)) < 0)
 			return DROP_INVALID;
 
 		switch (icmp6hdr.icmp6_type) {
 		case ICMPV6_ECHO_REPLY:
 		case ICMPV6_REDIRECT:
+		case ICMP6_RS_MSG_TYPE:
+		case ICMP6_RA_MSG_TYPE:
 		case ICMP6_NS_MSG_TYPE:
 		case ICMP6_NA_MSG_TYPE:
 			return NAT_PUNT_TO_STACK;
 		case ICMPV6_ECHO_REQUEST:
-			tuple->dport = 0;
-			tuple->sport = icmp6hdr.icmp6_dataun.u_echo.identifier;
+			args->tuple.dport = 0;
+			args->tuple.sport = icmp6hdr.icmp6_dataun.u_echo.identifier;
 			port_off = offsetof(struct icmp6hdr,
 					    icmp6_dataun.u_echo.identifier);
 			/* Don't clamp the ID field: */
-			target->min_port = 0;
-			target->max_port = UINT16_MAX;
+			args->target.min_port = 0;
+			args->target.max_port = UINT16_MAX;
 
 			break;
 		case ICMPV6_DEST_UNREACH:
@@ -1980,43 +2008,41 @@ nat_icmp_v6:
 			return DROP_NAT_UNSUPP_PROTO;
 		}
 		break;
+	}
+#endif /* ENABLE_SNAT_ICMPV6 */
 	default:
 		return NAT_PUNT_TO_STACK;
 	};
 
-	return __snat_v6_nat(ctx, tuple, state, fraginfo, off, false, target,
-			     port_off, trace, ext_err);
+	return __snat_v6_nat(ctx, &args->tuple, state, fraginfo, off, false, &args->target,
+			     port_off, &args->trace, ext_err);
 }
 
+#ifdef ENABLE_SNAT_ICMPV6
 static __always_inline __maybe_unused int
 snat_v6_rev_nat_handle_icmp_pkt_toobig(struct __ctx_buff *ctx,
 				       __u32 inner_l3_off,
 				       struct ipv6_nat_entry **state)
 {
 	struct ipv6_ct_tuple tuple = {};
-	struct ipv6hdr iphdr;
+	fraginfo_t fraginfo = 0;
 	__u16 port_off;
-	__u32 icmpoff;
+	__u32 inner_l4_off;
 	__u8 type;
 	int hdrlen;
-
-	/* According to the RFC 5508, any networking
-	 * equipment that is responding with an ICMP Error
-	 * packet should embed the original packet in its
-	 * response.
-	 */
-
-	if (ctx_load_bytes(ctx, inner_l3_off, &iphdr, sizeof(iphdr)) < 0)
-		return DROP_INVALID;
 
 	/* From the embedded IP headers we should be able
 	 * to determine corresponding protocol, IP src/dst
 	 * of the packet sent to resolve the NAT session.
 	 */
+	if (ctx_load_bytes(ctx, inner_l3_off + offsetof(struct ipv6hdr, nexthdr),
+			   &tuple.nexthdr, sizeof(tuple.nexthdr)) < 0)
+		return DROP_INVALID;
 
-	tuple.nexthdr = iphdr.nexthdr;
-	ipv6_addr_copy(&tuple.saddr, (union v6addr *)&iphdr.daddr);
-	ipv6_addr_copy(&tuple.daddr, (union v6addr *)&iphdr.saddr);
+	if (ctx_load_bytes(ctx, inner_l3_off + offsetof(struct ipv6hdr, saddr),
+			   &tuple.daddr, 2 * sizeof(tuple.saddr)) < 0)
+		return DROP_INVALID;
+
 	tuple.flags = NAT_DIR_INGRESS;
 
 	/* Force tuple to be on the stack, a fix for a odd compiler bug
@@ -2025,11 +2051,11 @@ snat_v6_rev_nat_handle_icmp_pkt_toobig(struct __ctx_buff *ctx,
 	 */
 	asm volatile ("" ::"r"(&tuple));
 
-	hdrlen = ipv6_hdrlen_offset(ctx, inner_l3_off, &tuple.nexthdr, NULL);
+	hdrlen = ipv6_hdrlen_offset(ctx, inner_l3_off, &tuple.nexthdr, &fraginfo);
 	if (hdrlen < 0)
 		return hdrlen;
 
-	icmpoff = inner_l3_off + hdrlen;
+	inner_l4_off = inner_l3_off + hdrlen;
 
 	switch (tuple.nexthdr) {
 	case IPPROTO_TCP:
@@ -2037,11 +2063,8 @@ snat_v6_rev_nat_handle_icmp_pkt_toobig(struct __ctx_buff *ctx,
 #ifdef ENABLE_SCTP
 	case IPPROTO_SCTP:
 #endif  /* ENABLE_SCTP */
-		/* No reasons to handle IP fragmentation for this case
-		 * as it is expected that DF isn't set for this particular
-		 * context.
-		 */
-		if (l4_load_ports(ctx, icmpoff, &tuple.dport) < 0)
+		if (!ipfrag_has_l4_header(fraginfo) ||
+		    l4_load_ports(ctx, inner_l4_off, &tuple.dport) < 0)
 			return DROP_INVALID;
 
 		port_off = TCP_SPORT_OFF;
@@ -2050,15 +2073,14 @@ snat_v6_rev_nat_handle_icmp_pkt_toobig(struct __ctx_buff *ctx,
 		/* No reasons to see a packet different than
 		 * ICMPV6_ECHO_REQUEST.
 		 */
-		if (icmp6_load_type(ctx, icmpoff, &type) < 0 ||
+		if (icmp6_load_type(ctx, inner_l4_off, &type) < 0 ||
 		    type != ICMPV6_ECHO_REQUEST)
 			return DROP_INVALID;
 
 		port_off = offsetof(struct icmp6hdr,
 				    icmp6_dataun.u_echo.identifier);
 
-		if (ctx_load_bytes(ctx, icmpoff + port_off,
-				   &tuple.dport, sizeof(tuple.dport)) < 0)
+		if (l4_load_port(ctx, inner_l4_off + port_off, &tuple.dport) < 0)
 			return DROP_INVALID;
 		break;
 	default:
@@ -2070,25 +2092,25 @@ snat_v6_rev_nat_handle_icmp_pkt_toobig(struct __ctx_buff *ctx,
 		return NAT_PUNT_TO_STACK;
 
 	/* The embedded packet was SNATed on egress. Reverse it again: */
-	return snat_v6_rewrite_headers(ctx, tuple.nexthdr, inner_l3_off, true, icmpoff,
+	return snat_v6_rewrite_headers(ctx, tuple.nexthdr, inner_l3_off, true, inner_l4_off,
 				       &tuple.daddr, &(*state)->to_daddr, IPV6_SADDR_OFF,
 				       tuple.dport, (*state)->to_dport, port_off);
 }
+#endif /* ENABLE_SNAT_ICMPV6 */
 
 static __always_inline __maybe_unused int
 snat_v6_rev_nat(struct __ctx_buff *ctx, const struct ipv6_nat_target *target,
-		struct trace_ctx *trace, __s8 *ext_err __maybe_unused)
+		struct trace_ctx *trace)
 {
-	struct icmp6hdr icmp6hdr __align_stack_8;
 	struct ipv6_nat_entry *state = NULL;
 	struct ipv6_ct_tuple tuple = {};
-	__u32 off, inner_l3_off;
+	fraginfo_t fraginfo = 0;
 	void *data, *data_end;
 	struct ipv6hdr *ip6;
-	fraginfo_t fraginfo;
 	__be16 to_dport = 0;
 	__u16 port_off = 0;
 	int ret, hdrlen;
+	__u32 off;
 
 	build_bug_on(sizeof(struct ipv6_nat_entry) > 64);
 
@@ -2121,7 +2143,11 @@ snat_v6_rev_nat(struct __ctx_buff *ctx, const struct ipv6_nat_target *target,
 			return NAT_PUNT_TO_STACK;
 
 		break;
-	case IPPROTO_ICMPV6:
+#ifdef ENABLE_SNAT_ICMPV6
+	case IPPROTO_ICMPV6: {
+		struct icmp6hdr icmp6hdr __align_stack_8;
+		__u32 inner_l3_off;
+
 		if (ipfrag_is_fragment(fraginfo))
 			return DROP_INVALID;
 		if (ctx_load_bytes(ctx, off, &icmp6hdr, sizeof(icmp6hdr)) < 0)
@@ -2153,6 +2179,8 @@ snat_v6_rev_nat(struct __ctx_buff *ctx, const struct ipv6_nat_target *target,
 			return NAT_PUNT_TO_STACK;
 		}
 		break;
+	}
+#endif /* ENABLE_SNAT_ICMPV6 */
 	default:
 		return NAT_PUNT_TO_STACK;
 	};
@@ -2164,25 +2192,11 @@ snat_v6_rev_nat(struct __ctx_buff *ctx, const struct ipv6_nat_target *target,
 	/* Skip port rewrite for ICMPV6_PKT_TOOBIG by passing old_port == new_port == 0. */
 	to_dport = state->to_dport;
 
-rewrite:
+rewrite: __maybe_unused
 	return snat_v6_rewrite_headers(ctx, tuple.nexthdr, ETH_HLEN,
 				       ipfrag_has_l4_header(fraginfo), off,
 				       &tuple.daddr, &state->to_daddr, IPV6_DADDR_OFF,
 				       tuple.dport, to_dport, port_off);
-}
-#else /* defined(ENABLE_IPV6) && defined(ENABLE_NODEPORT) */
-static __always_inline __maybe_unused
-int snat_v6_nat(struct __ctx_buff *ctx __maybe_unused,
-		const struct ipv6_nat_target *target __maybe_unused)
-{
-	return CTX_ACT_OK;
-}
-
-static __always_inline __maybe_unused
-int snat_v6_rev_nat(struct __ctx_buff *ctx __maybe_unused,
-		    const struct ipv6_nat_target *target __maybe_unused)
-{
-	return CTX_ACT_OK;
 }
 #endif /* defined(ENABLE_IPV6) && defined(ENABLE_NODEPORT) */
 

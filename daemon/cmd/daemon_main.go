@@ -24,24 +24,23 @@ import (
 
 	"github.com/cilium/cilium/daemon/cmd/legacy"
 	"github.com/cilium/cilium/daemon/infraendpoints"
-	agentK8s "github.com/cilium/cilium/daemon/k8s"
 	"github.com/cilium/cilium/pkg/bpf"
 	"github.com/cilium/cilium/pkg/cgroups"
 	"github.com/cilium/cilium/pkg/common"
+	ipsec "github.com/cilium/cilium/pkg/datapath/linux/ipsec/types"
 	"github.com/cilium/cilium/pkg/datapath/linux/probes"
 	datapathOption "github.com/cilium/cilium/pkg/datapath/option"
 	datapathTables "github.com/cilium/cilium/pkg/datapath/tables"
-	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/defaults"
+	endpointTypes "github.com/cilium/cilium/pkg/endpoint/types"
 	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/envoy"
+	util "github.com/cilium/cilium/pkg/envoy/util"
 	"github.com/cilium/cilium/pkg/flowdebug"
-	"github.com/cilium/cilium/pkg/fqdn/bootstrap"
-	"github.com/cilium/cilium/pkg/fqdn/namemanager"
 	"github.com/cilium/cilium/pkg/hive"
 	"github.com/cilium/cilium/pkg/identity"
 	identitycell "github.com/cilium/cilium/pkg/identity/cache/cell"
-	"github.com/cilium/cilium/pkg/ipam"
+	ipamcell "github.com/cilium/cilium/pkg/ipam/cell"
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	k8sSynced "github.com/cilium/cilium/pkg/k8s/synced"
@@ -87,11 +86,6 @@ const (
 	// fatalSleep is the duration Cilium should sleep before existing in case
 	// of a log.Fatal is issued or a CLI flag is specified but does not exist.
 	fatalSleep = 2 * time.Second
-)
-
-var (
-	bootstrapTimestamp = time.Now()
-	bootstrapStats     = bootstrapStatistics{}
 )
 
 func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
@@ -194,8 +188,9 @@ func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
 	option.BindEnv(vp, option.DebugVerbose)
 
 	flags.String(option.DatapathMode, defaults.DatapathMode,
-		fmt.Sprintf("Datapath mode name (%s, %s, %s)",
-			datapathOption.DatapathModeVeth, datapathOption.DatapathModeNetkit, datapathOption.DatapathModeNetkitL2))
+		fmt.Sprintf("Datapath mode name (%s, %s, %s, %s)",
+			datapathOption.DatapathModeAuto, datapathOption.DatapathModeVeth,
+			datapathOption.DatapathModeNetkit, datapathOption.DatapathModeNetkitL2))
 	option.BindEnv(vp, option.DatapathMode)
 
 	flags.Bool(option.EnableEndpointRoutes, defaults.EnableEndpointRoutes, "Use per endpoint routes instead of routing via cilium_host")
@@ -213,6 +208,9 @@ func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
 	flags.Bool(option.EnableIPv6Name, defaults.EnableIPv6, "Enable IPv6 support")
 	option.BindEnv(vp, option.EnableIPv6Name)
 
+	flags.Bool(option.PreferIpv6Name, defaults.PreferIpv6, "Prefer IPv6 addresses over IPv4 when both are available")
+	option.BindEnv(vp, option.PreferIpv6Name)
+
 	flags.Bool(option.EnableNat46X64Gateway, false, "Enable NAT46 and NAT64 gateway")
 	option.BindEnv(vp, option.EnableNat46X64Gateway)
 
@@ -226,6 +224,10 @@ func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
 	flags.MarkHidden(option.EnableSRv6)
 	option.BindEnv(vp, option.EnableSRv6)
 
+	flags.Bool(option.EnableFibTableIDAnnotation, defaults.EnableFibTableIDAnnotation, "Enable parsing of the network.cilium.io/fib-table-id pod annotation for pod egress routing")
+	flags.MarkHidden(option.EnableFibTableIDAnnotation)
+	option.BindEnv(vp, option.EnableFibTableIDAnnotation)
+
 	flags.String(option.SRv6EncapModeName, defaults.SRv6EncapMode, "Encapsulation mode for SRv6 (\"srh\" or \"reduced\")")
 	flags.MarkHidden(option.SRv6EncapModeName)
 	option.BindEnv(vp, option.SRv6EncapModeName)
@@ -236,10 +238,8 @@ func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
 	flags.String(option.IPv6MCastDevice, "", "Device that joins a Solicited-Node multicast group for IPv6")
 	option.BindEnv(vp, option.IPv6MCastDevice)
 
-	flags.String(option.EncryptInterface, "", "Transparent encryption interface")
-	option.BindEnv(vp, option.EncryptInterface)
-
 	flags.Bool(option.EncryptNode, defaults.EncryptNode, "Enables encrypting traffic from non-Cilium pods and host networking (only supported with WireGuard, beta)")
+	flags.MarkDeprecated(option.EncryptNode, "This option is obsolete and will be removed in v1.22")
 	option.BindEnv(vp, option.EncryptNode)
 
 	flags.StringSlice(option.IPv4PodSubnets, []string{}, "List of IPv4 pod subnets to preconfigure for encryption")
@@ -328,14 +328,17 @@ func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
 	flags.Duration(option.L2AnnouncerRetryPeriod, 2*time.Second, "Timeout after a renew failure, before the next retry")
 	option.BindEnv(vp, option.L2AnnouncerRetryPeriod)
 
-	flags.Bool(option.EnableEncryptionStrictMode, false, "Enable encryption strict mode")
-	option.BindEnv(vp, option.EnableEncryptionStrictMode)
+	flags.Bool(option.EnableEncryptionStrictModeEgress, false, "Enable strict mode encryption enforcement for egress traffic")
+	option.BindEnv(vp, option.EnableEncryptionStrictModeEgress)
 
-	flags.String(option.EncryptionStrictModeCIDR, "", "In strict-mode encryption, all unencrypted traffic coming from this CIDR and going to this same CIDR will be dropped")
-	option.BindEnv(vp, option.EncryptionStrictModeCIDR)
+	flags.String(option.EncryptionStrictEgressCIDR, "", "In strict-mode-egress encryption, all unencrypted traffic coming from this CIDR and going to this same CIDR will be dropped.")
+	option.BindEnv(vp, option.EncryptionStrictEgressCIDR)
 
-	flags.Bool(option.EncryptionStrictModeAllowRemoteNodeIdentities, false, "Allows unencrypted traffic from pods to remote node identities within the strict mode CIDR. This is required when tunneling is used or direct routing is used and the node CIDR and pod CIDR overlap.")
-	option.BindEnv(vp, option.EncryptionStrictModeAllowRemoteNodeIdentities)
+	flags.Bool(option.EncryptionStrictEgressAllowRemoteNodeIdentities, false, "Allows unencrypted traffic from pods to remote node identities within the strict mode CIDR. This is required when tunneling is used or direct routing is used and the node CIDR and pod CIDR overlap.")
+	option.BindEnv(vp, option.EncryptionStrictEgressAllowRemoteNodeIdentities)
+
+	flags.Bool(option.EnableEncryptionStrictModeIngress, false, "Enable strict mode encryption enforcement for ingress traffic")
+	option.BindEnv(vp, option.EnableEncryptionStrictModeIngress)
 
 	flags.Var(option.NewMapOptions(&option.Config.FixedIdentityMapping, option.Config.FixedIdentityMappingValidator),
 		option.FixedIdentityMapping, "Key-value for the fixed identity mapping which allows to use reserved label for fixed identities, e.g. 128=kv-store,129=kube-dns")
@@ -356,19 +359,19 @@ func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
 	flags.String(option.IPAM, ipamOption.IPAMClusterPool, "Backend to use for IPAM")
 	option.BindEnv(vp, option.IPAM)
 
-	flags.String(option.IPv4Range, AutoCIDR, "Per-node IPv4 endpoint prefix, e.g. 10.16.0.0/16")
+	flags.String(option.IPv4Range, option.AutoCIDR, "Per-node IPv4 endpoint prefix, e.g. 10.16.0.0/16")
 	option.BindEnv(vp, option.IPv4Range)
 
-	flags.String(option.IPv6Range, AutoCIDR, "Per-node IPv6 endpoint prefix, e.g. fd02:1:1::/96")
+	flags.String(option.IPv6Range, option.AutoCIDR, "Per-node IPv6 endpoint prefix, e.g. fd02:1:1::/96")
 	option.BindEnv(vp, option.IPv6Range)
 
 	flags.String(option.IPv6ClusterAllocCIDRName, defaults.IPv6ClusterAllocCIDR, "IPv6 /64 CIDR used to allocate per node endpoint /96 CIDR")
 	option.BindEnv(vp, option.IPv6ClusterAllocCIDRName)
 
-	flags.String(option.IPv4ServiceRange, AutoCIDR, "Kubernetes IPv4 services CIDR if not inside cluster prefix")
+	flags.String(option.IPv4ServiceRange, option.AutoCIDR, "Kubernetes IPv4 services CIDR if not inside cluster prefix")
 	option.BindEnv(vp, option.IPv4ServiceRange)
 
-	flags.String(option.IPv6ServiceRange, AutoCIDR, "Kubernetes IPv6 services CIDR if not inside cluster prefix")
+	flags.String(option.IPv6ServiceRange, option.AutoCIDR, "Kubernetes IPv6 services CIDR if not inside cluster prefix")
 	option.BindEnv(vp, option.IPv6ServiceRange)
 
 	flags.String(option.K8sNamespaceName, "", "Name of the Kubernetes namespace in which Cilium is deployed in")
@@ -478,14 +481,6 @@ func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
 
 	flags.Bool(option.LogSystemLoadConfigName, false, "Enable periodic logging of system load")
 	option.BindEnv(vp, option.LogSystemLoadConfigName)
-
-	flags.String(option.ServiceLoopbackIPv4, defaults.ServiceLoopbackIPv4, "IPv4 source address to use for SNAT "+
-		"when a Pod talks to itself over a Service.")
-	option.BindEnv(vp, option.ServiceLoopbackIPv4)
-
-	flags.String(option.ServiceLoopbackIPv6, defaults.ServiceLoopbackIPv6, "IPv6 source address to use for SNAT "+
-		"when a Pod talks to itself over a Service.")
-	option.BindEnv(vp, option.ServiceLoopbackIPv6)
 
 	flags.Bool(option.EnableIPv4Masquerade, true, "Masquerade IPv4 traffic from endpoints leaving the host")
 	option.BindEnv(vp, option.EnableIPv4Masquerade)
@@ -652,6 +647,7 @@ func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
 	option.BindEnv(vp, option.FQDNRegexCompileLRUSize)
 
 	flags.String(option.ToFQDNsPreCache, defaults.ToFQDNsPreCache, "DNS cache data at this path is preloaded on agent startup")
+	flags.MarkDeprecated(option.ToFQDNsPreCache, "This option is obsolete and will be removed in v1.21")
 	option.BindEnv(vp, option.ToFQDNsPreCache)
 
 	flags.Int(option.DNSProxyConcurrencyLimit, 0, "Limit concurrency of DNS message processing")
@@ -682,7 +678,7 @@ func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
 	flags.Bool(option.PolicyAuditModeArg, false, "Enable policy audit (non-drop) mode")
 	option.BindEnv(vp, option.PolicyAuditModeArg)
 
-	flags.Bool(option.PolicyAccountingArg, true, "Enable policy accounting")
+	flags.Bool(option.PolicyAccountingArg, defaults.PolicyAccounting, "Maintain packet and byte counters for every policy entry")
 	option.BindEnv(vp, option.PolicyAccountingArg)
 
 	flags.Bool(option.EnableIPv4FragmentsTrackingName, defaults.EnableIPv4FragmentsTracking, "Enable IPv4 fragments tracking for L4-based lookups")
@@ -752,18 +748,6 @@ func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
 	flags.MarkHidden(option.TCFilterPriority)
 	option.BindEnv(vp, option.TCFilterPriority)
 
-	flags.Bool(option.EnableBGPControlPlane, false, "Enable the BGP control plane.")
-	option.BindEnv(vp, option.EnableBGPControlPlane)
-
-	flags.Bool(option.EnableBGPControlPlaneStatusReport, true, "Enable the BGP control plane status reporting")
-	option.BindEnv(vp, option.EnableBGPControlPlaneStatusReport)
-
-	flags.String(option.BGPRouterIDAllocationMode, option.BGPRouterIDAllocationModeDefault, "BGP router-id allocation mode. Currently supported values: 'default' or 'ip-pool'")
-	option.BindEnv(vp, option.BGPRouterIDAllocationMode)
-
-	flags.String(option.BGPRouterIDAllocationIPPool, "", "IP pool to allocate the BGP router-id from when the mode is 'ip-pool'")
-	option.BindEnv(vp, option.BGPRouterIDAllocationIPPool)
-
 	flags.Bool(option.EnablePMTUDiscovery, false, "Enable path MTU discovery to send ICMP fragmentation-needed replies to the client")
 	option.BindEnv(vp, option.EnablePMTUDiscovery)
 
@@ -774,6 +758,10 @@ func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
 	flags.MarkHidden(option.EnableK8sNetworkPolicy)
 	option.BindEnv(vp, option.EnableK8sNetworkPolicy)
 
+	flags.Bool(option.EnableK8sClusterNetworkPolicy, defaults.EnableK8sClusterNetworkPolicy, "Enable support for K8s ClusterNetworkPolicy")
+	flags.MarkHidden(option.EnableK8sClusterNetworkPolicy)
+	option.BindEnv(vp, option.EnableK8sClusterNetworkPolicy)
+
 	flags.Bool(option.EnableCiliumNetworkPolicy, defaults.EnableCiliumNetworkPolicy, "Enable support for Cilium Network Policy")
 	flags.MarkHidden(option.EnableCiliumNetworkPolicy)
 	option.BindEnv(vp, option.EnableCiliumNetworkPolicy)
@@ -782,7 +770,7 @@ func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
 	flags.MarkHidden(option.EnableCiliumClusterwideNetworkPolicy)
 	option.BindEnv(vp, option.EnableCiliumClusterwideNetworkPolicy)
 
-	flags.StringSlice(option.PolicyCIDRMatchMode, defaults.PolicyCIDRMatchMode, "The entities that can be selected by CIDR policy. Supported values: 'nodes'")
+	flags.StringSlice(option.PolicyCIDRMatchMode, defaults.PolicyCIDRMatchMode, "The entities that can be selected by CIDR policy. Supported values: 'nodes', 'pods'")
 	option.BindEnv(vp, option.PolicyCIDRMatchMode)
 
 	flags.Duration(option.MaxInternalTimerDelay, defaults.MaxInternalTimerDelay, "Maximum internal timer value across the entire agent. Use in test environments to detect race conditions in agent logic.")
@@ -818,6 +806,10 @@ func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
 	flags.Bool(option.EnableCiliumNodeCRDName, defaults.EnableCiliumNodeCRD, "Enable use of CiliumNode CRD")
 	flags.MarkHidden(option.EnableCiliumNodeCRDName)
 	option.BindEnv(vp, option.EnableCiliumNodeCRDName)
+
+	flags.Bool(option.EnableDatapathPlugins, defaults.EnableDatapathPlugins, "Enable use of datapath plugins and the CiliumDatapathPlugins CRD")
+	flags.MarkHidden(option.EnableDatapathPlugins)
+	option.BindEnv(vp, option.EnableDatapathPlugins)
 
 	if err := vp.BindPFlags(flags); err != nil {
 		logging.Fatal(logger, "BindPFlags failed", logfields.Error, err)
@@ -871,9 +863,6 @@ func initDaemonConfigAndLogging(vp *viper.Viper) {
 }
 
 func initEnv(logger *slog.Logger, vp *viper.Viper) {
-	bootstrapStats.earlyInit.Start()
-	defer bootstrapStats.earlyInit.End(true)
-
 	var debugDatapath bool
 
 	option.LogRegisteredSlogOptions(vp, logger)
@@ -953,7 +942,7 @@ func initEnv(logger *slog.Logger, vp *viper.Viper) {
 
 	// Creating Envoy sockets directory for cases which doesn't provide a volume mount
 	// (e.g. embedded Envoy, external workload in ClusterMesh scenario)
-	if err := os.MkdirAll(envoy.GetSocketDir(option.Config.RunDir), defaults.RuntimePathRights); err != nil {
+	if err := os.MkdirAll(util.GetSocketDir(option.Config.RunDir), defaults.RuntimePathRights); err != nil {
 		logging.Fatal(scopedLog, "Could not create envoy sockets directory", logfields.Error, err)
 	}
 
@@ -990,8 +979,8 @@ func initEnv(logger *slog.Logger, vp *viper.Viper) {
 		)
 	}
 
-	option.Config.AllowLocalhost = strings.ToLower(option.Config.AllowLocalhost)
-	switch option.Config.AllowLocalhost {
+	option.Config.UnsafeDaemonConfigOption.AllowLocalhost = strings.ToLower(option.Config.UnsafeDaemonConfigOption.AllowLocalhost)
+	switch option.Config.UnsafeDaemonConfigOption.AllowLocalhost {
 	case option.AllowLocalhostAlways, option.AllowLocalhostAuto, option.AllowLocalhostPolicy:
 	default:
 		logging.Fatal(scopedLog, fmt.Sprintf("Invalid setting for --allow-localhost, must be { %s, %s, %s }",
@@ -1030,9 +1019,7 @@ func initEnv(logger *slog.Logger, vp *viper.Viper) {
 	option.Config.Opts.SetBool(option.PolicyVerdictNotify, option.Config.BPFEventsPolicyVerdictEnabled)
 	option.Config.Opts.SetBool(option.TraceNotify, option.Config.BPFEventsTraceEnabled)
 	option.Config.Opts.SetBool(option.PolicyTracing, option.Config.EnableTracing)
-	option.Config.Opts.SetBool(option.ConntrackAccounting, option.Config.BPFConntrackAccounting)
 	option.Config.Opts.SetBool(option.PolicyAuditMode, option.Config.PolicyAuditMode)
-	option.Config.Opts.SetBool(option.PolicyAccounting, option.Config.PolicyAccounting)
 	option.Config.Opts.SetBool(option.SourceIPVerification, option.Config.EnableSourceIPVerification)
 
 	monitorAggregationLevel, err := option.ParseMonitorAggregationLevel(option.Config.MonitorAggregation)
@@ -1057,31 +1044,16 @@ func initEnv(logger *slog.Logger, vp *viper.Viper) {
 		logging.Fatal(logger, "Unable to parse Label prefix configuration", logfields.Error, err)
 	}
 
-	switch option.Config.DatapathMode {
-	case datapathOption.DatapathModeVeth:
-	case datapathOption.DatapathModeNetkit, datapathOption.DatapathModeNetkitL2:
-		// For netkit we enable also tcx for all non-netkit devices.
-		// The underlying kernel does support it given tcx got merged
-		// before netkit and supporting legacy tc in this context does
-		// not make any sense whatsoever.
-		option.Config.EnableTCX = true
-		if err := probes.HaveNetkit(); err != nil {
-			logging.Fatal(logger, "netkit devices need kernel 6.7.0 or newer and CONFIG_NETKIT")
-		}
-	default:
-		logging.Fatal(logger, "Invalid datapath mode", logfields.DatapathMode, option.Config.DatapathMode)
-	}
-
-	if option.Config.EnableL7Proxy && !option.Config.InstallIptRules {
-		logging.Fatal(logger, "L7 proxy requires iptables rules (--install-iptables-rules=\"true\")")
+	if option.Config.EnableL7Proxy && !option.Config.InstallIptRules && !option.Config.EnableBPFTProxy {
+		logging.Fatal(logger, "L7 proxy requires iptables rules (--install-iptables-rules=\"true\") or BPF TProxy (--enable-bpf-tproxy=\"true\")")
 	}
 
 	if option.Config.EnableRemoteNodeMasquerade && !option.Config.EnableBPFMasquerade {
 		logging.Fatal(logger, "Option "+option.EnableRemoteNodeMasquerade+" requires BPF masquerade to be enabled ("+option.EnableBPFMasquerade+")")
 	}
 
-	if option.Config.TunnelingEnabled() && option.Config.EnableAutoDirectRouting {
-		logging.Fatal(logger, fmt.Sprintf("%s cannot be used with tunneling. Packets must be routed through the tunnel device.", option.EnableAutoDirectRoutingName))
+	if !option.Config.RequiresNativeRouting() && option.Config.EnableAutoDirectRouting {
+		logging.Fatal(logger, fmt.Sprintf("%s requires native or hybrid routing mode.", option.EnableAutoDirectRoutingName))
 	}
 
 	initClockSourceOption(logger)
@@ -1105,12 +1077,8 @@ func initEnv(logger *slog.Logger, vp *viper.Viper) {
 	}
 
 	if option.Config.LocalRouterIPv4 != "" || option.Config.LocalRouterIPv6 != "" {
-		// TODO(weil0ng): add a proper check for ipam in PR# 15429.
-		if option.Config.TunnelingEnabled() {
-			logging.Fatal(logger, fmt.Sprintf("Cannot specify %s or %s in tunnel mode.", option.LocalRouterIPv4, option.LocalRouterIPv6))
-		}
-		if !option.Config.EnableEndpointRoutes {
-			logging.Fatal(logger, fmt.Sprintf("Cannot specify %s or %s  without %s.", option.LocalRouterIPv4, option.LocalRouterIPv6, option.EnableEndpointRoutes))
+		if !option.Config.RequiresNativeRouting() {
+			logging.Fatal(logger, fmt.Sprintf("%s and %s require native or hybrid routing mode.", option.LocalRouterIPv4, option.LocalRouterIPv6))
 		}
 	}
 
@@ -1210,8 +1178,8 @@ type daemonConfigParams struct {
 	K8sClientConfig k8sClient.Config
 	KPRConfig       kpr.KPRConfig
 	KPRInitializer  kprinitializer.KPRInitializer
-	IPSecConfig     datapath.IPsecConfig
-	WireguardConfig wgTypes.WireguardConfig
+	IPSecConfig     ipsec.Config
+	WireguardConfig wgTypes.Config
 }
 
 type daemonParams struct {
@@ -1226,11 +1194,9 @@ type daemonParams struct {
 
 	Clientset           k8sClient.Clientset
 	KVStoreClient       kvstore.Client
-	WGAgent             wgTypes.WireguardAgent
+	WGAgent             wgTypes.Agent
 	LocalNodeStore      *node.LocalNodeStore
-	Resources           agentK8s.Resources
 	K8sWatcher          *watchers.K8sWatcher
-	NodeHandler         datapath.NodeHandler
 	EndpointManager     endpointmanager.EndpointManager
 	EndpointRestorer    *endpointRestorer
 	IdentityAllocator   identitycell.CachingIdentityAllocator
@@ -1239,13 +1205,12 @@ type daemonParams struct {
 	DB                  *statedb.DB
 	Devices             statedb.Table[*datapathTables.Device]
 	DirectRoutingDevice datapathTables.DirectRoutingDevice
-	IPsecAgent          datapath.IPsecAgent
+	IPsecAgent          ipsec.Agent
+	Orchestrator        endpointTypes.Orchestrator
 	SyncHostIPs         *syncHostIPs
 	NodeDiscovery       *nodediscovery.NodeDiscovery
-	IPAM                *ipam.IPAM
+	IPAMInitializer     *ipamcell.IPAMInitializer
 	CRDSyncPromise      promise.Promise[k8sSynced.CRDSync]
-	DNSProxy            bootstrap.FQDNProxyBootstrapper
-	DNSNameManager      namemanager.NameManager
 	KPRConfig           kpr.KPRConfig
 	KPRInitializer      kprinitializer.KPRInitializer
 	InfraIPAllocator    infraendpoints.InfraIPAllocator
@@ -1310,7 +1275,7 @@ func daemonLegacyInitialization(params daemonParams) legacy.DaemonInitialization
 				return fmt.Errorf("daemon configuration failed: %w", err)
 			}
 
-			params.Logger.Info("Daemon initialization completed", logfields.BootstrapTime, time.Since(bootstrapTimestamp))
+			params.Logger.Info("Daemon initialization completed")
 
 			if err := params.MonitorAgent.SendEvent(monitorAPI.MessageTypeAgent, monitorAPI.StartMessage(time.Now())); err != nil {
 				params.Logger.Warn("Failed to send agent start monitor message", logfields.Error, err)

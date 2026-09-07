@@ -21,30 +21,36 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	mcsapicontrollers "sigs.k8s.io/mcs-api/controllers"
-	mcsapiv1alpha1 "sigs.k8s.io/mcs-api/pkg/apis/v1alpha1"
+	mcsapiv1beta1 "sigs.k8s.io/mcs-api/pkg/apis/v1beta1"
 
 	"github.com/cilium/cilium/pkg/annotation"
+	cmnamespace "github.com/cilium/cilium/pkg/clustermesh/namespace"
 )
 
 var (
 	typeMetaSvcImport = metav1.TypeMeta{
 		Kind:       "ServiceImport",
-		APIVersion: mcsapiv1alpha1.GroupVersion.String(),
+		APIVersion: mcsapiv1beta1.GroupVersion.String(),
 	}
 	typeMetaSvcExport = metav1.TypeMeta{
 		Kind:       "ServiceExport",
-		APIVersion: mcsapiv1alpha1.GroupVersion.String(),
+		APIVersion: mcsapiv1beta1.GroupVersion.String(),
 	}
 
 	mcsFixtures = []client.Object{
-		&mcsapiv1alpha1.ServiceExport{
+		&corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "default",
+			},
+		},
+		&mcsapiv1beta1.ServiceExport{
 			TypeMeta: typeMetaSvcExport,
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "full",
 				Namespace: "default",
 			},
 		},
-		&mcsapiv1alpha1.ServiceImport{
+		&mcsapiv1beta1.ServiceImport{
 			TypeMeta: typeMetaSvcImport,
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "full",
@@ -54,13 +60,13 @@ var (
 					"test-annotation":        "copied",
 				},
 				Labels: map[string]string{
-					mcsapiv1alpha1.LabelSourceCluster: "not-used",
-					mcsapiv1alpha1.LabelServiceName:   "not-used",
-					"test-label":                      "copied",
+					mcsapiv1beta1.LabelSourceCluster: "not-used",
+					mcsapiv1beta1.LabelServiceName:   "not-used",
+					"test-label":                     "copied",
 				},
 			},
-			Spec: mcsapiv1alpha1.ServiceImportSpec{
-				Ports: []mcsapiv1alpha1.ServicePort{{
+			Spec: mcsapiv1beta1.ServiceImportSpec{
+				Ports: []mcsapiv1beta1.ServicePort{{
 					Name: "my-port-1",
 					Port: 42,
 				}, {
@@ -89,14 +95,14 @@ var (
 			},
 		},
 
-		&mcsapiv1alpha1.ServiceExport{
+		&mcsapiv1beta1.ServiceExport{
 			TypeMeta: typeMetaSvcExport,
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "full-update",
 				Namespace: "default",
 			},
 		},
-		&mcsapiv1alpha1.ServiceImport{
+		&mcsapiv1beta1.ServiceImport{
 			TypeMeta: typeMetaSvcImport,
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "full-update",
@@ -108,8 +114,8 @@ var (
 					"test-label": "copied",
 				},
 			},
-			Spec: mcsapiv1alpha1.ServiceImportSpec{
-				Ports: []mcsapiv1alpha1.ServicePort{{
+			Spec: mcsapiv1beta1.ServiceImportSpec{
+				Ports: []mcsapiv1beta1.ServicePort{{
 					Name: "my-port-1",
 					Port: 42,
 				}, {
@@ -148,7 +154,7 @@ var (
 			},
 		},
 
-		&mcsapiv1alpha1.ServiceImport{
+		&mcsapiv1beta1.ServiceImport{
 			TypeMeta: typeMetaSvcImport,
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "import-only",
@@ -157,25 +163,25 @@ var (
 					annotation.GlobalService: "not-used",
 				},
 				Labels: map[string]string{
-					mcsapiv1alpha1.LabelSourceCluster: "not-used",
+					mcsapiv1beta1.LabelSourceCluster: "not-used",
 				},
 			},
-			Spec: mcsapiv1alpha1.ServiceImportSpec{
-				Ports: []mcsapiv1alpha1.ServicePort{{
+			Spec: mcsapiv1beta1.ServiceImportSpec{
+				Ports: []mcsapiv1beta1.ServicePort{{
 					Name: "my-port-2",
 					Port: 42,
 				}},
 			},
 		},
 
-		&mcsapiv1alpha1.ServiceImport{
+		&mcsapiv1beta1.ServiceImport{
 			TypeMeta: typeMetaSvcImport,
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "import-and-local",
 				Namespace: "default",
 			},
-			Spec: mcsapiv1alpha1.ServiceImportSpec{
-				Ports: []mcsapiv1alpha1.ServicePort{{
+			Spec: mcsapiv1beta1.ServiceImportSpec{
+				Ports: []mcsapiv1beta1.ServicePort{{
 					Name: "my-port-2",
 					Port: 42,
 				}},
@@ -193,7 +199,7 @@ var (
 			},
 		},
 
-		&mcsapiv1alpha1.ServiceExport{
+		&mcsapiv1beta1.ServiceExport{
 			TypeMeta: typeMetaSvcExport,
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "export-only",
@@ -213,7 +219,7 @@ var (
 			},
 		},
 
-		&mcsapiv1alpha1.ServiceExport{
+		&mcsapiv1beta1.ServiceExport{
 			TypeMeta: typeMetaSvcExport,
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "export-no-svc",
@@ -221,14 +227,14 @@ var (
 			},
 		},
 
-		&mcsapiv1alpha1.ServiceImport{
+		&mcsapiv1beta1.ServiceImport{
 			TypeMeta: typeMetaSvcImport,
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "switch-to-headless",
 				Namespace: "default",
 			},
-			Spec: mcsapiv1alpha1.ServiceImportSpec{
-				Type: mcsapiv1alpha1.Headless,
+			Spec: mcsapiv1beta1.ServiceImportSpec{
+				Type: mcsapiv1beta1.Headless,
 			},
 		},
 		&corev1.Service{
@@ -243,7 +249,7 @@ var (
 func testScheme() *runtime.Scheme {
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-	utilruntime.Must(mcsapiv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(mcsapiv1beta1.AddToScheme(scheme))
 	return scheme
 }
 
@@ -253,8 +259,9 @@ func Test_mcsDerivedService_Reconcile(t *testing.T) {
 		WithScheme(testScheme()).
 		Build()
 	r := &mcsAPIServiceReconciler{
-		Client: c,
-		Logger: hivetest.Logger(t),
+		Client:          c,
+		Logger:          hivetest.Logger(t),
+		NamespaceConfig: cmnamespace.Config{GlobalNamespacesByDefault: true},
 	}
 
 	t.Run("Test service creation/update with export and import", func(t *testing.T) {
@@ -281,7 +288,7 @@ func Test_mcsDerivedService_Reconcile(t *testing.T) {
 			require.Len(t, svc.OwnerReferences, 1)
 			require.Equal(t, "ServiceImport", svc.OwnerReferences[0].Kind)
 
-			require.Equal(t, key.Name, svc.Labels[mcsapiv1alpha1.LabelServiceName])
+			require.Equal(t, key.Name, svc.Labels[mcsapiv1beta1.LabelServiceName])
 			require.Equal(t, "copied", svc.Labels["test-label"])
 
 			require.Equal(t, "true", svc.Annotations[annotation.GlobalService])
@@ -291,7 +298,7 @@ func Test_mcsDerivedService_Reconcile(t *testing.T) {
 			require.Equal(t, "my-port-1", svc.Spec.Ports[0].Name)
 			require.Equal(t, "my-port-target-port", svc.Spec.Ports[1].Name)
 
-			svcImport := &mcsapiv1alpha1.ServiceImport{}
+			svcImport := &mcsapiv1beta1.ServiceImport{}
 			err = c.Get(context.Background(), key, svcImport)
 			require.NoError(t, err)
 			require.Equal(t, keyDerived.Name, svcImport.Annotations[mcsapicontrollers.DerivedServiceAnnotation])
@@ -416,6 +423,110 @@ func Test_mcsDerivedService_Reconcile(t *testing.T) {
 		require.NoError(t, err)
 
 		require.Equal(t, corev1.ClusterIPNone, svc.Spec.ClusterIP)
+	})
+}
+
+func Test_mcsDerivedService_NonGlobalNamespace(t *testing.T) {
+	nonGlobalFixtures := []client.Object{
+		&corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "non-global-ns",
+				Annotations: map[string]string{
+					annotation.GlobalNamespace: "false",
+				},
+			},
+		},
+		&mcsapiv1beta1.ServiceImport{
+			TypeMeta: typeMetaSvcImport,
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "non-global-svc",
+				Namespace: "non-global-ns",
+			},
+			Spec: mcsapiv1beta1.ServiceImportSpec{
+				Ports: []mcsapiv1beta1.ServicePort{{
+					Name: "test-port",
+					Port: 80,
+				}},
+			},
+		},
+		&corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      derivedName(types.NamespacedName{Name: "non-global-svc", Namespace: "non-global-ns"}),
+				Namespace: "non-global-ns",
+			},
+			Spec: corev1.ServiceSpec{
+				ClusterIP:  "10.0.0.100",
+				ClusterIPs: []string{"10.0.0.100"},
+			},
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithObjects(nonGlobalFixtures...).
+		WithScheme(testScheme()).
+		Build()
+	r := &mcsAPIServiceReconciler{
+		Client:          c,
+		Logger:          hivetest.Logger(t),
+		NamespaceConfig: cmnamespace.Config{GlobalNamespacesByDefault: true},
+	}
+
+	t.Run("Test derived service deletion for non-global namespace", func(t *testing.T) {
+		key := types.NamespacedName{
+			Name:      "non-global-svc",
+			Namespace: "non-global-ns",
+		}
+		result, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: key,
+		})
+
+		require.NoError(t, err)
+		require.Equal(t, ctrl.Result{}, result, "Result should be empty")
+
+		keyDerived := types.NamespacedName{
+			Name:      derivedName(key),
+			Namespace: key.Namespace,
+		}
+		svc := &corev1.Service{}
+		err = c.Get(context.Background(), keyDerived, svc)
+		require.True(t, k8sApiErrors.IsNotFound(err), "Derived service should be deleted for non-global namespace")
+	})
+
+	t.Run("Test derived service not created for non-global namespace", func(t *testing.T) {
+		newSvcImport := &mcsapiv1beta1.ServiceImport{
+			TypeMeta: typeMetaSvcImport,
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "new-non-global-svc",
+				Namespace: "non-global-ns",
+			},
+			Spec: mcsapiv1beta1.ServiceImportSpec{
+				Ports: []mcsapiv1beta1.ServicePort{{
+					Name: "test-port",
+					Port: 80,
+				}},
+			},
+		}
+		err := c.Create(context.Background(), newSvcImport)
+		require.NoError(t, err)
+
+		key := types.NamespacedName{
+			Name:      "new-non-global-svc",
+			Namespace: "non-global-ns",
+		}
+		result, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: key,
+		})
+
+		require.NoError(t, err)
+		require.Equal(t, ctrl.Result{}, result, "Result should be empty")
+
+		keyDerived := types.NamespacedName{
+			Name:      derivedName(key),
+			Namespace: key.Namespace,
+		}
+		svc := &corev1.Service{}
+		err = c.Get(context.Background(), keyDerived, svc)
+		require.True(t, k8sApiErrors.IsNotFound(err), "Derived service should not be created for non-global namespace")
 	})
 }
 

@@ -9,13 +9,15 @@ import (
 	"log/slog"
 	"maps"
 	"net"
+	"net/netip"
 
 	"github.com/cilium/hive/cell"
 
 	agentK8s "github.com/cilium/cilium/daemon/k8s"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
+	ipsec "github.com/cilium/cilium/pkg/datapath/linux/ipsec/types"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
-	datapath "github.com/cilium/cilium/pkg/datapath/types"
-	"github.com/cilium/cilium/pkg/identity"
+	iputil "github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/k8s"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/resource"
@@ -39,15 +41,22 @@ var LocalNodeSyncCell = cell.Module(
 	cell.Provide(newLocalNodeSynchronizer),
 )
 
+// InitFunc is called before during startup to fill in the local node before other
+// sub-systems can access it. This is called after the [node.LocalNode] is filled in
+// from configuration and k8s node.
+type InitFunc func(context.Context, *node.LocalNode) error
+
 type localNodeSynchronizerParams struct {
 	cell.In
 
 	Logger             *slog.Logger
 	Config             *option.DaemonConfig
+	ClusterInfo        cmtypes.ClusterInfo
 	TunnelConfig       tunnel.Config
 	K8sLocalNode       agentK8s.LocalNodeResource
 	K8sCiliumLocalNode agentK8s.LocalCiliumNodeResource
-	IPsecConfig        datapath.IPsecConfig
+	IPsecConfig        ipsec.Config
+	ExtraInitFuncs     []InitFunc `group:"init-funcs"`
 }
 
 // localNodeSynchronizer performs the bootstrapping of the LocalNodeStore,
@@ -61,7 +70,6 @@ type localNodeSynchronizer struct {
 
 func (ini *localNodeSynchronizer) InitLocalNode(ctx context.Context, n *node.LocalNode) error {
 	n.Source = source.Local
-	n.NodeIdentity = uint32(identity.ReservedIdentityHost)
 
 	if err := ini.initFromConfig(n); err != nil {
 		return err
@@ -76,6 +84,12 @@ func (ini *localNodeSynchronizer) InitLocalNode(ctx context.Context, n *node.Loc
 	n.BootID = node.GetBootID(ini.Logger)
 	if ini.IPsecConfig.Enabled() && n.BootID == "" {
 		return fmt.Errorf("IPSec requires a valid BootID")
+	}
+
+	for _, fn := range ini.ExtraInitFuncs {
+		if err := fn(ctx, n); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -96,7 +110,7 @@ func (ini *localNodeSynchronizer) SyncLocalNode(ctx context.Context, store *node
 					ln.Local.IsBeingDeleted = true
 				})
 			}
-			new := parseNode(ini.Logger, ev.Object)
+			new := parseNode(ini.Logger, ev.Object, ini.ClusterInfo)
 			if !ini.mutableFieldsEqual(new) {
 				store.Update(func(ln *node.LocalNode) {
 					ini.syncFromK8s(ln, new)
@@ -122,8 +136,8 @@ func newLocalNodeSynchronizer(p localNodeSynchronizerParams) node.LocalNodeSynch
 }
 
 func (ini *localNodeSynchronizer) initFromConfig(n *node.LocalNode) error {
-	n.Cluster = ini.Config.ClusterName
-	n.ClusterID = ini.Config.ClusterID
+	n.Cluster = ini.ClusterInfo.Name
+	n.ClusterID = ini.ClusterInfo.ID
 	n.Name = nodeTypes.GetName()
 
 	n.Local.IPv4NativeRoutingCIDR = ini.Config.IPv4NativeRoutingCIDR
@@ -193,7 +207,7 @@ func (ini *localNodeSynchronizer) initFromK8s(ctx context.Context, node *node.Lo
 	if err != nil {
 		return err
 	}
-	parsedNode := parseNode(ini.Logger, k8sNode)
+	parsedNode := parseNode(ini.Logger, k8sNode, ini.ClusterInfo)
 
 	// Initialize the fields in local node where the source of truth is in Kubernetes.
 	// Later stages will deal with updating rest of the fields depending on configuration.
@@ -227,11 +241,13 @@ func (ini *localNodeSynchronizer) initFromK8s(ctx context.Context, node *node.Lo
 
 		if ini.Config.EnableHealthChecking && ini.Config.EnableEndpointHealthChecking {
 			if ini.Config.EnableIPv4 {
-				node.IPv4HealthIP = net.ParseIP(k8sCiliumNode.Spec.HealthAddressing.IPv4)
+				addr, _ := netip.ParseAddr(k8sCiliumNode.Spec.HealthAddressing.IPv4)
+				node.IPv4HealthIP = iputil.AddrFrom(addr)
 			}
 
 			if ini.Config.EnableIPv6 {
-				node.IPv6HealthIP = net.ParseIP(k8sCiliumNode.Spec.HealthAddressing.IPv6)
+				addr, _ := netip.ParseAddr(k8sCiliumNode.Spec.HealthAddressing.IPv6)
+				node.IPv6HealthIP = iputil.AddrFrom(addr)
 			}
 		}
 	} else {
@@ -293,9 +309,9 @@ func (ini *localNodeSynchronizer) syncFromK8s(ln, new *node.LocalNode) {
 	)
 }
 
-func parseNode(logger *slog.Logger, k8sNode *slim_corev1.Node) *node.LocalNode {
+func parseNode(logger *slog.Logger, k8sNode *slim_corev1.Node, clusterInfo cmtypes.ClusterInfo) *node.LocalNode {
 	return &node.LocalNode{
-		Node: *k8s.ParseNode(logger, k8sNode, source.Kubernetes),
+		Node: *k8s.ParseNode(logger, k8sNode, source.Kubernetes, clusterInfo),
 		Local: &node.LocalNodeInfo{
 			UID:        k8sNode.GetUID(),
 			ProviderID: k8sNode.Spec.ProviderID,

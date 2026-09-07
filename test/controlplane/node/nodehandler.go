@@ -5,20 +5,20 @@ package node
 
 import (
 	"fmt"
+	"net/netip"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/cilium/cilium/pkg/cidr"
-	fakeTypes "github.com/cilium/cilium/pkg/datapath/fake/types"
+	fakenode "github.com/cilium/cilium/pkg/node/fake"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/test/controlplane"
 	"github.com/cilium/cilium/test/controlplane/suite"
 )
 
 var (
-	podCIDR = cidr.MustParseCIDR("10.0.1.0/24")
+	podCIDR = netip.MustParsePrefix("10.0.1.0/24")
 
 	minimalNode = &corev1.Node{
 		TypeMeta:   metav1.TypeMeta{Kind: "Node", APIVersion: "v1"},
@@ -37,7 +37,7 @@ var (
 	}
 )
 
-func validateNodes(fnh *fakeTypes.FakeNodeHandler) error {
+func validateNodes(fnh *fakenode.Handler) error {
 	nodes := fnh.Nodes
 
 	if len(nodes) != 1 {
@@ -53,8 +53,8 @@ func validateNodes(fnh *fakeTypes.FakeNodeHandler) error {
 		return fmt.Errorf("name mismatch: %q vs %q", "minimal", minimal.Name)
 	}
 
-	if !podCIDR.Equal(minimal.IPv4AllocCIDR) {
-		return fmt.Errorf("cidr mismatch: %q vs %q", podCIDR, minimal)
+	if minimal.IPv4AllocCIDR.Prefix.Prefix != podCIDR {
+		return fmt.Errorf("cidr mismatch: %q vs %q", podCIDR, minimal.IPv4AllocCIDR)
 	}
 
 	return nil

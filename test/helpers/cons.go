@@ -25,9 +25,6 @@ var (
 	// than ShortCommandTimeout, but less time than HelperTimeout to execute.
 	MidCommandTimeout = 30 * time.Second
 
-	// CiliumStartTimeout is a predefined timeout value for Cilium startup.
-	CiliumStartTimeout = 100 * time.Second
-
 	// CheckLogs newtes a new buffer where all the warnings and checks that
 	// happens during the test are saved. This buffer will be printed in the
 	// test output inside <checks> labels.
@@ -43,18 +40,11 @@ const (
 	K8sManifestBase = "k8s/manifests"
 
 	// VM / Test suite constants.
-	K8s     = "k8s"
-	K8s1    = "k8s1"
-	K8s2    = "k8s2"
-	K8s3    = "k8s3"
-	Runtime = "runtime"
+	K8s  = "k8s"
+	K8s1 = "k8s1"
+	K8s2 = "k8s2"
 
-	Enabled  = "enabled"
-	Disabled = "disabled"
-	Total    = "total"
-	Public   = "public"
-	Private  = "private"
-	Name     = "Name"
+	Enabled = "enabled"
 
 	// CiliumAgentLabel is the label used for Cilium
 	CiliumAgentLabel = "k8s-app=cilium"
@@ -70,33 +60,12 @@ const (
 	// for Cilium.
 	PolicyEnforcementDefault = "default"
 
-	// PolicyEnforcementAlways represents the PolicyEnforcement mode
-	// for Cilium in which traffic is denied by default even when no policy
-	// is imported.
-	PolicyEnforcementAlways = "always"
-
-	// CiliumDockerNetwork is the name of the Docker network which Cilium manages.
-	CiliumDockerNetwork = "cilium-net"
-
-	// HostDockerNetwork is the name of the host network driver.
-	HostDockerNetwork = "host"
-
-	// WorldDockerNetwork is the name of the docker network that is *not*
-	// managed by Cilium, intended to be treated as "world" for identity
-	// purposes (for policy tests).
-	WorldDockerNetwork = "world"
-
 	// Names of commonly used containers in tests.
-	Httpd1      = "httpd1"
-	Httpd2      = "httpd2"
-	Httpd3      = "httpd3"
-	App1        = "app1"
-	App2        = "app2"
-	App3        = "app3"
-	Client      = "client"
-	Server      = "server"
-	Host        = "host"
-	WorldHttpd1 = "WorldHttpd1"
+	App1   = "app1"
+	App2   = "app2"
+	App3   = "app3"
+	Client = "client"
+	Host   = "host"
 	// Container lifecycle actions.
 	Create = "create"
 	Delete = "delete"
@@ -108,13 +77,6 @@ const (
 	// LogPerm is the permission for files that are created by this framework
 	// that contain logs, outputs of Cilium CLI commands, etc.
 	LogPerm = os.FileMode(0666)
-
-	// Configuration options for endpoints. Copied from endpoint/endpoint.go
-	// TODO: these should be converted into types for use in configuration
-	// functions instead of using basic strings.
-
-	OptionConntrackAccounting = "ConntrackAccounting"
-	OptionEnabled             = "Enabled"
 
 	PingCount   = 5
 	PingTimeout = 5
@@ -135,18 +97,9 @@ const (
 	CiliumNamespaceDefault = KubeSystemNamespace
 
 	TestResultsPath = "test_results/"
-	RunDir          = "/var/run/cilium"
-	LibDir          = "/var/lib/cilium"
-
-	DaemonName             = "cilium"
-	CiliumBugtool          = "cilium-bugtool"
-	CiliumBugtoolArgs      = "--exclude-object-files"
-	CiliumDockerDaemonName = "cilium-docker"
 
 	KubectlDelete = ResourceLifeCycleAction("delete")
 	KubectlApply  = ResourceLifeCycleAction("apply")
-
-	MonitorLogFileName = "monitor.log"
 
 	// CiliumTestLog is the filename where the cilium logs that happens during
 	// the test are saved.
@@ -159,17 +112,6 @@ const (
 	// CiliumOperatorTestLog is the filename where the cilium operator logs that happens during
 	// the test are saved.
 	CiliumOperatorTestLog = "cilium-operator-test.log"
-
-	// FakeIPv4WorldAddress is an IP which is used in some datapath tests
-	// for simulating external IPv4 connectivity.
-	FakeIPv4WorldAddress = "192.168.254.254"
-
-	// FakeIPv6WorldAddress is an IP which is used in some datapath tests
-	// for simulating external IPv6 connectivity.
-	FakeIPv6WorldAddress = "fdff::ff"
-
-	// DockerBridgeIP is the IP on the docker0 bridge
-	DockerBridgeIP = "172.17.0.1"
 
 	// Logs messages that should not be in the cilium logs...
 	panicMessage        = "panic:"
@@ -185,28 +127,30 @@ const (
 	emptyIPNodeIDAlloc  = "Attempt to allocate a node ID for an empty node IP address"
 
 	// ...and their exceptions.
-	opCantBeFulfilled          = "Operation cannot be fulfilled on leases.coordination.k8s.io"        // cf. https://github.com/cilium/cilium/issues/16402
-	initLeaderElection         = "error initially creating leader election record: leases."           // cf. https://github.com/cilium/cilium/issues/16402#issuecomment-861544964
-	globalDataSupport          = "kernel doesn't support global data"                                 // cf. https://github.com/cilium/cilium/issues/16418
-	failedToListCRDs           = "the server could not find the requested resource"                   // cf. https://github.com/cilium/cilium/issues/16425
-	retrieveResLock            = "retrieving resource lock kube-system/cilium-operator-resource-lock" // cf. https://github.com/cilium/cilium/issues/16402#issuecomment-871155492
-	failedToRelLockEmptyName   = "Failed to release lock: resource name may not be empty"             // cf. https://github.com/cilium/cilium/issues/16402#issuecomment-985819560
-	failedToUpdateLock         = "Failed to update lock"
-	failedToReleaseLock        = "Failed to release lock:"
-	errorCreatingInitialLeader = "error initially creating leader election record:"
-	cantEnableJIT              = "bpf_jit_enable: no such file or directory"                             // Because we run tests in Kind.
-	delMissingService          = "Deleting no longer present service"                                    // cf. https://github.com/cilium/cilium/issues/29679
-	podCIDRUnavailable         = " PodCIDR not available"                                                // cf. https://github.com/cilium/cilium/issues/29680
-	unableGetNode              = "Unable to get node resource"                                           // cf. https://github.com/cilium/cilium/issues/29710
-	objectHasBeenModified      = "the object has been modified; please apply your changes"               // cf. https://github.com/cilium/cilium/issues/29712
-	etcdTimeout                = "etcd client timeout exceeded"                                          // cf. https://github.com/cilium/cilium/issues/29714
-	endpointRestoreFailed      = "Unable to restore endpoint, ignoring"                                  // cf. https://github.com/cilium/cilium/issues/29716
-	cantFindIdentityInCache    = "unable to release identity: unable to find key in local cache"         // cf. https://github.com/cilium/cilium/issues/29732
-	keyAllocFailedFoundMaster  = "Found master key after proceeding with new allocation"                 // cf. https://github.com/cilium/cilium/issues/29738
-	cantRecreateMasterKey      = "unable to re-create missing master key"                                // cf. https://github.com/cilium/cilium/issues/29738
-	cantUpdateCRDIdentity      = "Unable update CRD identity information with a reference for this node" // cf. https://github.com/cilium/cilium/issues/29739
-	cantDeleteFromPolicyMap    = "cilium_call_policy: delete: key does not exist"                        // cf. https://github.com/cilium/cilium/issues/29754
-	mutationDetector           = "Mutation detector is enabled, this will result in memory leakage."     // cf. https://github.com/cilium/cilium/issues/35929
+	opCantBeFulfilled                 = "Operation cannot be fulfilled on leases.coordination.k8s.io"        // cf. https://github.com/cilium/cilium/issues/16402
+	initLeaderElection                = "error initially creating leader election record: leases."           // cf. https://github.com/cilium/cilium/issues/16402#issuecomment-861544964
+	globalDataSupport                 = "kernel doesn't support global data"                                 // cf. https://github.com/cilium/cilium/issues/16418
+	failedToListCRDs                  = "the server could not find the requested resource"                   // cf. https://github.com/cilium/cilium/issues/16425
+	retrieveResLock                   = "retrieving resource lock kube-system/cilium-operator-resource-lock" // cf. https://github.com/cilium/cilium/issues/16402#issuecomment-871155492
+	failedToRelLockEmptyName          = "Failed to release lock: resource name may not be empty"             // cf. https://github.com/cilium/cilium/issues/16402#issuecomment-985819560
+	failedToUpdateLock                = "Failed to update lock"
+	failedToReleaseLock               = "Failed to release lock:"
+	errorCreatingInitialLeader        = "error initially creating leader election record:"
+	failedToRetrieveLock              = "Error retrieving lease lock"                                           // cf. https://github.com/cilium/cilium/issues/45426 ; client-go v1.35+ renamed "error retrieving resource lock".
+	leaderElectionReadTimeout         = "(Client.Timeout or context cancellation while reading body)"           // cf. https://github.com/cilium/cilium/issues/45426 ; sibling of failedToRetrieveLock, matched on the cause so genuine read failures still fail.
+	cantEnableJIT                     = "bpf_jit_enable: no such file or directory"                             // Because we run tests in Kind.
+	podCIDRUnavailable                = " PodCIDR not available"                                                // cf. https://github.com/cilium/cilium/issues/29680
+	unableGetNode                     = "Unable to get node resource"                                           // cf. https://github.com/cilium/cilium/issues/29710
+	objectHasBeenModified             = "the object has been modified; please apply your changes"               // cf. https://github.com/cilium/cilium/issues/29712
+	etcdTimeout                       = "etcd client timeout exceeded"                                          // cf. https://github.com/cilium/cilium/issues/29714
+	endpointRestoreFailed             = "Unable to restore endpoint, ignoring"                                  // cf. https://github.com/cilium/cilium/issues/29716
+	cantFindIdentityInCache           = "unable to release identity: unable to find key in local cache"         // cf. https://github.com/cilium/cilium/issues/29732
+	keyAllocFailedFoundMaster         = "Found master key after proceeding with new allocation"                 // cf. https://github.com/cilium/cilium/issues/29738
+	cantRecreateMasterKey             = "unable to re-create missing master key"                                // cf. https://github.com/cilium/cilium/issues/29738
+	cantUpdateCRDIdentity             = "Unable update CRD identity information with a reference for this node" // cf. https://github.com/cilium/cilium/issues/29739
+	cantDeleteFromPolicyMap           = "cilium_call_policy: delete: key does not exist"                        // cf. https://github.com/cilium/cilium/issues/29754
+	mutationDetector                  = "Mutation detector is enabled, this will result in memory leakage."     // cf. https://github.com/cilium/cilium/issues/35929
+	errorCreatingInitialLeaderGEK8s35 = "Error initially creating lease lock"                                   // cf.
 	// HelmTemplate is the location of the Helm templates to install Cilium
 	HelmTemplate = "../install/kubernetes/cilium"
 
@@ -223,12 +167,9 @@ var (
 	LogGathererNamespace = CiliumNamespace
 )
 
-// Re-definitions of stable constants in the API. The re-definition is on
-// purpose to validate these values in the API. They may never change
+// Re-definition of a stable constant in the API. The re-definition is on
+// purpose to validate this value in the API. It may never change.
 const (
-	// ReservedIdentityHealth is equivalent to pkg/identity.ReservedIdentityHealth
-	ReservedIdentityHealth = 4
-
 	// ReservedIdentityHost is equivalent to pkg/identity.ReservedIdentityHost
 	ReservedIdentityHost = 1
 )
@@ -254,36 +195,21 @@ var badLogMessages = map[string][]string{
 	// error cannot be fixed in Cilium or in the test.
 	logutils.ErrorLogs: {opCantBeFulfilled, initLeaderElection, globalDataSupport,
 		failedToListCRDs, retrieveResLock, failedToRelLockEmptyName, failedToUpdateLock,
-		failedToReleaseLock, errorCreatingInitialLeader},
-	logutils.WarningLogs: {cantEnableJIT, delMissingService, podCIDRUnavailable,
-		unableGetNode, objectHasBeenModified, etcdTimeout, endpointRestoreFailed,
+		failedToReleaseLock, errorCreatingInitialLeader, errorCreatingInitialLeaderGEK8s35,
+		failedToRetrieveLock, leaderElectionReadTimeout},
+	logutils.WarningLogs: {cantEnableJIT, podCIDRUnavailable, unableGetNode,
+		objectHasBeenModified, etcdTimeout, endpointRestoreFailed,
 		cantFindIdentityInCache, keyAllocFailedFoundMaster, cantRecreateMasterKey,
 		cantUpdateCRDIdentity, cantDeleteFromPolicyMap, failedToListCRDs, mutationDetector},
 }
 
-var ciliumCLICommands = map[string]string{
-	"cilium-dbg endpoint list -o json":          "endpoint_list.txt",
-	"cilium-dbg service list -o json":           "service_list.txt",
-	"cilium-dbg config":                         "config.txt",
-	"sudo cilium-dbg bpf lb list":               "bpf_lb_list.txt",
-	"sudo cilium-dbg bpf ct list":               "bpf_ct_list.txt",
-	"sudo cilium-dbg bpf tunnel list":           "bpf_tunnel_list.txt",
-	"cilium-dbg policy get":                     "policy_get.txt",
-	"cilium-dbg status --all-controllers":       "status.txt",
-	"cilium-dbg kvstore get cilium --recursive": "kvstore_get.txt",
-
-	"hubble observe --since 4h -o jsonpb": "hubble_observe.json",
-}
-
-// ciliumKubCLICommands these commands are the same as `ciliumCLICommands` but
-// it'll run inside a container and it does not have sudo support
+// ciliumKubCLICommands are run inside a container and do not have sudo support.
 var ciliumKubCLICommands = map[string]string{
 	"cilium-dbg endpoint list -o json":    "endpoint_list.txt",
 	"cilium-dbg service list -o json":     "service_list.txt",
 	"cilium-dbg config":                   "config.txt",
 	"cilium-dbg bpf lb list":              "bpf_lb_list.txt",
 	"cilium-dbg bpf ct list":              "bpf_ct_list.txt",
-	"cilium-dbg bpf tunnel list":          "bpf_tunnel_list.txt",
 	"cilium-dbg policy get":               "policy_get.txt",
 	"cilium-dbg status --all-controllers": "status.txt",
 

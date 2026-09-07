@@ -83,6 +83,7 @@ type ConnectivityTest struct {
 	echoExternalServices map[string]Service
 	ingressService       map[string]Service
 	l7LBService          map[string]Service
+	l7LBNonL7Service     map[string]Service
 	k8sService           Service
 	lrpClientPods        map[string]Pod
 	lrpBackendPods       map[string]Pod
@@ -246,6 +247,7 @@ func NewConnectivityTest(
 		echoExternalServices:     make(map[string]Service),
 		ingressService:           make(map[string]Service),
 		l7LBService:              make(map[string]Service),
+		l7LBNonL7Service:         make(map[string]Service),
 		hostNetNSPodsByNode:      make(map[string]Pod),
 		secondaryNetworkNodeIPv4: make(map[string]string),
 		secondaryNetworkNodeIPv6: make(map[string]string),
@@ -407,6 +409,15 @@ func (ct *ConnectivityTest) setupAndValidatePerf(ctx context.Context, _ SetupHoo
 		return err
 	}
 
+	// The perf suite is also run without Cilium, to collect baseline numbers.
+	if err := ct.initCiliumPods(ctx); errors.Is(err, errNoCiliumPods) {
+		ct.Warnf("Skipping Cilium version detection: %s", err)
+	} else if err != nil {
+		return err
+	} else if err := ct.detectCiliumVersion(ctx); err != nil {
+		return err
+	}
+
 	if err := ct.deployPerf(ctx); err != nil {
 		return err
 	}
@@ -495,7 +506,7 @@ func (ct *ConnectivityTest) PrintReport(ctx context.Context) error {
 				defer wg.Done()
 
 				ct.Debugf("Flushing CT entries in %s/%s", pod.Pod.Namespace, pod.Pod.Name)
-				_, err := pod.K8sClient.ExecInPod(ctx, pod.Pod.Namespace, pod.Pod.Name, defaults.AgentContainerName, cmd)
+				_, err := ct.execInPodWithTransportRetry(ctx, pod.K8sClient, pod.Pod.Namespace, pod.Pod.Name, defaults.AgentContainerName, cmd)
 				if err != nil {
 					ct.Fatalf("failed to flush ct entries: %v", err)
 				}
@@ -572,6 +583,9 @@ func (ct *ConnectivityTest) report() error {
 			ct.LogOwners(allScenarios...)
 		}
 
+		if ct.params.ExitZeroOnFailure {
+			return nil
+		}
 		return fmt.Errorf("[%s] %d tests failed", ct.params.TestNamespace, nf)
 	}
 
@@ -688,13 +702,13 @@ func (ct *ConnectivityTest) detectPodCIDRs() {
 		hostIPs := pod.Pod.Status.PodIPs
 
 		for _, cidr := range n.Spec.IPAM.PodCIDRs {
-			ct.params.PodCIDRs = append(ct.params.PodCIDRs, toPodCIDRs(cidr, hostIPs...)...)
+			ct.params.PodCIDRs = append(ct.params.PodCIDRs, toPodCIDRs(cidr.String(), hostIPs...)...)
 		}
 
 		// additional IP pools from multi-pool IPAM mode
 		for _, pool := range n.Spec.IPAM.Pools.Allocated {
 			for _, podCIDR := range pool.CIDRs {
-				ct.params.PodCIDRs = append(ct.params.PodCIDRs, toPodCIDRs(string(podCIDR), hostIPs...)...)
+				ct.params.PodCIDRs = append(ct.params.PodCIDRs, toPodCIDRs(podCIDR.String(), hostIPs...)...)
 			}
 		}
 	}
@@ -806,24 +820,72 @@ func (ct *ConnectivityTest) detectNodesWithoutCiliumIPs() error {
 	return nil
 }
 
-func (ct *ConnectivityTest) modifyStaticRoutesForNodesWithoutCilium(ctx context.Context, verb string) error {
+type ipRouteVerb string
+
+const (
+	verbAdd ipRouteVerb = "add"
+	verbDel ipRouteVerb = "del"
+)
+
+func (ct *ConnectivityTest) modifyStaticRoutesForNodesWithoutCilium(ctx context.Context, verb ipRouteVerb) error {
 	for _, e := range ct.params.PodCIDRs {
 		for withoutCilium := range ct.nodesWithoutCilium {
 			pod := ct.hostNetNSPodsByNode[withoutCilium]
-			_, err := ct.client.ExecInPod(ctx, pod.Pod.Namespace, pod.Pod.Name, hostNetNSDeploymentNameNonCilium,
-				[]string{"ip", "route", verb, e.CIDR, "via", e.HostIP},
+			_, err := ct.execInPodWithTransportRetry(ctx, ct.client, pod.Pod.Namespace, pod.Pod.Name, hostNetNSDeploymentNameNonCilium,
+				[]string{"ip", "route", string(verb), e.CIDR, "via", e.HostIP},
 			)
 			ct.Debugf("Modifying (%s) static route on nodes without Cilium (%v): %v",
 				verb, withoutCilium,
-				[]string{"ip", "route", verb, e.CIDR, "via", e.HostIP},
+				[]string{"ip", "route", string(verb), e.CIDR, "via", e.HostIP},
 			)
 			if err != nil {
+				if verb == verbDel {
+					// Ignore errors when deleting routes, as the route may not exist.
+					ct.Debugf("Ignoring error deleting static route: %v", err)
+					continue
+				}
 				return fmt.Errorf("failed to %s static route: %w", verb, err)
 			}
 		}
 	}
 
 	return nil
+}
+
+// NeedsStaticRoutes checks whether any test requires static ip routes
+// installed.
+func (ct *ConnectivityTest) NeedsStaticRoutes() bool {
+	// Static routes are only needed when running unsafe tests.
+	if !ct.params.IncludeUnsafeTests {
+		return false
+	}
+
+	// Static routes are only needed on kind. Cloud platforms have pod IP -> node IP
+	// connectivity.
+	if f, ok := ct.Feature(features.Flavor); ok && f.Enabled && f.Mode != "kind" {
+		return false
+	}
+
+	return slices.ContainsFunc(ct.tests, func(t *Test) bool {
+		return t.installIPRoutesFromOutsideToPodCIDRs
+	})
+}
+
+// SetupStaticRoutes idempotently sets up static routes for nodes without Cilium.
+func (ct *ConnectivityTest) SetupStaticRoutes(ctx context.Context) error {
+	if !ct.NeedsStaticRoutes() {
+		return nil
+	}
+	ct.modifyStaticRoutesForNodesWithoutCilium(ctx, verbDel)
+	return ct.modifyStaticRoutesForNodesWithoutCilium(ctx, verbAdd)
+}
+
+// TeardownStaticRoutes tears down static routes for nodes without Cilium.
+func (ct *ConnectivityTest) TeardownStaticRoutes(ctx context.Context) error {
+	if !ct.NeedsStaticRoutes() {
+		return nil
+	}
+	return ct.modifyStaticRoutesForNodesWithoutCilium(ctx, verbDel)
 }
 
 // multiClusterClientLock protects K8S client instantiation (Scheme registration)
@@ -872,9 +934,9 @@ func (ct *ConnectivityTest) detectSingleNode(ctx context.Context) error {
 	for _, n := range nodes.Items {
 		for _, t := range n.Spec.Taints {
 			switch {
-			case (t.Key == "node-role.kubernetes.io/master" && t.Effect == "NoSchedule"):
+			case (t.Key == "node-role.kubernetes.io/master" && t.Effect == slimcorev1.TaintEffectNoSchedule):
 				numWorkerNodes--
-			case (t.Key == "node-role.kubernetes.io/control-plane" && t.Effect == "NoSchedule"):
+			case (t.Key == "node-role.kubernetes.io/control-plane" && t.Effect == slimcorev1.TaintEffectNoSchedule):
 				numWorkerNodes--
 			}
 		}
@@ -917,6 +979,11 @@ func (ct *ConnectivityTest) initClients(ctx context.Context) error {
 	return nil
 }
 
+// errNoCiliumPods is returned by initCiliumPods when a cluster runs no Cilium
+// agent, so that callers which tolerate this can tell it apart from a failure
+// to reach the Kubernetes API.
+var errNoCiliumPods = errors.New("no cilium agent pods found")
+
 // initCiliumPods fetches the Cilium agent pod information from all clients
 func (ct *ConnectivityTest) initCiliumPods(ctx context.Context) error {
 	for _, client := range ct.clients.clients() {
@@ -925,7 +992,7 @@ func (ct *ConnectivityTest) initCiliumPods(ctx context.Context) error {
 			return fmt.Errorf("unable to list Cilium pods: %w", err)
 		}
 		if len(ciliumPods.Items) == 0 {
-			return fmt.Errorf("no cilium agent pods found in -n %s -l %s", ct.params.CiliumNamespace, ct.params.AgentPodSelector)
+			return fmt.Errorf("%w in -n %s -l %s", errNoCiliumPods, ct.params.CiliumNamespace, ct.params.AgentPodSelector)
 		}
 		for _, ciliumPod := range ciliumPods.Items {
 			// TODO: Can Cilium pod names collide across clusters?
@@ -1213,6 +1280,10 @@ func (ct *ConnectivityTest) L7LBService() map[string]Service {
 	return ct.l7LBService
 }
 
+func (ct *ConnectivityTest) L7LBNonL7Service() map[string]Service {
+	return ct.l7LBNonL7Service
+}
+
 func (ct *ConnectivityTest) K8sService() Service {
 	return ct.k8sService
 }
@@ -1339,6 +1410,13 @@ func (ct *ConnectivityTest) ForEachIPFamily(do func(features.IPFamily)) {
 			}
 		}
 	}
+}
+
+func (ct *ConnectivityTest) ShouldRunConnDisrupt() bool {
+	return ct.params.IncludeConnDisruptTest ||
+		ct.ShouldRunConnDisruptNSTraffic() ||
+		ct.ShouldRunConnDisruptL7Traffic() ||
+		ct.ShouldRunConnDisruptEgressGateway()
 }
 
 func (ct *ConnectivityTest) ShouldRunConnDisruptNSTraffic() bool {

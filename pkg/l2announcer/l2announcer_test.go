@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/utils/ptr"
@@ -44,14 +45,29 @@ type fixture struct {
 	stateDB            *statedb.DB
 	svcs               statedb.RWTable[*loadbalancer.Service]
 	fes                statedb.RWTable[*loadbalancer.Frontend]
-	fakePolicyStore    *fakeStore[*v2alpha1.CiliumL2AnnouncementPolicy]
+	bes                statedb.RWTable[*loadbalancer.Backend]
+
+	fakePolicyStore *fakeStore[*v2alpha1.CiliumL2AnnouncementPolicy]
 }
 
-func (f *fixture) insertService(svc *loadbalancer.Service, fes ...*loadbalancer.Frontend) {
+func (f *fixture) insertService(svc *loadbalancer.Service) {
 	wtxn := f.stateDB.WriteTxn(f.svcs, f.fes)
 	f.svcs.Insert(wtxn, svc)
+	wtxn.Commit()
+}
+
+func (f *fixture) insertFrontends(fes ...*loadbalancer.Frontend) {
+	wtxn := f.stateDB.WriteTxn(f.fes, f.bes)
 	for _, fe := range fes {
 		f.fes.Insert(wtxn, fe)
+	}
+	wtxn.Commit()
+}
+
+func (f *fixture) insertBackends(bes ...*loadbalancer.Backend) {
+	wtxn := f.stateDB.WriteTxn(f.bes)
+	for _, be := range bes {
+		f.bes.Insert(wtxn, be)
 	}
 	wtxn.Commit()
 }
@@ -61,6 +77,7 @@ func newFixture(t testing.TB) *fixture {
 		tbl    statedb.RWTable[*tables.L2AnnounceEntry]
 		svcs   statedb.RWTable[*loadbalancer.Service]
 		fes    statedb.RWTable[*loadbalancer.Frontend]
+		bes    statedb.RWTable[*loadbalancer.Backend]
 		db     *statedb.DB
 		jg     job.Group
 		logger = hivetest.Logger(t)
@@ -71,14 +88,23 @@ func newFixture(t testing.TB) *fixture {
 			tables.NewL2AnnounceTable,
 			loadbalancer.NewServicesTable,
 			loadbalancer.NewFrontendsTable,
+			loadbalancer.NewBackendsTable,
 			func() loadbalancer.Config { return loadbalancer.DefaultConfig },
 		),
-		cell.Invoke(func(d *statedb.DB, t statedb.RWTable[*tables.L2AnnounceEntry], svcs_ statedb.RWTable[*loadbalancer.Service], fes_ statedb.RWTable[*loadbalancer.Frontend], jg_ job.Group) {
+		cell.Invoke(func(
+			d *statedb.DB,
+			t statedb.RWTable[*tables.L2AnnounceEntry],
+			svcs_ statedb.RWTable[*loadbalancer.Service],
+			fes_ statedb.RWTable[*loadbalancer.Frontend],
+			bes_ statedb.RWTable[*loadbalancer.Backend],
+			jg_ job.Group,
+		) {
 			db = d
 			tbl = t
 			jg = jg_
 			svcs = svcs_
 			fes = fes_
+			bes = bes_
 		}),
 	).Populate(logger)
 
@@ -107,6 +133,7 @@ func newFixture(t testing.TB) *fixture {
 	announcer.params.JobGroup = jg
 	announcer.params.Services = svcs
 	announcer.params.Frontends = fes
+	announcer.params.Backends = bes
 	announcer.scopedGroup = announcer.params.JobGroup.Scoped("leader-election")
 
 	return &fixture{
@@ -115,6 +142,7 @@ func newFixture(t testing.TB) *fixture {
 		stateDB:            db,
 		svcs:               svcs,
 		fes:                fes,
+		bes:                bes,
 		fakePolicyStore:    fakePolicyStore,
 	}
 }
@@ -207,13 +235,14 @@ func bluePolicy() *v2alpha1.CiliumL2AnnouncementPolicy {
 	}
 }
 
-func blueService() (*loadbalancer.Service, *loadbalancer.Frontend) {
+func blueService() (*loadbalancer.Service, *loadbalancer.Frontend, *loadbalancer.Backend) {
 	svc := &loadbalancer.Service{
 		Name: loadbalancer.NewServiceName("default", "blue-service"),
 		Labels: labels.Labels{
 			"color": labels.NewLabel("color", "blue", "k8s"),
 		},
 	}
+
 	var addr loadbalancer.L3n4Addr
 	addr.ParseFromString("192.168.2.1:80/TCP")
 	fe := &loadbalancer.Frontend{
@@ -224,7 +253,17 @@ func blueService() (*loadbalancer.Service, *loadbalancer.Frontend) {
 		},
 		Service: svc,
 	}
-	return svc, fe
+
+	var beAddr loadbalancer.L3n4Addr
+	beAddr.ParseFromString("10.1.2.3:80/TCP")
+	be := &loadbalancer.Backend{
+		ServiceName: svc.Name,
+		Address:     beAddr,
+		NodeName:    blueNode().Name,
+		State:       loadbalancer.BackendStateActive,
+	}
+
+	return svc, fe, be
 }
 
 // Test the happy path, make sure that we create proxy neighbor entries
@@ -249,11 +288,13 @@ func TestHappyPath(t *testing.T) {
 		Done:   func(err error) {},
 	})
 	assert.NoError(t, err)
-	assert.Contains(t, fix.announcer.selectedPolicies, resource.NewKey(policy))
+	assert.Contains(t, fix.announcer.selectedPolicies, types.NamespacedName{Namespace: policy.Namespace, Name: policy.Name})
 
-	svc, fe := blueService()
-	fix.insertService(svc, fe)
-	err = fix.announcer.processSvcEvent(statedb.Change[*loadbalancer.Service]{
+	svc, fe, be := blueService()
+	fix.insertService(svc)
+	fix.insertFrontends(fe)
+	fix.insertBackends(be)
+	err = fix.announcer.processSvcEvent(fix.stateDB.ReadTxn(), statedb.Change[*loadbalancer.Service]{
 		Deleted: false,
 		Object:  svc,
 	})
@@ -284,7 +325,7 @@ func TestHappyPath(t *testing.T) {
 			IP:               fe.Address.Addr(),
 			NetworkInterface: policy.Spec.Interfaces[0],
 		},
-		Origins: []resource.Key{svcKey},
+		Origins: []types.NamespacedName{svcKey},
 	}, entries[0])
 }
 
@@ -308,9 +349,11 @@ func TestHappyPathPermutations(t *testing.T) {
 		assert.NoError(tt, err)
 	}
 	addService := func(fix *fixture, tt *testing.T) {
-		svc, fe := blueService()
-		fix.insertService(svc, fe)
-		err := fix.announcer.processSvcEvent(statedb.Change[*loadbalancer.Service]{
+		svc, fe, be := blueService()
+		fix.insertService(svc)
+		fix.insertFrontends(fe)
+		fix.insertBackends(be)
+		err := fix.announcer.processSvcEvent(fix.stateDB.ReadTxn(), statedb.Change[*loadbalancer.Service]{
 			Deleted: false,
 			Object:  svc,
 		})
@@ -346,7 +389,7 @@ func TestHappyPathPermutations(t *testing.T) {
 			entries := statedb.Collect(iter)
 			assert.Empty(tt, entries)
 
-			svc, fe := blueService()
+			svc, fe, _ := blueService()
 			if assert.Contains(tt, fix.announcer.selectedServices, serviceKey(svc)) {
 				err = fix.announcer.processLeaderEvent(leaderElectionEvent{
 					typ:             leaderElectionLeading,
@@ -364,7 +407,7 @@ func TestHappyPathPermutations(t *testing.T) {
 						IP:               fe.Address.Addr(),
 						NetworkInterface: bluePolicy().Spec.Interfaces[0],
 					},
-					Origins: []resource.Key{serviceKey(svc)},
+					Origins: []types.NamespacedName{serviceKey(svc)},
 				}, entries[0])
 			}
 		})
@@ -431,9 +474,11 @@ func TestPolicyRedundancy(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Add service policy
-	svc, fe := blueService()
-	fix.insertService(svc, fe)
-	err = fix.announcer.processSvcEvent(statedb.Change[*loadbalancer.Service]{
+	svc, fe, be := blueService()
+	fix.insertService(svc)
+	fix.insertFrontends(fe)
+	fix.insertBackends(be)
+	err = fix.announcer.processSvcEvent(fix.stateDB.ReadTxn(), statedb.Change[*loadbalancer.Service]{
 		Deleted: false,
 		Object:  svc,
 	})
@@ -465,7 +510,7 @@ func TestPolicyRedundancy(t *testing.T) {
 			IP:               fe.Address.Addr(),
 			NetworkInterface: policy.Spec.Interfaces[0],
 		},
-		Origins: []resource.Key{svcKey},
+		Origins: []types.NamespacedName{svcKey},
 	}, entries[0])
 
 	// Delete second policy
@@ -480,7 +525,7 @@ func TestPolicyRedundancy(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Assert only one policy selected
-	assert.Equal(t, []resource.Key{
+	assert.Equal(t, []types.NamespacedName{
 		policyKey(policy),
 	}, fix.announcer.selectedServices[svcKey].byPolicies)
 
@@ -494,7 +539,7 @@ func TestPolicyRedundancy(t *testing.T) {
 			IP:               fe.Address.Addr(),
 			NetworkInterface: policy.Spec.Interfaces[0],
 		},
-		Origins: []resource.Key{svcKey},
+		Origins: []types.NamespacedName{svcKey},
 	}, entries[0])
 }
 
@@ -525,9 +570,11 @@ func baseUpdateSetup(t *testing.T) *fixture {
 	require.Len(t, fix.announcer.selectedPolicies, 1)
 	require.Empty(t, fix.announcer.selectedServices)
 
-	svc, fe := blueService()
-	fix.insertService(svc, fe)
-	err = fix.announcer.processSvcEvent(statedb.Change[*loadbalancer.Service]{
+	svc, fe, be := blueService()
+	fix.insertService(svc)
+	fix.insertFrontends(fe)
+	fix.insertBackends(be)
+	err = fix.announcer.processSvcEvent(fix.stateDB.ReadTxn(), statedb.Change[*loadbalancer.Service]{
 		Deleted: false,
 		Object:  svc,
 	})
@@ -605,15 +652,19 @@ func TestUpdateHostLabels_AdditionalMatch(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Add a non matching service
-	svc, fe := blueService()
+	svc, fe, be := blueService()
 	svc.Name = loadbalancer.NewServiceName(svc.Name.Namespace(), "cyan-service")
 	svc.Labels = labels.Labels{
 		"hue": labels.NewLabel("hue", "cyan", "k8s"),
 	}
+	fix.insertService(svc)
+
 	fe.ServiceName = svc.Name
 	require.NoError(t, fe.Address.ParseFromString("192.168.2.2:80/TCP"))
-	fix.insertService(svc, fe)
-	err = fix.announcer.processSvcEvent(statedb.Change[*loadbalancer.Service]{
+	fix.insertFrontends(fe)
+
+	fix.insertBackends(be)
+	err = fix.announcer.processSvcEvent(fix.stateDB.ReadTxn(), statedb.Change[*loadbalancer.Service]{
 		Deleted: false,
 		Object:  svc,
 	})
@@ -692,15 +743,18 @@ func TestUpdatePolicy_AdditionalMatch(t *testing.T) {
 	fix := baseUpdateSetup(t)
 
 	// Add a non matching service
-	svc, fe := blueService()
+	svc, fe, be := blueService()
 	svc.Name = loadbalancer.NewServiceName(svc.Name.Namespace(), "cyan-service")
 	fe.ServiceName = svc.Name
+	be.ServiceName = svc.Name
 	svc.Labels = labels.Map2Labels(map[string]string{
 		"color": "cyan",
 	}, "k8s")
 	require.NoError(t, fe.Address.ParseFromString("192.168.2.2:80/TCP"))
-	fix.insertService(svc, fe)
-	err := fix.announcer.processSvcEvent(statedb.Change[*loadbalancer.Service]{
+	fix.insertService(svc)
+	fix.insertFrontends(fe)
+	fix.insertBackends(be)
+	err := fix.announcer.processSvcEvent(fix.stateDB.ReadTxn(), statedb.Change[*loadbalancer.Service]{
 		Deleted: false,
 		Object:  svc,
 	})
@@ -757,10 +811,12 @@ func TestPolicySelection(t *testing.T) {
 	assert.Len(t, fix.announcer.selectedServices, 1)
 
 	// A service with no externalIP and no LB IP should never be selected
-	svc, fe := blueService()
+	svc, fe, be := blueService()
 	fe.Type = loadbalancer.SVCTypeClusterIP
-	fix.insertService(svc, fe)
-	err = fix.announcer.processSvcEvent(statedb.Change[*loadbalancer.Service]{
+	fix.insertService(svc)
+	fix.insertFrontends(fe)
+	fix.insertBackends(be)
+	err = fix.announcer.processSvcEvent(fix.stateDB.ReadTxn(), statedb.Change[*loadbalancer.Service]{
 		Deleted: false,
 		Object:  svc,
 	})
@@ -787,10 +843,13 @@ func TestPolicySelection(t *testing.T) {
 	// Updating an existing non-selected service should not select it
 	svc = svc.Clone()
 	fe = fe.Clone()
+	be = be.Clone()
 	fe.Type = loadbalancer.SVCTypeExternalIPs
 	require.NoError(t, fe.Address.ParseFromString("192.168.2.2:80/TCP"))
-	fix.insertService(svc, fe)
-	err = fix.announcer.processSvcEvent(statedb.Change[*loadbalancer.Service]{
+	fix.insertService(svc)
+	fix.insertFrontends(fe)
+	fix.insertBackends(be)
+	err = fix.announcer.processSvcEvent(fix.stateDB.ReadTxn(), statedb.Change[*loadbalancer.Service]{
 		Deleted: false,
 		Object:  svc,
 	})
@@ -802,11 +861,14 @@ func TestPolicySelection(t *testing.T) {
 	// Adding an LB IP to an existing non-selected service should not select it
 	fe = fe.Clone()
 	svc = svc.Clone()
+	be = be.Clone()
 	fe.Type = loadbalancer.SVCTypeLoadBalancer
 	require.NoError(t, fe.Address.ParseFromString("192.168.2.7:80/TCP"))
-	fix.insertService(svc, fe)
+	fix.insertService(svc)
+	fix.insertFrontends(fe)
+	fix.insertBackends(be)
 
-	err = fix.announcer.processSvcEvent(statedb.Change[*loadbalancer.Service]{
+	err = fix.announcer.processSvcEvent(fix.stateDB.ReadTxn(), statedb.Change[*loadbalancer.Service]{
 		Deleted: false,
 		Object:  svc,
 	})
@@ -844,8 +906,58 @@ func TestPolicySelection(t *testing.T) {
 			IP:               netip.MustParseAddr("192.168.2.7"),
 			NetworkInterface: bluePolicy().Spec.Interfaces[0],
 		},
-		Origins: []resource.Key{serviceKey(svc)},
+		Origins: []types.NamespacedName{serviceKey(svc)},
 	})
+}
+
+func TestFrontendUpdateSelectsPreviouslyIgnoredService(t *testing.T) {
+	fix := newFixture(t)
+
+	policy := bluePolicy()
+	policy.Spec.LoadBalancerIPs = true
+	policy.Spec.ExternalIPs = false
+	fix.fakePolicyStore.slice = []*v2alpha1.CiliumL2AnnouncementPolicy{policy}
+
+	node := blueNode()
+	err := fix.announcer.processLocalNodeEvent(context.Background(), resource.Event[*v2.CiliumNode]{
+		Kind:   resource.Upsert,
+		Key:    resource.NewKey(node),
+		Object: node,
+		Done:   func(error) {},
+	})
+	require.NoError(t, err)
+
+	err = fix.announcer.processPolicyEvent(context.Background(), resource.Event[*v2alpha1.CiliumL2AnnouncementPolicy]{
+		Kind:   resource.Upsert,
+		Key:    resource.NewKey(policy),
+		Object: policy,
+		Done:   func(error) {},
+	})
+	require.NoError(t, err)
+
+	svc, fe, be := blueService()
+	fe.Type = loadbalancer.SVCTypeLoadBalancer
+
+	fix.insertService(svc)
+
+	err = fix.announcer.processSvcEvent(fix.stateDB.ReadTxn(), statedb.Change[*loadbalancer.Service]{
+		Deleted: false,
+		Object:  svc,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, fix.announcer.selectedServices)
+
+	fix.insertFrontends(fe)
+	fix.insertBackends(be)
+
+	err = fix.announcer.processFrontendEvent(fix.stateDB.ReadTxn(), statedb.Change[*loadbalancer.Frontend]{
+		Deleted: false,
+		Object:  fe,
+	})
+	require.NoError(t, err)
+
+	assert.Len(t, fix.announcer.selectedServices, 1)
+	assert.Contains(t, fix.announcer.selectedServices, serviceKey(svc))
 }
 
 // Test that when the selected IP types in the policy changes, that proxy neighbor table is updated properly.
@@ -874,11 +986,13 @@ func TestUpdatePolicy_ChangeIPType(t *testing.T) {
 	assert.Empty(t, entries)
 
 	// Adding an LB IP should select the service and create an entry
-	svc, fe := blueService()
+	svc, fe, be := blueService()
 	fe.Type = loadbalancer.SVCTypeLoadBalancer
 	assert.NoError(t, fe.Address.ParseFromString("192.168.2.3:80/TCP"))
-	fix.insertService(svc, fe)
-	err = fix.announcer.processSvcEvent(statedb.Change[*loadbalancer.Service]{
+	fix.insertService(svc)
+	fix.insertFrontends(fe)
+	fix.insertBackends(be)
+	err = fix.announcer.processSvcEvent(fix.stateDB.ReadTxn(), statedb.Change[*loadbalancer.Service]{
 		Deleted: false,
 		Object:  svc,
 	})
@@ -902,15 +1016,18 @@ func TestUpdatePolicy_ChangeIPType(t *testing.T) {
 			IP:               netip.MustParseAddr("192.168.2.3"),
 			NetworkInterface: bluePolicy().Spec.Interfaces[0],
 		},
-		Origins: []resource.Key{serviceKey(svc)},
+		Origins: []types.NamespacedName{serviceKey(svc)},
 	})
 
 	// changing the frontend type should unselect the service
 	svc = svc.Clone()
 	fe = fe.Clone()
+	be = be.Clone()
 	fe.Type = loadbalancer.SVCTypeClusterIP
-	fix.insertService(svc, fe)
-	err = fix.announcer.processSvcEvent(statedb.Change[*loadbalancer.Service]{
+	fix.insertService(svc)
+	fix.insertFrontends(fe)
+	fix.insertBackends(be)
+	err = fix.announcer.processSvcEvent(fix.stateDB.ReadTxn(), statedb.Change[*loadbalancer.Service]{
 		Deleted: false,
 		Object:  svc,
 	})
@@ -947,7 +1064,7 @@ func TestUpdatePolicy_ChangeInterfaces(t *testing.T) {
 	assert.Len(t, fix.announcer.selectedPolicies, 1)
 	assert.Len(t, fix.announcer.selectedServices, 1)
 
-	svc, fe := blueService()
+	svc, fe, _ := blueService()
 
 	// Check that the old entry is deleted and the new entry added
 	rtx := fix.stateDB.ReadTxn()
@@ -959,7 +1076,7 @@ func TestUpdatePolicy_ChangeInterfaces(t *testing.T) {
 			IP:               fe.Address.Addr(),
 			NetworkInterface: "eth0",
 		},
-		Origins: []resource.Key{serviceKey(svc)},
+		Origins: []types.NamespacedName{serviceKey(svc)},
 	})
 }
 
@@ -967,12 +1084,12 @@ func TestUpdatePolicy_ChangeInterfaces(t *testing.T) {
 func TestUpdateService_DelIP(t *testing.T) {
 	fix := baseUpdateSetup(t)
 
-	svc, fe := blueService()
+	svc, fe, _ := blueService()
 	wtxn := fix.stateDB.WriteTxn(fix.fes)
 	fix.fes.Delete(wtxn, fe)
 	wtxn.Commit()
 
-	err := fix.announcer.processSvcEvent(statedb.Change[*loadbalancer.Service]{
+	err := fix.announcer.processSvcEvent(fix.stateDB.ReadTxn(), statedb.Change[*loadbalancer.Service]{
 		Deleted: false,
 		Object:  svc,
 	})
@@ -989,15 +1106,17 @@ func TestUpdateService_DelIP(t *testing.T) {
 func TestUpdateService_AddIP(t *testing.T) {
 	fix := baseUpdateSetup(t)
 
-	svc, fe1 := blueService()
+	svc, fe1, be := blueService()
 	svc = svc.Clone()
 	fe1 = fe1.Clone()
 	assert.NoError(t, fe1.Address.ParseFromString("192.168.2.1:80/TCP"))
 	fe2 := fe1.Clone()
 	assert.NoError(t, fe2.Address.ParseFromString("192.168.2.2:80/TCP"))
-	fix.insertService(svc, fe1, fe2)
+	fix.insertService(svc)
+	fix.insertFrontends(fe1, fe2)
+	fix.insertBackends(be)
 
-	err := fix.announcer.processSvcEvent(statedb.Change[*loadbalancer.Service]{
+	err := fix.announcer.processSvcEvent(fix.stateDB.ReadTxn(), statedb.Change[*loadbalancer.Service]{
 		Deleted: false,
 		Object:  svc,
 	})
@@ -1014,11 +1133,13 @@ func TestUpdateService_AddIP(t *testing.T) {
 func TestUpdateService_NoMatch(t *testing.T) {
 	fix := baseUpdateSetup(t)
 
-	svc, fe := blueService()
+	svc, fe, be := blueService()
 	svc.Labels["color"] = labels.NewLabel("color", "red", "k8s")
-	fix.insertService(svc, fe)
+	fix.insertService(svc)
+	fix.insertFrontends(fe)
+	fix.insertBackends(be)
 
-	err := fix.announcer.processSvcEvent(statedb.Change[*loadbalancer.Service]{
+	err := fix.announcer.processSvcEvent(fix.stateDB.ReadTxn(), statedb.Change[*loadbalancer.Service]{
 		Deleted: false,
 		Object:  svc,
 	})
@@ -1036,11 +1157,14 @@ func TestUpdateService_NoMatch(t *testing.T) {
 func TestUpdateService_LoadBalancerClassMatch(t *testing.T) {
 	fix := baseUpdateSetup(t)
 
-	svc, fe := blueService()
+	svc, fe, be := blueService()
+	svc = svc.Clone()
 	svc.LoadBalancerClass = ptr.To[string](v2alpha1.L2AnnounceLoadBalancerClass)
-	fix.insertService(svc, fe)
+	fix.insertService(svc)
+	fix.insertFrontends(fe)
+	fix.insertBackends(be)
 
-	err := fix.announcer.processSvcEvent(statedb.Change[*loadbalancer.Service]{
+	err := fix.announcer.processSvcEvent(fix.stateDB.ReadTxn(), statedb.Change[*loadbalancer.Service]{
 		Deleted: false,
 		Object:  svc,
 	})
@@ -1058,11 +1182,87 @@ func TestUpdateService_LoadBalancerClassMatch(t *testing.T) {
 func TestUpdateService_LoadBalancerClassNotMatch(t *testing.T) {
 	fix := baseUpdateSetup(t)
 
-	svc, fe := blueService()
+	svc, fe, be := blueService()
+	svc = svc.Clone()
 	svc.LoadBalancerClass = ptr.To[string]("unsupported.io/lb-class")
-	fix.insertService(svc, fe)
+	fix.insertService(svc)
+	fix.insertFrontends(fe)
+	fix.insertBackends(be)
 
-	err := fix.announcer.processSvcEvent(statedb.Change[*loadbalancer.Service]{
+	err := fix.announcer.processSvcEvent(fix.stateDB.ReadTxn(), statedb.Change[*loadbalancer.Service]{
+		Deleted: false,
+		Object:  svc,
+	})
+	assert.NoError(t, err)
+
+	// Check that the entry got deleted
+	rtx := fix.stateDB.ReadTxn()
+	iter := fix.proxyNeighborTable.All(rtx)
+	entries := statedb.Collect(iter)
+	assert.Empty(t, entries)
+}
+
+// Test that when a service with external traffic policy local has local backends, it is selected and announced.
+func TestUpdateService_ExternalTrafficPolicyLocal(t *testing.T) {
+	fix := baseUpdateSetup(t)
+
+	svc, fe, be := blueService()
+	svc.ExtTrafficPolicy = loadbalancer.SVCTrafficPolicyLocal
+	fix.insertService(svc)
+	fix.insertFrontends(fe)
+	fix.insertBackends(be)
+
+	err := fix.announcer.processSvcEvent(fix.stateDB.ReadTxn(), statedb.Change[*loadbalancer.Service]{
+		Deleted: false,
+		Object:  svc,
+	})
+	assert.NoError(t, err)
+
+	// Check that the entry got added
+	rtx := fix.stateDB.ReadTxn()
+	iter := fix.proxyNeighborTable.All(rtx)
+	entries := statedb.Collect(iter)
+	assert.Len(t, entries, 1)
+}
+
+// Test that when a service with external traffic policy local has no local backends, its not selected and not announced.
+func TestUpdateService_ExternalTrafficPolicyLocal_NoLocalBackends(t *testing.T) {
+	fix := baseUpdateSetup(t)
+
+	svc, fe, be := blueService()
+	svc.ExtTrafficPolicy = loadbalancer.SVCTrafficPolicyLocal
+	be = be.Clone()
+	be.NodeName = "red-node" // backend on different node
+	fix.insertService(svc)
+	fix.insertFrontends(fe)
+	fix.insertBackends(be)
+
+	err := fix.announcer.processSvcEvent(fix.stateDB.ReadTxn(), statedb.Change[*loadbalancer.Service]{
+		Deleted: false,
+		Object:  svc,
+	})
+	assert.NoError(t, err)
+
+	// Check that the entry got deleted
+	rtx := fix.stateDB.ReadTxn()
+	iter := fix.proxyNeighborTable.All(rtx)
+	entries := statedb.Collect(iter)
+	assert.Empty(t, entries)
+}
+
+// Test that when a service with external traffic policy local only has unhealthy local backends, its not selected and not announced.
+func TestUpdateService_ExternalTrafficPolicyLocal_UnhealthyLocalBackends(t *testing.T) {
+	fix := baseUpdateSetup(t)
+
+	svc, fe, be := blueService()
+	svc.ExtTrafficPolicy = loadbalancer.SVCTrafficPolicyLocal
+	be = be.Clone()
+	be.Unhealthy = true
+	fix.insertService(svc)
+	fix.insertFrontends(fe)
+	fix.insertBackends(be)
+
+	err := fix.announcer.processSvcEvent(fix.stateDB.ReadTxn(), statedb.Change[*loadbalancer.Service]{
 		Deleted: false,
 		Object:  svc,
 	})
@@ -1083,9 +1283,9 @@ func TestDelService(t *testing.T) {
 	fix.svcs.DeleteAll(wtxn)
 	fix.fes.DeleteAll(wtxn)
 	wtxn.Commit()
-	svc, _ := blueService()
+	svc, _, _ := blueService()
 
-	err := fix.announcer.processSvcEvent(statedb.Change[*loadbalancer.Service]{
+	err := fix.announcer.processSvcEvent(fix.stateDB.ReadTxn(), statedb.Change[*loadbalancer.Service]{
 		Deleted: true,
 		Object:  svc,
 	})
@@ -1110,6 +1310,7 @@ func TestL2AnnouncerLifecycle(t *testing.T) {
 		cell.Provide(
 			func() loadbalancer.Config { return loadbalancer.DefaultConfig },
 			loadbalancer.NewFrontendsTable, statedb.RWTable[*loadbalancer.Frontend].ToTable,
+			loadbalancer.NewBackendsTable, statedb.RWTable[*loadbalancer.Backend].ToTable,
 			loadbalancer.NewServicesTable, statedb.RWTable[*loadbalancer.Service].ToTable,
 		),
 		cell.Provide(tables.NewL2AnnounceTable),

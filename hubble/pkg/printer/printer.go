@@ -15,6 +15,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
+	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
@@ -183,8 +184,6 @@ func GetFlowType(f *flowpb.Flow) string {
 		case *flowpb.Layer7_Dns:
 			l7Protocol = "dns"
 			l7Type += " " + l7.GetDns().GetObservationSource()
-		case *flowpb.Layer7_Kafka:
-			l7Protocol = "kafka"
 		}
 		return l7Protocol + "-" + l7Type
 	}
@@ -193,6 +192,9 @@ func GetFlowType(f *flowpb.Flow) string {
 	case api.MessageTypeTrace:
 		return api.TraceObservationPoint(uint8(f.GetEventType().GetSubType()))
 	case api.MessageTypeDrop:
+		if desc := f.GetExtDropReasonDesc(); desc != "" {
+			return desc
+		}
 		return api.DropReason(uint8(f.GetEventType().GetSubType()))
 	case api.MessageTypePolicyVerdict:
 		return fmt.Sprintf("%s:%s %s",
@@ -203,7 +205,7 @@ func GetFlowType(f *flowpb.Flow) string {
 	case api.MessageTypeCapture:
 		return f.GetDebugCapturePoint().String()
 	case api.MessageTypeTraceSock:
-		switch f.GetSockXlatePoint() {
+		switch flowpb.SocketTranslationPoint(f.GetEventType().GetSubType()) {
 		case flowpb.SocketTranslationPoint_SOCK_XLATE_POINT_POST_DIRECTION_FWD:
 			return "post-xlate-fwd"
 		case flowpb.SocketTranslationPoint_SOCK_XLATE_POINT_POST_DIRECTION_REV:
@@ -213,7 +215,7 @@ func GetFlowType(f *flowpb.Flow) string {
 		case flowpb.SocketTranslationPoint_SOCK_XLATE_POINT_PRE_DIRECTION_REV:
 			return "pre-xlate-rev"
 		}
-		return f.GetSockXlatePoint().String()
+		return flowpb.SocketTranslationPoint_SOCK_XLATE_POINT_UNKNOWN.String()
 	}
 
 	return "UNKNOWN"
@@ -250,6 +252,13 @@ func (p Printer) getVerdict(f *flowpb.Flow) string {
 	case flowpb.Verdict_AUDIT:
 		if f.GetEventType().GetType() == api.MessageTypePolicyVerdict {
 			msg = "AUDITED"
+			if p.opts.policyNames {
+				if f.GetTrafficDirection() == flowpb.TrafficDirection_EGRESS {
+					msg += formatPolicyNames(f.GetEgressDeniedBy())
+				} else if f.GetTrafficDirection() == flowpb.TrafficDirection_INGRESS {
+					msg += formatPolicyNames(f.GetIngressDeniedBy())
+				}
+			}
 		}
 		return p.color.verdictAudit(msg)
 	case flowpb.Verdict_TRACED:
@@ -403,12 +412,29 @@ func (p *Printer) WriteProtoFlow(res *observerpb.GetFlowsResponse) error {
 			return fmt.Errorf("failed to write out packet: %w", w.err)
 		}
 	case JSONLegacyOutput:
+		stripUnkownExtensions(f)
 		return p.jsonEncoder.Encode(f)
 	case JSONPBOutput:
+		if stripUnkownExtensions(f) {
+			res.ResponseTypes = &observerpb.GetFlowsResponse_Flow{
+				Flow: f,
+			}
+		}
 		return p.jsonEncoder.Encode(res)
 	}
 	p.line++
 	return nil
+}
+
+func stripUnkownExtensions(f *flowpb.Flow) bool {
+	if f.GetExtensions() != nil {
+		if _, err := protoregistry.GlobalTypes.FindMessageByURL(f.GetExtensions().TypeUrl); err != nil {
+			// Type unknown - strip out the extension
+			f.Extensions = nil
+			return true
+		}
+	}
+	return false
 }
 
 // joinWithCutOff performs a strings.Join, but will omit elements if the

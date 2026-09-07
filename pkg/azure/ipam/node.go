@@ -7,11 +7,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/netip"
+	"slices"
+	"strings"
 
+	"github.com/cilium/cilium/operator/pkg/ipam/nodemanager"
+	"github.com/cilium/cilium/operator/pkg/ipam/stats"
 	"github.com/cilium/cilium/pkg/azure/types"
 	"github.com/cilium/cilium/pkg/defaults"
-	"github.com/cilium/cilium/pkg/ipam"
-	"github.com/cilium/cilium/pkg/ipam/stats"
 	ipamTypes "github.com/cilium/cilium/pkg/ipam/types"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -42,51 +45,72 @@ func (n *Node) UpdatedNode(obj *v2.CiliumNode) {
 }
 
 // PopulateStatusFields fills in the status field of the CiliumNode custom
-// resource with Azure specific information
+// resource with Azure specific information.
+//
+// ForeachInterface iterates a map and Azure does not document an order for an
+// interface's IP configurations, so both levels are sorted: an unchanged node
+// then compares equal in ciliumNodeUpdateImplementation.UpdateStatus and the
+// /status write is skipped. ID and IP are each unique within their scope, so
+// sorting on them alone is deterministic.
 func (n *Node) PopulateStatusFields(k8sObj *v2.CiliumNode) {
-	k8sObj.Status.Azure.Interfaces = []types.AzureInterface{}
+	interfaces := []types.AzureInterface{}
 
 	n.manager.mutex.RLock()
 	defer n.manager.mutex.RUnlock()
-	n.manager.instances.ForeachInterface(n.node.InstanceID(), func(instanceID, interfaceID string, interfaceObj ipamTypes.InterfaceRevision) error {
-		iface, ok := interfaceObj.Resource.(*types.AzureInterface)
-		if ok {
-			k8sObj.Status.Azure.Interfaces = append(k8sObj.Status.Azure.Interfaces, *(iface.DeepCopy()))
+	n.manager.instances.ForeachInterface(n.node.InstanceID(), func(instanceID, interfaceID string, interfaceObj ipamTypes.Interface) error {
+		iface, ok := interfaceObj.(*types.AzureInterface)
+		if !ok {
+			return nil
 		}
+		// Copied because the sorts below mutate in place and the instance
+		// cache is only read locked.
+		interfaces = append(interfaces, *iface.DeepCopy())
 		return nil
 	})
+
+	// ID alone is a total order: it is the instance's interface map key.
+	slices.SortFunc(interfaces, func(a, b types.AzureInterface) int {
+		return strings.Compare(a.ID, b.ID)
+	})
+	for i := range interfaces {
+		slices.SortFunc(interfaces[i].Addresses, func(a, b types.AzureAddress) int {
+			return a.IP.Addr.Compare(b.IP.Addr)
+		})
+	}
+	k8sObj.Status.Azure.Interfaces = interfaces
 }
 
 // PrepareIPRelease prepares the release of IPs
-func (n *Node) PrepareIPRelease(excessIPs int, scopedLog *slog.Logger) *ipam.ReleaseAction {
-	return &ipam.ReleaseAction{}
+func (n *Node) PrepareIPRelease(excessIPs int, scopedLog *slog.Logger) *nodemanager.ReleaseAction {
+	return &nodemanager.ReleaseAction{}
 }
 
 // ReleaseIPPrefixes is a no-op on Azure since Azure ENIs don't
 // support prefix delegation.
-func (n *Node) ReleaseIPPrefixes(ctx context.Context, r *ipam.ReleaseAction) error {
+func (n *Node) ReleaseIPPrefixes(ctx context.Context, r *nodemanager.ReleaseAction) error {
 	// nothing to do
 	return nil
 }
 
 // ReleaseIPs performs the IP release operation
-func (n *Node) ReleaseIPs(ctx context.Context, r *ipam.ReleaseAction) error {
+func (n *Node) ReleaseIPs(ctx context.Context, r *nodemanager.ReleaseAction) error {
 	return fmt.Errorf("not implemented")
 }
 
 // PrepareIPAllocation returns the number of IPs that can be allocated/created.
-func (n *Node) PrepareIPAllocation(scopedLog *slog.Logger) (a *ipam.AllocationAction, err error) {
-	a = &ipam.AllocationAction{}
+func (n *Node) PrepareIPAllocation(scopedLog *slog.Logger) (a *nodemanager.AllocationAction, err error) {
+	a = &nodemanager.AllocationAction{}
 	requiredIfaceName := n.k8sObj.Spec.Azure.InterfaceName
 	n.manager.mutex.RLock()
 	defer n.manager.mutex.RUnlock()
-	err = n.manager.instances.ForeachInterface(n.node.InstanceID(), func(instanceID, interfaceID string, interfaceObj ipamTypes.InterfaceRevision) error {
-		iface, ok := interfaceObj.Resource.(*types.AzureInterface)
+	usePrimary := n.manager.usePrimary
+	err = n.manager.instances.ForeachInterface(n.node.InstanceID(), func(instanceID, interfaceID string, interfaceObj ipamTypes.Interface) error {
+		iface, ok := interfaceObj.(*types.AzureInterface)
 		if !ok {
 			return fmt.Errorf("invalid interface object")
 		}
 
-		availableOnInterface, available := isAvailableInterface(requiredIfaceName, iface, scopedLog)
+		availableOnInterface, available := isAvailableInterface(requiredIfaceName, iface, usePrimary, scopedLog)
 		if !available {
 			return nil
 		}
@@ -100,11 +124,9 @@ func (n *Node) PrepareIPAllocation(scopedLog *slog.Logger) (a *ipam.AllocationAc
 				logfields.AvailableAddresses, availableOnInterface,
 			)
 
-			preferredPoolIDs := []ipamTypes.PoolID{}
-			for _, address := range iface.Addresses {
-				if address.Subnet != "" {
-					preferredPoolIDs = append(preferredPoolIDs, ipamTypes.PoolID(address.Subnet))
-				}
+			var preferredPoolIDs []ipamTypes.PoolID
+			if iface.Subnet.ID != "" {
+				preferredPoolIDs = []ipamTypes.PoolID{ipamTypes.PoolID(iface.Subnet.ID)}
 			}
 
 			poolID, available := n.manager.subnets.FirstSubnetWithAvailableAddresses(preferredPoolIDs)
@@ -128,29 +150,37 @@ func (n *Node) PrepareIPAllocation(scopedLog *slog.Logger) (a *ipam.AllocationAc
 }
 
 // AllocateIPs performs the Azure IP allocation operation
-func (n *Node) AllocateIPs(ctx context.Context, a *ipam.AllocationAction) error {
-	iface, ok := a.Interface.Resource.(*types.AzureInterface)
+func (n *Node) AllocateIPs(ctx context.Context, a *nodemanager.AllocationAction) error {
+	iface, ok := a.Interface.(*types.AzureInterface)
 	if !ok {
 		return fmt.Errorf("invalid interface object")
 	}
 
-	if iface.GetVMScaleSetName() == "" {
+	vmss := iface.GetVMScaleSetName()
+	if vmss == "" {
 		return n.manager.api.AssignPrivateIpAddressesVM(ctx, string(a.PoolID), iface.Name, a.IPv4.AvailableForAllocation)
 	} else {
-		return n.manager.api.AssignPrivateIpAddressesVMSS(ctx, iface.GetVMID(), iface.GetVMScaleSetName(), string(a.PoolID), iface.Name, a.IPv4.AvailableForAllocation)
+		return n.manager.api.AssignPrivateIpAddressesVMSS(ctx, iface.GetVMID(), vmss, string(a.PoolID), iface.Name, a.IPv4.AvailableForAllocation)
 	}
 }
 
 func (n *Node) AllocateStaticIP(ctx context.Context, staticIPTags ipamTypes.Tags) (string, error) {
+	var addr netip.Addr
+	var err error
 	if n.vmss == "" {
-		return n.manager.api.AssignPublicIPAddressesVM(ctx, n.node.InstanceID(), staticIPTags)
+		addr, err = n.manager.api.AssignPublicIPAddressesVM(ctx, n.node.InstanceID(), staticIPTags)
+	} else {
+		addr, err = n.manager.api.AssignPublicIPAddressesVMSS(ctx, n.node.InstanceID(), n.vmss, staticIPTags)
 	}
-	return n.manager.api.AssignPublicIPAddressesVMSS(ctx, n.node.InstanceID(), n.vmss, staticIPTags)
+	if err != nil {
+		return "", err
+	}
+	return addr.String(), nil
 }
 
 // CreateInterface is called to create a new interface. This operation is
 // currently not supported on Azure.
-func (n *Node) CreateInterface(ctx context.Context, allocation *ipam.AllocationAction, scopedLog *slog.Logger) (int, string, error) {
+func (n *Node) CreateInterface(ctx context.Context, allocation *nodemanager.AllocationAction, scopedLog *slog.Logger) (int, string, error) {
 	return 0, "", fmt.Errorf("not implemented")
 }
 
@@ -161,12 +191,6 @@ func (n *Node) ResyncInterfacesAndIPs(ctx context.Context, scopedLog *slog.Logge
 	stats stats.InterfaceStats,
 	err error) {
 
-	// Azure virtual machines always have an upper limit of 256 addresses.
-	// Both VMs and NICs can have a maximum of 256 addresses, so as long as
-	// there is at least one available NIC, we can allocate up to 256 addresses
-	// on the VM (minus the primary IP address).
-	stats.NodeCapacity = max(n.GetMaximumAllocatableIPv4()-1, 0)
-
 	if n.node.InstanceID() == "" {
 		return nil, stats, nil
 	}
@@ -174,36 +198,28 @@ func (n *Node) ResyncInterfacesAndIPs(ctx context.Context, scopedLog *slog.Logge
 	available = ipamTypes.AllocationMap{}
 	n.manager.mutex.RLock()
 	defer n.manager.mutex.RUnlock()
-	err = n.manager.instances.ForeachAddress(n.node.InstanceID(), func(instanceID, interfaceID, ip, poolID string, addressObj ipamTypes.Address) error {
-		address, ok := addressObj.(types.AzureAddress)
-		if !ok {
-			scopedLog.Warn(
-				"Not an Azure address object, ignoring IP",
-				logfields.IPAddr, ip,
-			)
-			return nil
-		}
+	usePrimary := n.manager.usePrimary
 
-		if address.State == types.StateSucceeded {
-			available[address.IP] = ipamTypes.AllocationIP{Resource: interfaceID}
-		} else {
-			scopedLog.Warn(
-				"Ignoring potentially available IP due to non-successful state",
-				logfields.IPAddr, ip,
-				logfields.State, address.State,
-			)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, stats, err
-	}
-
+	// Azure caps both NICs and VMs at 256 addresses; start from that ceiling
+	// and decrement per NIC below for any primary slot we can't allocate.
+	nodeCapacity := types.InterfaceAddressLimit
 	requiredIfaceName := n.k8sObj.Spec.Azure.InterfaceName
-	err = n.manager.instances.ForeachInterface(n.node.InstanceID(), func(instanceID, interfaceID string, interfaceObj ipamTypes.InterfaceRevision) error {
-		iface, ok := interfaceObj.Resource.(*types.AzureInterface)
+	err = n.manager.instances.ForeachInterface(n.node.InstanceID(), func(instanceID, interfaceID string, interfaceObj ipamTypes.Interface) error {
+		iface, ok := interfaceObj.(*types.AzureInterface)
 		if !ok {
 			return fmt.Errorf("invalid interface object")
+		}
+
+		for _, address := range iface.Addresses {
+			if address.State == types.StateSucceeded {
+				available[address.IP.String()] = ipamTypes.AllocationIP{Resource: interfaceID}
+			} else {
+				scopedLog.Warn(
+					"Ignoring potentially available IP due to non-successful state",
+					logfields.IPAddr, address.IP,
+					logfields.State, address.State,
+				)
+			}
 		}
 
 		// Cache the VMSS name from the first interface we see
@@ -211,8 +227,13 @@ func (n *Node) ResyncInterfacesAndIPs(ctx context.Context, scopedLog *slog.Logge
 			n.vmss = iface.GetVMScaleSetName()
 		}
 
-		_, available := isAvailableInterface(requiredIfaceName, iface, scopedLog)
-		if available {
+		// The primary IP still consumes a NIC slot even when it is not
+		// allocatable; reserve it from the VM-wide budget.
+		if !usePrimary && iface.IP.IsValid() {
+			nodeCapacity--
+		}
+
+		if _, isAvailable := isAvailableInterface(requiredIfaceName, iface, usePrimary, scopedLog); isAvailable {
 			stats.RemainingAvailableInterfaceCount++
 		}
 		return nil
@@ -220,6 +241,7 @@ func (n *Node) ResyncInterfacesAndIPs(ctx context.Context, scopedLog *slog.Logge
 	if err != nil {
 		return nil, stats, err
 	}
+	stats.NodeCapacity = max(nodeCapacity, 0)
 
 	return available, stats, nil
 }
@@ -242,8 +264,26 @@ func (n *Node) IsPrefixDelegated() bool {
 	return false
 }
 
+// GetAttachedCIDRs is a no-op since Azure does not use multi-pool but uses
+// the CRD allocator.
+func (n *Node) GetAttachedCIDRs() []netip.Prefix {
+	return nil
+}
+
+// PrepareCIDRRelease is a no-op since Azure does not use multi-pool but uses
+// the CRD allocator, that's backed by PrepareIPRelease
+func (n *Node) PrepareCIDRRelease(_ []netip.Prefix) []*nodemanager.ReleaseAction {
+	return nil
+}
+
+// ReleaseCIDRs is a no-op since Azure does not use multi-pool but uses the
+// CRD allocator, that's backed by ReleaseIPs/ReleaseIPPrefixes
+func (n *Node) ReleaseCIDRs(_ context.Context, _ *nodemanager.ReleaseAction) ([]netip.Prefix, error) {
+	return nil, nil
+}
+
 // isAvailableInterface returns whether interface is available and the number of available IPs to allocate in interface
-func isAvailableInterface(requiredIfaceName string, iface *types.AzureInterface, scopedLog *slog.Logger) (availableOnInterface int, available bool) {
+func isAvailableInterface(requiredIfaceName string, iface *types.AzureInterface, usePrimary bool, scopedLog *slog.Logger) (availableOnInterface int, available bool) {
 	if requiredIfaceName != "" {
 		if iface.Name != requiredIfaceName {
 			scopedLog.Debug(
@@ -261,7 +301,14 @@ func isAvailableInterface(requiredIfaceName string, iface *types.AzureInterface,
 		logfields.NumAddresses, len(iface.Addresses),
 	)
 
-	availableOnInterface = max(types.InterfaceAddressLimit-len(iface.Addresses), 0)
+	// The 256-address NIC limit covers both the primary and any secondaries.
+	// When the primary is not exposed to the pool, its slot is consumed but
+	// not reflected in iface.Addresses, so reserve it here.
+	limit := types.InterfaceAddressLimit
+	if !usePrimary && iface.IP.IsValid() {
+		limit--
+	}
+	availableOnInterface = max(limit-len(iface.Addresses), 0)
 	if availableOnInterface <= 0 {
 		return 0, false
 	}

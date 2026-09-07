@@ -17,10 +17,13 @@ import (
 	envoyCfg "github.com/cilium/cilium/pkg/envoy/config"
 	"github.com/cilium/cilium/pkg/hive"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client/testutils"
+	k8sTables "github.com/cilium/cilium/pkg/k8s/tables"
 	"github.com/cilium/cilium/pkg/kpr"
+	"github.com/cilium/cilium/pkg/lbipamconfig"
 	"github.com/cilium/cilium/pkg/maglev"
 	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/node"
+	"github.com/cilium/cilium/pkg/nodeipamconfig"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/source"
 )
@@ -33,11 +36,13 @@ func TestCell(t *testing.T) {
 		k8sClient.FakeClientCell(),
 		daemonk8s.ResourcesCell,
 		cell.Config(envoyCfg.SecretSyncConfig{}),
-		daemonk8s.TablesCell,
+		k8sTables.TablesCell,
 		maglev.Cell,
 		node.LocalNodeStoreTestCell,
 		metrics.Cell,
 		kpr.Cell,
+		lbipamconfig.Cell,
+		nodeipamconfig.Cell,
 		Cell,
 		cell.Provide(
 			func() cmtypes.ClusterInfo { return cmtypes.ClusterInfo{} },

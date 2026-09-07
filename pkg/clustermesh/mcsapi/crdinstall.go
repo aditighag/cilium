@@ -4,6 +4,7 @@
 package mcsapi
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -11,10 +12,11 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	mcsapicrd "sigs.k8s.io/mcs-api/config/crd"
-	mcsapiv1alpha1 "sigs.k8s.io/mcs-api/pkg/apis/v1alpha1"
+	mcsapiv1beta1 "sigs.k8s.io/mcs-api/pkg/apis/v1beta1"
 	"sigs.k8s.io/yaml"
 
 	"github.com/cilium/cilium/pkg/k8s/apis/crdhelpers"
+	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/versioncheck"
@@ -22,14 +24,20 @@ import (
 
 // createCustomResourceDefinitions creates our CRD objects in the Kubernetes
 // cluster.
-func createCustomResourceDefinitions(logger *slog.Logger, clientset apiextensionsclient.Interface) error {
-	for _, crdName := range []string{mcsapiv1alpha1.ServiceImportVersionedName, mcsapiv1alpha1.ServiceExportVersionedName} {
-		if err := createCRD(logger, clientset, crdName); err != nil {
-			return fmt.Errorf("Unable to create custom resource definition: %w", err)
+func createCustomResourceDefinitions(ctx context.Context, logger *slog.Logger, clientset k8sClient.Clientset) (
+	needsMigration []*apiextensionsv1.CustomResourceDefinition,
+	err error) {
+
+	for _, crdName := range []string{mcsapiv1beta1.ServiceImportVersionedName, mcsapiv1beta1.ServiceExportVersionedName} {
+		crd, err := createCRD(ctx, logger, clientset, crdName)
+		if err != nil {
+			return nil, fmt.Errorf("Unable to create custom resource definition: %w", err)
+		}
+		if crdhelpers.CRDNeedsMigration(crd) {
+			needsMigration = append(needsMigration, crd)
 		}
 	}
-
-	return nil
+	return
 }
 
 // getPregeneratedCRD returns the pregenerated CRD based on the requested CRD
@@ -41,9 +49,9 @@ func getPregeneratedCRD(logger *slog.Logger, crdName string) apiextensionsv1.Cus
 	)
 
 	switch crdName {
-	case mcsapiv1alpha1.ServiceImportVersionedName:
+	case mcsapiv1beta1.ServiceImportVersionedName:
 		crdBytes = mcsapicrd.ServiceImportCRD
-	case mcsapiv1alpha1.ServiceExportVersionedName:
+	case mcsapiv1beta1.ServiceExportVersionedName:
 		crdBytes = mcsapicrd.ServiceExportCRD
 	default:
 		logging.Fatal(logger, "Pregenerated CRD does not exist", logfields.CRDName, crdName)
@@ -64,10 +72,11 @@ func getPregeneratedCRD(logger *slog.Logger, crdName string) apiextensionsv1.Cus
 
 // createCRD creates and updates a CRD.
 // It should be called on operator startup but is idempotent and safe to call again.
-func createCRD(logger *slog.Logger, clientset apiextensionsclient.Interface, crdVersionedName string) error {
+func createCRD(ctx context.Context, logger *slog.Logger, clientset apiextensionsclient.Interface, crdVersionedName string) (*apiextensionsv1.CustomResourceDefinition, error) {
 	crd := getPregeneratedCRD(logger, crdVersionedName)
 
 	return crdhelpers.CreateUpdateCRD(
+		ctx,
 		logger,
 		clientset,
 		&crd,
@@ -83,38 +92,37 @@ func needsUpdateMCS(targetCRD, currentCRD *apiextensionsv1.CustomResourceDefinit
 	}
 
 	// release version check
-	v, ok := currentCRD.Labels[mcsapicrd.ReleaseVersionLabel]
+	currentVer, ok := currentCRD.Labels[mcsapicrd.ReleaseVersionLabel]
 	if !ok {
 		// no schema version detected
 		return true, nil
 	}
-	currentVersion, err := versioncheck.Version(v)
-	version, errTarget := versioncheck.Version(targetCRD.Labels[mcsapicrd.ReleaseVersionLabel])
+	currentVersion, err := versioncheck.Version(currentVer)
+	targetVersion, errTarget := versioncheck.Version(targetCRD.Labels[mcsapicrd.ReleaseVersionLabel])
 	if errTarget != nil {
 		return false, fmt.Errorf("invalid release version label on CRD %s: %s", targetCRD.Name, targetCRD.Labels[mcsapicrd.ReleaseVersionLabel])
 	}
 
-	if err != nil || currentVersion.LT(version) {
-		// version in cluster is either unparsable or smaller than current version
-		return true, nil
+	if err != nil || !currentVersion.EQ(targetVersion) {
+		// upgrade the CRD if the in cluster version is either unparsable or smaller
+		// than the target CRD. Stop here if the in cluster version is higher
+		// to prevent downgrading the CRD.
+		return err != nil || currentVersion.LT(targetVersion), nil
 	}
 
 	// CRD Revision check
-	rev, ok := currentCRD.Labels[mcsapicrd.CustomResourceDefinitionSchemaRevisionLabel]
+	currentRev, ok := currentCRD.Labels[mcsapicrd.CustomResourceDefinitionSchemaRevisionLabel]
 	if !ok {
 		// no CRD revision detected
 		return true, nil
 	}
-	currentRevision, err := strconv.Atoi(rev)
-	revision, errTarget := strconv.Atoi(targetCRD.Labels[mcsapicrd.CustomResourceDefinitionSchemaRevisionLabel])
+	currentRevision, err := strconv.Atoi(currentRev)
+	targetRevision, errTarget := strconv.Atoi(targetCRD.Labels[mcsapicrd.CustomResourceDefinitionSchemaRevisionLabel])
 	if errTarget != nil {
 		return false, fmt.Errorf("invalid CRD revision label on CRD %s: %s", targetCRD.Name, targetCRD.Labels[mcsapicrd.CustomResourceDefinitionSchemaRevisionLabel])
 	}
 
-	if err != nil || currentRevision < revision {
-		// crd revision in cluster is either unparsable or smaller than current version
-		return true, nil
-	}
-
-	return false, nil
+	// upgrade the CRD if the in cluster revision is either unparsable or smaller
+	// than the target CRD
+	return err != nil || currentRevision < targetRevision, nil
 }

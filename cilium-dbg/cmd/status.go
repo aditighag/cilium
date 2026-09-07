@@ -119,15 +119,14 @@ func statusDaemon() {
 		}
 		if healthEnabled {
 			table := newRemoteTable[types.Status]("health")
-			iter, errChan := table.LowerBound(context.Background(), health.PrimaryIndex.Query("agent"))
+			iter, errChan := table.LowerBound(context.Background(), health.StatusByID("agent"))
 			ss := statedb.Collect(iter)
 			if err := <-errChan; err != nil {
 				Fatalf("Failed while streaming remote health data table: %s", err)
 			}
 
 			healthPkg.GetAndFormatHealthStatus(w, allNodes, verbose, healthLines)
-			fmt.Fprintf(w, "Modules Health:")
-			healthPkg.GetAndFormatModulesHealth(w, ss, allHealth, "\t\t")
+			healthPkg.GetAndFormatModulesHealth(w, ss, allHealth, "  ")
 			fmt.Fprintln(w)
 		} else {
 			fmt.Fprint(w, "Cluster health:\tProbe disabled\n")

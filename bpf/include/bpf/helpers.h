@@ -6,6 +6,7 @@
 #include <linux/bpf.h>
 
 #include "ctx/ctx.h"
+#include "builtins.h"
 #include "compiler.h"
 
 #ifndef BPF_FUNC
@@ -97,6 +98,9 @@ static struct bpf_sock *BPF_FUNC(sk_lookup_udp, void *ctx,
 static int BPF_FUNC_REMAP(get_socket_opt, void *ctx, int level, int optname,
 			  void *optval, int optlen) =
 	(void *)BPF_FUNC_getsockopt;
+static int BPF_FUNC_REMAP(set_socket_opt, void *ctx, int level, int optname,
+			  void *optval, int optlen) =
+	(void *)BPF_FUNC_setsockopt;
 
 static __u64 BPF_FUNC(get_current_cgroup_id);
 
@@ -104,11 +108,10 @@ static int BPF_FUNC(set_retval, int retval);
 
 static inline int try_set_retval(int retval __maybe_unused)
 {
-#ifdef HAVE_SET_RETVAL
-	return set_retval(retval);
-#else
+	if (bpf_core_enum_value_exists(enum bpf_func_id, BPF_FUNC_set_retval))
+		return set_retval(retval);
+
 	return 0;
-#endif
 }
 
 static long BPF_FUNC(loop, __u32 nr_loops, void *callback_fn, void *callback_ctx, __u64 flags);

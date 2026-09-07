@@ -14,12 +14,12 @@ struct {
 	__type(key, struct auth_key);
 	__type(value, struct auth_info);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
-	__uint(max_entries, AUTH_MAP_SIZE);
-	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(max_entries, 524288);
+	__uint(map_flags, BPF_F_NO_PREALLOC | BPF_F_RDONLY_PROG_COND);
 } cilium_auth_map __section_maps_btf;
 
 static __always_inline int
-auth_lookup(struct __ctx_buff *ctx, __u32 local_id, __u32 remote_id, __u32 remote_node_ip,
+auth_lookup(const struct __ctx_buff *ctx, __u32 local_id, __u32 remote_id, __u32 remote_node_ip,
 	    __u8 auth_type)
 {
 	const struct node_value *node_value = NULL;

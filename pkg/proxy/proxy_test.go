@@ -11,20 +11,20 @@ import (
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/hive/hivetest"
 	"github.com/cilium/hive/job"
-	cilium "github.com/cilium/proxy/go/cilium/api"
 	statedbReconciler "github.com/cilium/statedb/reconciler"
 	"github.com/stretchr/testify/require"
 
 	"github.com/cilium/cilium/pkg/completion"
-	datapath "github.com/cilium/cilium/pkg/datapath/fake/types"
-	"github.com/cilium/cilium/pkg/datapath/iptables"
+	iptables "github.com/cilium/cilium/pkg/datapath/iptables/fake"
 	"github.com/cilium/cilium/pkg/datapath/linux/route/reconciler"
 	"github.com/cilium/cilium/pkg/envoy"
+	util "github.com/cilium/cilium/pkg/envoy/util"
 	"github.com/cilium/cilium/pkg/envoy/xds"
 	"github.com/cilium/cilium/pkg/hive"
 	"github.com/cilium/cilium/pkg/policy"
 	"github.com/cilium/cilium/pkg/proxy/endpoint"
 	"github.com/cilium/cilium/pkg/proxy/proxyports"
+	"github.com/cilium/cilium/pkg/revert"
 	"github.com/cilium/cilium/pkg/time"
 	"github.com/cilium/cilium/pkg/u8proto"
 )
@@ -40,7 +40,7 @@ func proxyForTest(t *testing.T, envoyIntegration *envoyProxyIntegration) *Proxy 
 			drm = m
 		}),
 	).Populate(hivetest.Logger(t))
-	fakeIPTablesManager := &datapath.FakeIptablesManager{}
+	fakeIPTablesManager := iptables.NewManager()
 	ppConfig := proxyports.ProxyPortsConfig{
 		ProxyPortrangeMin:          10000,
 		ProxyPortrangeMax:          20000,
@@ -84,7 +84,7 @@ func (p *fakeProxyPolicy) GetListener() string {
 
 func TestCreateOrUpdateRedirectMissingListener(t *testing.T) {
 	testRunDir := t.TempDir()
-	socketDir := envoy.GetSocketDir(testRunDir)
+	socketDir := util.GetSocketDir(testRunDir)
 	err := os.MkdirAll(socketDir, 0o700)
 	require.NoError(t, err)
 
@@ -103,16 +103,15 @@ func TestCreateOrUpdateRedirectMissingListener(t *testing.T) {
 
 func TestCreateOrUpdateRedirectMissingListenerWithUseOriginalSourceAddrFlagEnabled(t *testing.T) {
 	testRunDir := t.TempDir()
-	socketDir := envoy.GetSocketDir(testRunDir)
+	socketDir := util.GetSocketDir(testRunDir)
 	err := os.MkdirAll(socketDir, 0o700)
 	require.NoError(t, err)
-	ipTablesManager := &iptables.Manager{}
 	xdsServer := &fakeXdsServer{}
 	envoyIntegrationConfig := EnvoyProxyIntegrationConfig{
 		ProxyUseOriginalSourceAddress: true,
 	}
 	envoyIntegrationParams := envoyProxyIntegrationParams{
-		IptablesManager: ipTablesManager,
+		IptablesManager: iptables.NewManager(),
 		XdsServer:       xdsServer,
 		Cfg:             envoyIntegrationConfig,
 	}
@@ -130,16 +129,15 @@ func TestCreateOrUpdateRedirectMissingListenerWithUseOriginalSourceAddrFlagEnabl
 
 func TestCreateOrUpdateRedirectMissingListenerWithUseOriginalSourceAddrFlagDisabled(t *testing.T) {
 	testRunDir := t.TempDir()
-	socketDir := envoy.GetSocketDir(testRunDir)
+	socketDir := util.GetSocketDir(testRunDir)
 	err := os.MkdirAll(socketDir, 0o700)
 	require.NoError(t, err)
-	ipTablesManager := &iptables.Manager{}
 	xdsServer := &fakeXdsServer{}
 	envoyIntegrationConfig := EnvoyProxyIntegrationConfig{
 		ProxyUseOriginalSourceAddress: false,
 	}
 	envoyIntegrationParams := envoyProxyIntegrationParams{
-		IptablesManager: ipTablesManager,
+		IptablesManager: iptables.NewManager(),
 		XdsServer:       xdsServer,
 		Cfg:             envoyIntegrationConfig,
 	}
@@ -160,32 +158,28 @@ type fakeXdsServer struct {
 	ObservedMayUseOriginalSourceAddr bool
 }
 
-func (r *fakeXdsServer) UpdateEnvoyResources(ctx context.Context, old envoy.Resources, new envoy.Resources) error {
+func (r *fakeXdsServer) UpdateEnvoyResources(ctx context.Context, old xds.Resources, new xds.Resources, waitGroup *completion.WaitGroup) error {
 	panic("unimplemented")
 }
 
-func (r *fakeXdsServer) DeleteEnvoyResources(ctx context.Context, resources envoy.Resources) error {
+func (r *fakeXdsServer) DeleteEnvoyResources(ctx context.Context, resources xds.Resources, waitGroup *completion.WaitGroup) error {
 	panic("unimplemented")
 }
 
-func (r *fakeXdsServer) UpsertEnvoyResources(ctx context.Context, resources envoy.Resources) error {
+func (r *fakeXdsServer) UpsertEnvoyResources(ctx context.Context, resources xds.Resources, waitGroup *completion.WaitGroup) error {
 	panic("unimplemented")
 }
 
-func (s *fakeXdsServer) AddListener(name string, kind policy.L7ParserType, port uint16, isIngress bool, mayUseOriginalSourceAddr bool, wg *completion.WaitGroup, cb func(err error)) error {
+func (s *fakeXdsServer) AddListener(ctx context.Context, name string, kind policy.L7ParserType, port uint16, isIngress bool, mayUseOriginalSourceAddr bool, wg *completion.WaitGroup, cb func(err error)) error {
 	s.ObservedMayUseOriginalSourceAddr = mayUseOriginalSourceAddr
 	return nil
 }
 
-func (*fakeXdsServer) AddAdminListener(port uint16, wg *completion.WaitGroup) {
+func (*fakeXdsServer) AddAdminListener(ctx context.Context, port uint16, wg *completion.WaitGroup) {
 	panic("unimplemented")
 }
 
-func (*fakeXdsServer) AddMetricsListener(port uint16, wg *completion.WaitGroup) {
-	panic("unimplemented")
-}
-
-func (*fakeXdsServer) GetNetworkPolicies(resourceNames []string) (map[string]*cilium.NetworkPolicy, error) {
+func (*fakeXdsServer) AddMetricsListener(ctx context.Context, port uint16, wg *completion.WaitGroup) {
 	panic("unimplemented")
 }
 
@@ -193,19 +187,15 @@ func (*fakeXdsServer) RemoveAllNetworkPolicies() {
 	panic("unimplemented")
 }
 
-func (*fakeXdsServer) RemoveListener(name string, wg *completion.WaitGroup) xds.AckingResourceMutatorRevertFunc {
+func (*fakeXdsServer) RemoveListener(ctx context.Context, name string, wg *completion.WaitGroup) xds.AckingResourceMutatorRevertFunc {
 	panic("unimplemented")
 }
 
-func (*fakeXdsServer) RemoveNetworkPolicy(ep endpoint.EndpointInfoSource) {
+func (*fakeXdsServer) RemoveNetworkPolicy(ctx context.Context, ep endpoint.EndpointInfoSource) {
 	panic("unimplemented")
 }
 
-func (*fakeXdsServer) UpdateNetworkPolicy(ep endpoint.EndpointUpdater, policy *policy.EndpointPolicy, wg *completion.WaitGroup) (error, func() error) {
-	panic("unimplemented")
-}
-
-func (*fakeXdsServer) UseCurrentNetworkPolicy(ep endpoint.EndpointUpdater, policy *policy.EndpointPolicy, wg *completion.WaitGroup) {
+func (*fakeXdsServer) UpdateNetworkPolicy(ctx context.Context, ep endpoint.EndpointUpdater, policy *policy.EndpointPolicy, wg *completion.WaitGroup) (error, revert.RevertFunc, revert.FinalizeFunc) {
 	panic("unimplemented")
 }
 

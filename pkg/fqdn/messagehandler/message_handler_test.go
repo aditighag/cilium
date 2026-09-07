@@ -15,6 +15,7 @@ import (
 	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/require"
 
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/endpoint"
 	"github.com/cilium/cilium/pkg/fqdn"
@@ -72,6 +73,11 @@ func BenchmarkNotifyOnDNSMsg(b *testing.B) {
 		emptyPRCtx = &dnsproxy.ProxyRequestContext{}
 	)
 
+	ciliumMsgDetails, err := dnsproxy.ExtractResponseMsgDetails(ciliumMsg)
+	require.NoError(b, err)
+	ebpfMsgDetails, err := dnsproxy.ExtractResponseMsgDetails(ebpfMsg)
+	require.NoError(b, err)
+
 	var (
 		ciliumIOSel             = api.FQDNSelector{MatchName: "cilium.io"}
 		ciliumIOSelMatchPattern = api.FQDNSelector{MatchPattern: "*cilium.io."}
@@ -80,7 +86,7 @@ func BenchmarkNotifyOnDNSMsg(b *testing.B) {
 		wg sync.WaitGroup
 	)
 
-	policyRepo := policy.NewPolicyRepository(logger, nil, nil, nil, nil, testpolicy.NewPolicyMetricsNoop())
+	policyRepo := policy.NewPolicyRepository(logger, cmtypes.DefaultClusterInfo, nil, nil, nil, nil, testpolicy.NewPolicyMetricsNoop())
 	ipc := &mockipc.MockIPCache{}
 	nm := namemanager.New(namemanager.ManagerParams{
 		Config: namemanager.NameManagerConfig{
@@ -93,7 +99,6 @@ func BenchmarkNotifyOnDNSMsg(b *testing.B) {
 		Logger:     logger,
 	})
 	policyRepo.GetSelectorCache().SetLocalIdentityNotifier(nm)
-	node.SetTestLocalNodeStore()
 	option.Config.DNSProxyLockTimeout = defaults.DNSProxyLockTimeout
 	option.Config.FQDNProxyResponseMaxDelay = defaults.FQDNProxyResponseMaxDelay
 
@@ -101,13 +106,13 @@ func BenchmarkNotifyOnDNSMsg(b *testing.B) {
 		DNSMessageHandlerParams{
 			Logger:            logger,
 			NameManager:       nm,
-			ProxyAccessLogger: accesslog.NewProxyAccessLogger(logger, accesslog.ProxyAccessLoggerConfig{}, &noopNotifier{}, &dummyInfoRegistry{}),
+			ProxyAccessLogger: accesslog.NewProxyAccessLogger(logger, accesslog.ProxyAccessLoggerConfig{}, &noopNotifier{}, &dummyInfoRegistry{}, node.NewTestLocalNodeStore(node.LocalNode{})),
 		})
 
 	// Register rules (simulates applied policies).
 	dscu := &testpolicy.DummySelectorCacheUser{}
 	selectorsToAdd := api.FQDNSelectorSlice{ciliumIOSel, ciliumIOSelMatchPattern, ebpfIOSel}
-	policyRepo.GetSelectorCache().AddSelectors(dscu, policy.EmptyStringLabels, types.ToSelectors(selectorsToAdd...)...)
+	policyRepo.GetSelectorCache().AddSelectors(dscu, types.ToSelectors(selectorsToAdd...)...)
 
 	const nEndpoints int = 1024
 
@@ -118,7 +123,7 @@ func BenchmarkNotifyOnDNSMsg(b *testing.B) {
 			ID:   uint16(i),
 			IPv4: netip.MustParseAddr(fmt.Sprintf("10.96.%d.%d", i/256, i%256)),
 			SecurityIdentity: &identity.Identity{
-				ID: identity.NumericIdentity(i % int(identity.GetMaximumAllocationIdentity(option.Config.ClusterID))),
+				ID: identity.NumericIdentity(i % int(cmtypes.DefaultClusterInfo.MaximumAllocationIdentity())),
 			},
 			DNSZombies: &fqdn.DNSZombieMappings{
 				Mutex: lock.Mutex{},
@@ -135,16 +140,14 @@ func BenchmarkNotifyOnDNSMsg(b *testing.B) {
 	// ebpf.io, done by every endpoint.
 	for b.Loop() {
 		for _, ep := range endpoints {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				// Using a hardcoded string representing endpoint IP:port as this
 				// parameter is only used in logging. Not using the endpoint's IP
 				// so we don't spend any time in the benchmark on converting from
 				// net.IP to string.
-				require.NoError(b, handler.NotifyOnDNSMsg(time.Now(), ep, "10.96.64.8:12345", 0, srvAddr, ciliumMsg, "udp", true, emptyPRCtx))
-				require.NoError(b, handler.NotifyOnDNSMsg(time.Now(), ep, "10.96.64.4:54321", 0, srvAddr, ebpfMsg, "udp", true, emptyPRCtx))
-			}()
+				require.NoError(b, handler.NotifyOnDNSMsg(time.Now(), ep, "10.96.64.8:12345", 0, srvAddr, ciliumMsgDetails, "udp", true, emptyPRCtx))
+				require.NoError(b, handler.NotifyOnDNSMsg(time.Now(), ep, "10.96.64.4:54321", 0, srvAddr, ebpfMsgDetails, "udp", true, emptyPRCtx))
+			})
 		}
 		wg.Wait()
 	}

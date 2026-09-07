@@ -7,7 +7,6 @@ import (
 	"github.com/cilium/hive/cell"
 
 	operatorK8s "github.com/cilium/cilium/operator/k8s"
-	"github.com/cilium/cilium/pkg/clustermesh/mcsapi"
 	"github.com/cilium/cilium/pkg/k8s"
 )
 
@@ -27,8 +26,8 @@ var (
 
 		cell.Provide(
 			k8s.ServiceResource,
-			mcsapi.ServiceExportResource,
-			operatorK8s.EndpointsResource,
+			ServiceExportResource,
+			operatorK8s.EndpointSliceResource,
 			CiliumNodeResource,
 			CiliumIdentityResource,
 			// The CiliumSlimEndpoint and CiliumEndpointSlice resource constructors in the agent depend

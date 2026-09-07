@@ -4,9 +4,11 @@
 package nodemap
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
-	"net"
+	"net/netip"
+	"os"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -29,11 +31,11 @@ const (
 type MapV2 interface {
 	// Update inserts or updates the node map object associated with the provided
 	// IP, node id, and SPI.
-	Update(ip net.IP, nodeID uint16, SPI uint8) error
+	Update(ip netip.Addr, nodeID uint16, SPI uint8) error
 
 	// Delete deletes the node map object associated with the provided
 	// IP.
-	Delete(ip net.IP) error
+	Delete(ip netip.Addr) error
 
 	// IterateWithCallback iterates through all the keys/values of a node map,
 	// passing each key/value pair to the cb callback.
@@ -61,7 +63,7 @@ func newMapV2(logger *slog.Logger, mapName string, conf Config) *nodeMapV2 {
 			KeySize:    uint32(unsafe.Sizeof(NodeKey{})),
 			ValueSize:  uint32(unsafe.Sizeof(NodeValueV2{})),
 			MaxEntries: conf.NodeMapMax,
-			Flags:      unix.BPF_F_NO_PREALLOC,
+			Flags:      unix.BPF_F_NO_PREALLOC | unix.BPF_F_RDONLY_PROG,
 			Pinning:    ebpf.PinByName,
 		}),
 	}
@@ -78,21 +80,26 @@ type NodeKey struct {
 func (k *NodeKey) String() string {
 	switch k.Family {
 	case bpf.EndpointKeyIPv4:
-		return net.IP(k.IP[:net.IPv4len]).String()
+		return netip.AddrFrom4([4]byte(k.IP[:4])).String()
 	case bpf.EndpointKeyIPv6:
 		return k.IP.String()
 	}
 	return "<unknown>"
 }
 
-func newNodeKey(ip net.IP) NodeKey {
+func newNodeKey(ip netip.Addr) NodeKey {
 	result := NodeKey{}
-	if ip4 := ip.To4(); ip4 != nil {
+	if !ip.IsValid() {
+		return result
+	}
+	if ip.Is4() {
+		ip4 := ip.As4()
 		result.Family = bpf.EndpointKeyIPv4
-		copy(result.IP[:], ip4)
+		copy(result.IP[:], ip4[:])
 	} else {
+		ip6 := ip.As16()
 		result.Family = bpf.EndpointKeyIPv6
-		copy(result.IP[:], ip)
+		copy(result.IP[:], ip6[:])
 	}
 	return result
 }
@@ -103,7 +110,7 @@ type NodeValueV2 struct {
 	Pad    uint8
 }
 
-func (m *nodeMapV2) Update(ip net.IP, nodeID uint16, SPI uint8) error {
+func (m *nodeMapV2) Update(ip netip.Addr, nodeID uint16, SPI uint8) error {
 	key := newNodeKey(ip)
 	val := NodeValueV2{NodeID: nodeID, SPI: SPI}
 	if err := m.bpfMap.Update(key, val, 0); err != nil {
@@ -117,7 +124,7 @@ func (m *nodeMapV2) Size() uint32 {
 	return m.conf.NodeMapMax
 }
 
-func (m *nodeMapV2) Delete(ip net.IP) error {
+func (m *nodeMapV2) Delete(ip netip.Addr) error {
 	key := newNodeKey(ip)
 	if err := m.bpfMap.Delete(key); err != nil {
 		return fmt.Errorf("failed to delete node map: %w", err)
@@ -168,6 +175,13 @@ func LoadNodeMapV2(logger *slog.Logger) (MapV2, error) {
 }
 
 func (m *nodeMapV2) init() error {
+	if existing, err := ebpf.LoadRegisterMap(m.logger, MapNameV2); err == nil {
+		m.bpfMap = existing
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		m.logger.Debug("Falling back to recreate node map", logfields.Error, err)
+	}
+
 	if err := m.bpfMap.OpenOrCreate(); err != nil {
 		return fmt.Errorf("failed to init bpf map: %w", err)
 	}

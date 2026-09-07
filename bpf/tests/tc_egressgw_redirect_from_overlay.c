@@ -63,7 +63,7 @@ mock_fib_lookup(void *ctx __maybe_unused, struct bpf_fib_lookup *params __maybe_
 /* Test that a packet matching an egress gateway policy on the from-overlay program
  * gets correctly redirected to the target netdev.
  */
-PKTGEN("tc", "tc_egressgw_redirect_from_overlay")
+PKTGEN(PROG_TYPE, "tc_egressgw_redirect_from_overlay")
 int egressgw_redirect_pktgen(struct __ctx_buff *ctx)
 {
 	return egressgw_pktgen(ctx, (struct egressgw_test_ctx) {
@@ -72,17 +72,50 @@ int egressgw_redirect_pktgen(struct __ctx_buff *ctx)
 		});
 }
 
-SETUP("tc", "tc_egressgw_redirect_from_overlay")
+SETUP(PROG_TYPE, "tc_egressgw_redirect_from_overlay")
 int egressgw_redirect_setup(struct __ctx_buff *ctx)
 {
 	add_egressgw_policy_entry(CLIENT_IP, EXTERNAL_SVC_IP & 0xffffff, 24, GATEWAY_NODE_IP,
-				  EGRESS_IP);
+				  EGRESS_IP, 0);
 
 	return overlay_receive_packet(ctx);
 }
 
-CHECK("tc", "tc_egressgw_redirect_from_overlay")
+CHECK(PROG_TYPE, "tc_egressgw_redirect_from_overlay")
 int egressgw_redirect_check(const struct __ctx_buff *ctx)
+{
+	int ret = egressgw_status_check(ctx, (struct egressgw_test_ctx) {
+			.status_code = TC_ACT_REDIRECT,
+	});
+
+	del_egressgw_policy_entry(CLIENT_IP, EXTERNAL_SVC_IP & 0xffffff, 24);
+
+	return ret;
+}
+
+/* Test that a packet matching an egress gateway policy on the from-overlay program
+ * gets correctly redirected to the target netdev, using the ifindex from the policy.
+ */
+PKTGEN(PROG_TYPE, "tc_egressgw_redirect_from_overlay_with_ifindex")
+int egressgw_redirect_with_ifindex_pktgen(struct __ctx_buff *ctx)
+{
+	return egressgw_pktgen(ctx, (struct egressgw_test_ctx) {
+			.test = TEST_REDIRECT,
+			.redirect = true,
+		});
+}
+
+SETUP(PROG_TYPE, "tc_egressgw_redirect_from_overlay_with_ifindex")
+int egressgw_redirect_with_ifindex_setup(struct __ctx_buff *ctx)
+{
+	add_egressgw_policy_entry(CLIENT_IP, EXTERNAL_SVC_IP & 0xffffff, 24, GATEWAY_NODE_IP,
+				  EGRESS_IP, IFACE_IFINDEX);
+
+	return overlay_receive_packet(ctx);
+}
+
+CHECK(PROG_TYPE, "tc_egressgw_redirect_from_overlay_with_ifindex")
+int egressgw_redirect_with_ifindex_check(const struct __ctx_buff *ctx)
 {
 	int ret = egressgw_status_check(ctx, (struct egressgw_test_ctx) {
 			.status_code = TC_ACT_REDIRECT,
@@ -96,7 +129,7 @@ int egressgw_redirect_check(const struct __ctx_buff *ctx)
 /* Test that a packet matching an excluded CIDR egress gateway policy on the
  * from-overlay program does not get redirected to the target netdev.
  */
-PKTGEN("tc", "tc_egressgw_skip_excluded_cidr_redirect_from_overlay")
+PKTGEN(PROG_TYPE, "tc_egressgw_skip_excluded_cidr_redirect_from_overlay")
 int egressgw_skip_excluded_cidr_redirect_pktgen(struct __ctx_buff *ctx)
 {
 	return egressgw_pktgen(ctx, (struct egressgw_test_ctx) {
@@ -104,18 +137,18 @@ int egressgw_skip_excluded_cidr_redirect_pktgen(struct __ctx_buff *ctx)
 		});
 }
 
-SETUP("tc", "tc_egressgw_skip_excluded_cidr_redirect_from_overlay")
+SETUP(PROG_TYPE, "tc_egressgw_skip_excluded_cidr_redirect_from_overlay")
 int egressgw_skip_excluded_cidr_redirect_setup(struct __ctx_buff *ctx)
 {
 	add_egressgw_policy_entry(CLIENT_IP, EXTERNAL_SVC_IP & 0xffffff, 24, GATEWAY_NODE_IP,
-				  EGRESS_IP);
+				  EGRESS_IP, 0);
 	add_egressgw_policy_entry(CLIENT_IP, EXTERNAL_SVC_IP, 32, EGRESS_GATEWAY_EXCLUDED_CIDR,
-				  EGRESS_IP);
+				  EGRESS_IP, 0);
 
 	return overlay_receive_packet(ctx);
 }
 
-CHECK("tc", "tc_egressgw_skip_excluded_cidr_redirect_from_overlay")
+CHECK(PROG_TYPE, "tc_egressgw_skip_excluded_cidr_redirect_from_overlay")
 int egressgw_skip_excluded_cidr_redirect_check(const struct __ctx_buff *ctx)
 {
 	int ret = egressgw_status_check(ctx, (struct egressgw_test_ctx) {
@@ -131,7 +164,7 @@ int egressgw_skip_excluded_cidr_redirect_check(const struct __ctx_buff *ctx)
 /* Test that a packet matching an egress gateway policy without a gateway on the
  * from-overlay program does not get redirected to the target netdev.
  */
-PKTGEN("tc", "tc_egressgw_skip_no_gateway_redirect_from_overlay")
+PKTGEN(PROG_TYPE, "tc_egressgw_skip_no_gateway_redirect_from_overlay")
 int egressgw_skip_no_gateway_redirect_pktgen(struct __ctx_buff *ctx)
 {
 	return egressgw_pktgen(ctx, (struct egressgw_test_ctx) {
@@ -139,16 +172,16 @@ int egressgw_skip_no_gateway_redirect_pktgen(struct __ctx_buff *ctx)
 		});
 }
 
-SETUP("tc", "tc_egressgw_skip_no_gateway_redirect_from_overlay")
+SETUP(PROG_TYPE, "tc_egressgw_skip_no_gateway_redirect_from_overlay")
 int egressgw_skip_no_gateway_redirect_setup(struct __ctx_buff *ctx)
 {
 	add_egressgw_policy_entry(CLIENT_IP, EXTERNAL_SVC_IP, 32, EGRESS_GATEWAY_NO_GATEWAY,
-				  EGRESS_IP);
+				  EGRESS_IP, 0);
 
 	return overlay_receive_packet(ctx);
 }
 
-CHECK("tc", "tc_egressgw_skip_no_gateway_redirect_from_overlay")
+CHECK(PROG_TYPE, "tc_egressgw_skip_no_gateway_redirect_from_overlay")
 int egressgw_skip_no_gateway_redirect_check(const struct __ctx_buff *ctx)
 {
 	int ret = egressgw_status_check(ctx, (struct egressgw_test_ctx) {
@@ -163,7 +196,7 @@ int egressgw_skip_no_gateway_redirect_check(const struct __ctx_buff *ctx)
 /* Test that a packet matching an egress gateway policy without an egressIP on the
  * from-overlay program gets dropped.
  */
-PKTGEN("tc", "tc_egressgw_drop_no_egress_ip_from_overlay")
+PKTGEN(PROG_TYPE, "tc_egressgw_drop_no_egress_ip_from_overlay")
 int egressgw_drop_no_egress_ip_pktgen(struct __ctx_buff *ctx)
 {
 	return egressgw_pktgen(ctx, (struct egressgw_test_ctx) {
@@ -171,16 +204,16 @@ int egressgw_drop_no_egress_ip_pktgen(struct __ctx_buff *ctx)
 		});
 }
 
-SETUP("tc", "tc_egressgw_drop_no_egress_ip_from_overlay")
+SETUP(PROG_TYPE, "tc_egressgw_drop_no_egress_ip_from_overlay")
 int egressgw_drop_no_egress_ip_setup(struct __ctx_buff *ctx)
 {
 	add_egressgw_policy_entry(CLIENT_IP, EXTERNAL_SVC_IP, 32, GATEWAY_NODE_IP,
-				  EGRESS_GATEWAY_NO_EGRESS_IP);
+				  EGRESS_GATEWAY_NO_EGRESS_IP, 0);
 
 	return overlay_receive_packet(ctx);
 }
 
-CHECK("tc", "tc_egressgw_drop_no_egress_ip_from_overlay")
+CHECK(PROG_TYPE, "tc_egressgw_drop_no_egress_ip_from_overlay")
 int egressgw_drop_no_egress_ip_check(const struct __ctx_buff *ctx)
 {
 	int ret = egressgw_status_check(ctx, (struct egressgw_test_ctx) {
@@ -195,8 +228,8 @@ int egressgw_drop_no_egress_ip_check(const struct __ctx_buff *ctx)
 /* Test that a packet matching an egress gateway policy on the from-overlay program
  * gets correctly redirected to the target netdev for IPv6.
  */
-PKTGEN("tc", "tc_egressgw_redirect_from_overlay_v6")
-int egressgw_redirect_pktgen_v6(struct __ctx_buff *ctx)
+PKTGEN(PROG_TYPE, "tc_egressgw_v6_redirect_from_overlay")
+int egressgw_v6_redirect_pktgen(struct __ctx_buff *ctx)
 {
 	return egressgw_pktgen_v6(ctx, (struct egressgw_test_ctx) {
 			.test = TEST_REDIRECT,
@@ -204,8 +237,8 @@ int egressgw_redirect_pktgen_v6(struct __ctx_buff *ctx)
 		});
 }
 
-SETUP("tc", "tc_egressgw_redirect_from_overlay_v6")
-int egressgw_redirect_setup_v6(struct __ctx_buff *ctx)
+SETUP(PROG_TYPE, "tc_egressgw_v6_redirect_from_overlay")
+int egressgw_v6_redirect_setup(struct __ctx_buff *ctx)
 {
 	union v6addr ext_svc_ip = EXTERNAL_SVC_IP_V6;
 	union v6addr client_ip = CLIENT_IP_V6;
@@ -217,8 +250,48 @@ int egressgw_redirect_setup_v6(struct __ctx_buff *ctx)
 	return overlay_receive_packet(ctx);
 }
 
-CHECK("tc", "tc_egressgw_redirect_from_overlay_v6")
-int egressgw_redirect_check_v6(const struct __ctx_buff *ctx)
+CHECK(PROG_TYPE, "tc_egressgw_v6_redirect_from_overlay")
+int egressgw_v6_redirect_check(const struct __ctx_buff *ctx)
+{
+	union v6addr ext_svc_ip = EXTERNAL_SVC_IP_V6;
+	union v6addr client_ip = CLIENT_IP_V6;
+
+	int ret = egressgw_status_check(ctx, (struct egressgw_test_ctx) {
+			.status_code = TC_ACT_REDIRECT,
+	});
+
+	del_egressgw_policy_entry_v6(&client_ip, &ext_svc_ip, IPV6_SUBNET_PREFIX);
+
+	return ret;
+}
+
+/* Test that a packet matching an egress gateway policy on the from-overlay program
+ * gets correctly redirected to the target netdev for IPv6, using the ifindex from the policy.
+ */
+PKTGEN(PROG_TYPE, "tc_egressgw_v6_redirect_from_overlay_with_ifindex")
+int egressgw_v6_redirect_with_ifindex_pktgen(struct __ctx_buff *ctx)
+{
+	return egressgw_pktgen_v6(ctx, (struct egressgw_test_ctx) {
+			.test = TEST_REDIRECT,
+			.redirect = true,
+		});
+}
+
+SETUP(PROG_TYPE, "tc_egressgw_v6_redirect_from_overlay_with_ifindex")
+int egressgw_v6_redirect_with_ifindex_setup(struct __ctx_buff *ctx)
+{
+	union v6addr ext_svc_ip = EXTERNAL_SVC_IP_V6;
+	union v6addr client_ip = CLIENT_IP_V6;
+	union v6addr egress_ip = EGRESS_IP_V6;
+
+	add_egressgw_policy_entry_v6(&client_ip, &ext_svc_ip, IPV6_SUBNET_PREFIX, GATEWAY_NODE_IP,
+				     &egress_ip, IFACE_IFINDEX);
+
+	return overlay_receive_packet(ctx);
+}
+
+CHECK(PROG_TYPE, "tc_egressgw_v6_redirect_from_overlay_with_ifindex")
+int egressgw_v6_redirect_check_with_ifindex(const struct __ctx_buff *ctx)
 {
 	union v6addr ext_svc_ip = EXTERNAL_SVC_IP_V6;
 	union v6addr client_ip = CLIENT_IP_V6;
@@ -235,7 +308,7 @@ int egressgw_redirect_check_v6(const struct __ctx_buff *ctx)
 /* Test that a packet matching an excluded CIDR egress gateway policy on the
  * from-overlay program does not get redirected to the target netdev.
  */
-PKTGEN("tc", "tc_egressgw_skip_excluded_cidr_redirect_from_overlay_v6")
+PKTGEN(PROG_TYPE, "tc_egressgw_skip_excluded_cidr_redirect_from_overlay_v6")
 int egressgw_skip_excluded_cidr_redirect_pktgen_v6(struct __ctx_buff *ctx)
 {
 	return egressgw_pktgen_v6(ctx, (struct egressgw_test_ctx) {
@@ -243,7 +316,7 @@ int egressgw_skip_excluded_cidr_redirect_pktgen_v6(struct __ctx_buff *ctx)
 		});
 }
 
-SETUP("tc", "tc_egressgw_skip_excluded_cidr_redirect_from_overlay_v6")
+SETUP(PROG_TYPE, "tc_egressgw_skip_excluded_cidr_redirect_from_overlay_v6")
 int egressgw_skip_excluded_cidr_redirect_setup_v6(struct __ctx_buff *ctx)
 {
 	union v6addr ext_svc_ip = EXTERNAL_SVC_IP_V6;
@@ -258,7 +331,7 @@ int egressgw_skip_excluded_cidr_redirect_setup_v6(struct __ctx_buff *ctx)
 	return overlay_receive_packet(ctx);
 }
 
-CHECK("tc", "tc_egressgw_skip_excluded_cidr_redirect_from_overlay_v6")
+CHECK(PROG_TYPE, "tc_egressgw_skip_excluded_cidr_redirect_from_overlay_v6")
 int egressgw_skip_excluded_cidr_redirect_check_v6(const struct __ctx_buff *ctx)
 {
 	union v6addr ext_svc_ip = EXTERNAL_SVC_IP_V6;
@@ -277,7 +350,7 @@ int egressgw_skip_excluded_cidr_redirect_check_v6(const struct __ctx_buff *ctx)
 /* Test that a packet matching an egress gateway policy without a gateway on the
  * from-overlay program does not get redirected to the target netdev.
  */
-PKTGEN("tc", "tc_egressgw_skip_no_gateway_redirect_from_overlay_v6")
+PKTGEN(PROG_TYPE, "tc_egressgw_skip_no_gateway_redirect_from_overlay_v6")
 int egressgw_skip_no_gateway_redirect_pktgen_v6(struct __ctx_buff *ctx)
 {
 	return egressgw_pktgen_v6(ctx, (struct egressgw_test_ctx) {
@@ -285,7 +358,7 @@ int egressgw_skip_no_gateway_redirect_pktgen_v6(struct __ctx_buff *ctx)
 		});
 }
 
-SETUP("tc", "tc_egressgw_skip_no_gateway_redirect_from_overlay_v6")
+SETUP(PROG_TYPE, "tc_egressgw_skip_no_gateway_redirect_from_overlay_v6")
 int egressgw_skip_no_gateway_redirect_setup_v6(struct __ctx_buff *ctx)
 {
 	union v6addr ext_svc_ip = EXTERNAL_SVC_IP_V6;
@@ -298,7 +371,7 @@ int egressgw_skip_no_gateway_redirect_setup_v6(struct __ctx_buff *ctx)
 	return overlay_receive_packet(ctx);
 }
 
-CHECK("tc", "tc_egressgw_skip_no_gateway_redirect_from_overlay_v6")
+CHECK(PROG_TYPE, "tc_egressgw_skip_no_gateway_redirect_from_overlay_v6")
 int egressgw_skip_no_gateway_redirect_check_v6(const struct __ctx_buff *ctx)
 {
 	union v6addr ext_svc_ip = EXTERNAL_SVC_IP_V6;
@@ -316,7 +389,7 @@ int egressgw_skip_no_gateway_redirect_check_v6(const struct __ctx_buff *ctx)
 /* Test that a packet matching an egress gateway policy without an egressIP on the
  * from-overlay program gets dropped.
  */
-PKTGEN("tc", "tc_egressgw_drop_no_egress_ip_from_overlay_v6")
+PKTGEN(PROG_TYPE, "tc_egressgw_drop_no_egress_ip_from_overlay_v6")
 int egressgw_drop_no_egress_ip_pktgen_v6(struct __ctx_buff *ctx)
 {
 	return egressgw_pktgen_v6(ctx, (struct egressgw_test_ctx) {
@@ -324,7 +397,7 @@ int egressgw_drop_no_egress_ip_pktgen_v6(struct __ctx_buff *ctx)
 		});
 }
 
-SETUP("tc", "tc_egressgw_drop_no_egress_ip_from_overlay_v6")
+SETUP(PROG_TYPE, "tc_egressgw_drop_no_egress_ip_from_overlay_v6")
 int egressgw_drop_no_egress_ip_setup_v6(struct __ctx_buff *ctx)
 {
 	union v6addr ext_svc_ip = EXTERNAL_SVC_IP_V6;
@@ -337,7 +410,7 @@ int egressgw_drop_no_egress_ip_setup_v6(struct __ctx_buff *ctx)
 	return overlay_receive_packet(ctx);
 }
 
-CHECK("tc", "tc_egressgw_drop_no_egress_ip_from_overlay_v6")
+CHECK(PROG_TYPE, "tc_egressgw_drop_no_egress_ip_from_overlay_v6")
 int egressgw_drop_no_egress_ip_check_v6(const struct __ctx_buff *ctx)
 {
 	union v6addr ext_svc_ip = EXTERNAL_SVC_IP_V6;

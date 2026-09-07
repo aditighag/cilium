@@ -4,29 +4,39 @@
 package linux
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"log/slog"
 	"net"
+	"net/netip"
 	"sync"
 	"syscall"
 
 	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/job"
+	"github.com/cilium/statedb"
+	"github.com/cilium/statedb/reconciler"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vishvananda/netlink"
+	"go4.org/netipx"
 	"golang.org/x/sys/unix"
+	"golang.org/x/time/rate"
 	"k8s.io/apimachinery/pkg/util/sets"
 
-	"github.com/cilium/cilium/pkg/cidr"
-	fakeTypes "github.com/cilium/cilium/pkg/datapath/fake/types"
+	"github.com/cilium/cilium/pkg/backoff"
+	"github.com/cilium/cilium/pkg/datapath/config"
 	"github.com/cilium/cilium/pkg/datapath/linux/ipsec"
+	fakeipsec "github.com/cilium/cilium/pkg/datapath/linux/ipsec/fake"
+	ipsecTypes "github.com/cilium/cilium/pkg/datapath/linux/ipsec/types"
 	"github.com/cilium/cilium/pkg/datapath/linux/linux_defaults"
 	"github.com/cilium/cilium/pkg/datapath/linux/route"
 	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	dpTunnel "github.com/cilium/cilium/pkg/datapath/tunnel"
-	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/idpool"
+	"github.com/cilium/cilium/pkg/ip"
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	"github.com/cilium/cilium/pkg/kpr"
 	"github.com/cilium/cilium/pkg/lock"
@@ -36,12 +46,14 @@ import (
 	"github.com/cilium/cilium/pkg/node/manager"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
-	"github.com/cilium/cilium/pkg/source"
+	cslices "github.com/cilium/cilium/pkg/slices"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 const (
-	wildcardIPv4 = "0.0.0.0"
-	wildcardIPv6 = "0::0"
+	wildcardIPv4             = "0.0.0.0"
+	wildcardIPv6             = "0::0"
+	linuxNodeRefreshInterval = time.Minute
 )
 
 // NeighLink contains the details of a NeighLink
@@ -52,14 +64,22 @@ type NeighLink struct {
 type linuxNodeHandler struct {
 	log *slog.Logger
 
-	mutex             lock.RWMutex
-	isInitialized     bool
-	nodeConfig        datapath.LocalNodeConfiguration
-	datapathConfig    DatapathConfiguration
-	nodes             map[nodeTypes.Identity]*nodeTypes.Node
+	mutex          lock.RWMutex
+	isInitialized  bool
+	nodeConfig     config.Config
+	datapathConfig DatapathConfiguration
+	// nodes contains the last successfully reconciled node version. This cannot
+	// be recovered from the node table, which only contains the latest desired
+	// version, while nodeUpdate needs the previous realized version to remove
+	// obsolete datapath state.
+	nodes map[nodeTypes.Identity]*nodeTypes.Node
+	// pendingNodes contains versions that may have been partially realized by
+	// a failed update and therefore also need cleanup if the object is deleted.
+	pendingNodes      map[nodeTypes.Identity]*nodeTypes.Node
 	ipsecUpdateNeeded map[nodeTypes.Identity]bool
 
-	nodeMap nodemap.MapV2
+	localNodeStore *node.LocalNodeStore
+	nodeMap        nodemap.MapV2
 	// Pool of available IDs for nodes.
 	nodeIDs *idpool.IDPool
 	// Node-scoped unique IDs for the nodes.
@@ -69,68 +89,281 @@ type linuxNodeHandler struct {
 
 	ipsecMetricCollector prometheus.Collector
 	ipsecMetricOnce      sync.Once
-	ipsecAgent           datapath.IPsecAgent
+	ipsecAgent           ipsecTypes.Agent
 
-	enableEncapsulation func(node *nodeTypes.Node) bool
+	nodePolicy *NodePolicy
 
 	kprCfg kpr.KPRConfig
 
-	ipsecCfg datapath.IPsecConfig
+	ipsecCfg ipsecTypes.Config
+
+	// configReady is closed after the first NodeConfigurationChanged call. Node
+	// reconciliation must not run before the feature configuration it consumes
+	// is available.
+	configReady chan struct{}
 }
 
 var (
-	_ datapath.NodeHandler             = (*linuxNodeHandler)(nil)
-	_ datapath.NodeConfigChangeHandler = (*linuxNodeHandler)(nil)
-	_ datapath.NodeIDHandler           = (*linuxNodeHandler)(nil)
+	_ config.ChangeHandler              = (*linuxNodeHandler)(nil)
+	_ node.IDHandler                    = (*linuxNodeHandler)(nil)
+	_ reconciler.Operations[*node.Node] = (*linuxNodeOps)(nil)
 )
 
-// NewNodeHandler returns a new node handler to handle node events and
-// implement the implications in the Linux datapath
+type linuxNodeOps struct {
+	handler *linuxNodeHandler
+}
+
+// RegisterNodeReconciler declares the Linux datapath as a required node
+// reconciler during Hive construction.
+func RegisterNodeReconciler(writer *node.Writer) {
+	writer.RegisterReconciler(node.LinuxNodeReconciler)
+}
+
+// NewNodeHandler constructs the Linux node datapath and provides node ID
+// lookups.
 func NewNodeHandler(
 	lifecycle cell.Lifecycle,
 	log *slog.Logger,
 	tunnelConfig dpTunnel.Config,
 	nodeMap nodemap.MapV2,
-	nodeManager manager.NodeManager,
 	nodeConfigNotifier *manager.NodeConfigNotifier,
 	kprCfg kpr.KPRConfig,
-	ipsecAgent datapath.IPsecAgent,
-) (datapath.NodeHandler, datapath.NodeIDHandler) {
+	ipsecAgent ipsecTypes.Agent,
+	localNodeStore *node.LocalNodeStore,
+	nodePolicy *NodePolicy,
+	params reconciler.Params,
+	nodes statedb.Table[*node.Node],
+	health cell.Health,
+	daemonConfig *option.DaemonConfig,
+) node.IDHandler {
 	datapathConfig := DatapathConfiguration{
 		HostDevice:   defaults.HostDevice,
 		TunnelDevice: tunnelConfig.DeviceName(),
 	}
 
-	handler := newNodeHandler(log, datapathConfig, nodeMap, kprCfg, ipsecAgent, fakeTypes.IPsecConfig{})
+	handler := newNodeHandler(
+		log,
+		datapathConfig,
+		nodeMap,
+		kprCfg,
+		ipsecAgent,
+		fakeipsec.Config{},
+		localNodeStore,
+		nodePolicy,
+	)
+	checkpoint := newLinuxNodeCheckpoint(
+		log,
+		health,
+		params.DB,
+		nodes,
+		func(ctx context.Context, restored nodeTypes.Node) error {
+			// Pruning may start as soon as the node table is initialized, but the
+			// datapath configuration is needed to determine which restored state to
+			// remove.
+			if err := handler.waitForConfig(ctx); err != nil {
+				return err
+			}
 
-	nodeManager.Subscribe(handler)
+			handler.mutex.Lock()
+			defer handler.mutex.Unlock()
+			return handler.nodeDelete(&restored)
+		},
+		daemonConfig.StateDir,
+	)
+	nodeTable := nodes.(statedb.RWTable[*node.Node])
+
 	nodeConfigNotifier.Subscribe(handler)
 
 	lifecycle.Append(cell.Hook{
 		OnStart: func(_ cell.HookContext) error {
 			handler.RestoreNodeIDs()
+			if err := checkpoint.start(); err != nil {
+				return fmt.Errorf("starting Linux node checkpoint: %w", err)
+			}
+
+			params.JobGroup.Add(
+				job.OneShot(
+					"linux-node-refresh",
+					func(ctx context.Context, health cell.Health) error {
+						return refreshLinuxNodes(ctx, health, params.DB, nodeTable)
+					},
+				),
+				job.OneShot("linux-node-checkpoint-writer", checkpoint.watch),
+				job.OneShot(
+					"linux-node-restored-pruning",
+					checkpoint.prune,
+					job.WithRetry(-1, &job.ExponentialBackoff{
+						Min: nodeCheckpointCleanupRetryMin,
+						Max: nodeCheckpointCleanupRetryMax,
+					}),
+				),
+			)
+			return nil
+		},
+		OnStop: func(_ cell.HookContext) error {
+			if err := checkpoint.stop(); err != nil {
+				log.Error("Failed to write final Linux node checkpoint",
+					logfields.Error, err,
+				)
+			}
 			return nil
 		},
 	})
+	// Queue the registration after the start hook so restored node IDs and the
+	// checkpoint are initialized before reconciliation can begin.
+	params.JobGroup.Add(job.OneShot(
+		"linux-node-reconciler-registration",
+		func(ctx context.Context, _ cell.Health) error {
+			if err := handler.waitForConfig(ctx); err != nil {
+				return nil
+			}
 
-	return handler, handler
+			_, err := reconciler.Register(
+				params,
+				nodeTable,
+				(*node.Node).DeepCopy,
+				func(n *node.Node, status reconciler.Status) *node.Node {
+					n.Statuses = n.Statuses.Set(node.LinuxNodeReconciler.String(), status)
+					return n
+				},
+				func(n *node.Node) reconciler.Status {
+					return n.Statuses.Get(node.LinuxNodeReconciler.String())
+				},
+				&linuxNodeOps{handler: handler},
+				nil,
+				reconciler.WithName(node.LinuxNodeReconciler.String()),
+				reconciler.WithoutPruning(),
+			)
+			if err != nil {
+				return fmt.Errorf("registering Linux node reconciler: %w", err)
+			}
+			return nil
+		},
+	))
+
+	return handler
 }
 
-// newNodeHandler returns a new node handler to handle node events and
-// implement the implications in the Linux datapath
+// refreshLinuxNodes periodically refreshes reconciled nodes. This is done
+// explicitly instead of with reconciler.WithRefreshing so that the refresh
+// interval can grow with the cluster size and nodes can be paced across it.
+func refreshLinuxNodes(
+	ctx context.Context,
+	health cell.Health,
+	db *statedb.DB,
+	nodes statedb.RWTable[*node.Node],
+) error {
+	for {
+		interval := backoff.ClusterSizeDependantInterval(
+			linuxNodeRefreshInterval,
+			nodes.NumObjects(db.ReadTxn()),
+		)
+		startWaiting := time.After(interval)
+		refreshLinuxNodesOnce(ctx, db, nodes, interval)
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-startWaiting:
+		}
+		health.OK("Node refresh complete")
+	}
+}
+
+func refreshLinuxNodesOnce(
+	ctx context.Context,
+	db *statedb.DB,
+	nodes statedb.RWTable[*node.Node],
+	interval time.Duration,
+) {
+	targets := []string{}
+	for n := range nodes.All(db.ReadTxn()) {
+		targets = append(targets, n.Fullname())
+	}
+	if len(targets) == 0 {
+		return
+	}
+
+	limiter := rate.NewLimiter(
+		rate.Limit(float64(len(targets))/interval.Seconds()),
+		1,
+	)
+	for _, fullname := range targets {
+		if limiter.Wait(ctx) != nil {
+			return
+		}
+		refreshLinuxNode(ctx, db, nodes, fullname)
+	}
+}
+
+func refreshLinuxNode(
+	ctx context.Context,
+	db *statedb.DB,
+	nodes statedb.RWTable[*node.Node],
+	fullname string,
+) {
+	// marked records whether this invocation transitioned the node to
+	// Refreshing, so a later terminal status belongs to this refresh attempt.
+	marked := false
+	for {
+		n, _, watch, found := nodes.GetWatch(db.ReadTxn(), node.NodeByName(fullname))
+		if !found {
+			return
+		}
+
+		kind := n.Statuses.Get(node.LinuxNodeReconciler.String()).Kind
+		if marked && (kind == reconciler.StatusKindDone || kind == reconciler.StatusKindError) {
+			return
+		}
+		if !marked && kind == reconciler.StatusKindError {
+			// Failed objects are already retried by the reconciler.
+			return
+		}
+		if !marked && kind == reconciler.StatusKindDone {
+			wtxn := db.WriteTxn(nodes)
+			current, _, found := nodes.Get(wtxn, node.NodeByName(fullname))
+			if found && current.Statuses.Get(node.LinuxNodeReconciler.String()).Kind == reconciler.StatusKindDone {
+				current = current.DeepCopy()
+				current.Statuses = current.Statuses.Set(
+					node.LinuxNodeReconciler.String(),
+					reconciler.StatusRefreshing(),
+				)
+				nodes.Insert(wtxn, current)
+				wtxn.Commit()
+				marked = true
+			} else {
+				wtxn.Abort()
+			}
+			continue
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-watch:
+		}
+	}
+}
+
+// newNodeHandler constructs the implementation of Linux node datapath
+// operations.
 func newNodeHandler(
 	log *slog.Logger,
 	datapathConfig DatapathConfiguration,
 	nodeMap nodemap.MapV2,
 	kprCfg kpr.KPRConfig,
-	ipsecAgent datapath.IPsecAgent,
-	ipsecCfg datapath.IPsecConfig,
+	ipsecAgent ipsecTypes.Agent,
+	ipsecCfg ipsecTypes.Config,
+	localNodeStore *node.LocalNodeStore,
+	nodePolicy *NodePolicy,
 ) *linuxNodeHandler {
 	return &linuxNodeHandler{
 		log:                  log,
 		datapathConfig:       datapathConfig,
-		nodeConfig:           datapath.LocalNodeConfiguration{},
+		nodeConfig:           config.Config{},
 		nodes:                map[nodeTypes.Identity]*nodeTypes.Node{},
+		pendingNodes:         map[nodeTypes.Identity]*nodeTypes.Node{},
+		localNodeStore:       localNodeStore,
 		nodeMap:              nodeMap,
 		nodeIDs:              idpool.NewIDPool(minNodeID, maxNodeID),
 		nodeIDsByIPs:         map[string]uint16{},
@@ -140,19 +373,97 @@ func newNodeHandler(
 		kprCfg:               kprCfg,
 		ipsecAgent:           ipsecAgent,
 		ipsecCfg:             ipsecCfg,
+		nodePolicy:           nodePolicy,
+		configReady:          make(chan struct{}),
 	}
 }
 
-func (l *linuxNodeHandler) Name() string {
-	return "linux-node-datapath"
+func (ops *linuxNodeOps) Update(
+	_ context.Context,
+	_ statedb.ReadTxn,
+	_ statedb.Revision,
+	desired *node.Node,
+) error {
+	n := desired.Node.DeepCopy()
+	ops.handler.mutex.Lock()
+	defer ops.handler.mutex.Unlock()
+
+	old, found := ops.handler.nodes[n.Identity()]
+	if pending, pendingFound := ops.handler.pendingNodes[n.Identity()]; pendingFound && !pending.DeepEqual(n) {
+		// Use the last attempted version as old when a newer update supersedes a
+		// failed one so partially realized state is removed. Retries of the same
+		// version still use the last successful version and reattempt every
+		// operation.
+		old = pending
+		found = true
+	}
+	if err := ops.handler.nodeUpdate(old, n, !found); err != nil {
+		ops.handler.pendingNodes[n.Identity()] = n
+		return err
+	}
+	ops.handler.nodes[n.Identity()] = n
+	delete(ops.handler.pendingNodes, n.Identity())
+	return nil
 }
 
-func createDirectRouteSpec(log *slog.Logger, CIDR *cidr.CIDR, nodeIP net.IP, skipUnreachable bool) (routeSpec *netlink.Route, addRoute bool, err error) {
+func (ops *linuxNodeOps) Delete(
+	_ context.Context,
+	_ statedb.ReadTxn,
+	_ statedb.Revision,
+	deleted *node.Node,
+) error {
+	ops.handler.mutex.Lock()
+	defer ops.handler.mutex.Unlock()
+
+	identity := deleted.Identity()
+	old, found := ops.handler.nodes[identity]
+	pending, pendingFound := ops.handler.pendingNodes[identity]
+	if !found && !pendingFound {
+		return nil
+	}
+
+	var errs error
+	if pendingFound {
+		errs = errors.Join(errs, ops.handler.nodeDelete(pending))
+	}
+	if found && (!pendingFound || !old.DeepEqual(pending)) {
+		errs = errors.Join(errs, ops.handler.nodeDelete(old))
+	}
+	if errs != nil {
+		return errs
+	}
+	delete(ops.handler.nodes, identity)
+	delete(ops.handler.pendingNodes, identity)
+	return nil
+}
+
+func (*linuxNodeOps) Prune(
+	context.Context,
+	statedb.ReadTxn,
+	iter.Seq2[*node.Node, statedb.Revision],
+) error {
+	// Deletions are handled incrementally. State restored from nodes.json is
+	// pruned separately by linuxNodeCheckpoint once the node table is initialized.
+	return nil
+}
+
+// waitForConfig prevents reconciliation from running before the datapath
+// feature configuration used by nodeUpdate and nodeDelete is available.
+func (n *linuxNodeHandler) waitForConfig(ctx context.Context) error {
+	select {
+	case <-n.configReady:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func createDirectRouteSpec(log *slog.Logger, prefix netip.Prefix, nodeIP net.IP, skipUnreachable bool) (routeSpec *netlink.Route, addRoute bool, err error) {
 	var routes []netlink.Route
 	addRoute = true
 
 	routeSpec = &netlink.Route{
-		Dst:      CIDR.IPNet,
+		Dst:      netipx.PrefixIPNet(prefix),
 		Gw:       nodeIP,
 		Protocol: linux_defaults.RTProto,
 	}
@@ -217,8 +528,8 @@ func createDirectRouteSpec(log *slog.Logger, CIDR *cidr.CIDR, nodeIP net.IP, ski
 	return
 }
 
-func installDirectRoute(log *slog.Logger, CIDR *cidr.CIDR, nodeIP net.IP, skipUnreachable bool) (routeSpec *netlink.Route, err error) {
-	routeSpec, addRoute, err := createDirectRouteSpec(log, CIDR, nodeIP, skipUnreachable)
+func installDirectRoute(log *slog.Logger, prefix netip.Prefix, nodeIP net.IP, skipUnreachable bool) (routeSpec *netlink.Route, err error) {
+	routeSpec, addRoute, err := createDirectRouteSpec(log, prefix, nodeIP, skipUnreachable)
 	if err != nil {
 		return
 	}
@@ -229,7 +540,7 @@ func installDirectRoute(log *slog.Logger, CIDR *cidr.CIDR, nodeIP net.IP, skipUn
 	return
 }
 
-func (n *linuxNodeHandler) updateDirectRoutes(oldCIDRs, newCIDRs []*cidr.CIDR, oldIP, newIP net.IP, firstAddition, directRouteEnabled bool, directRouteSkipUnreachable bool) error {
+func (n *linuxNodeHandler) updateDirectRoutes(oldCIDRs, newCIDRs []netip.Prefix, oldIP, newIP net.IP, firstAddition, directRouteEnabled bool, directRouteSkipUnreachable bool) error {
 	if !directRouteEnabled {
 		// When the protocol family is disabled, the initial node addition will
 		// trigger a deletion to clean up leftover entries. The deletion happens
@@ -240,9 +551,11 @@ func (n *linuxNodeHandler) updateDirectRoutes(oldCIDRs, newCIDRs []*cidr.CIDR, o
 		return nil
 	}
 
-	var addedCIDRs, removedCIDRs []*cidr.CIDR
+	var addedCIDRs, removedCIDRs []netip.Prefix
 	if oldIP.Equal(newIP) {
-		addedCIDRs, removedCIDRs = cidr.DiffCIDRLists(oldCIDRs, newCIDRs)
+		oldSet, newSet := sets.New(oldCIDRs...), sets.New(newCIDRs...)
+		addedCIDRs = newSet.Difference(oldSet).UnsortedList()
+		removedCIDRs = oldSet.Difference(newSet).UnsortedList()
 	} else {
 		// if the node IP changed, then we need to update all routes with the
 		// new IP, but we also want to remove any of the old routes with the
@@ -257,8 +570,8 @@ func (n *linuxNodeHandler) updateDirectRoutes(oldCIDRs, newCIDRs []*cidr.CIDR, o
 		logfields.RemovedCIDRs, removedCIDRs,
 	)
 
-	for _, cidr := range addedCIDRs {
-		if routeSpec, err := installDirectRoute(n.log, cidr, newIP, directRouteSkipUnreachable); err != nil {
+	for _, prefix := range addedCIDRs {
+		if routeSpec, err := installDirectRoute(n.log, prefix, newIP, directRouteSkipUnreachable); err != nil {
 			n.log.Warn("Unable to install direct node route",
 				logfields.Route, routeSpec,
 				logfields.Error, err,
@@ -282,30 +595,30 @@ func (n *linuxNodeHandler) updateDirectRoutes(oldCIDRs, newCIDRs []*cidr.CIDR, o
 	return nil
 }
 
-func (n *linuxNodeHandler) deleteAllDirectRoutes(CIDRs []*cidr.CIDR, nodeIP net.IP) error {
+func (n *linuxNodeHandler) deleteAllDirectRoutes(prefixes []netip.Prefix, nodeIP net.IP) error {
 	var errs error
-	for _, cidr := range CIDRs {
-		if err := n.deleteDirectRoute(cidr, nodeIP); err != nil {
+	for _, prefix := range prefixes {
+		if err := n.deleteDirectRoute(prefix, nodeIP); err != nil {
 			errs = errors.Join(errs, err)
 		}
 	}
 	return errs
 }
 
-func (n *linuxNodeHandler) deleteDirectRoute(CIDR *cidr.CIDR, nodeIP net.IP) error {
-	if CIDR == nil {
+func (n *linuxNodeHandler) deleteDirectRoute(prefix netip.Prefix, nodeIP net.IP) error {
+	if !prefix.IsValid() {
 		return nil
 	}
 
 	family := netlink.FAMILY_V4
 	familyStr := "ip4"
-	if CIDR.IP.To4() == nil {
+	if !prefix.Addr().Is4() {
 		family = netlink.FAMILY_V6
 		familyStr = "ip6"
 	}
 
 	filter := &netlink.Route{
-		Dst:      CIDR.IPNet,
+		Dst:      netipx.PrefixIPNet(prefix),
 		Gw:       nodeIP,
 		Protocol: linux_defaults.RTProto,
 	}
@@ -336,25 +649,25 @@ func (n *linuxNodeHandler) deleteDirectRoute(CIDR *cidr.CIDR, nodeIP net.IP) err
 // Example:
 // 10.10.0.0/24 via 10.10.0.1 dev cilium_host src 10.10.0.1
 // f00d::a0a:0:0:0/112 via f00d::a0a:0:0:1 dev cilium_host src fd04::11 metric 1024 pref medium
-func (n *linuxNodeHandler) createNodeRouteSpec(prefix *cidr.CIDR, isLocalNode bool) (route.Route, error) {
+func (n *linuxNodeHandler) createNodeRouteSpec(prefix netip.Prefix, isLocalNode bool) (route.Route, error) {
 	var (
 		local   net.IP
 		nexthop *net.IP
 		mtu     int
 	)
-	if prefix.IP.To4() != nil {
-		if n.nodeConfig.CiliumInternalIPv4 == nil {
+	if prefix.Addr().Is4() {
+		if !n.nodeConfig.CiliumInternalIPv4.IsValid() {
 			return route.Route{}, fmt.Errorf("IPv4 router address unavailable")
 		}
 
-		local = n.nodeConfig.CiliumInternalIPv4
+		local = net.IP(n.nodeConfig.CiliumInternalIPv4.AsSlice())
 		nexthop = &local
 	} else {
-		if n.nodeConfig.CiliumInternalIPv6 == nil {
+		if !n.nodeConfig.CiliumInternalIPv6.IsValid() {
 			return route.Route{}, fmt.Errorf("IPv6 router address unavailable")
 		}
 
-		if n.nodeConfig.NodeIPv6 == nil {
+		if !n.nodeConfig.NodeIPv6.IsValid() {
 			return route.Route{}, fmt.Errorf("external IPv6 address unavailable")
 		}
 
@@ -362,7 +675,7 @@ func (n *linuxNodeHandler) createNodeRouteSpec(prefix *cidr.CIDR, isLocalNode bo
 		// with "Error: Gateway can not be a local address". Instead, we have to remove "via"
 		// as "ip r a $cidr dev cilium_host" to make it work.
 		nexthop = nil
-		local = n.nodeConfig.CiliumInternalIPv6
+		local = net.IP(n.nodeConfig.CiliumInternalIPv6.AsSlice())
 	}
 
 	if !isLocalNode {
@@ -374,15 +687,15 @@ func (n *linuxNodeHandler) createNodeRouteSpec(prefix *cidr.CIDR, isLocalNode bo
 		Nexthop:  nexthop,
 		Local:    local,
 		Device:   n.datapathConfig.HostDevice,
-		Prefix:   *prefix.IPNet,
+		Prefix:   *netipx.PrefixIPNet(prefix),
 		MTU:      mtu,
 		Priority: option.Config.RouteMetric,
 		Proto:    linux_defaults.RTProto,
 	}, nil
 }
 
-func (n *linuxNodeHandler) lookupNodeRoute(prefix *cidr.CIDR, isLocalNode bool) (*route.Route, error) {
-	if prefix == nil {
+func (n *linuxNodeHandler) lookupNodeRoute(prefix netip.Prefix, isLocalNode bool) (*route.Route, error) {
+	if !prefix.IsValid() {
 		return nil, nil
 	}
 
@@ -394,8 +707,8 @@ func (n *linuxNodeHandler) lookupNodeRoute(prefix *cidr.CIDR, isLocalNode bool) 
 	return route.Lookup(routeSpec)
 }
 
-func (n *linuxNodeHandler) updateNodeRoute(prefix *cidr.CIDR, addressFamilyEnabled bool, isLocalNode bool) error {
-	if prefix == nil || !addressFamilyEnabled {
+func (n *linuxNodeHandler) updateNodeRoute(prefix netip.Prefix, addressFamilyEnabled bool, isLocalNode bool) error {
+	if !prefix.IsValid() || !addressFamilyEnabled {
 		return nil
 	}
 
@@ -412,8 +725,8 @@ func (n *linuxNodeHandler) updateNodeRoute(prefix *cidr.CIDR, addressFamilyEnabl
 	return nil
 }
 
-func (n *linuxNodeHandler) deleteNodeRoute(prefix *cidr.CIDR, isLocalNode bool) error {
-	if prefix == nil {
+func (n *linuxNodeHandler) deleteNodeRoute(prefix netip.Prefix, isLocalNode bool) error {
+	if !prefix.IsValid() {
 		return nil
 	}
 
@@ -422,6 +735,12 @@ func (n *linuxNodeHandler) deleteNodeRoute(prefix *cidr.CIDR, isLocalNode bool) 
 		return err
 	}
 	if err := route.Delete(nodeRoute); err != nil {
+		// Deletion is retried by the node reconciler and restored-state
+		// pruning. A previous attempt may have removed the route before a
+		// later operation failed, so an already absent route is success.
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
 		n.log.Warn("Unable to delete route",
 			append(nodeRoute.LogAttrs(), logfields.Error, err)...)
 		return err
@@ -430,18 +749,18 @@ func (n *linuxNodeHandler) deleteNodeRoute(prefix *cidr.CIDR, isLocalNode bool) 
 	return nil
 }
 
-func (n *linuxNodeHandler) familyEnabled(c *cidr.CIDR) bool {
-	return (c.IP.To4() != nil && n.nodeConfig.EnableIPv4) || (c.IP.To4() == nil && n.nodeConfig.EnableIPv6)
+func (n *linuxNodeHandler) familyEnabled(prefix netip.Prefix) bool {
+	return (prefix.Addr().Is4() && n.nodeConfig.EnableIPv4) || (prefix.Addr().Is6() && n.nodeConfig.EnableIPv6)
 }
 
-func (n *linuxNodeHandler) updateOrRemoveNodeRoutes(old, new []*cidr.CIDR, isLocalNode bool) error {
+func (n *linuxNodeHandler) updateOrRemoveNodeRoutes(old, new []netip.Prefix, isLocalNode bool) error {
 	var errs error
-	addedAuxRoutes, removedAuxRoutes := cidr.DiffCIDRLists(old, new)
+	oldSet, newSet := sets.New(old...), sets.New(new...)
+	addedAuxRoutes := newSet.Difference(oldSet).UnsortedList()
+	removedAuxRoutes := oldSet.Difference(newSet).UnsortedList()
 	for _, prefix := range addedAuxRoutes {
-		if prefix != nil {
-			if err := n.updateNodeRoute(prefix, n.familyEnabled(prefix), isLocalNode); err != nil {
-				errs = errors.Join(errs, fmt.Errorf("failed to add aux route %q: %w", prefix, err))
-			}
+		if err := n.updateNodeRoute(prefix, n.familyEnabled(prefix), isLocalNode); err != nil {
+			errs = errors.Join(errs, fmt.Errorf("failed to add aux route %q: %w", prefix, err))
 		}
 	}
 	for _, prefix := range removedAuxRoutes {
@@ -454,32 +773,6 @@ func (n *linuxNodeHandler) updateOrRemoveNodeRoutes(old, new []*cidr.CIDR, isLoc
 	return errs
 }
 
-func (n *linuxNodeHandler) NodeAdd(newNode nodeTypes.Node) error {
-	n.mutex.Lock()
-	defer n.mutex.Unlock()
-
-	n.nodes[newNode.Identity()] = &newNode
-
-	if n.isInitialized {
-		return n.nodeUpdate(nil, &newNode, true)
-	}
-
-	return nil
-}
-
-func (n *linuxNodeHandler) NodeUpdate(oldNode, newNode nodeTypes.Node) error {
-	n.mutex.Lock()
-	defer n.mutex.Unlock()
-
-	n.nodes[newNode.Identity()] = &newNode
-
-	if n.isInitialized {
-		return n.nodeUpdate(&oldNode, &newNode, false)
-	}
-
-	return nil
-}
-
 // Must be called with linuxNodeHandler.mutex held.
 func (n *linuxNodeHandler) nodeUpdate(oldNode, newNode *nodeTypes.Node, firstAddition bool) error {
 	var (
@@ -487,7 +780,7 @@ func (n *linuxNodeHandler) nodeUpdate(oldNode, newNode *nodeTypes.Node, firstAdd
 		// log and aggregate errors in accumulator.
 		errs error
 
-		oldAllIP4AllocCidrs, oldAllIP6AllocCidrs []*cidr.CIDR
+		oldAllIP4AllocCidrs, oldAllIP6AllocCidrs []netip.Prefix
 		newAllIP4AllocCidrs                      = newNode.GetIPv4AllocCIDRs()
 		newAllIP6AllocCidrs                      = newNode.GetIPv6AllocCIDRs()
 		oldIP4, oldIP6                           net.IP
@@ -575,26 +868,6 @@ func (n *linuxNodeHandler) nodeUpdate(oldNode, newNode *nodeTypes.Node, firstAdd
 	return errs
 }
 
-func (n *linuxNodeHandler) NodeDelete(oldNode nodeTypes.Node) error {
-	n.mutex.Lock()
-	defer n.mutex.Unlock()
-
-	nodeIdentity := oldNode.Identity()
-	if oldCachedNode, nodeExists := n.nodes[nodeIdentity]; nodeExists || oldNode.Source == source.Restored {
-		delete(n.nodes, nodeIdentity)
-
-		if oldNode.Source == source.Restored {
-			oldCachedNode = &oldNode
-		}
-
-		if n.isInitialized {
-			return n.nodeDelete(oldCachedNode)
-		}
-	}
-
-	return nil
-}
-
 // Must be called with linuxNodeHandler.mutex held.
 func (n *linuxNodeHandler) nodeDelete(oldNode *nodeTypes.Node) error {
 	if oldNode.IsLocal() {
@@ -610,15 +883,15 @@ func (n *linuxNodeHandler) nodeDelete(oldNode *nodeTypes.Node) error {
 	var errs error
 	if n.nodeConfig.EnableAutoDirectRouting && !n.enableEncapsulation(oldNode) {
 		if n.nodeConfig.EnableIPv4 {
-			for _, cidr := range oldAllIP4AllocCidrs {
-				if err := n.deleteDirectRoute(cidr, oldIP4); err != nil {
+			for _, prefix := range oldAllIP4AllocCidrs {
+				if err := n.deleteDirectRoute(prefix, oldIP4); err != nil {
 					errs = errors.Join(errs, fmt.Errorf("failed to remove old direct routing: deleting old routes: %w", err))
 				}
 			}
 		}
 		if n.nodeConfig.EnableIPv6 {
-			for _, cidr := range oldAllIP6AllocCidrs {
-				if err := n.deleteDirectRoute(cidr, oldIP6); err != nil {
+			for _, prefix := range oldAllIP6AllocCidrs {
+				if err := n.deleteDirectRoute(prefix, oldIP6); err != nil {
 					errs = errors.Join(errs, fmt.Errorf("failed to remove old direct routing: deleting old routes: %w", err))
 				}
 			}
@@ -627,15 +900,15 @@ func (n *linuxNodeHandler) nodeDelete(oldNode *nodeTypes.Node) error {
 
 	if n.enableEncapsulation(oldNode) {
 		if n.nodeConfig.EnableIPv4 {
-			for _, cidr := range oldAllIP4AllocCidrs {
-				if err := n.deleteNodeRoute(cidr, false); err != nil {
+			for _, prefix := range oldAllIP4AllocCidrs {
+				if err := n.deleteNodeRoute(prefix, false); err != nil {
 					errs = errors.Join(errs, fmt.Errorf("failed to remove old encapsulation config: deleting old single cluster node route for ipv4: %w", err))
 				}
 			}
 		}
 		if n.nodeConfig.EnableIPv6 {
-			for _, cidr := range oldAllIP6AllocCidrs {
-				if err := n.deleteNodeRoute(cidr, false); err != nil {
+			for _, prefix := range oldAllIP6AllocCidrs {
+				if err := n.deleteNodeRoute(prefix, false); err != nil {
 					errs = errors.Join(errs, fmt.Errorf("failed to remove old encapsulation config: deleting old single cluster node route for ipv6: %w", err))
 				}
 			}
@@ -685,40 +958,42 @@ func (n *linuxNodeHandler) replaceHostRules() error {
 }
 
 // NodeConfigurationChanged is called when the LocalNodeConfiguration has changed
-func (n *linuxNodeHandler) NodeConfigurationChanged(newConfig datapath.LocalNodeConfiguration) error {
+func (n *linuxNodeHandler) NodeConfigurationChanged(newConfig config.Config) error {
 	n.mutex.Lock()
 	defer n.mutex.Unlock()
 
 	prevConfig := n.nodeConfig
 	n.nodeConfig = newConfig
 
-	if n.enableEncapsulation == nil {
-		n.enableEncapsulation = func(*nodeTypes.Node) bool { return n.nodeConfig.EnableEncapsulation }
-	}
-
-	if err := n.updateOrRemoveNodeRoutes(prevConfig.AuxiliaryPrefixes, newConfig.AuxiliaryPrefixes, true); err != nil {
+	if err := n.updateOrRemoveNodeRoutes(
+		cslices.Map(prevConfig.AuxiliaryPrefixes, ip.Prefix.Unwrap),
+		cslices.Map(newConfig.AuxiliaryPrefixes, ip.Prefix.Unwrap),
+		true,
+	); err != nil {
 		return fmt.Errorf("failed to update or remove node routes: %w", err)
-	}
-
-	// Clean up stale IP rules for IPsec. This can be removed in the v1.20 release.
-	if err := n.removeEncryptRules(); err != nil {
-		n.log.Warn("Cannot cleanup previous encryption rule state.", logfields.Error, err)
 	}
 
 	if newConfig.EnableIPSec {
 		// For the ENI ipam mode on EKS, this will be the interface that
 		// the router (cilium_host) IP is associated to.
-		if (option.Config.IPAM == ipamOption.IPAMENI || option.Config.IPAM == ipamOption.IPAMAzure) &&
-			len(option.Config.IPv4PodSubnets) == 0 {
+		if option.Config.IPAM == ipamOption.IPAMENI || option.Config.IPAM == ipamOption.IPAMAzure {
 			if info := node.GetRouterInfo(); info != nil {
-				cidrs := info.GetCIDRs()
-				var ipv4PodSubnets []*cidr.CIDR
-				for _, c := range cidrs {
-					if c.IP.To4() != nil {
-						ipv4PodSubnets = append(ipv4PodSubnets, cidr.NewCIDR(&c))
+				var ipv4PodSubnets, ipv6PodSubnets []ip.Prefix
+				for _, c := range info.GetCIDRs() {
+					if c.Addr().Is4() {
+						ipv4PodSubnets = append(ipv4PodSubnets, ip.PrefixFrom(c))
+					} else {
+						ipv6PodSubnets = append(ipv6PodSubnets, ip.PrefixFrom(c))
 					}
 				}
-				n.nodeConfig.IPv4PodSubnets = ipv4PodSubnets
+				// Only derive the pod subnets which have not been explicitly
+				// configured.
+				if len(option.Config.IPv4PodSubnets) == 0 {
+					n.nodeConfig.IPv4PodSubnets = ipv4PodSubnets
+				}
+				if len(option.Config.IPv6PodSubnets) == 0 {
+					n.nodeConfig.IPv6PodSubnets = ipv6PodSubnets
+				}
 			}
 		}
 
@@ -735,52 +1010,15 @@ func (n *linuxNodeHandler) NodeConfigurationChanged(newConfig datapath.LocalNode
 		}
 	}
 
-	var errs error
 	if !n.isInitialized {
 		n.isInitialized = true
-
-		for _, unlinkedNode := range n.nodes {
-			if err := n.nodeUpdate(nil, unlinkedNode, true); err != nil {
-				errs = errors.Join(errs, err)
-			}
-		}
+		// The reconciler may have observed nodes before the datapath was
+		// initialized. Release those operations now that their configuration is
+		// available.
+		close(n.configReady)
 	}
 
-	return errs
-}
-
-// NodeValidateImplementation is called to validate the implementation of the
-// node in the datapath
-func (n *linuxNodeHandler) NodeValidateImplementation(nodeToValidate nodeTypes.Node) error {
-	n.mutex.Lock()
-	defer n.mutex.Unlock()
-
-	if !n.isInitialized {
-		return nil
-	}
-
-	return n.nodeUpdate(nil, &nodeToValidate, false)
-}
-
-// AllNodeValidateImplementation is called to validate the implementation of the
-// node in the datapath for all existing nodes
-func (n *linuxNodeHandler) AllNodeValidateImplementation() {
-	n.mutex.Lock()
-	defer n.mutex.Unlock()
-
-	if !n.isInitialized {
-		return
-	}
-
-	var errs error
-	for _, updateNode := range n.nodes {
-		if err := n.nodeUpdate(nil, updateNode, false); err != nil {
-			errs = errors.Join(errs, err)
-		}
-	}
-	if errs != nil {
-		n.log.Warn("Node update failed during datapath node validation", logfields.Error, errs)
-	}
+	return nil
 }
 
 // NodeDeviceNameWithDefaultRoute returns the node's device name which
@@ -849,6 +1087,6 @@ func deleteDefaultLocalRule(family int) error {
 	return nil
 }
 
-func (n *linuxNodeHandler) OverrideEnableEncapsulation(fn func(*nodeTypes.Node) bool) {
-	n.enableEncapsulation = fn
+func (n *linuxNodeHandler) enableEncapsulation(node *nodeTypes.Node) bool {
+	return n.nodePolicy.EnableEncapsulation(node, n.nodeConfig.EnableEncapsulation)
 }

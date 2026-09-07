@@ -2,10 +2,12 @@ package asm
 
 import (
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"math"
 	"sort"
@@ -41,6 +43,14 @@ type Instruction struct {
 
 	// Metadata contains optional metadata about this instruction.
 	Metadata Metadata
+}
+
+// Width returns how many raw BPF instructions the Instruction occupies within
+// an instruction stream. For example, an Instruction encoding a 64-bit value
+// will typically occupy 2 raw instructions, while a 32-bit constant can be
+// encoded in a single raw instruction.
+func (ins *Instruction) Width() RawInstructionOffset {
+	return RawInstructionOffset(ins.OpCode.rawInstructions())
 }
 
 // Unmarshal decodes a BPF instruction.
@@ -386,13 +396,19 @@ func (ins Instruction) Format(f fmt.State, c rune) {
 		}
 
 	case cls.IsJump():
-		fmt.Fprintf(f, "%v ", op)
 		switch jop := op.JumpOp(); jop {
 		case Call:
+			fmt.Fprintf(f, "%v ", op)
 			switch ins.Src {
 			case PseudoCall:
-				// bpf-to-bpf call
-				fmt.Fprint(f, ins.Constant)
+				// bpf-to-bpf call. For JIT-compiled programs, the kernel stores
+				// the PC offset in the 'off' field (ins.Offset) rather than 'imm'
+				// (ins.Constant). See kernel bpf_insn_prepare_dump in verifier.c.
+				if ins.Offset != 0 {
+					fmt.Fprint(f, ins.Offset)
+				} else {
+					fmt.Fprint(f, ins.Constant)
+				}
 			case PseudoKfuncCall:
 				// kfunc call
 				fmt.Fprintf(f, "Kfunc(%d)", ins.Constant)
@@ -401,13 +417,23 @@ func (ins Instruction) Format(f fmt.State, c rune) {
 			}
 
 		case Ja:
+			fmt.Fprintf(f, "%v ", op)
 			if ins.OpCode.Class() == Jump32Class {
 				fmt.Fprintf(f, "imm: %d", ins.Constant)
 			} else {
 				fmt.Fprintf(f, "off: %d", ins.Offset)
 			}
 
+		case JCOND:
+			switch ins.Src {
+			case PseudoMayGoto:
+				fmt.Fprintf(f, "JCond may_goto off: %d", ins.Offset)
+			default:
+				fmt.Fprintf(f, "%v", op)
+			}
+
 		default:
+			fmt.Fprintf(f, "%v ", op)
 			fmt.Fprintf(f, "dst: %s off: %d ", ins.Dst, ins.Offset)
 			if op.Source() == ImmSource {
 				fmt.Fprintf(f, "imm: %d", ins.Constant)
@@ -745,18 +771,72 @@ func (insns Instructions) Marshal(w io.Writer, bo binary.ByteOrder) error {
 // It mirrors bpf_prog_calc_tag in the kernel and so can be compared
 // to ProgramInfo.Tag to figure out whether a loaded program matches
 // certain instructions.
+//
+// Deprecated: The value produced by this method no longer matches tags produced
+// by the kernel since Linux 6.18. Use [Instructions.HasTag] instead.
 func (insns Instructions) Tag(bo binary.ByteOrder) (string, error) {
+	// We cannot determine which hashing function to use without probing the kernel.
+	// So use the legacy SHA-1 implementation and deprecate this method.
+	return insns.tagSha1(bo)
+}
+
+// HasTag returns true if the given tag matches the kernel tag of insns.
+func (insns Instructions) HasTag(tag string, bo binary.ByteOrder) (bool, error) {
+	sha256Tag, err := insns.tagSha256(bo)
+	if err != nil {
+		return false, fmt.Errorf("hashing sha256: %w", err)
+	}
+	if tag == sha256Tag {
+		return true, nil
+	}
+
+	sha1Tag, err := insns.tagSha1(bo)
+	if err != nil {
+		return false, fmt.Errorf("hashing sha1: %w", err)
+	}
+
+	return tag == sha1Tag, nil
+}
+
+// tagSha1 calculates the kernel tag for a series of instructions.
+//
+// It mirrors bpf_prog_calc_tag in kernels up to v6.18 and can be compared to
+// ProgramInfo.Tag to figure out whether a loaded Program matches insns.
+func (insns Instructions) tagSha1(bo binary.ByteOrder) (string, error) {
 	h := sha1.New()
+	if err := insns.hash(h, bo); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)[:sys.BPF_TAG_SIZE]), nil
+}
+
+// tagSha256 calculates the kernel tag for a series of instructions.
+//
+// It mirrors bpf_prog_calc_tag in the kernel and can be compared to
+// ProgramInfo.Tag to figure out whether a loaded Program matches insns.
+func (insns Instructions) tagSha256(bo binary.ByteOrder) (string, error) {
+	h := sha256.New()
+	if err := insns.hash(h, bo); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)[:sys.BPF_TAG_SIZE]), nil
+}
+
+// hash calculates the hash of the instruction stream. Map load instructions
+// are zeroed out, since these contain map file descriptors or pointers to
+// maps, which will be different from load to load and would make the hash
+// non-deterministic.
+func (insns Instructions) hash(h hash.Hash, bo binary.ByteOrder) error {
 	for i, ins := range insns {
 		if ins.IsLoadFromMap() {
 			ins.Constant = 0
 		}
 		_, err := ins.Marshal(h, bo)
 		if err != nil {
-			return "", fmt.Errorf("instruction %d: %w", i, err)
+			return fmt.Errorf("instruction %d: %w", i, err)
 		}
 	}
-	return hex.EncodeToString(h.Sum(nil)[:sys.BPF_TAG_SIZE]), nil
+	return nil
 }
 
 // encodeFunctionReferences populates the Offset (or Constant, depending on

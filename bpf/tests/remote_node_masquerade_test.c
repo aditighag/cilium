@@ -9,6 +9,7 @@
 #define ENABLE_SCTP
 #define ENABLE_IPV4
 #define ENABLE_NODEPORT
+#include <bpf/config/global.h>
 #include <bpf/config/node.h>
 
 #define DEBUG
@@ -41,51 +42,46 @@ ASSIGN_CONFIG(bool, enable_extended_ip_protocols, false)
 
 #include "lib/ipcache.h"
 
-CHECK("tc", "nat4_remote_node_masquerade_enabled_test")
+CHECK(PROG_TYPE, "nat4_remote_node_masquerade_enabled_test")
 int test_nat4_remote_node_masquerade_enabled(__maybe_unused struct __ctx_buff *ctx)
 {
-    struct ipv4_ct_tuple tuple = {};
-    struct iphdr ip4 = {
-    .protocol = IPPROTO_TCP,
-    };
-    fraginfo_t fraginfo = 0;
-    int l4_off = 0;
-    int ret;
+	struct snat_v4_args *args = AUX(snat_v4_args);
+	fraginfo_t fraginfo = 0;
+	int l4_off = 0;
+	int ret;
 
-    test_init();
+	test_init();
 
-    ipcache_v4_add_entry(IPV4_DST, 0, REMOTE_NODE_ID, 0, 0);
+	ipcache_v4_add_entry(IPV4_DST, 0, REMOTE_NODE_ID, 0, 0);
 
-    /* Set up the tuple as if the packet is going to a remote node */
-    tuple.daddr = IPV4_DST;
-    tuple.saddr = bpf_htonl(0xDEADBEEF); /* Unlikely to be a local endpoint */
-    tuple.nexthdr = IPPROTO_TCP;
-    tuple.sport = bpf_htons(12345);
-    tuple.dport = bpf_htons(443);
-    tuple.flags = NAT_DIR_EGRESS;
+	/* Set up the tuple as if the packet is going to a remote node */
+	args->tuple.daddr = IPV4_DST;
+	args->tuple.saddr = bpf_htonl(0xDEADBEEF); /* Unlikely to be a local endpoint */
+	args->tuple.nexthdr = IPPROTO_TCP;
+	args->tuple.sport = bpf_htons(12345);
+	args->tuple.dport = bpf_htons(443);
+	args->tuple.flags = NAT_DIR_EGRESS;
 
-    /* Setup NAT target structure */
-    struct ipv4_nat_target target = {
-    .min_port            = NODEPORT_PORT_MIN_NAT, /* Standard min port */
-    .max_port            = NODEPORT_PORT_MAX_NAT, /* Standard max port */
-    .addr                = 0,
-    .from_local_endpoint = false,
-    .egress_gateway      = false,
-    .cluster_id          = 0,
-    .needs_ct            = false,
-    .ifindex             = 0,
-    };
+	/* Setup NAT target structure */
+	args->target.min_port = NODEPORT_PORT_MIN_NAT; /* Standard min port */
+	args->target.max_port = NODEPORT_PORT_MAX_NAT; /* Standard max port */
+	args->target.addr = 0;
+	args->target.from_local_endpoint = false;
+	args->target.egress_gateway = false;
+	args->target.cluster_id = 0;
+	args->target.needs_ct = false;
+	args->target.ifindex = 0;
 
-    /*
-     * Test: With enable_remote_node_masquerade configured as true via ASSIGN_CONFIG.
-     * Expect NAT_NEEDED and target.addr to be set.
-     */
-    ret = snat_v4_needs_masquerade(ctx, &tuple, &ip4, fraginfo, l4_off, &target);
-    assert(ret == NAT_NEEDED);
-    assert(target.addr == IPV4_MASQUERADE); /* Masquerade address set */
+	/*
+	 * Test: With enable_remote_node_masquerade configured as true via ASSIGN_CONFIG.
+	 * Expect NAT_NEEDED and target.addr to be set.
+	 */
+	ret = snat_v4_needs_masquerade(ctx, fraginfo, l4_off);
+	assert(ret == NAT_NEEDED);
+	assert(args->target.addr == IPV4_MASQUERADE); /* Masquerade address set */
 
-    test_finish();
-    return 0;
+	test_finish();
+	return 0;
 }
 
 BPF_LICENSE("Dual BSD/GPL");

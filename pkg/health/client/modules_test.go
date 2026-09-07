@@ -21,10 +21,11 @@ func TestGetAndFormatModulesHealth(t *testing.T) {
 		v  bool
 	}{
 		"happy": {
-			e: "Stopped(0) Degraded(2) OK(2)",
+			e: "Modules Health:	Stopped(0) Degraded(2) OK(2)",
 		},
 		"happy-verbose": {
-			e: `agent
+			e: `Modules Health:	Stopped(0) Degraded(2) OK(2)
+		agent
 		├── a
 		│   └── b
 		│       └── c
@@ -46,6 +47,28 @@ func TestGetAndFormatModulesHealth(t *testing.T) {
 			assert.Equal(t, u.e, strings.TrimSpace(w.String()))
 		})
 	}
+}
+
+func TestGetAndFormatModulesHealthMultipleRoots(t *testing.T) {
+	w := bytes.NewBufferString("")
+	client.GetAndFormatModulesHealth(w, []types.Status{
+		{
+			ID:      ident([]string{"operator", "operator-controlplane"}, "leader-election"),
+			Level:   types.LevelOK,
+			Message: "Leader",
+		},
+		{
+			ID:      ident([]string{"health"}, "job-module-status-metrics"),
+			Level:   types.LevelOK,
+			Message: "Running",
+		},
+	}, true, "")
+
+	out := strings.TrimSpace(w.String())
+	assert.Contains(t, out, "health\n└── job-module-status-metrics")
+	assert.Contains(t, out, "operator\n└── operator-controlplane")
+	assert.Contains(t, out, "[OK] Running")
+	assert.Contains(t, out, "[OK] Leader")
 }
 
 // Helpers

@@ -5,6 +5,7 @@ package endpoint
 
 import (
 	"bytes"
+	"encoding/json"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -13,27 +14,26 @@ import (
 	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/require"
 
-	fakeTypes "github.com/cilium/cilium/pkg/datapath/fake/types"
-	"github.com/cilium/cilium/pkg/identity/identitymanager"
-	"github.com/cilium/cilium/pkg/maps/ctmap"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
-	testidentity "github.com/cilium/cilium/pkg/testutils/identity"
-	testipcache "github.com/cilium/cilium/pkg/testutils/ipcache"
 	testpolicy "github.com/cilium/cilium/pkg/testutils/policy"
 )
 
+const testField = "testField"
+
 func TestPolicyLog(t *testing.T) {
-	setupEndpointSuite(t)
-	logger := hivetest.Logger(t)
-	logPath := filepath.Join(option.Config.StateDir, "endpoint-policy.log")
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "endpoint-policy.log")
 	f, err := os.Create(logPath)
 	require.NoError(t, err)
 
-	do := &DummyOwner{repo: policy.NewPolicyRepository(logger, nil, nil, nil, nil, testpolicy.NewPolicyMetricsNoop())}
+	logger := hivetest.Logger(t)
+	do := &DummyOwner{repo: policy.NewPolicyRepository(logger, cmtypes.DefaultClusterInfo, nil, nil, nil, nil, testpolicy.NewPolicyMetricsNoop())}
 
 	model := newTestEndpointModel(12345, StateReady)
-	ep, err := NewEndpointFromChangeModel(t.Context(), logger, nil, &MockEndpointBuildQueue{}, nil, nil, nil, nil, nil, identitymanager.NewIDManager(logger), nil, nil, do.repo, testipcache.NewMockIPCache(), nil, testidentity.NewMockIdentityAllocator(nil), ctmap.NewFakeGCRunner(), nil, model, fakeTypes.WireguardConfig{}, fakeTypes.IPsecConfig{}, f, nil)
+	p := createEndpointParams(t, nil, do.repo, do.fetcher)
+	ep, err := NewEndpointFromChangeModel(p, nil, nil, model, f)
 	require.NoError(t, err)
 
 	ep.Start(uint16(model.ID))
@@ -49,18 +49,13 @@ func TestPolicyLog(t *testing.T) {
 	ep.UpdateLogger(nil)
 	policyLogger = ep.getPolicyLogger()
 	require.NotNil(t, policyLogger)
-	defer func() {
-		// remote created log file when we are done.
-		err := os.Remove(logPath)
-		require.NoError(t, err)
-	}()
 
 	// Test logging, policyLogger must not be nil
 	policyLogger.Info("testing policy logging")
 
 	// Test logging with integrated nil check, no fields
 	ep.PolicyDebug("testing PolicyDebug")
-	ep.PolicyDebug("PolicyDebug with fields", slog.String("testField", "Test Value"))
+	ep.PolicyDebug("PolicyDebug with fields", slog.String(testField, "Test Value"))
 
 	// Disable option
 	ep.Options.SetValidated(option.DebugPolicy, option.OptionDisabled)
@@ -75,4 +70,27 @@ func TestPolicyLog(t *testing.T) {
 	require.True(t, bytes.Contains(buf, []byte("testing policy logging")))
 	require.True(t, bytes.Contains(buf, []byte("testing PolicyDebug")))
 	require.True(t, bytes.Contains(buf, []byte("Test Value")))
+}
+
+func TestPolicyLogAfterEndpointRestore(t *testing.T) {
+	logger := hivetest.Logger(t)
+	do := &DummyOwner{repo: policy.NewPolicyRepository(logger, cmtypes.DefaultClusterInfo, nil, nil, nil, nil, testpolicy.NewPolicyMetricsNoop())}
+	p := createEndpointParams(t, nil, do.repo, do.fetcher)
+	model := newTestEndpointModel(12345, StateReady)
+
+	ep, err := NewEndpointFromChangeModel(p, nil, nil, model, nil)
+	require.NoError(t, err)
+	ep.Options.SetValidated(option.DebugPolicy, option.OptionEnabled)
+
+	ep.unconditionalRLock()
+	epJSON, err := json.Marshal(ep)
+	ep.runlock()
+	require.NoError(t, err)
+
+	var policyLog bytes.Buffer
+	restoredEP, err := ParseEndpoint(p, nil, nil, epJSON, &policyLog)
+	require.NoError(t, err)
+
+	restoredEP.PolicyDebug("testing restored endpoint PolicyDebug")
+	require.Contains(t, policyLog.String(), "testing restored endpoint PolicyDebug")
 }

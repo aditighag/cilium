@@ -5,11 +5,11 @@ package monitor
 
 import (
 	"bufio"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"net"
+	"net/netip"
 
-	"github.com/cilium/cilium/pkg/byteorder"
 	"github.com/cilium/cilium/pkg/hubble/parser/getters"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/monitor/api"
@@ -109,7 +109,7 @@ func (tn *TraceNotify) Decode(data []byte) error {
 		if l := len(data); l < traceNotifyV2Len {
 			return fmt.Errorf("unexpected TraceNotify data length (version %d), expected at least %d but got %d", version, traceNotifyV2Len, l)
 		}
-		tn.IPTraceID = byteorder.Native.Uint64(data[48:56])
+		tn.IPTraceID = binary.NativeEndian.Uint64(data[48:56])
 		fallthrough
 	case TraceNotifyVersion1:
 		if l := len(data); l < traceNotifyV1Len {
@@ -121,18 +121,18 @@ func (tn *TraceNotify) Decode(data []byte) error {
 	// Decode logic for version >= v0.
 	tn.Type = data[0]
 	tn.ObsPoint = data[1]
-	tn.Source = byteorder.Native.Uint16(data[2:4])
-	tn.Hash = byteorder.Native.Uint32(data[4:8])
-	tn.OrigLen = byteorder.Native.Uint32(data[8:12])
-	tn.CapLen = byteorder.Native.Uint16(data[12:14])
+	tn.Source = binary.NativeEndian.Uint16(data[2:4])
+	tn.Hash = binary.NativeEndian.Uint32(data[4:8])
+	tn.OrigLen = binary.NativeEndian.Uint32(data[8:12])
+	tn.CapLen = binary.NativeEndian.Uint16(data[12:14])
 	tn.Version = version
 	tn.ExtVersion = data[15]
-	tn.SrcLabel = identity.NumericIdentity(byteorder.Native.Uint32(data[16:20]))
-	tn.DstLabel = identity.NumericIdentity(byteorder.Native.Uint32(data[20:24]))
-	tn.DstID = byteorder.Native.Uint16(data[24:26])
+	tn.SrcLabel = identity.NumericIdentity(binary.NativeEndian.Uint32(data[16:20]))
+	tn.DstLabel = identity.NumericIdentity(binary.NativeEndian.Uint32(data[20:24]))
+	tn.DstID = binary.NativeEndian.Uint16(data[24:26])
 	tn.Reason = data[26]
 	tn.Flags = data[27]
-	tn.Ifindex = byteorder.Native.Uint32(data[28:32])
+	tn.Ifindex = binary.NativeEndian.Uint32(data[28:32])
 
 	return nil
 }
@@ -317,11 +317,13 @@ func (n *TraceNotify) IsGeneve() bool {
 
 // OriginalIP returns the original source IP if reverse NAT was performed on
 // the flow
-func (n *TraceNotify) OriginalIP() net.IP {
+func (n *TraceNotify) OriginalIP() netip.Addr {
 	if n.IsIPv6() {
-		return n.OrigIP[:]
+		return netip.AddrFrom16(n.OrigIP)
 	}
-	return n.OrigIP[:4]
+	var arr [4]byte
+	copy(arr[:], n.OrigIP[:4])
+	return netip.AddrFrom4(arr)
 }
 
 // DataOffset returns the offset from the beginning of TraceNotify where the

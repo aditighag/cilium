@@ -15,6 +15,7 @@ import (
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/identity"
 	identitycell "github.com/cilium/cilium/pkg/identity/cache/cell"
+	iputil "github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/ipcache"
 	ipcachetypes "github.com/cilium/cilium/pkg/ipcache/types"
 	"github.com/cilium/cilium/pkg/labels"
@@ -136,37 +137,6 @@ func (d *LocalIdentityRestorer) dumpOldIPCache() (map[netip.Prefix]identity.Nume
 	if err != nil {
 		// ignore non-existent cache
 		if errors.Is(err, fs.ErrNotExist) {
-			// We might be in the upgrade case, with the ipcache v1 from v1.18
-			// still around.
-			return d.dumpOldIPCacheV1()
-		}
-	}
-	d.params.Logger.Debug("dumping ipache with local identities", logfields.Count, len(localPrefixes))
-	return localPrefixes, err
-}
-
-// dumpOldIPCacheV1 does the same as dumpOldIPCache but for the v1 of the ipcache map.
-func (d *LocalIdentityRestorer) dumpOldIPCacheV1() (map[netip.Prefix]identity.NumericIdentity, error) {
-	localPrefixes := map[netip.Prefix]identity.NumericIdentity{}
-
-	// Dump the bpf ipcache, recording any prefixes with local or ingress
-	// numeric identities.
-	err := ipcachemap.IPCacheMapV1().DumpWithCallback(func(key bpf.MapKey, value bpf.MapValue) {
-		k := key.(*ipcachemap.Key)
-		v := value.(*ipcachemap.RemoteEndpointInfoV1)
-		nid := identity.NumericIdentity(v.SecurityIdentity)
-
-		if nid.Scope() == identity.IdentityScopeLocal || (nid == identity.ReservedIdentityIngress && v.TunnelEndpoint.IsZero()) {
-			localPrefixes[k.Prefix()] = nid
-		}
-	})
-	// dumpwithcallback() leaves the ipcache map open, must close before opened for
-	// parallel mode in daemon.initmaps()
-	ipcachemap.IPCacheMapV1().Close()
-
-	if err != nil {
-		// ignore non-existent cache
-		if errors.Is(err, fs.ErrNotExist) {
 			err = nil
 		}
 	}
@@ -227,9 +197,9 @@ func (d *LocalIdentityRestorer) restoreIPCache(ipCache *ipcache.IPCache, localPr
 			d.params.NodeLocalStore.Update(func(n *node.LocalNode) {
 				addr := prefix.Addr()
 				if addr.Is4() {
-					n.IPv4IngressIP = addr.AsSlice()
+					n.IPv4IngressIP = iputil.AddrFrom(addr)
 				} else {
-					n.IPv6IngressIP = addr.AsSlice()
+					n.IPv6IngressIP = iputil.AddrFrom(addr)
 				}
 			})
 			d.params.Logger.Info("Restored ingress IP", logfields.Ingress, prefix)

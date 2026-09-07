@@ -4,103 +4,65 @@
 package ztunnel
 
 import (
-	"context"
-	_ "embed"
-	"fmt"
-	"log/slog"
-
 	"github.com/cilium/hive/cell"
-	"github.com/spf13/pflag"
-	appsv1 "k8s.io/api/apps/v1"
-	"sigs.k8s.io/yaml"
+	"github.com/cilium/statedb"
+	"github.com/cilium/statedb/reconciler"
 
-	operatorOption "github.com/cilium/cilium/operator/option"
-	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
-	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/operator/pkg/ztunnel/config"
+	ztunnelReconciler "github.com/cilium/cilium/operator/pkg/ztunnel/reconciler"
+	k8sTables "github.com/cilium/cilium/pkg/k8s/tables"
+	"github.com/cilium/cilium/pkg/metrics"
+	"github.com/cilium/cilium/pkg/ztunnel/table"
 )
 
-var DefaultConfig = Config{
-	EnableZTunnel: false,
-}
-
-type Config struct {
-	EnableZTunnel bool
-}
-
-func (c Config) Flags(flags *pflag.FlagSet) {
-	flags.Bool("enable-ztunnel", false, "Use zTunnel as Cilium's encryption infrastructure")
-}
-
-// Cell manages the ztunnel DaemonSet, ensuring a ztunnel proxy runs on each
-// node in the cluster when ztunnel encryption is enabled.
+// Cell manages SPIRE enrollment for namespaces when ztunnel encryption is enabled.
 var Cell = cell.Module(
 	"ztunnel",
-	"ZTunnel DaemonSet Controller",
+	"ZTunnel SPIRE Enrollment",
 
-	cell.Config(DefaultConfig),
-	cell.Invoke(newZTunnelController),
+	cell.Config(config.DefaultConfig),
+	metrics.Metric(ztunnelReconciler.NewMetrics),
+	cell.Provide(
+		k8sTables.NewNamespaceTableAndReflector,
+		table.NewEnrolledNamespacesTable,
+		ztunnelReconciler.NewServiceAccountTable,
+		ztunnelReconciler.NewEnrollmentReconciler,
+	),
+	cell.Invoke(statedb.Derive("derive-desired-mtls-namespace-enrollments", table.K8sNamespaceToEnrolledNamespace)),
+	cell.Invoke(registerEnrollmentReconciler),
+	cell.Invoke(enableMetrics),
 )
 
-type controllerParams struct {
-	cell.In
-
-	Lifecycle      cell.Lifecycle
-	Logger         *slog.Logger
-	Clientset      k8sClient.Clientset
-	Config         Config
-	OperatorConfig *operatorOption.OperatorConfig
+func enableMetrics(cfg config.Config, m *ztunnelReconciler.Metrics) {
+	if cfg.EnableZTunnel {
+		m.EnrollmentOps.SetEnabled(true)
+	}
 }
 
-//go:embed ztunnel-daemonset.yaml
-var ztunnelDaemonSetYAML []byte
-
-// createDaemonSet parses the embedded YAML and returns a DaemonSet object
-func createDaemonSet(namespace string) (*appsv1.DaemonSet, error) {
-	var daemonSet appsv1.DaemonSet
-	if err := yaml.Unmarshal(ztunnelDaemonSetYAML, &daemonSet); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal ztunnel DaemonSet YAML: %w", err)
+func registerEnrollmentReconciler(
+	cfg config.Config,
+	params reconciler.Params,
+	ops reconciler.Operations[*table.EnrolledNamespace],
+	tbl statedb.RWTable[*table.EnrolledNamespace],
+) error {
+	// The reconciler manages SPIRE entries for enrolled namespaces, so it only
+	// runs when ztunnel is configured to use an external SPIRE CA. With the
+	// internal CA there is no SPIRE server to enroll against.
+	if !cfg.UseSpireCA() {
+		return nil
 	}
-	daemonSet.Namespace = namespace
-	return &daemonSet, nil
-}
-
-func newZTunnelController(params controllerParams) error {
-	params.Logger.Info("Creating ZTunnel DaemonSet controller")
-
-	c := &controller{
-		client:         params.Clientset,
-		logger:         params.Logger,
-		config:         params.Config,
-		operatorConfig: params.OperatorConfig,
+	_, err := reconciler.Register(
+		params,
+		tbl,
+		(*table.EnrolledNamespace).Clone,
+		(*table.EnrolledNamespace).SetStatus,
+		(*table.EnrolledNamespace).GetStatus,
+		ops,
+		nil, // no batch operations support
+		reconciler.WithoutPruning(),
+	)
+	if err != nil {
+		return err
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	params.Lifecycle.Append(cell.Hook{
-		OnStart: func(_ cell.HookContext) error {
-			params.Logger.Info("Starting ztunnel DaemonSet controller")
-			go func() {
-				// must parse embedded yaml into a daemon set
-				ds, err := createDaemonSet(params.OperatorConfig.CiliumK8sNamespace)
-				if err != nil {
-					params.Logger.Error("Failed to create ztunnel DaemonSet",
-						logfields.Error, err)
-					return
-				}
-
-				if err := c.run(ctx, ds); err != nil {
-					params.Logger.Error("ZTunnel controller error",
-						logfields.Error, err)
-				}
-			}()
-			return nil
-		},
-		OnStop: func(ctx cell.HookContext) error {
-			params.Logger.Info("Stopping ztunnel DaemonSet controller")
-			cancel()
-			return nil
-		},
-	})
-
 	return nil
 }

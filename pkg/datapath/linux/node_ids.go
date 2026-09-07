@@ -4,15 +4,19 @@
 package linux
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/bpf"
 	"github.com/cilium/cilium/pkg/idpool"
+	"github.com/cilium/cilium/pkg/ip"
+	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/maps/nodemap"
 	"github.com/cilium/cilium/pkg/node"
@@ -31,7 +35,12 @@ func (n *linuxNodeHandler) GetNodeIP(nodeID uint16) string {
 	// Check for local node ID explicitly as local node IPs are not in our maps!
 	if nodeID == 0 {
 		// Returns local node's IPv4 address if available, IPv6 address otherwise.
-		return node.GetCiliumEndpointNodeIP(n.log)
+		ln, err := n.localNodeStore.Get(context.Background())
+		if err != nil {
+			logging.Fatal(n.log, "failed to retrieve local node")
+		}
+
+		return node.GetCiliumEndpointNodeIP(ln)
 	}
 
 	// Otherwise, return one of the IPs matching the given ID.
@@ -42,17 +51,23 @@ func (n *linuxNodeHandler) GetNodeIP(nodeID uint16) string {
 	return ""
 }
 
-func (n *linuxNodeHandler) GetNodeID(nodeIP net.IP) (uint16, bool) {
+func (n *linuxNodeHandler) GetNodeID(nodeIP netip.Addr) (uint16, bool) {
 	n.mutex.RLock()
 	defer n.mutex.RUnlock()
 
 	return n.getNodeIDForIP(nodeIP)
 }
 
-func (n *linuxNodeHandler) getNodeIDForIP(nodeIP net.IP) (uint16, bool) {
-	localNodeV4 := node.GetIPv4(n.log)
-	localNodeV6 := node.GetIPv6(n.log)
-	if localNodeV4.Equal(nodeIP) || localNodeV6.Equal(nodeIP) {
+func (n *linuxNodeHandler) getNodeIDForIP(nodeIP netip.Addr) (uint16, bool) {
+	if !nodeIP.IsValid() {
+		return 0, false
+	}
+	ln, err := n.localNodeStore.Get(context.Background())
+	if err != nil {
+		logging.Fatal(n.log, "failed to retrieve local node")
+	}
+
+	if ip.AddrFromIP(ln.GetNodeIP(false)) == nodeIP || ip.AddrFromIP(ln.GetNodeIP(true)) == nodeIP {
 		return 0, true
 	}
 
@@ -80,7 +95,10 @@ func (n *linuxNodeHandler) getNodeIDForNode(node *nodeTypes.Node) uint16 {
 // node IPs receive the same. This might happen if we allocated a node ID from
 // the ipcache, where we don't have all node IPs but only one.
 func (n *linuxNodeHandler) allocateIDForNode(oldNode *nodeTypes.Node, node *nodeTypes.Node) (uint16, error) {
-	var errs error
+	var (
+		errs           error
+		newlyAllocated bool
+	)
 
 	// Did we already allocate a node ID for any IP of that node?
 	nodeID := n.getNodeIDForNode(node)
@@ -104,6 +122,7 @@ func (n *linuxNodeHandler) allocateIDForNode(oldNode *nodeTypes.Node, node *node
 			// so we make early return here.
 			return nodeID, fmt.Errorf("no available node ID %q", node.Name)
 		} else {
+			newlyAllocated = true
 			n.log.Debug("Allocated new node ID for node",
 				logfields.NodeID, nodeID,
 				logfields.NodeName, node.Name,
@@ -141,7 +160,15 @@ func (n *linuxNodeHandler) allocateIDForNode(oldNode *nodeTypes.Node, node *node
 				logfields.SPI, node.EncryptionKey,
 			)
 			errs = errors.Join(errs,
-				fmt.Errorf("failed to map IP %q with node ID %q: %w", nodeID, nodeID, err))
+				fmt.Errorf("failed to map IP %s with node ID %d: %w", ip, nodeID, err))
+		}
+	}
+	// Return a new ID to the pool when every map update failed. If at least one
+	// update succeeded, the ID belongs to partially realized state that a retry
+	// must reuse or clean up.
+	if newlyAllocated && errs != nil {
+		if _, mapped := n.nodeIPsByIDs[nodeID]; !mapped {
+			n.nodeIDs.Insert(idpool.ID(nodeID))
 		}
 	}
 	return nodeID, errs
@@ -202,13 +229,12 @@ func (n *linuxNodeHandler) deallocateNodeIDLocked(nodeID uint16, nodeIPs map[str
 	return errs
 }
 
-// mapNodeID adds a node ID <> IP mapping into the local in-memory map of the
-// Node Manager and in the corresponding BPF map. If any of those map updates
-// fail, both are cancelled and the function returns an error.
+// mapNodeID adds a node ID <> IP mapping to the local in-memory indexes and the
+// corresponding BPF map. If the BPF update fails, the indexes remain unchanged.
 func (n *linuxNodeHandler) mapNodeID(ip string, id uint16, SPI uint8) error {
-	nodeIP := net.ParseIP(ip)
-	if nodeIP == nil {
-		return fmt.Errorf("invalid node IP %s", ip)
+	nodeIP, err := netip.ParseAddr(ip)
+	if err != nil {
+		return fmt.Errorf("invalid node IP %s: %w", ip, err)
 	}
 
 	if err := n.nodeMap.Update(nodeIP, id, SPI); err != nil {
@@ -223,17 +249,17 @@ func (n *linuxNodeHandler) mapNodeID(ip string, id uint16, SPI uint8) error {
 	return nil
 }
 
-// unmapNodeID removes a node ID <> IP mapping from the local in-memory map of
-// the Node Manager and from the corresponding BPF map. If any of those map
-// updates fail, it returns an error; in such a case, both are cancelled.
+// unmapNodeID removes a node ID <> IP mapping from the local in-memory indexes
+// and the corresponding BPF map. If the BPF update fails, the indexes remain
+// unchanged.
 func (n *linuxNodeHandler) unmapNodeID(ip string) error {
 	// Check error cases first, to avoid having to cancel anything.
 	if _, exists := n.nodeIDsByIPs[ip]; !exists {
 		return fmt.Errorf("cannot remove IP %s from node ID map as it doesn't exist", ip)
 	}
-	nodeIP := net.ParseIP(ip)
-	if nodeIP == nil {
-		return fmt.Errorf("invalid node IP %s", ip)
+	nodeIP, err := netip.ParseAddr(ip)
+	if err != nil {
+		return fmt.Errorf("invalid node IP %s: %w", ip, err)
 	}
 
 	if err := n.nodeMap.Delete(nodeIP); err != nil {
@@ -347,11 +373,11 @@ func (n *linuxNodeHandler) registerNodeIDAllocations(allocatedNodeIDs map[string
 	if len(n.nodeIDsByIPs) > 0 {
 		// If this happens, we likely have a bug in the startup logic and
 		// restored node IDs too late (after new node IDs were allocated).
-		n.log.Error("The node manager already contains node IDs")
+		n.log.Error("The node ID indexes already contain mappings")
 	}
 
-	// The node manager holds both a map of nodeIP=>nodeID and a pool of ID for
-	// the allocation of node IDs. Not only do we need to update the map,
+	// The handler holds both nodeIP=>nodeID indexes and a pool for allocating
+	// node IDs. Not only do we need to update the indexes,
 	nodeIDs := make(map[uint16]struct{})
 	IDsByIPs := make(map[string]uint16)
 	IPsByIDs := make(map[uint16]sets.Set[string])

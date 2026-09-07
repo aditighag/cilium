@@ -5,6 +5,7 @@ package policycell
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"maps"
 	"slices"
@@ -20,6 +21,7 @@ import (
 	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/metrics/metric"
 	"github.com/cilium/cilium/pkg/policy"
+	"github.com/cilium/cilium/pkg/policy/compute"
 	"github.com/cilium/cilium/pkg/time"
 )
 
@@ -41,8 +43,8 @@ type identityAllocatorParams struct {
 
 	Log              *slog.Logger
 	Registry         job.Registry
-	Lifecycle        cell.Lifecycle
 	PolicyRepository policy.PolicyRepository
+	PolicyComputer   compute.PolicyRecomputer
 	EPManager        endpointmanager.EndpointManager
 	Health           cell.Health
 	Metrics          *identityUpdaterMetrics
@@ -55,6 +57,7 @@ type identityAllocatorParams struct {
 type identityUpdater struct {
 	logger    *slog.Logger
 	policy    policy.PolicyRepository
+	computer  compute.PolicyRecomputer
 	epmanager endpointmanager.EndpointManager
 
 	identityHandlers []identity.UpdateIdentities
@@ -83,6 +86,7 @@ func newIdentityUpdater(params identityAllocatorParams) IdentityUpdater {
 	i := &identityUpdater{
 		logger:    params.Log,
 		policy:    params.PolicyRepository,
+		computer:  params.PolicyComputer,
 		epmanager: params.EPManager,
 		pending: batch{
 			done: make(chan struct{}),
@@ -95,7 +99,7 @@ func newIdentityUpdater(params identityAllocatorParams) IdentityUpdater {
 	close(i.inFlightDone)
 
 	i.updatePolicyMaps = job.NewTrigger()
-	jg := params.Registry.NewGroup(params.Health, params.Lifecycle, job.WithMetrics(params.Metrics), job.WithLogger(params.Log))
+	jg := params.Registry.NewGroup(params.Health, job.WithMetrics(params.Metrics), job.WithLogger(params.Log))
 	jg.Add(job.Timer("id-alloc-update-policy-maps", i.doUpdatePolicyMaps,
 		/* no interval, only on trigger */ 0, job.WithTrigger(i.updatePolicyMaps)))
 
@@ -207,22 +211,32 @@ func (i *identityUpdater) doUpdatePolicyMaps(ctx context.Context) error {
 		return ctx.Err()
 	}
 
-	// UpdatePolicyMaps also waits for notifications to be complete, but we already waited :-)
-	noopWG := &sync.WaitGroup{}
-
 	// Direct all endpoints to consume the incremental changes and update policy.
-	// This returns a wg that is done when all endpoints have updated both their bpf
+	// This waits until all endpoints have updated both their bpf
 	// policymaps as well as Envoy. (Or if ctx is closed).
 	i.logger.Debug("Incremental policy update: triggering UpdatePolicyMaps for all endpoints")
-	updatedWG := i.epmanager.UpdatePolicyMaps(ctx, noopWG)
-	updatedWG.Wait()
+	err := i.epmanager.UpdatePolicyMaps(ctx)
+	if errors.Is(err, context.DeadlineExceeded) {
+		i.logger.Warn("Endpoint proxy policy update timed out. Retrying...",
+			logfields.Error, err)
+
+		// enqueue a dummy update and trigger again
+		wg := &sync.WaitGroup{}
+		i.enqueue(wg, time.Now(), false)
+		i.updatePolicyMaps.Trigger()
+
+		// proceed as if the proxy updates had completed. This is to guard against stalling
+		// for repeated timeouts
+	}
+
 	metrics.PolicyIncrementalUpdateDuration.WithLabelValues("global").Observe(time.Since(q.firstStartTime).Seconds())
 
 	// We mutated a selector, we must regenerate.
 	if q.forcePolicyRegen {
 		i.logger.Info("Incremental policy update mutated identities. Forcing policy recalculation.")
-		i.policy.BumpRevision()
-		i.epmanager.TriggerRegenerateAllEndpoints()
+		rev := i.policy.BumpRevision()
+		i.computer.RecomputeIdentityPolicyForAllIdentities(rev)
+		i.epmanager.RegenerateAllForPolicy(rev)
 	}
 
 	// inform waiters that the in-flight batch is done.

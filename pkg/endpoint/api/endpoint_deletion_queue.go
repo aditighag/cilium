@@ -21,6 +21,7 @@ import (
 	"github.com/cilium/cilium/pkg/lock/lockfile"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/promise"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 // DeletionQueue manages the processing of persisted CNI delete requests.
@@ -46,9 +47,17 @@ func (dq *DeletionQueue) process(ctx context.Context, health cell.Health) error 
 		return fmt.Errorf("failed to wait for endpoint restoration: %w", err)
 	}
 
+	dq.logger.Debug(
+		"Attempting to acquire deletion queue lock",
+		logfields.Path, defaults.DeleteQueueLockfile,
+	)
+	startTime := time.Now()
 	if err := dq.lock(ctx); err != nil {
 		return fmt.Errorf("unable to get exclusive lock: %w", err)
 	}
+	dq.logger.Debug("Deletion Queue lock acquired",
+		logfields.Path, defaults.DeleteQueueLockfile,
+		logfields.Duration, time.Since(startTime))
 
 	// unlock lock file also in case of errors
 	defer func() { close(dq.processed) }()
@@ -211,12 +220,8 @@ func (dq *DeletionQueue) processQueuedDeleteEntryLocked(file string) error {
 	var req models.EndpointBatchDeleteRequest
 	err = req.UnmarshalBinary(contents)
 	if err != nil {
-		// fall back on treating the file contents as an endpoint id (legacy behavior)
+		// fall back on treating the file contents as an endpoint id (not a batch deletion)
 		epID := string(contents)
-		dq.logger.Debug("Falling back on legacy deletion queue format",
-			logfields.EndpointID, epID,
-			logfields.Error, err,
-		)
 		_, _ = dq.endpointAPIManager.DeleteEndpoint(epID) // this will log errors elsewhere
 		return nil
 	}

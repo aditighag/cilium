@@ -44,7 +44,7 @@ Address NodePort Primary DeviceName
 
 -- services.table --
 Name        Source   PortNames            TrafficPolicy   Flags
-test/echo   k8s      http=80, https=443   Cluster         LoadBalancerClass=test
+test/echo   k8s      http=80, https=443   Cluster
 
 -- frontends.table --
 Address                Type           ServiceName   PortName   Backends                                 RedirectTo   Status
@@ -65,11 +65,11 @@ Address                Type           ServiceName   PortName   Backends   Redire
 172.16.1.1:443/TCP     LoadBalancer   test/echo     https                              Done
 
 -- backends.table --
-Address              Instances           Shadows   NodeName
-10.244.1.1:80/TCP    test/echo (http)              nodeport-worker1
-10.244.1.1:443/TCP   test/echo (https)             nodeport-worker1
-10.244.1.2:80/TCP    test/echo (http)              nodeport-worker2
-10.244.1.2:443/TCP   test/echo (https)             nodeport-worker2
+Service    Address             NodeName
+test/echo  10.244.1.1:80/TCP   nodeport-worker1
+test/echo  10.244.1.1:443/TCP  nodeport-worker1
+test/echo  10.244.1.2:80/TCP   nodeport-worker2
+test/echo  10.244.1.2:443/TCP  nodeport-worker2
 
 -- lbmaps.expected --
 BE: ID=1 ADDR=10.244.1.1:80/TCP STATE=active
@@ -142,7 +142,6 @@ spec:
   selector:
     name: echo
   sessionAffinity: None
-  loadBalancerClass: "test"
   type: LoadBalancer
 status:
   loadBalancer:

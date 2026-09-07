@@ -40,6 +40,7 @@ struct policy_verdict_notify {
 	__u8	pad1[3]; /* align with 64 bits */
 	__u32	cookie;
 	__u32	pad2; /* align with 64 bits */
+
 	POLICY_VERDICT_EXTENSION
 };
 
@@ -55,7 +56,7 @@ static __always_inline bool policy_verdict_filter_allow(__u32 filter, __u8 dir)
 }
 
 static __always_inline void
-send_policy_verdict_notify(struct __ctx_buff *ctx, __u32 remote_label, __u16 dst_port,
+send_policy_verdict_notify(const struct __ctx_buff *ctx, __u32 remote_label, __u16 dst_port,
 			   __u8 proto, __u8 dir, __u8 is_ipv6, int verdict, __u16 proxy_port,
 			   __u8 match_type, __u8 is_audited, __u8 auth_type, __u32 cookie)
 {
@@ -93,9 +94,9 @@ send_policy_verdict_notify(struct __ctx_buff *ctx, __u32 remote_label, __u16 dst
 	if (verdict == 0)
 		verdict = (int)proxy_port;
 
-	if (EVENTS_MAP_RATE_LIMIT > 0) {
-		settings.bucket_size = EVENTS_MAP_BURST_LIMIT;
-		settings.tokens_per_topup = EVENTS_MAP_RATE_LIMIT;
+	if (CONFIG(events_map_rate_limit) > 0) {
+		settings.bucket_size = CONFIG(events_map_burst_limit);
+		settings.tokens_per_topup = CONFIG(events_map_rate_limit);
 		if (!ratelimit_check_and_take(&rkey, &settings))
 			return;
 	}
@@ -123,7 +124,7 @@ send_policy_verdict_notify(struct __ctx_buff *ctx, __u32 remote_label, __u16 dst
 }
 #else
 static __always_inline void
-send_policy_verdict_notify(struct __ctx_buff *ctx __maybe_unused,
+send_policy_verdict_notify(const struct __ctx_buff *ctx __maybe_unused,
 			   __u32 remote_label __maybe_unused, __u16 dst_port __maybe_unused,
 			   __u8 proto __maybe_unused, __u8 dir __maybe_unused,
 			   __u8 is_ipv6 __maybe_unused, int verdict __maybe_unused,

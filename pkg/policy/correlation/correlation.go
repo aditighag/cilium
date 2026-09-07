@@ -4,6 +4,7 @@
 package correlation
 
 import (
+	"cmp"
 	"log/slog"
 
 	flowpb "github.com/cilium/cilium/api/v1/flow"
@@ -20,26 +21,32 @@ import (
 )
 
 // CorrelatePolicy updates the IngressAllowedBy/EgressAllowedBy fields on the
-// provided flow.
-func CorrelatePolicy(logger *slog.Logger, endpointGetter getters.EndpointGetter, f *flowpb.Flow) {
+// provided flow. notifyEPID is the endpoint the datapath reported the verdict
+// at, zero if the notification carried none, and takes precedence over the ID
+// derived from the flow, which is unset for the host endpoint.
+func CorrelatePolicy(logger *slog.Logger, endpointGetter getters.EndpointGetter, f *flowpb.Flow, notifyEPID uint16) {
 	if f.GetEventType().GetType() != int32(monitorAPI.MessageTypePolicyVerdict) {
 		// If it's not a policy verdict, we don't care.
 		return
 	}
 
 	// We are only interested in flows which are either allowed (i.e. the verdict is either
-	// FORWARDED or REDIRECTED) or explicitly denied (i.e. DROPPED, and matched by a deny policy),
-	// since we cannot usefully annotate the verdict otherwise. (Put differently, which policy
-	// should be listed in {in|e}gress_denied_by for an unmatched flow?)
+	// FORWARDED or REDIRECTED), denied by policy (i.e. DROPPED with a policy deny reason),
+	// or audited (i.e. AUDIT, which represents traffic allowed due to audit mode that would
+	// have been denied otherwise).
 	verdict := f.GetVerdict()
 	allowed := verdict == flowpb.Verdict_FORWARDED || verdict == flowpb.Verdict_REDIRECTED
-	denied := verdict == flowpb.Verdict_DROPPED && f.GetDropReasonDesc() == flowpb.DropReason_POLICY_DENY
-	if !(allowed || denied) {
+	dropReason := f.GetDropReasonDesc()
+	denied := verdict == flowpb.Verdict_DROPPED &&
+		(dropReason == flowpb.DropReason_POLICY_DENY || dropReason == flowpb.DropReason_POLICY_DENIED)
+	audited := verdict == flowpb.Verdict_AUDIT
+	if !(allowed || denied || audited) {
 		return
 	}
 
 	// extract fields relevant for looking up the policy
 	direction, endpointID, remoteIdentity, proto, dport := extractFlowKey(f)
+	endpointID = cmp.Or(notifyEPID, endpointID)
 	if dport == 0 || proto == 0 {
 		logger.Debug(
 			"failed to extract flow key",
@@ -58,9 +65,9 @@ func CorrelatePolicy(logger *slog.Logger, endpointGetter getters.EndpointGetter,
 		return
 	}
 
-	info, ok := lookupPolicyForKey(epInfo,
+	info, ok := epInfo.GetPolicyCorrelationInfoForKey(
 		policy.KeyForDirection(direction).WithIdentity(remoteIdentity).WithPortProto(proto, dport),
-		f.GetPolicyMatchType())
+	)
 	if !ok {
 		logger.Debug(
 			"unable to find policy for policy verdict notification",
@@ -76,11 +83,11 @@ func CorrelatePolicy(logger *slog.Logger, endpointGetter getters.EndpointGetter,
 	switch {
 	case direction == trafficdirection.Egress && allowed:
 		f.EgressAllowedBy = rules
-	case direction == trafficdirection.Egress && denied:
+	case direction == trafficdirection.Egress && (denied || audited):
 		f.EgressDeniedBy = rules
 	case direction == trafficdirection.Ingress && allowed:
 		f.IngressAllowedBy = rules
-	case direction == trafficdirection.Ingress && denied:
+	case direction == trafficdirection.Ingress && (denied || audited):
 		f.IngressDeniedBy = rules
 	}
 	// policy log is independent of verdict
@@ -137,86 +144,6 @@ func extractFlowKey(f *flowpb.Flow) (
 	}
 
 	return
-}
-
-func lookupPolicyForKey(ep getters.EndpointInfo, key policy.Key, matchType uint32) (policyTypes.PolicyCorrelationInfo, bool) {
-	switch matchType {
-	case monitorAPI.PolicyMatchL3L4:
-		// Check for L4 policy rules.
-		//
-		// Consider the network policy:
-		//
-		// spec:
-		//  podSelector: {}
-		//  ingress:
-		//  - podSelector:
-		//      matchLabels:
-		//        app: client
-		//    ports:
-		//    - port: 80
-		//      protocol: TCP
-	case monitorAPI.PolicyMatchL3Proto:
-		// Check for L3 policy rules with protocol (but no port).
-		//
-		// Consider the network policy:
-		//
-		// spec:
-		//  podSelector: {}
-		//  ingress:
-		//  - podSelector:
-		//      matchLabels:
-		//        app: client
-		//    ports:
-		//    - protocol: TCP
-		key = policy.KeyForDirection(key.TrafficDirection()).WithIdentity(key.Identity).WithProto(key.Nexthdr)
-	case monitorAPI.PolicyMatchL4Only:
-		// Check for port-specific rules.
-		// This covers the case where one or more identities are allowed by network policy.
-		//
-		// Consider the network policy:
-		//
-		// spec:
-		//  podSelector: {}
-		//  ingress:
-		//  - ports:
-		//    - port: 80
-		//      protocol: TCP // protocol is optional for this match.
-		key = policy.KeyForDirection(key.TrafficDirection()).WithPortProto(key.Nexthdr, key.DestPort)
-	case monitorAPI.PolicyMatchProtoOnly:
-		// Check for protocol-only policies.
-		//
-		// Consider the network policy:
-		//
-		// spec:
-		//  podSelector: {}
-		//  ingress:
-		//  - ports:
-		//    - protocol: TCP
-		key = policy.KeyForDirection(key.TrafficDirection()).WithProto(key.Nexthdr)
-	case monitorAPI.PolicyMatchL3Only:
-		// Check for L3 policy rules.
-		//
-		// Consider the network policy:
-		//
-		// spec:
-		//  podSelector: {}
-		//  ingress:
-		//  - podSelector:
-		//      matchLabels:
-		//        app: client
-		key = policy.KeyForDirection(key.TrafficDirection()).WithIdentity(key.Identity)
-	case monitorAPI.PolicyMatchAll:
-		// Check for allow-all policy rules.
-		//
-		// Consider the network policy:
-		//
-		// spec:
-		//  podSelector: {}
-		//  ingress:
-		//  - {}
-		key = policy.KeyForDirection(key.TrafficDirection())
-	}
-	return ep.GetPolicyCorrelationInfoForKey(key)
 }
 
 func toProto(info policyTypes.PolicyCorrelationInfo) (policies []*flowpb.Policy) {

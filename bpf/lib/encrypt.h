@@ -13,16 +13,21 @@
 #include "lib/ipv4.h"
 #include "lib/identity.h"
 
-#if defined(ENABLE_IPSEC) || defined(ENABLE_WIREGUARD)
+#ifdef IS_BPF_HOST
+DECLARE_CONFIG(union v4addr, strict_ipv4_net,
+	       "IPv4 network where strict egress encryption is enforced.")
+DECLARE_CONFIG(__u8, strict_ipv4_net_size,
+	       "Prefix length of the strict egress encryption IPv4 network.")
+#endif
+
 static __always_inline void
 set_decrypt_mark(struct __ctx_buff *ctx, __u16 node_id)
 {
 	/* Decrypt "key" is determined by SPI and originating node */
 	ctx->mark = MARK_MAGIC_DECRYPT | node_id << 16;
 }
-#endif /* defined(ENABLE_IPSEC) || defined(ENABLE_WIREGUARD) */
 
-#ifdef ENCRYPTION_STRICT_MODE
+#if defined(ENCRYPTION_STRICT_MODE_EGRESS) && defined(IS_BPF_HOST)
 /* strict_allow checks whether the packet is allowed to pass through the strict mode. */
 static __always_inline bool
 strict_allow(struct __ctx_buff *ctx, __be16 proto) {
@@ -41,15 +46,16 @@ strict_allow(struct __ctx_buff *ctx, __be16 proto) {
 		 * (1) When encapsulation is used and the destination is a remote pod.
 		 * (2) When the destination is a remote-node.
 		 */
-		if (ip4->saddr == IPV4_GATEWAY || ip4->saddr == IPV4_ENCRYPT_IFACE)
+		if (ip4->saddr == CONFIG(router_ipv4).be32 ||
+		    ip4->saddr == IPV4_ENCRYPT_IFACE)
 			return true;
 
 		in_strict_cidr = ipv4_is_in_subnet(ip4->daddr,
-						   STRICT_IPV4_NET,
-						   STRICT_IPV4_NET_SIZE);
+						   CONFIG(strict_ipv4_net).be32,
+						   CONFIG(strict_ipv4_net_size));
 		in_strict_cidr &= ipv4_is_in_subnet(ip4->saddr,
-						    STRICT_IPV4_NET,
-						    STRICT_IPV4_NET_SIZE);
+						    CONFIG(strict_ipv4_net).be32,
+						    CONFIG(strict_ipv4_net_size));
 
 #if defined(TUNNEL_MODE) || defined(STRICT_IPV4_OVERLAPPING_CIDR)
 		/* Allow pod to remote-node communication */
@@ -63,4 +69,34 @@ strict_allow(struct __ctx_buff *ctx, __be16 proto) {
 		return true;
 	}
 }
-#endif /* ENCRYPTION_STRICT_MODE */
+#endif /* ENCRYPTION_STRICT_MODE_EGRESS && IS_BPF_HOST */
+
+/* checks whether the source endpoint matches the encryption policy */
+static __always_inline bool
+encrypt_src_matches_policy(__u32 src_sec_identity) {
+#ifndef ENABLE_NODE_ENCRYPTION
+	/* Unless node encryption is enabled, we don't want to encrypt
+	 * traffic from the hostns.
+	 *
+	 * NB: if iptables has SNAT-ed the packet, its sec id is HOST_ID.
+	 * This means that the packet won't be encrypted. This is fine,
+	 * as with --encrypt-node=false we encrypt only pod-to-pod packets.
+	 */
+	if (src_sec_identity == HOST_ID)
+		return false;
+#endif /* !ENABLE_NODE_ENCRYPTION */
+
+	/* We don't want to encrypt any traffic that originates from outside
+	 * the cluster. This check excludes DSR traffic from the LB node to a remote backend.
+	 */
+	if (!identity_is_cluster(src_sec_identity))
+		return false;
+
+	/* If source is remote node we should treat it like outside traffic.
+	 * This is possible when connection is done from pod to load balancer with DSR enabled.
+	 */
+	if (identity_is_remote_node(src_sec_identity))
+		return false;
+
+	return true;
+}

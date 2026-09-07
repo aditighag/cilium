@@ -40,43 +40,46 @@ func TestMain(m *testing.M) {
 func TestRemoteClusterStatus(t *testing.T) {
 	client := kvstore.NewInMemoryClient(statedb.New(), "__remote__")
 	kvsService := map[string]string{
-		"cilium/state/services/v1/foo/baz/bar": `{"name": "bar", "namespace": "baz", "cluster": "foo", "clusterID": 1}`,
-	}
-	kvsServiceExport := map[string]string{
-		"cilium/state/serviceexports/v1/foo/baz/bar": `{"name": "bar", "namespace": "baz", "cluster": "foo", "exportCreationTimestamp": "2024-07-07T15:55:07.627472784+02:00", "type": "ClusterSetIP", "sessionAffinity": "None"}`,
+		"cilium/state/services/v1/foo/baz/bar": `{"name": "bar", "namespace": "baz", "cluster": "foo", "clusterID": 10}`,
 	}
 
 	tests := []struct {
 		name                            string
 		clusterMeshEnableEndpointSync   bool
+		serviceModeV2                   types.ServiceModeV2
 		clusterMeshEnableMCSAPI         bool
 		capabilityServiceExportsEnabled *bool
 		expectedServiceSync             bool
-		expectedMCSAPISync              bool
 	}{
 		{
 			name:                            "Everything disabled",
 			clusterMeshEnableEndpointSync:   false,
+			serviceModeV2:                   types.ServiceV2PreferLegacy,
 			clusterMeshEnableMCSAPI:         false,
 			capabilityServiceExportsEnabled: nil,
 			expectedServiceSync:             false,
-			expectedMCSAPISync:              false,
 		},
 		{
 			name:                            "Both config enabled but remote doesn't support service exports",
 			clusterMeshEnableEndpointSync:   true,
+			serviceModeV2:                   types.ServiceV2PreferLegacy,
 			clusterMeshEnableMCSAPI:         true,
 			capabilityServiceExportsEnabled: nil,
 			expectedServiceSync:             true,
-			expectedMCSAPISync:              false,
 		},
 		{
 			name:                            "Both config enabled and remote supports service exports",
 			clusterMeshEnableEndpointSync:   true,
+			serviceModeV2:                   types.ServiceV2PreferLegacy,
 			clusterMeshEnableMCSAPI:         true,
 			capabilityServiceExportsEnabled: ptr.To(false),
 			expectedServiceSync:             true,
-			expectedMCSAPISync:              true,
+		},
+		{
+			name:                          "Endpoint sync enabled but services disabled by mode",
+			clusterMeshEnableEndpointSync: true,
+			serviceModeV2:                 types.ServiceV2OnlyEndpointSlice,
+			expectedServiceSync:           false,
 		},
 	}
 
@@ -94,25 +97,19 @@ func TestRemoteClusterStatus(t *testing.T) {
 			logger := hivetest.Logger(t)
 			metrics := NewMetrics()
 			cm := clusterMesh{
-				logger:               logger,
-				metrics:              metrics,
-				storeFactory:         st,
-				globalServices:       common.NewGlobalServiceCache(logger),
-				globalServiceExports: NewGlobalServiceExportCache(),
-				cfg:                  ClusterMeshConfig{ClusterMeshEnableEndpointSync: tt.clusterMeshEnableEndpointSync},
-				cfgMCSAPI:            mcsapitypes.MCSAPIConfig{EnableMCSAPI: tt.clusterMeshEnableMCSAPI},
+				logger:         logger,
+				metrics:        metrics,
+				storeFactory:   st,
+				globalServices: common.NewGlobalServiceCache(logger),
+				cfg:            ClusterMeshConfig{ClusterMeshEnableEndpointSync: tt.clusterMeshEnableEndpointSync},
+				cfgMCSAPI:      mcsapitypes.MCSAPIConfig{EnableMCSAPI: tt.clusterMeshEnableMCSAPI},
+				serviceModeV2:  tt.serviceModeV2,
 			}
 
 			// Populate the kvstore with the appropriate KV pairs
 			for key, value := range kvsService {
 				require.NoErrorf(t, client.Update(ctx, key, []byte(value), false), "Failed to set %s=%s", key, value)
 			}
-			if tt.capabilityServiceExportsEnabled != nil {
-				for key, value := range kvsServiceExport {
-					require.NoErrorf(t, client.Update(ctx, key, []byte(value), false), "Failed to set %s=%s", key, value)
-				}
-			}
-
 			rc := cm.newRemoteCluster("foo", func() *models.RemoteCluster {
 				return &models.RemoteCluster{Ready: true, Config: &models.RemoteClusterConfig{
 					ServiceExportsEnabled: tt.capabilityServiceExportsEnabled,
@@ -121,21 +118,16 @@ func TestRemoteClusterStatus(t *testing.T) {
 
 			// Validate the status before watching the remote cluster.
 			status := rc.(*remoteCluster).Status()
-			if tt.expectedServiceSync || tt.expectedMCSAPISync {
+			if tt.expectedServiceSync {
 				require.False(t, status.Ready, "Status should not be ready")
 			}
 
 			if tt.expectedServiceSync {
 				require.False(t, status.Synced.Services, "Services should not be synced")
-			}
-			if tt.expectedMCSAPISync {
-				require.False(t, status.Synced.ServiceExports != nil && *status.Synced.ServiceExports, "Service Exports should not be synced")
 			} else {
-				require.Nil(t, status.Synced.ServiceExports, "Service Exports should not be considered for syncing")
+				require.True(t, status.Synced.Services, "Services should be marked as synced")
 			}
-
 			require.EqualValues(t, 0, status.NumSharedServices, "Incorrect number of services")
-			require.EqualValues(t, 0, status.NumServiceExports, "Incorrect number of service exports")
 
 			cfg := types.CiliumClusterConfig{
 				ID: 10, Capabilities: types.CiliumClusterConfigCapabilities{
@@ -143,11 +135,9 @@ func TestRemoteClusterStatus(t *testing.T) {
 				},
 			}
 			ready := make(chan error)
-			wg.Add(1)
-			go func() {
+			wg.Go(func() {
 				rc.Run(ctx, client, cfg, ready)
-				wg.Done()
-			}()
+			})
 
 			require.NoError(t, <-ready, "rc.Run() failed")
 
@@ -155,22 +145,15 @@ func TestRemoteClusterStatus(t *testing.T) {
 				status := rc.(*remoteCluster).Status()
 				assert.True(c, status.Ready, "Status should be ready")
 
-				assert.True(c, status.Synced.Services, "Services should be synced")
-				if tt.expectedMCSAPISync {
-					assert.True(c, status.Synced.ServiceExports != nil && *status.Synced.ServiceExports, "Service Exports should be synced")
+				if tt.expectedServiceSync {
+					assert.True(c, status.Synced.Services, "Services should be synced")
 				} else {
-					assert.Nil(c, status.Synced.ServiceExports, "Service Exports should not be considered for syncing")
+					assert.True(c, status.Synced.Services, "Disabled services should be considered synced")
 				}
-
 				if tt.expectedServiceSync {
 					assert.EqualValues(c, 1, status.NumSharedServices, "Incorrect number of services")
 				} else {
 					assert.EqualValues(c, 0, status.NumSharedServices, "Incorrect number of services")
-				}
-				if tt.expectedMCSAPISync {
-					assert.EqualValues(c, 1, status.NumServiceExports, "Incorrect number of service exports")
-				} else {
-					assert.EqualValues(c, 0, status.NumServiceExports, "Incorrect number of service exports")
 				}
 			}, timeout, tick, "Reported status is not correct")
 		})
@@ -190,11 +173,10 @@ func TestRemoteClusterHooks(t *testing.T) {
 	metrics := NewMetrics()
 	st := store.NewFactory(logger, store.MetricsProvider())
 	cm := clusterMesh{
-		logger:               logger,
-		metrics:              metrics,
-		storeFactory:         st,
-		globalServices:       common.NewGlobalServiceCache(logger),
-		globalServiceExports: NewGlobalServiceExportCache(),
+		logger:         logger,
+		metrics:        metrics,
+		storeFactory:   st,
+		globalServices: common.NewGlobalServiceCache(logger),
 	}
 
 	clusterAddCalledCount := atomic.Uint32{}
@@ -215,11 +197,9 @@ func TestRemoteClusterHooks(t *testing.T) {
 		return &models.RemoteCluster{Ready: true, Config: &models.RemoteClusterConfig{}}
 	})
 
-	wg.Add(1)
-	go func() {
+	wg.Go(func() {
 		rc.Run(ctx, client, cfg, ready)
-		wg.Done()
-	}()
+	})
 
 	require.EventuallyWithT(t, func(c *assert.CollectT) {
 		assert.EqualValues(c, 1, clusterAddCalledCount.Load(), "cluster add called once")

@@ -4,10 +4,8 @@
 package ciliumidentity
 
 import (
-	"fmt"
 	"log/slog"
 	"os"
-	"reflect"
 	"sync"
 	"testing"
 
@@ -55,7 +53,7 @@ func TestCIDState(t *testing.T) {
 			},
 		}
 
-		assert.NoError(t, validateCIDState(state, expectedState), "cid 1 added")
+		validateCIDState(t, state, expectedState, "cid 1 added")
 
 		state.Upsert("2", k2)
 		expectedState = &CIDState{
@@ -72,7 +70,7 @@ func TestCIDState(t *testing.T) {
 			},
 		}
 
-		assert.NoError(t, validateCIDState(state, expectedState), "cid 2 added")
+		validateCIDState(t, state, expectedState, "cid 2 added")
 
 		state.Upsert("3", k3)
 		expectedState = &CIDState{
@@ -89,7 +87,7 @@ func TestCIDState(t *testing.T) {
 			},
 		}
 
-		assert.NoError(t, validateCIDState(state, expectedState), "cid 3 added - duplicate")
+		validateCIDState(t, state, expectedState, "cid 3 added - duplicate")
 	})
 
 	t.Run("Lookup CID state", func(t *testing.T) {
@@ -124,7 +122,7 @@ func TestCIDState(t *testing.T) {
 			},
 		}
 
-		assert.NoError(t, validateCIDState(state, expectedState), "cid 2 removed")
+		validateCIDState(t, state, expectedState, "cid 2 removed")
 
 		_, exists := state.LookupByID("2")
 		assert.False(t, exists, "cid 2 LookupByID - not found")
@@ -139,7 +137,7 @@ func TestCIDState(t *testing.T) {
 				},
 			},
 		}
-		assert.NoError(t, validateCIDState(state, expectedState), "cid 3 removed")
+		validateCIDState(t, state, expectedState, "cid 3 removed")
 	})
 }
 
@@ -175,16 +173,10 @@ func TestCIDStateThreadSafety(t *testing.T) {
 	wg.Wait()
 }
 
-func validateCIDState(state, expectedState *CIDState) error {
-	if !reflect.DeepEqual(state.idToLabels, expectedState.idToLabels) {
-		return fmt.Errorf("failed to validate the state, expected idToLabels %v, got %v", expectedState.idToLabels, state.idToLabels)
-	}
-
-	if !reflect.DeepEqual(state.labelsToID, expectedState.labelsToID) {
-		return fmt.Errorf("failed to validate the state, expected labelsToID %v, got %v", expectedState.labelsToID, state.labelsToID)
-	}
-
-	return nil
+func validateCIDState(t *testing.T, state, expectedState *CIDState, msg string) {
+	t.Helper()
+	assert.Equal(t, expectedState.idToLabels, state.idToLabels, msg)
+	assert.Equal(t, expectedState.labelsToID, state.labelsToID, msg)
 }
 
 func TestCIDUsageInPods(t *testing.T) {
@@ -278,15 +270,15 @@ func TestCIDUsageInPods(t *testing.T) {
 }
 
 func TestCIDUsageInCES(t *testing.T) {
-	cep1 := cestest.CreateManagerEndpoint("cep1", 1000)
-	cep2 := cestest.CreateManagerEndpoint("cep2", 1000)
-	cep3 := cestest.CreateManagerEndpoint("cep3", 2000)
-	cep4 := cestest.CreateManagerEndpoint("cep4", 3000)
+	cep1 := cestest.CreateManagerEndpoint("cep1", 1000, "node1")
+	cep2 := cestest.CreateManagerEndpoint("cep2", 1000, "node1")
+	cep3 := cestest.CreateManagerEndpoint("cep3", 2000, "node1")
+	cep4 := cestest.CreateManagerEndpoint("cep4", 3000, "node1")
 	ces1 := cestest.CreateStoreEndpointSlice("ces1", "ns", []capi_v2a1.CoreCiliumEndpoint{cep1, cep2, cep3, cep4})
 
-	cep5 := cestest.CreateManagerEndpoint("cep5", 1000)
-	cep6 := cestest.CreateManagerEndpoint("cep6", 1000)
-	cep7 := cestest.CreateManagerEndpoint("cep7", 2000)
+	cep5 := cestest.CreateManagerEndpoint("cep5", 1000, "node1")
+	cep6 := cestest.CreateManagerEndpoint("cep6", 1000, "node1")
+	cep7 := cestest.CreateManagerEndpoint("cep7", 2000, "node1")
 	ces2 := cestest.CreateStoreEndpointSlice("ces2", "ns", []capi_v2a1.CoreCiliumEndpoint{cep5, cep6, cep7})
 
 	assertTxt := "CES 1 is added"

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"os"
 	"runtime"
 	"strconv"
 	"sync"
@@ -42,6 +43,7 @@ func TestMain(m *testing.M) {
 		// Force garbage-collection to force finalizers to run and catch
 		// missing Event.Done() calls.
 		runtime.GC()
+		os.Exit(exitCode)
 	}
 	testutils.GoleakVerifyTestMain(m,
 		testutils.GoleakCleanup(cleanup),
@@ -112,9 +114,10 @@ func TestResource_WithFakeClient(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	fakeClient.KubernetesFakeClientset.CoreV1().Nodes().Create(
+	curr, err := fakeClient.KubernetesFakeClientset.CoreV1().Nodes().Create(
 		ctx,
 		node.DeepCopy(), metav1.CreateOptions{})
+	require.NoError(t, err, "Nodes.Create")
 
 	hive := hive.New(
 		cell.Provide(func() k8sClient.Clientset { return cs }),
@@ -158,11 +161,12 @@ func TestResource_WithFakeClient(t *testing.T) {
 
 	// Update the node and check the update event
 	node.Status.Phase = "update1"
-	node.ObjectMeta.ResourceVersion = "1"
+	node.ObjectMeta.ResourceVersion = curr.ResourceVersion
 
-	fakeClient.KubernetesFakeClientset.CoreV1().Nodes().Update(
+	curr, err = fakeClient.KubernetesFakeClientset.CoreV1().Nodes().Update(
 		ctx,
 		node.DeepCopy(), metav1.UpdateOptions{})
+	require.NoError(t, err, "Nodes.Update")
 
 	ev, ok = <-events
 	require.True(t, ok, "events channel closed unexpectedly")
@@ -193,10 +197,12 @@ func TestResource_WithFakeClient(t *testing.T) {
 		for i := 2; i <= 10; i++ {
 			node.Status.Phase = corev1.NodePhase(fmt.Sprintf("update%d", i))
 			node.ObjectMeta.Generation = int64(i)
+			node.ObjectMeta.ResourceVersion = curr.ResourceVersion
 
-			fakeClient.KubernetesFakeClientset.CoreV1().Nodes().Update(
+			curr, err = fakeClient.KubernetesFakeClientset.CoreV1().Nodes().Update(
 				ctx,
 				node.DeepCopy(), metav1.UpdateOptions{})
+			require.NoError(t, err, "Nodes.Update")
 			ev2, ok := <-events2
 			require.True(t, ok, "events channel closed unexpectedly")
 			require.Equal(t, resource.Upsert, ev2.Kind)
@@ -995,8 +1001,7 @@ func BenchmarkResource(b *testing.B) {
 	var wg sync.WaitGroup
 
 	// Feed in b.N nodes as watcher events
-	wg.Add(1)
-	go func() {
+	wg.Go(func() {
 		for i := 0; b.Loop(); i++ {
 			name := fmt.Sprintf("node-%d", i)
 			lw.events <- watch.Event{Type: watch.Added, Object: &corev1.Node{
@@ -1006,8 +1011,7 @@ func BenchmarkResource(b *testing.B) {
 				},
 			}}
 		}
-		wg.Done()
-	}()
+	})
 
 	// Consume the events via the resource
 	for b.Loop() {
@@ -1090,5 +1094,13 @@ var nodesResource = cell.Provide(
 	func(lc cell.Lifecycle, c k8sClient.Clientset) resource.Resource[*corev1.Node] {
 		lw := utils.ListerWatcherFromTyped[*corev1.NodeList](c.CoreV1().Nodes())
 		return resource.New[*corev1.Node](lc, lw, nil)
+	},
+)
+
+var nodesFilteredResource = cell.Provide(
+	func(r resource.Resource[*corev1.Node]) resource.FilteredResource[*corev1.Node] {
+		return resource.NewFilteringResource[*corev1.Node](r, func(obj *corev1.Node) bool {
+			return obj != nil && obj.Name == "some-node"
+		})
 	},
 )

@@ -12,12 +12,13 @@ import (
 	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/assert"
 	"github.com/tidwall/gjson"
+
+	"github.com/cilium/cilium/daemon/cmd/cni/config"
 )
 
 func TestInstallCNIConfFile(t *testing.T) {
 	workdir := t.TempDir()
-	//exhaustruct:ignore
-	cfg := Config{
+	cfg := config.Config{
 		CNILogFile:            `/opt"/cni.log`,
 		CNIChainingMode:       "none",
 		CNIExclusive:          true,
@@ -47,8 +48,7 @@ func TestInstallCNIConfFile(t *testing.T) {
 }
 
 func TestRenderCNIConfUnchained(t *testing.T) {
-	//exhaustruct:ignore
-	cfg := Config{
+	cfg := config.Config{
 		CNILogFile: `/opt"/cni.log`,
 	}
 	c := newConfigManager(hivetest.Logger(t), cfg, false)
@@ -64,8 +64,7 @@ func TestRenderCNIConfUnchained(t *testing.T) {
 }
 
 func TestRenderCNIConfChained(t *testing.T) {
-	//exhaustruct:ignore
-	cfg := Config{
+	cfg := config.Config{
 		CNILogFile:        `/opt"/cni.log`,
 		CNIChainingMode:   "testing",
 		CNIChainingTarget: "another-network",
@@ -234,8 +233,7 @@ func TestRenderCNIConfChained(t *testing.T) {
 
 func TestCleanupOtherCNI(t *testing.T) {
 	workdir := t.TempDir()
-	//exhaustruct:ignore
-	cfg := Config{
+	cfg := config.Config{
 		CNIExclusive:          true,
 		WriteCNIConfWhenReady: path.Join(workdir, "42-keep.json"),
 	}

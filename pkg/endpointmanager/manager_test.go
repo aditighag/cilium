@@ -5,6 +5,7 @@ package endpointmanager
 
 import (
 	"context"
+	"log/slog"
 	"net/netip"
 	"sync"
 	"testing"
@@ -16,7 +17,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	apiv1 "github.com/cilium/cilium/api/v1/models"
-	fakeTypes "github.com/cilium/cilium/pkg/datapath/fake/types"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
+	"github.com/cilium/cilium/pkg/completion"
+	fakeipsec "github.com/cilium/cilium/pkg/datapath/linux/ipsec/fake"
 	"github.com/cilium/cilium/pkg/endpoint"
 	endpointid "github.com/cilium/cilium/pkg/endpoint/id"
 	"github.com/cilium/cilium/pkg/identity/identitymanager"
@@ -27,14 +30,35 @@ import (
 	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/policy"
+	"github.com/cilium/cilium/pkg/policy/compute"
+	testcompute "github.com/cilium/cilium/pkg/testutils/compute"
 	testidentity "github.com/cilium/cilium/pkg/testutils/identity"
-	testipcache "github.com/cilium/cilium/pkg/testutils/ipcache"
 	testpolicy "github.com/cilium/cilium/pkg/testutils/policy"
+	fakewireguard "github.com/cilium/cilium/pkg/wireguard/fake"
 )
 
+func makeTestEndpointParams(logger *slog.Logger, s *EndpointManagerSuite) endpoint.EndpointParams {
+	return endpoint.EndpointParams{
+		Logger:              logger,
+		EPBuildQueue:        &endpoint.MockEndpointBuildQueue{},
+		PolicyRepo:          s.repo,
+		PolicyFetcher:       s.fetcher,
+		IdentityManager:     s.idmgr,
+		KVStoreSynchronizer: s.kvstoreSync,
+		IPSecConfig:         fakeipsec.Config{},
+		WgConfig:            fakewireguard.Config{},
+		CTMapGC:             ctmap.NewFakeGCRunner(),
+		Allocator:           testidentity.NewMockIdentityAllocator(nil),
+	}
+}
+
 func (mgr *endpointManager) waitEndpointRemoved(ep *endpoint.Endpoint, conf endpoint.DeleteConfig) []error {
+	isRestored := ep.GetState() == endpoint.StateRestoring
 	mgr.unexpose(ep)
 	ep.Stop()
+	if !isRestored {
+		mgr.releaseID(ep)
+	}
 	return nil
 }
 
@@ -55,12 +79,19 @@ func (mgr *endpointManager) WaitEndpointRemoved(ep *endpoint.Endpoint) {
 }
 
 type EndpointManagerSuite struct {
-	repo policy.PolicyRepository
+	repo        policy.PolicyRepository
+	idmgr       identitymanager.IDManager
+	fetcher     compute.PolicyRecomputer
+	kvstoreSync *ipcache.IPIdentitySynchronizer
 }
 
 func setupEndpointManagerSuite(tb testing.TB) *EndpointManagerSuite {
+	logger := hivetest.Logger(tb)
 	s := &EndpointManagerSuite{}
-	s.repo = policy.NewPolicyRepository(hivetest.Logger(tb), nil, nil, nil, nil, testpolicy.NewPolicyMetricsNoop())
+	s.idmgr = identitymanager.NewIDManager(logger)
+	s.repo = policy.NewPolicyRepository(logger, cmtypes.DefaultClusterInfo, nil, nil, nil, s.idmgr, testpolicy.NewPolicyMetricsNoop())
+	s.fetcher = testcompute.InstantiateCellForTesting(tb, logger, "endpointmanager", tb.Name(), s.repo, s.idmgr)
+	s.kvstoreSync = ipcache.NewIPIdentitySynchronizer(logger, kvstore.SetupDummy(tb, kvstore.DisabledBackendName))
 
 	return s
 }
@@ -77,6 +108,33 @@ func (epSync *dummyEpSyncher) RunK8sCiliumEndpointSync(e *endpoint.Endpoint, hr 
 }
 
 func (epSync *dummyEpSyncher) DeleteK8sCiliumEndpointSync(e *endpoint.Endpoint) {
+}
+
+type blockingCompletionOwner string
+
+func (o blockingCompletionOwner) ID() string {
+	return string(o)
+}
+
+func (blockingCompletionOwner) CleanupAfterWait(*completion.Completion) {}
+
+func TestWaitForProxyCompletionsReturnsBlockingCompletionDetailsOnTimeout(t *testing.T) {
+	logger := hivetest.Logger(t)
+	mgr := New(logger, nil, &dummyEpSyncher{}, nil, nil, nil, defaultEndpointManagerConfig)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	proxyWaitGroup := completion.NewWaitGroup(ctx)
+	const blockingCompletionID = "blocking-proxy-policy-update"
+
+	// Leave the completion pending so the wait group times out while waiting on it.
+	proxyWaitGroup.AddCompletionWithCallback(blockingCompletionOwner(blockingCompletionID), nil)
+
+	err := mgr.waitForProxyCompletions(proxyWaitGroup)
+	require.Error(t, err)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.ErrorContains(t, err, "Waiting on "+blockingCompletionID)
 }
 
 func TestLookup(t *testing.T) {
@@ -184,79 +242,6 @@ func TestLookup(t *testing.T) {
 			},
 		},
 		{
-			name: "endpoint by container ID (deprecated)",
-			cm: &apiv1.EndpointChangeRequest{
-				ContainerID: "1234",
-			},
-			setupArgs: func() args {
-				return args{
-					endpointid.NewID(endpointid.ContainerIdPrefix, "1234"),
-				}
-			},
-			setupWant: func() want {
-				return want{
-					ep:       true,
-					err:      nil,
-					errCheck: assert.EqualValues,
-				}
-			},
-		},
-		{
-			name: "endpoint by docker endpoint ID",
-			cm: &apiv1.EndpointChangeRequest{
-				DockerEndpointID: "1234",
-			},
-			setupArgs: func() args {
-				return args{
-					endpointid.NewID(endpointid.DockerEndpointPrefix, "1234"),
-				}
-			},
-			setupWant: func() want {
-				return want{
-					ep:       true,
-					err:      nil,
-					errCheck: assert.EqualValues,
-				}
-			},
-		},
-		{
-			name: "endpoint by container name (deprecated)",
-			cm: &apiv1.EndpointChangeRequest{
-				ContainerName: "foo",
-			},
-			setupArgs: func() args {
-				return args{
-					endpointid.NewID(endpointid.ContainerNamePrefix, "foo"),
-				}
-			},
-			setupWant: func() want {
-				return want{
-					ep:       true,
-					err:      nil,
-					errCheck: assert.EqualValues,
-				}
-			},
-		},
-		{
-			name: "endpoint by pod name",
-			cm: &apiv1.EndpointChangeRequest{
-				K8sNamespace: "default",
-				K8sPodName:   "foo",
-			},
-			setupArgs: func() args {
-				return args{
-					endpointid.NewID(endpointid.PodNamePrefix, "default/foo"),
-				}
-			},
-			setupWant: func() want {
-				return want{
-					ep:       true,
-					err:      nil,
-					errCheck: assert.EqualValues,
-				}
-			},
-		},
-		{
 			name: "endpoint by cep name",
 			cm: &apiv1.EndpointChangeRequest{
 				K8sNamespace: "default",
@@ -296,12 +281,12 @@ func TestLookup(t *testing.T) {
 			},
 		},
 		{
-			name: "endpoint by cep name with interface and disabled legacy identifers",
+			name: "endpoint by cep name with secondary interface",
 			cm: &apiv1.EndpointChangeRequest{
-				K8sNamespace:             "default",
-				K8sPodName:               "foo",
-				ContainerInterfaceName:   "net1",
-				DisableLegacyIdentifiers: true,
+				K8sNamespace:           "default",
+				K8sPodName:             "foo",
+				ContainerInterfaceName: "net1",
+				IsSecondaryInterface:   true,
 			},
 			setupArgs: func() args {
 				return args{
@@ -320,7 +305,7 @@ func TestLookup(t *testing.T) {
 			name: "endpoint by ipv4",
 			cm: &apiv1.EndpointChangeRequest{
 				Addressing: &apiv1.AddressPair{
-					IPV4: "127.0.0.1",
+					IPv4: "127.0.0.1",
 				},
 			},
 			setupArgs: func() args {
@@ -364,25 +349,6 @@ func TestLookup(t *testing.T) {
 				}
 			},
 		},
-		{
-			name: "invalid lookup with container id with disabled legacy identifiers",
-			cm: &apiv1.EndpointChangeRequest{
-				ContainerID:              "1234",
-				DisableLegacyIdentifiers: true,
-			},
-			setupArgs: func() args {
-				return args{
-					endpointid.NewID(endpointid.ContainerIdPrefix, "1234"),
-				}
-			},
-			setupWant: func() want {
-				return want{
-					ep:       false,
-					err:      nil,
-					errCheck: assert.EqualValues,
-				}
-			},
-		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -391,7 +357,7 @@ func TestLookup(t *testing.T) {
 			logger := hivetest.Logger(t)
 			mgr := New(logger, nil, &dummyEpSyncher{}, nil, nil, nil, defaultEndpointManagerConfig)
 			if tt.cm != nil {
-				ep, err = endpoint.NewEndpointFromChangeModel(context.Background(), logger, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, s.repo, testipcache.NewMockIPCache(), &endpoint.FakeEndpointProxy{}, testidentity.NewMockIdentityAllocator(nil), ctmap.NewFakeGCRunner(), nil, tt.cm, fakeTypes.WireguardConfig{}, fakeTypes.IPsecConfig{}, nil, nil)
+				ep, err = endpoint.NewEndpointFromChangeModel(makeTestEndpointParams(logger, s), nil, &endpoint.FakeEndpointProxy{}, tt.cm, nil)
 				require.NoErrorf(t, err, "Test Name: %s", tt.name)
 				err = mgr.expose(ep)
 				require.NoErrorf(t, err, "Test Name: %s", tt.name)
@@ -416,7 +382,7 @@ func TestLookupCiliumID(t *testing.T) {
 
 	model := newTestEndpointModel(2, endpoint.StateReady)
 	mgr := New(logger, nil, &dummyEpSyncher{}, nil, nil, nil, defaultEndpointManagerConfig)
-	ep, err := endpoint.NewEndpointFromChangeModel(t.Context(), logger, nil, &endpoint.MockEndpointBuildQueue{}, nil, nil, nil, nil, nil, identitymanager.NewIDManager(logger), nil, nil, s.repo, testipcache.NewMockIPCache(), &endpoint.FakeEndpointProxy{}, testidentity.NewMockIdentityAllocator(nil), ctmap.NewFakeGCRunner(), nil, model, fakeTypes.WireguardConfig{}, fakeTypes.IPsecConfig{}, nil, nil)
+	ep, err := endpoint.NewEndpointFromChangeModel(makeTestEndpointParams(logger, s), nil, &endpoint.FakeEndpointProxy{}, model, nil)
 	require.NoError(t, err)
 
 	ep.Start(uint16(model.ID))
@@ -491,10 +457,10 @@ func TestLookupCNIAttachmentID(t *testing.T) {
 
 	logger := hivetest.Logger(t)
 	mgr := New(logger, nil, &dummyEpSyncher{}, nil, nil, nil, defaultEndpointManagerConfig)
-	ep, err := endpoint.NewEndpointFromChangeModel(context.Background(), logger, nil, &endpoint.MockEndpointBuildQueue{}, nil, nil, nil, nil, nil, nil, nil, nil, s.repo, testipcache.NewMockIPCache(), &endpoint.FakeEndpointProxy{}, testidentity.NewMockIdentityAllocator(nil), ctmap.NewFakeGCRunner(), nil, &apiv1.EndpointChangeRequest{
+	ep, err := endpoint.NewEndpointFromChangeModel(makeTestEndpointParams(logger, s), nil, &endpoint.FakeEndpointProxy{}, &apiv1.EndpointChangeRequest{
 		ContainerID:            "foo",
 		ContainerInterfaceName: "bar",
-	}, fakeTypes.WireguardConfig{}, fakeTypes.IPsecConfig{}, nil, nil)
+	}, nil)
 	require.NoError(t, err)
 	require.NoError(t, mgr.expose(ep))
 
@@ -514,7 +480,7 @@ func TestLookupIPv4(t *testing.T) {
 
 	mgr := New(logger, nil, &dummyEpSyncher{}, nil, nil, nil, defaultEndpointManagerConfig)
 	model := newTestEndpointModel(4, endpoint.StateReady)
-	ep, err := endpoint.NewEndpointFromChangeModel(t.Context(), logger, nil, &endpoint.MockEndpointBuildQueue{}, nil, nil, nil, nil, nil, identitymanager.NewIDManager(logger), nil, nil, s.repo, testipcache.NewMockIPCache(), &endpoint.FakeEndpointProxy{}, testidentity.NewMockIdentityAllocator(nil), ctmap.NewFakeGCRunner(), nil, model, fakeTypes.WireguardConfig{}, fakeTypes.IPsecConfig{}, nil, nil)
+	ep, err := endpoint.NewEndpointFromChangeModel(makeTestEndpointParams(logger, s), nil, &endpoint.FakeEndpointProxy{}, model, nil)
 	require.NoError(t, err)
 
 	ep.Start(uint16(model.ID))
@@ -626,10 +592,10 @@ func TestLookupCEPName(t *testing.T) {
 		{
 			name: "existing pod name with container interface name",
 			cm: apiv1.EndpointChangeRequest{
-				K8sNamespace:             "default",
-				K8sPodName:               "bar",
-				ContainerInterfaceName:   "eth1",
-				DisableLegacyIdentifiers: true,
+				K8sNamespace:           "default",
+				K8sPodName:             "bar",
+				ContainerInterfaceName: "eth1",
+				IsSecondaryInterface:   true,
 			},
 			preTestRun: func(ep *endpoint.Endpoint) {
 				require.NoError(t, mgr.expose(ep))
@@ -667,7 +633,7 @@ func TestLookupCEPName(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		ep, err := endpoint.NewEndpointFromChangeModel(context.Background(), logger, nil, &endpoint.MockEndpointBuildQueue{}, nil, nil, nil, nil, nil, nil, nil, nil, s.repo, testipcache.NewMockIPCache(), &endpoint.FakeEndpointProxy{}, testidentity.NewMockIdentityAllocator(nil), ctmap.NewFakeGCRunner(), nil, &tt.cm, fakeTypes.WireguardConfig{}, fakeTypes.IPsecConfig{}, nil, nil)
+		ep, err := endpoint.NewEndpointFromChangeModel(makeTestEndpointParams(logger, s), nil, &endpoint.FakeEndpointProxy{}, &tt.cm, nil)
 		require.NoErrorf(t, err, "Test Name: %s", tt.name)
 		tt.preTestRun(ep)
 		args := tt.setupArgs()
@@ -692,14 +658,12 @@ func TestUpdateReferences(t *testing.T) {
 		{
 			name: "Updating all references",
 			cm: apiv1.EndpointChangeRequest{
-				K8sNamespace:     "default",
-				K8sPodName:       "foo",
-				ContainerID:      "container",
-				DockerEndpointID: "dockerendpointID",
+				K8sNamespace: "default",
+				K8sPodName:   "foo",
+				ContainerID:  "container",
 				Addressing: &apiv1.AddressPair{
-					IPV4: "127.0.0.1",
+					IPv4: "127.0.0.1",
 				},
-				ContainerName: "containername",
 			},
 			setupWant: func() want {
 				return want{
@@ -709,10 +673,10 @@ func TestUpdateReferences(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		var err error
-		ep, err = endpoint.NewEndpointFromChangeModel(context.Background(), hivetest.Logger(t), nil, &endpoint.MockEndpointBuildQueue{}, nil, nil, nil, nil, nil, nil, nil, nil, s.repo, testipcache.NewMockIPCache(), &endpoint.FakeEndpointProxy{}, testidentity.NewMockIdentityAllocator(nil), ctmap.NewFakeGCRunner(), nil, &tt.cm, fakeTypes.WireguardConfig{}, fakeTypes.IPsecConfig{}, nil, nil)
-		require.NoErrorf(t, err, "Test Name: %s", tt.name)
 		logger := hivetest.Logger(t)
+		var err error
+		ep, err = endpoint.NewEndpointFromChangeModel(makeTestEndpointParams(logger, s), nil, &endpoint.FakeEndpointProxy{}, &tt.cm, nil)
+		require.NoErrorf(t, err, "Test Name: %s", tt.name)
 		mgr := New(logger, nil, &dummyEpSyncher{}, nil, nil, nil, defaultEndpointManagerConfig)
 
 		err = mgr.expose(ep)
@@ -723,13 +687,7 @@ func TestUpdateReferences(t *testing.T) {
 		ep = mgr.LookupCNIAttachmentID(want.ep.GetCNIAttachmentID())
 		require.Equal(t, want.ep, ep, "Test Name: %s", tt.name)
 
-		ep = mgr.lookupDockerEndpoint(want.ep.GetDockerEndpointID())
-		require.Equal(t, want.ep, ep, "Test Name: %s", tt.name)
-
 		ep = mgr.LookupIPv4(want.ep.IPv4.String())
-		require.Equal(t, want.ep, ep, "Test Name: %s", tt.name)
-
-		ep = mgr.lookupDockerContainerName(want.ep.GetContainerName())
 		require.Equal(t, want.ep, ep, "Test Name: %s", tt.name)
 
 		ep = mgr.LookupCEPName(want.ep.GetK8sNamespaceAndCEPName())
@@ -746,7 +704,7 @@ func TestRemove(t *testing.T) {
 	logger := hivetest.Logger(t)
 	mgr := New(logger, nil, &dummyEpSyncher{}, nil, nil, nil, defaultEndpointManagerConfig)
 	model := newTestEndpointModel(7, endpoint.StateReady)
-	ep, err := endpoint.NewEndpointFromChangeModel(t.Context(), logger, nil, &endpoint.MockEndpointBuildQueue{}, nil, nil, nil, nil, nil, identitymanager.NewIDManager(logger), nil, nil, s.repo, testipcache.NewMockIPCache(), &endpoint.FakeEndpointProxy{}, testidentity.NewMockIdentityAllocator(nil), ctmap.NewFakeGCRunner(), nil, model, fakeTypes.WireguardConfig{}, fakeTypes.IPsecConfig{}, nil, nil)
+	ep, err := endpoint.NewEndpointFromChangeModel(makeTestEndpointParams(logger, s), nil, &endpoint.FakeEndpointProxy{}, model, nil)
 	require.NoError(t, err)
 
 	ep.Start(uint16(model.ID))
@@ -787,6 +745,137 @@ func TestRemove(t *testing.T) {
 	}
 }
 
+func TestWaitForEndpointsAtPolicyRev(t *testing.T) {
+	s := setupEndpointManagerSuite(t)
+	logger := hivetest.Logger(t)
+	mgr := New(logger, nil, &dummyEpSyncher{}, nil, nil, nil, defaultEndpointManagerConfig)
+	model := newTestEndpointModel(1, endpoint.StateReady)
+	ep, err := endpoint.NewEndpointFromChangeModel(makeTestEndpointParams(logger, s), nil, &endpoint.FakeEndpointProxy{}, model, nil)
+	require.NoError(t, err)
+
+	ep.Start(uint16(model.ID))
+	t.Cleanup(ep.Stop)
+	type args struct {
+		ctx    context.Context
+		rev    uint64
+		cancel context.CancelFunc
+	}
+	type want struct {
+		err      error
+		errCheck assert.ComparisonAssertionFunc
+	}
+	tests := []struct {
+		name        string
+		setupArgs   func() args
+		setupWant   func() want
+		preTestRun  func()
+		postTestRun func()
+	}{
+		{
+			name: "Endpoint with revision already set",
+			preTestRun: func() {
+				ep.ID = 1
+				ep.SetPolicyRevision(5)
+				require.NoError(t, mgr.expose(ep))
+			},
+			setupArgs: func() args {
+				return args{
+					ctx: context.Background(),
+					rev: 5,
+				}
+			},
+			setupWant: func() want {
+				return want{
+					err:      nil,
+					errCheck: assert.EqualValues,
+				}
+			},
+			postTestRun: func() {
+				mgr.WaitEndpointRemoved(ep)
+				model := newTestEndpointModel(1, endpoint.StateReady)
+				ep, err = endpoint.NewEndpointFromChangeModel(makeTestEndpointParams(logger, s), nil, &endpoint.FakeEndpointProxy{}, model, nil)
+				require.NoError(t, err)
+
+				ep.Start(uint16(model.ID))
+				t.Cleanup(ep.Stop)
+			},
+		},
+		{
+			name: "Context already timed out",
+			preTestRun: func() {
+				ep.ID = 1
+				ep.SetPolicyRevision(5)
+				require.NoError(t, mgr.expose(ep))
+			},
+			setupArgs: func() args {
+				ctx, cancel := context.WithTimeout(context.Background(), 0)
+				return args{
+					ctx:    ctx,
+					rev:    5,
+					cancel: cancel,
+				}
+			},
+			setupWant: func() want {
+				return want{
+					err:      nil,
+					errCheck: assert.NotEqualValues,
+				}
+			},
+			postTestRun: func() {
+				mgr.WaitEndpointRemoved(ep)
+				model := newTestEndpointModel(1, endpoint.StateReady)
+				ep, err = endpoint.NewEndpointFromChangeModel(makeTestEndpointParams(logger, s), nil, &endpoint.FakeEndpointProxy{}, model, nil)
+				require.NoError(t, err)
+
+				ep.Start(uint16(model.ID))
+				t.Cleanup(ep.Stop)
+			},
+		},
+		{
+			name: "Revision never reached before context times out",
+			preTestRun: func() {
+				ep.ID = 1
+				ep.SetPolicyRevision(4)
+				require.NoError(t, mgr.expose(ep))
+			},
+			setupArgs: func() args {
+				ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+				return args{
+					ctx:    ctx,
+					rev:    5,
+					cancel: cancel,
+				}
+			},
+			setupWant: func() want {
+				return want{
+					err:      nil,
+					errCheck: assert.NotEqualValues,
+				}
+			},
+			postTestRun: func() {
+				mgr.WaitEndpointRemoved(ep)
+				model := newTestEndpointModel(1, endpoint.StateReady)
+				ep, err = endpoint.NewEndpointFromChangeModel(makeTestEndpointParams(logger, s), nil, &endpoint.FakeEndpointProxy{}, model, nil)
+				require.NoError(t, err)
+
+				ep.Start(uint16(model.ID))
+				t.Cleanup(ep.Stop)
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt.preTestRun()
+		args := tt.setupArgs()
+		want := tt.setupWant()
+		got := mgr.WaitForEndpointsAtPolicyRev(args.ctx, args.rev)
+		want.errCheck(t, want.err, got, "Test Name: %s", tt.name)
+		if args.cancel != nil {
+			args.cancel()
+		}
+		tt.postTestRun()
+	}
+}
+
 func TestMissingNodeLabelsUpdate(t *testing.T) {
 	logger := hivetest.Logger(t)
 	// Initialize label filter config.
@@ -805,8 +894,7 @@ func TestMissingNodeLabelsUpdate(t *testing.T) {
 
 	// Create host endpoint and expose it in the endpoint manager.
 	model := newTestEndpointModel(1, endpoint.StateReady)
-	kvstoreSync := ipcache.NewIPIdentitySynchronizer(logger, kvstore.SetupDummy(t, kvstore.DisabledBackendName))
-	ep, err := endpoint.NewEndpointFromChangeModel(t.Context(), logger, nil, &endpoint.MockEndpointBuildQueue{}, nil, nil, nil, nil, nil, identitymanager.NewIDManager(logger), nil, nil, s.repo, testipcache.NewMockIPCache(), &endpoint.FakeEndpointProxy{}, testidentity.NewMockIdentityAllocator(nil), ctmap.NewFakeGCRunner(), kvstoreSync, model, fakeTypes.WireguardConfig{}, fakeTypes.IPsecConfig{}, nil, nil)
+	ep, err := endpoint.NewEndpointFromChangeModel(makeTestEndpointParams(logger, s), nil, &endpoint.FakeEndpointProxy{}, model, nil)
 	require.NoError(t, err)
 
 	ep.Start(uint16(model.ID))
@@ -835,7 +923,6 @@ func TestMissingNodeLabelsUpdate(t *testing.T) {
 
 func TestUpdateHostEndpointLabels(t *testing.T) {
 	logger := hivetest.Logger(t)
-	kvstoreSync := ipcache.NewIPIdentitySynchronizer(logger, kvstore.SetupDummy(t, kvstore.DisabledBackendName))
 	// Initialize label filter config.
 	labelsfilter.ParseLabelPrefixCfg(logger, []string{"k8s:!ignore1", "k8s:!ignore2"}, nil, "")
 	s := setupEndpointManagerSuite(t)
@@ -858,7 +945,7 @@ func TestUpdateHostEndpointLabels(t *testing.T) {
 			name: "Add labels",
 			preTestRun: func() {
 				model := newTestEndpointModel(1, endpoint.StateReady)
-				ep, err := endpoint.NewEndpointFromChangeModel(t.Context(), logger, nil, &endpoint.MockEndpointBuildQueue{}, nil, nil, nil, nil, nil, identitymanager.NewIDManager(logger), nil, nil, s.repo, testipcache.NewMockIPCache(), &endpoint.FakeEndpointProxy{}, testidentity.NewMockIdentityAllocator(nil), ctmap.NewFakeGCRunner(), kvstoreSync, model, fakeTypes.WireguardConfig{}, fakeTypes.IPsecConfig{}, nil, nil)
+				ep, err := endpoint.NewEndpointFromChangeModel(makeTestEndpointParams(logger, s), nil, &endpoint.FakeEndpointProxy{}, model, nil)
 				require.NoError(t, err)
 
 				ep.Start(uint16(model.ID))
@@ -889,7 +976,7 @@ func TestUpdateHostEndpointLabels(t *testing.T) {
 			preTestRun: func() {
 				model := newTestEndpointModel(1, endpoint.StateReady)
 				model.Labels = apiv1.Labels([]string{"k8s:k1=v1"})
-				ep, err := endpoint.NewEndpointFromChangeModel(t.Context(), logger, nil, &endpoint.MockEndpointBuildQueue{}, nil, nil, nil, nil, nil, identitymanager.NewIDManager(logger), nil, nil, s.repo, testipcache.NewMockIPCache(), &endpoint.FakeEndpointProxy{}, testidentity.NewMockIdentityAllocator(nil), ctmap.NewFakeGCRunner(), kvstoreSync, model, fakeTypes.WireguardConfig{}, fakeTypes.IPsecConfig{}, nil, nil)
+				ep, err := endpoint.NewEndpointFromChangeModel(makeTestEndpointParams(logger, s), nil, &endpoint.FakeEndpointProxy{}, model, nil)
 				require.NoError(t, err)
 
 				ep.Start(uint16(model.ID))
@@ -921,8 +1008,7 @@ func TestUpdateHostEndpointLabels(t *testing.T) {
 			preTestRun: func() {
 				model := newTestEndpointModel(1, endpoint.StateReady)
 				model.Labels = apiv1.Labels([]string{"k8s:k1=v1"})
-				kvstoreSync := ipcache.NewIPIdentitySynchronizer(logger, kvstore.SetupDummy(t, kvstore.DisabledBackendName))
-				ep, err := endpoint.NewEndpointFromChangeModel(t.Context(), logger, nil, &endpoint.MockEndpointBuildQueue{}, nil, nil, nil, nil, nil, identitymanager.NewIDManager(logger), nil, nil, s.repo, testipcache.NewMockIPCache(), &endpoint.FakeEndpointProxy{}, testidentity.NewMockIdentityAllocator(nil), ctmap.NewFakeGCRunner(), kvstoreSync, model, fakeTypes.WireguardConfig{}, fakeTypes.IPsecConfig{}, nil, nil)
+				ep, err := endpoint.NewEndpointFromChangeModel(makeTestEndpointParams(logger, s), nil, &endpoint.FakeEndpointProxy{}, model, nil)
 				ep.SetIsHost(true)
 				require.NoError(t, err)
 
@@ -975,4 +1061,60 @@ func TestUpdateHostEndpointLabels(t *testing.T) {
 		)
 		tt.postTestRun()
 	}
+}
+
+func TestUpdateCIDRLabelsPrefixScan(t *testing.T) {
+	logger := hivetest.Logger(t)
+	s := setupEndpointManagerSuite(t)
+	mgr := New(logger, nil, &dummyEpSyncher{}, nil, nil, nil, defaultEndpointManagerConfig)
+
+	// Create and expose two endpoints, one inside the subnet, one outside
+	model1 := newTestEndpointModel(1, endpoint.StateReady)
+	ep1, err := endpoint.NewEndpointFromChangeModel(makeTestEndpointParams(logger, s), nil, &endpoint.FakeEndpointProxy{}, model1, nil)
+	require.NoError(t, err)
+	ep1.IPv4 = netip.MustParseAddr("10.20.30.50")
+	ep1.Start(uint16(model1.ID))
+	t.Cleanup(ep1.Stop)
+	require.NoError(t, mgr.expose(ep1))
+	defer mgr.WaitEndpointRemoved(ep1)
+
+	model2 := newTestEndpointModel(2, endpoint.StateReady)
+	ep2, err := endpoint.NewEndpointFromChangeModel(makeTestEndpointParams(logger, s), nil, &endpoint.FakeEndpointProxy{}, model2, nil)
+	require.NoError(t, err)
+	ep2.IPv4 = netip.MustParseAddr("10.30.30.50")
+	ep2.Start(uint16(model2.ID))
+	t.Cleanup(ep2.Stop)
+	require.NoError(t, mgr.expose(ep2))
+	defer mgr.WaitEndpointRemoved(ep2)
+
+	// Call UpdateCIDRLabels for the prefix 10.20.30.0/24
+	subnet := netip.MustParsePrefix("10.20.30.0/24")
+	_ = mgr.UpdateCIDRLabels(context.Background(), subnet)
+
+	// Verify that the controller for ep1 was triggered or is present, while ep2 was not
+	m1 := ep1.GetModel()
+	require.NotNil(t, m1)
+	require.NotNil(t, m1.Status)
+
+	// Find controller for resolve-identity-1
+	foundEP1Ctrl := false
+	for _, c := range m1.Status.Controllers {
+		if c.Name == "resolve-identity-1" {
+			foundEP1Ctrl = true
+			break
+		}
+	}
+	assert.True(t, foundEP1Ctrl, "ep1 should have triggered identity resolver")
+
+	m2 := ep2.GetModel()
+	require.NotNil(t, m2)
+	require.NotNil(t, m2.Status)
+	foundEP2Ctrl := false
+	for _, c := range m2.Status.Controllers {
+		if c.Name == "resolve-identity-2" {
+			foundEP2Ctrl = true
+			break
+		}
+	}
+	assert.False(t, foundEP2Ctrl, "ep2 should not have triggered identity resolver")
 }

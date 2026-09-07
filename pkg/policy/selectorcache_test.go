@@ -23,59 +23,38 @@ import (
 	testidentity "github.com/cilium/cilium/pkg/testutils/identity"
 )
 
-// testNewSelectorCache returns a newly initialized SelectorCache and a function used to
-// stop the incremental update notifier goroutine of the new selector cache.
-// Typically the caller would do something like this:
-//
-// sc, closer := testNewSelectorCache(...)
-// defer closer()
-//
-// This way the 'closer' is called right before 'sc' goes out of scope. If 'sc' is returned up the
-// call stack, then the 'closer' should be returned as well so that the defer on it can be done at
-// the right scope.
 func testNewSelectorCache(tb testing.TB, logger *slog.Logger, ids identity.IdentityMap) *SelectorCache {
 	sc := NewSelectorCache(logger, ids)
 	sc.userHandlerDone = make(chan struct{})
-
 	sc.SetLocalIdentityNotifier(testidentity.NewDummyIdentityNotifier())
+	tb.Cleanup(sc.StopNotificationHandler)
+	return sc
+}
 
-	tb.Cleanup(func() {
-		sc.userMutex.Lock()
-		defer sc.userMutex.Unlock()
+// StopNotificationHandler drains pending notifications and terminates the
+// handler goroutine. Idempotent.
+func (sc *SelectorCache) StopNotificationHandler() {
+	sc.userMutex.Lock()
+	defer sc.userMutex.Unlock()
 
-		// Only ever execute the termination signaling and wait once
-		if sc.userHandlerDone != nil {
-			handlerWasStarted := true // assume the handler was started
+	if sc.userHandlerDone == nil {
+		return
+	}
 
-			// Execute Once to see if the handler was really started
-			sc.startNotificationsHandlerOnce.Do(func() {
-				// if this executes then the handler was NOT started
-				handlerWasStarted = false
-			})
-
-			if handlerWasStarted {
-				// Append an empty user notification to tell the handler to close
-				sc.userNotes = append(sc.userNotes, userNotification{})
-
-				// Unlock so thet handler is not blocked when it wakes up
-				sc.userMutex.Unlock()
-
-				// tell the handler to wake up
-				sc.userCond.Signal()
-
-				// wait for the handler to process the zero notification and close
-				<-sc.userHandlerDone
-
-				// lock again
-				sc.userMutex.Lock()
-
-				// nil the channel to not wait again for an already done handler
-				sc.userHandlerDone = nil
-			}
-		}
+	handlerWasStarted := true
+	sc.startNotificationsHandlerOnce.Do(func() {
+		handlerWasStarted = false
 	})
 
-	return sc
+	if handlerWasStarted {
+		sc.userNotes = append(sc.userNotes, userNotification{})
+		sc.userMutex.Unlock()
+		sc.userCond.Signal()
+		<-sc.userHandlerDone
+		sc.userMutex.Lock()
+	}
+
+	sc.userHandlerDone = nil
 }
 
 type selectorUpdate struct {
@@ -134,7 +113,7 @@ func (csu *cachedSelectionUser) AddIdentitySelector(sel api.EndpointSelector) Ca
 	csu.updateMutex.Lock()
 	defer csu.updateMutex.Unlock()
 
-	cached, added := csu.sc.AddIdentitySelectorForTest(csu, EmptyStringLabels, sel)
+	cached, added := csu.sc.AddIdentitySelectorForTest(csu, sel)
 	require.NotNil(csu.t, cached)
 
 	_, exists := csu.selections[cached]
@@ -153,7 +132,7 @@ func (csu *cachedSelectionUser) AddFQDNSelector(sel api.FQDNSelector) CachedSele
 	defer csu.updateMutex.Unlock()
 
 	var cached types.CachedSelector
-	css, added := csu.sc.AddSelectors(csu, EmptyStringLabels, types.ToSelectors(sel)...)
+	css, added := csu.sc.AddSelectors(csu, types.ToSelectors(sel)...)
 	cached = css[0]
 
 	require.NotNil(csu.t, cached)
@@ -241,6 +220,10 @@ func (csu *cachedSelectionUser) IsPeerSelector() bool {
 	return true
 }
 
+func (csu *cachedSelectionUser) GetRuleLabels(cs CachedSelector) labels.LabelArrayList {
+	return nil
+}
+
 // Mock CachedSelector for unit testing.
 //
 // testCachedSelector is used in isolation so there is no point to implement versioning for it.
@@ -264,7 +247,12 @@ func newTestCachedSelector(name string, wildcard bool, selections ...int) *testC
 func (cs *testCachedSelector) addSelections(selections ...int) (adds []identity.NumericIdentity) {
 	for _, id := range selections {
 		nid := identity.NumericIdentity(id)
-		adds = append(adds, nid)
+		// hack: expand 0 to all aggregates
+		if nid == 0 {
+			adds = append(adds, AllAggregates...)
+		} else {
+			adds = append(adds, nid)
+		}
 		if cs == nil {
 			continue
 		}
@@ -303,7 +291,7 @@ func (cs *testCachedSelector) GetSelectionsAt(SelectorSnapshot) identity.Numeric
 	return cs.selections
 }
 
-func (cs *testCachedSelector) GetMetadataLabels() labels.LabelArray {
+func (cs *testCachedSelector) GetMetadataLabels() labels.LabelArrayList {
 	return nil
 }
 func (cs *testCachedSelector) Selects(nid identity.NumericIdentity) bool {
@@ -720,8 +708,30 @@ func TestSelectorManagerCanGetBeforeSet(t *testing.T) {
 	}()
 
 	sc := testNewSelectorCache(t, hivetest.Logger(t), nil)
-	sel := newIdentitySelector(sc, "test", nil, EmptyStringLabels)
+	sel := newIdentitySelector(sc, "test", nil)
 
 	selections := sel.GetSelections()
 	require.Empty(t, selections)
+}
+
+func BenchmarkSelectorCacheIdentityUpdates(b *testing.B) {
+	td := newTestData(b, hivetest.Logger(b))
+	td.bootstrapRepo(GenerateMatchAllRules, 1, b)
+	ids := generateNumIdentities(10000)
+	wg := &sync.WaitGroup{}
+	for k, v := range ids {
+		td.sc.UpdateIdentities(identity.IdentityMap{k: v}, nil, wg)
+	}
+
+	wg.Wait()
+
+	b.ReportAllocs()
+	for b.Loop() {
+		wg := &sync.WaitGroup{}
+		td.sc.UpdateIdentities(nil, identity.IdentityMap{fooIdentity.ID: fooIdentity.LabelArray}, wg)
+		wg.Wait()
+		td.sc.UpdateIdentities(identity.IdentityMap{fooIdentity.ID: fooIdentity.LabelArray}, nil, wg)
+		wg.Wait()
+
+	}
 }

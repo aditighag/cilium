@@ -9,12 +9,15 @@ import (
 	"fmt"
 	"log/slog"
 
-	gobgp "github.com/osrg/gobgp/v3/api"
-	"github.com/osrg/gobgp/v3/pkg/server"
+	"github.com/google/uuid"
+	gobgp "github.com/osrg/gobgp/v4/api"
+	"github.com/osrg/gobgp/v4/pkg/apiutil"
+	"github.com/osrg/gobgp/v4/pkg/server"
 
 	"github.com/cilium/cilium/pkg/bgp/types"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 const (
@@ -24,9 +27,11 @@ const (
 	// idleHoldTimeAfterResetSeconds defines time BGP session will stay idle after neighbor reset.
 	idleHoldTimeAfterResetSeconds = 5
 
-	// globalAllowLocalPolicyName is a special GoBGP policy assignment name that refers to a local route policy
-	// it is used with a global import policy that rejects all paths announced toward Cilium from external peers
+	// globalAllowLocalPolicyName is the GoBGP policy that permits local routes that overrides
+	// the default reject import policy which rejects paths announced toward Cilium from external peers.
 	globalAllowLocalPolicyName = "allow-local"
+	// globalAllowLocalPolicyStatementName is the name of the statement in the global allow-local policy
+	globalAllowLocalPolicyStatementName = "accept-local"
 	// globalPolicyAssignmentName is a special GoBGP policy assignment name that refers to the router-global policy
 	globalPolicyAssignmentName = "global"
 )
@@ -49,17 +54,18 @@ var (
 		Name: globalAllowLocalPolicyName,
 		Statements: []*gobgp.Statement{
 			{
+				Name: scopedPolicyStatementName(globalAllowLocalPolicyName, globalAllowLocalPolicyStatementName),
 				Conditions: &gobgp.Conditions{
 					RouteType: gobgp.Conditions_ROUTE_TYPE_LOCAL,
 				},
 				Actions: &gobgp.Actions{
-					RouteAction: gobgp.RouteAction_ACCEPT,
+					RouteAction: gobgp.RouteAction_ROUTE_ACTION_ACCEPT,
 				},
 			},
 		},
 	}
 	// The default S/Afi pair to use if not provided by the user.
-	defaultSafiAfi = []*gobgp.AfiSafi{
+	defaultAfiSafi = []*gobgp.AfiSafi{
 		{
 			Config: &gobgp.AfiSafiConfig{
 				Family: GoBGPIPv4Family,
@@ -91,13 +97,12 @@ type GoBGPServer struct {
 
 // NewGoBGPServer returns instance of go bgp router wrapper.
 func NewGoBGPServer(ctx context.Context, log *slog.Logger, params types.ServerParameters) (types.Router, error) {
-	logger := NewServerLogger(log, LogParams{
-		AS:        params.Global.ASN,
-		Component: "gobgp.BgpServerInstance",
-		SubSys:    "bgp-control-plane",
-	})
+	logger := log.With(
+		types.ComponentLogField, "gobgp-server",
+		types.LocalASNLogField, params.Global.ASN,
+	)
 
-	s := server.NewBgpServer(server.LoggerOption(logger))
+	s := server.NewBgpServer(server.LoggerOption(logger, nil))
 	go s.Serve()
 
 	startReq := &gobgp.StartBgpRequest{
@@ -119,7 +124,7 @@ func NewGoBGPServer(ctx context.Context, log *slog.Logger, params types.ServerPa
 	}
 
 	gobgpSrv := &GoBGPServer{
-		logger: log,
+		logger: logger,
 		asn:    params.Global.ASN,
 		server: s,
 	}
@@ -136,8 +141,8 @@ func NewGoBGPServer(ctx context.Context, log *slog.Logger, params types.ServerPa
 	err := gobgpSrv.server.SetPolicyAssignment(ctx, &gobgp.SetPolicyAssignmentRequest{
 		Assignment: &gobgp.PolicyAssignment{
 			Name:          globalPolicyAssignmentName,
-			Direction:     gobgp.PolicyDirection_IMPORT,
-			DefaultAction: gobgp.RouteAction_REJECT,
+			Direction:     gobgp.PolicyDirection_POLICY_DIRECTION_IMPORT,
+			DefaultAction: gobgp.RouteAction_ROUTE_ACTION_REJECT,
 			Policies:      []*gobgp.Policy{allowLocalPolicy},
 		},
 	})
@@ -145,12 +150,21 @@ func NewGoBGPServer(ctx context.Context, log *slog.Logger, params types.ServerPa
 		return nil, fmt.Errorf("failed configuring BGP server's global import policy: %w", err)
 	}
 
-	// will log out any peer changes.
-	watchRequest := &gobgp.WatchEventRequest{
-		Peer: &gobgp.WatchEventRequest_Peer{},
+	// Reject all paths announced by Cilium until an explicit export policy permits them.
+	err = gobgpSrv.server.SetPolicyAssignment(ctx, &gobgp.SetPolicyAssignmentRequest{
+		Assignment: &gobgp.PolicyAssignment{
+			Name:          globalPolicyAssignmentName,
+			Direction:     gobgp.PolicyDirection_POLICY_DIRECTION_EXPORT,
+			DefaultAction: gobgp.RouteAction_ROUTE_ACTION_REJECT,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed configuring BGP server's global export policy: %w", err)
 	}
-	err = s.WatchEvent(ctx, watchRequest, func(r *gobgp.WatchEventResponse) {
-		if p := r.GetPeer(); p != nil && p.Type == gobgp.WatchEventResponse_PeerEvent_STATE {
+
+	// will log out any peer changes
+	peerCallback := func(p *apiutil.WatchEventMessage_PeerEvent, _ time.Time) {
+		if p.Type == apiutil.PEER_EVENT_STATE {
 			gobgpSrv.stopMutex.Lock()
 			defer gobgpSrv.stopMutex.Unlock()
 
@@ -158,7 +172,7 @@ func NewGoBGPServer(ctx context.Context, log *slog.Logger, params types.ServerPa
 				return
 			}
 
-			logger.l.Debug("Peer state change", types.PeerLogField, p)
+			logger.Debug("Peer state change", types.PeerLogField, p)
 
 			// if channel is nil (e.g. in tests) below code will not block and will act as a no-op.
 			select {
@@ -166,34 +180,9 @@ func NewGoBGPServer(ctx context.Context, log *slog.Logger, params types.ServerPa
 			default:
 			}
 		}
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to configure peer watching for virtual router with local-asn %v: %w", startReq.Global.Asn, err)
 	}
-
-	watchRequestTable := &gobgp.WatchEventRequest{
-		Table: &gobgp.WatchEventRequest_Table{
-			Filters: []*gobgp.WatchEventRequest_Table_Filter{
-				{
-					Type: gobgp.WatchEventRequest_Table_Filter_ADJIN,
-					Init: true,
-				},
-				{
-					Type: gobgp.WatchEventRequest_Table_Filter_BEST,
-					Init: true,
-				},
-				{
-					Type: gobgp.WatchEventRequest_Table_Filter_POST_POLICY,
-					Init: true,
-				},
-				{
-					Type: gobgp.WatchEventRequest_Table_Filter_EOR,
-					Init: true,
-				},
-			},
-		},
-	}
-	err = s.WatchEvent(ctx, watchRequestTable, func(_ *gobgp.WatchEventResponse) {
+	// will trigger state notifications upon route changes
+	routeCallback := func(_ []*apiutil.Path, _ time.Time) {
 		gobgpSrv.stopMutex.Lock()
 		defer gobgpSrv.stopMutex.Unlock()
 
@@ -201,16 +190,25 @@ func NewGoBGPServer(ctx context.Context, log *slog.Logger, params types.ServerPa
 			return
 		}
 
-		logger.l.Debug("Route event received")
+		logger.Debug("Route event received")
 
 		// if channel is nil (e.g. in tests) below code will not block and will act as a no-op.
 		select {
 		case params.StateNotification <- struct{}{}:
 		default:
 		}
-	})
+	}
+
+	err = s.WatchEvent(ctx,
+		server.WatchEventMessageCallbacks{
+			OnPeerUpdate: peerCallback,
+			OnPathUpdate: routeCallback,
+		},
+		server.WatchPeer(),
+		server.WatchPostUpdate(true, "", ""),
+	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to configure table watching for virtual router with local-asn %v: %w", startReq.Global.Asn, err)
+		return nil, fmt.Errorf("failed to configure event watching for virtual router with local-asn %v: %w", startReq.Global.Asn, err)
 	}
 
 	return gobgpSrv, nil
@@ -229,7 +227,7 @@ func (g *GoBGPServer) AdvertisePath(ctx context.Context, p types.PathRequest) (t
 		return types.PathResponse{}, fmt.Errorf("failed converting Path to %v: %w", p.Path.NLRI, err)
 	}
 
-	resp, err := g.server.AddPath(ctx, &gobgp.AddPathRequest{Path: gobgpPath})
+	resp, err := g.server.AddPath(apiutil.AddPathRequest{Paths: []*apiutil.Path{gobgpPath}})
 	if err != nil {
 		return types.PathResponse{}, fmt.Errorf("failed adding Path to %v: %w", gobgpPath.Nlri, err)
 	}
@@ -238,7 +236,14 @@ func (g *GoBGPServer) AdvertisePath(ctx context.Context, p types.PathRequest) (t
 	if err != nil {
 		return types.PathResponse{}, fmt.Errorf("failed converting Path to %v: %w", gobgpPath.Nlri, err)
 	}
-	agentPath.UUID = resp.Uuid
+	if len(resp) > 0 {
+		agentPath.UUID, err = resp[0].UUID.MarshalBinary()
+		if err != nil {
+			return types.PathResponse{}, fmt.Errorf("failed marshalling UUID to %v: %w", gobgpPath.Nlri, err)
+		}
+	} else {
+		return types.PathResponse{}, fmt.Errorf("empty AddPath reply for %v", gobgpPath.Nlri)
+	}
 
 	return types.PathResponse{
 		Path: agentPath,
@@ -247,8 +252,12 @@ func (g *GoBGPServer) AdvertisePath(ctx context.Context, p types.PathRequest) (t
 
 // WithdrawPath withdraws a Path produced by AdvertisePath from this BgpServer.
 func (g *GoBGPServer) WithdrawPath(ctx context.Context, p types.PathRequest) error {
-	err := g.server.DeletePath(ctx, &gobgp.DeletePathRequest{
-		Uuid: p.Path.UUID,
+	id, err := uuid.FromBytes(p.Path.UUID)
+	if err != nil {
+		return fmt.Errorf("failed converting UUID %v: %w", p.Path.UUID, err)
+	}
+	err = g.server.DeletePath(apiutil.DeletePathRequest{
+		UUIDs: []uuid.UUID{id},
 	})
 	return err
 }
@@ -362,7 +371,7 @@ func (g *GoBGPServer) deleteDefinedSets(ctx context.Context, definedSets []*gobg
 }
 
 // Stop closes gobgp server
-func (g *GoBGPServer) Stop(_ context.Context, r types.StopRequest) {
+func (g *GoBGPServer) Stop(ctx context.Context, r types.StopRequest) {
 	g.stopMutex.Lock()
 	defer g.stopMutex.Unlock()
 
@@ -370,13 +379,14 @@ func (g *GoBGPServer) Stop(_ context.Context, r types.StopRequest) {
 
 	if g.server != nil {
 		if r.FullDestroy {
-			// Currently, the GoBGP implementation always sends Cease notification to all configured BGP peers during Stop().
-			// This breaks Graceful Restart, since "normal BGP procedures MUST be followed when the TCP session terminates
-			// due to the sending or receiving of a BGP NOTIFICATION message" (rfc4724, section 4).
-			// Therefore, for now, if FullDestroy is false, we do not call Stop() and leave the GoBGP server
-			// running until the process terminates.
-			// This should be revisited once GoBGP supports termination without sending the notification to the configured peers.
+			// destroys all resources, but sends notification to all peers (breaks Graceful Restart)
 			g.server.Stop()
+		} else {
+			// stops BGP instance only, does not send notification to Graceful Restart -enabled peers
+			err := g.server.StopBgp(ctx, &gobgp.StopBgpRequest{AllowGracefulRestart: true})
+			if err != nil {
+				g.logger.Error("Error stopping bgp server", logfields.Error, err)
+			}
 		}
 	}
 }

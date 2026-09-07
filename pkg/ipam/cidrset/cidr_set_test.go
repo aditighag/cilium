@@ -6,10 +6,12 @@ package cidrset
 
 import (
 	"math/big"
-	"net"
+	"math/bits"
+	"net/netip"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"go4.org/netipx"
 )
 
 func TestCIDRSetFullyAllocated(t *testing.T) {
@@ -33,8 +35,8 @@ func TestCIDRSetFullyAllocated(t *testing.T) {
 		},
 	}
 	for _, tc := range cases {
-		_, clusterCIDR, _ := net.ParseCIDR(tc.clusterCIDRStr)
-		a, err := NewCIDRSet(clusterCIDR, tc.subNetMaskSize)
+		clusterPrefix := netip.MustParsePrefix(tc.clusterCIDRStr)
+		a, err := NewCIDRSet(clusterPrefix, tc.subNetMaskSize)
 		if err != nil {
 			t.Fatalf("unexpected error: %v for %v", err, tc.description)
 		}
@@ -184,8 +186,8 @@ func TestIndexToCIDRBlock(t *testing.T) {
 		},
 	}
 	for _, tc := range cases {
-		_, clusterCIDR, _ := net.ParseCIDR(tc.clusterCIDRStr)
-		a, err := NewCIDRSet(clusterCIDR, tc.subnetMaskSize)
+		clusterPrefix := netip.MustParsePrefix(tc.clusterCIDRStr)
+		a, err := NewCIDRSet(clusterPrefix, tc.subnetMaskSize)
 		if err != nil {
 			t.Fatalf("error for %v ", tc.description)
 		}
@@ -211,13 +213,13 @@ func TestCIDRSet_RandomishAllocation(t *testing.T) {
 		},
 	}
 	for _, tc := range cases {
-		_, clusterCIDR, _ := net.ParseCIDR(tc.clusterCIDRStr)
-		a, err := NewCIDRSet(clusterCIDR, 24)
+		clusterPrefix := netip.MustParsePrefix(tc.clusterCIDRStr)
+		a, err := NewCIDRSet(clusterPrefix, 24)
 		if err != nil {
 			t.Fatalf("Error allocating CIDRSet for %v", tc.description)
 		}
 		// allocate all the CIDRs
-		var cidrs []*net.IPNet
+		var cidrs []netip.Prefix
 
 		for range 256 {
 			if c, err := a.AllocateNext(); err == nil {
@@ -238,7 +240,7 @@ func TestCIDRSet_RandomishAllocation(t *testing.T) {
 		}
 
 		// allocate the CIDRs again
-		var rcidrs []*net.IPNet
+		var rcidrs []netip.Prefix
 		for i := range 256 {
 			if c, err := a.AllocateNext(); err == nil {
 				rcidrs = append(rcidrs, c)
@@ -270,13 +272,13 @@ func TestCIDRSet_AllocationOccupied(t *testing.T) {
 		},
 	}
 	for _, tc := range cases {
-		_, clusterCIDR, _ := net.ParseCIDR(tc.clusterCIDRStr)
-		a, err := NewCIDRSet(clusterCIDR, 24)
+		clusterPrefix := netip.MustParsePrefix(tc.clusterCIDRStr)
+		a, err := NewCIDRSet(clusterPrefix, 24)
 		if err != nil {
 			t.Fatalf("Error allocating CIDRSet for %v", tc.description)
 		}
 		// allocate all the CIDRs
-		var cidrs []*net.IPNet
+		var cidrs []netip.Prefix
 		var numCIDRs = 256
 
 		for range numCIDRs {
@@ -302,7 +304,7 @@ func TestCIDRSet_AllocationOccupied(t *testing.T) {
 		}
 
 		// allocate the first 128 CIDRs again
-		var rcidrs []*net.IPNet
+		var rcidrs []netip.Prefix
 		for i := range numCIDRs / 2 {
 			if c, err := a.AllocateNext(); err == nil {
 				rcidrs = append(rcidrs, c)
@@ -445,21 +447,21 @@ func TestGetBitforCIDR(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		_, clusterCIDR, err := net.ParseCIDR(tc.clusterCIDRStr)
+		clusterPrefix, err := netip.ParsePrefix(tc.clusterCIDRStr)
 		if err != nil {
 			t.Fatalf("unexpected error: %v for %v", err, tc.description)
 		}
 
-		cs, err := NewCIDRSet(clusterCIDR, tc.subNetMaskSize)
+		cs, err := NewCIDRSet(clusterPrefix, tc.subNetMaskSize)
 		if err != nil {
 			t.Fatalf("Error allocating CIDRSet for %v", tc.description)
 		}
-		_, subnetCIDR, err := net.ParseCIDR(tc.subNetCIDRStr)
+		subnetPrefix, err := netip.ParsePrefix(tc.subNetCIDRStr)
 		if err != nil {
 			t.Fatalf("unexpected error: %v for %v", err, tc.description)
 		}
 
-		got, err := cs.getIndexForIP(subnetCIDR.IP)
+		got, err := cs.getIndexForAddr(subnetPrefix.Addr())
 		if err == nil && tc.expectErr {
 			t.Errorf("expected error but got null for %v", tc.description)
 			continue
@@ -615,22 +617,22 @@ func TestOccupy(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		_, clusterCIDR, err := net.ParseCIDR(tc.clusterCIDRStr)
+		clusterPrefix, err := netip.ParsePrefix(tc.clusterCIDRStr)
 		if err != nil {
 			t.Fatalf("unexpected error: %v for %v", err, tc.description)
 		}
 
-		cs, err := NewCIDRSet(clusterCIDR, tc.subNetMaskSize)
+		cs, err := NewCIDRSet(clusterPrefix, tc.subNetMaskSize)
 		if err != nil {
 			t.Fatalf("Error allocating CIDRSet for %v", tc.description)
 		}
 
-		_, subnetCIDR, err := net.ParseCIDR(tc.subNetCIDRStr)
+		subnetPrefix, err := netip.ParsePrefix(tc.subNetCIDRStr)
 		if err != nil {
 			t.Fatalf("unexpected error: %v for %v", err, tc.description)
 		}
 
-		err = cs.Occupy(subnetCIDR)
+		err = cs.Occupy(subnetPrefix)
 		if err == nil && tc.expectErr {
 			t.Errorf("expected error but got none for %v", tc.description)
 			continue
@@ -684,10 +686,10 @@ func TestCIDRSetv6(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.description, func(t *testing.T) {
-			_, clusterCIDR, _ := net.ParseCIDR(tc.clusterCIDRStr)
-			a, err := NewCIDRSet(clusterCIDR, tc.subNetMaskSize)
+			clusterPrefix := netip.MustParsePrefix(tc.clusterCIDRStr)
+			a, err := NewCIDRSet(clusterPrefix, tc.subNetMaskSize)
 			if gotErr := err != nil; gotErr != tc.expectErr {
-				t.Fatalf("NewCIDRSet(%v, %v) = %v, %v; gotErr = %t, want %t", clusterCIDR, tc.subNetMaskSize, a, err, gotErr, tc.expectErr)
+				t.Fatalf("NewCIDRSet(%v, %v) = %v, %v; gotErr = %t, want %t", clusterPrefix, tc.subNetMaskSize, a, err, gotErr, tc.expectErr)
 			}
 			if a == nil {
 				return
@@ -700,7 +702,7 @@ func TestCIDRSetv6(t *testing.T) {
 				t.Errorf("a.AllocateNext() = %+v, want no error", err)
 			}
 			if !tc.expectErr {
-				if p != nil && p.String() != tc.expectedCIDR {
+				if p.IsValid() && p.String() != tc.expectedCIDR {
 					t.Fatalf("a.AllocateNext() got %+v, want %+v", p.String(), tc.expectedCIDR)
 				}
 			}
@@ -712,7 +714,7 @@ func TestCIDRSetv6(t *testing.T) {
 				t.Errorf("a.AllocateNext() = %+v, want no error", err)
 			}
 			if !tc.expectErr {
-				if p2 != nil && p2.String() != tc.expectedCIDR2 {
+				if p2.IsValid() && p2.String() != tc.expectedCIDR2 {
 					t.Fatalf("a.AllocateNext() got %+v, want %+v", p2.String(), tc.expectedCIDR)
 				}
 			}
@@ -754,11 +756,164 @@ func TestInvalidSubNetMaskSize(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.description, func(t *testing.T) {
-			_, clusterCIDR, _ := net.ParseCIDR(tc.clusterCIDRStr)
-			a, err := NewCIDRSet(clusterCIDR, tc.subNetMaskSize)
+			clusterPrefix := netip.MustParsePrefix(tc.clusterCIDRStr)
+			a, err := NewCIDRSet(clusterPrefix, tc.subNetMaskSize)
 			if gotErr := err != nil; gotErr != tc.expectErr {
-				t.Fatalf("NewCIDRSet(%v, %v) = %v, %v; gotErr = %t, want %t", clusterCIDR, tc.subNetMaskSize, a, err, gotErr, tc.expectErr)
+				t.Fatalf("NewCIDRSet(%v, %v) = %v, %v; gotErr = %t, want %t", clusterPrefix, tc.subNetMaskSize, a, err, gotErr, tc.expectErr)
 			}
 		})
 	}
+}
+
+func TestCountUnavailableCIDRs(t *testing.T) {
+	cases := []struct {
+		description     string
+		usedIndices     []int
+		reservedIndices []int
+		want            int
+	}{
+		{
+			description: "Used bitmap spans more words",
+			usedIndices: []int{
+				bits.UintSize - 1,
+				bits.UintSize,
+				bits.UintSize*2 + 1,
+			},
+			reservedIndices: []int{bits.UintSize, bits.UintSize + 1},
+			want:            4,
+		},
+		{
+			description: "Reserved bitmap spans more words",
+			usedIndices: []int{
+				bits.UintSize - 1,
+				bits.UintSize,
+			},
+			reservedIndices: []int{
+				bits.UintSize,
+				bits.UintSize + 1,
+				bits.UintSize*2 + 1,
+			},
+			want: 4,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.description, func(t *testing.T) {
+			var used, reserved big.Int
+			for _, index := range tc.usedIndices {
+				used.SetBit(&used, index, 1)
+			}
+			for _, index := range tc.reservedIndices {
+				reserved.SetBit(&reserved, index, 1)
+			}
+
+			assert.Equal(t, tc.want, countUnavailableCIDRs(&used, &reserved))
+		})
+	}
+}
+
+func TestSetReservedRanges(t *testing.T) {
+	cases := []struct {
+		description    string
+		clusterCIDR    string
+		subNetMaskSize int
+		reservedFrom   string
+		reservedTo     string
+		allocatedCIDR  string
+		unreservedCIDR string
+	}{
+		{
+			description:    "IPv4",
+			clusterCIDR:    "10.0.0.0/30",
+			subNetMaskSize: 31,
+			reservedFrom:   "10.0.0.0",
+			reservedTo:     "10.0.0.1",
+			allocatedCIDR:  "10.0.0.2/31",
+			unreservedCIDR: "10.0.0.0/31",
+		},
+		{
+			description:    "IPv6",
+			clusterCIDR:    "fd00::/126",
+			subNetMaskSize: 127,
+			reservedFrom:   "fd00::",
+			reservedTo:     "fd00::1",
+			allocatedCIDR:  "fd00::2/127",
+			unreservedCIDR: "fd00::/127",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.description, func(t *testing.T) {
+			cidrSet, err := NewCIDRSet(netip.MustParsePrefix(tc.clusterCIDR), tc.subNetMaskSize)
+			if err != nil {
+				t.Fatalf("NewCIDRSet() returned an unexpected error: %v", err)
+			}
+
+			reserved := netipx.IPRangeFrom(
+				netip.MustParseAddr(tc.reservedFrom),
+				netip.MustParseAddr(tc.reservedTo),
+			)
+			if err := cidrSet.SetReservedRanges([]netipx.IPRange{reserved}); err != nil {
+				t.Fatalf("SetReservedRanges() returned an unexpected error: %v", err)
+			}
+			assert.Equal(t, 1, cidrSet.unavailableCIDRs)
+
+			allocated, err := cidrSet.AllocateNext()
+			if err != nil {
+				t.Fatalf("AllocateNext() returned an unexpected error: %v", err)
+			}
+			assert.Equal(t, netip.MustParsePrefix(tc.allocatedCIDR), allocated)
+			assert.Equal(t, 2, cidrSet.unavailableCIDRs)
+			assert.True(t, cidrSet.IsFull())
+
+			_, err = cidrSet.AllocateNext()
+			assert.ErrorIs(t, err, ErrCIDRRangeNoCIDRsRemaining)
+
+			if err := cidrSet.SetReservedRanges(nil); err != nil {
+				t.Fatalf("SetReservedRanges(nil) returned an unexpected error: %v", err)
+			}
+			assert.Equal(t, 1, cidrSet.unavailableCIDRs)
+			assert.False(t, cidrSet.IsFull())
+
+			allocated, err = cidrSet.AllocateNext()
+			if err != nil {
+				t.Fatalf("AllocateNext() returned an unexpected error after clearing reserved ranges: %v", err)
+			}
+			assert.Equal(t, netip.MustParsePrefix(tc.unreservedCIDR), allocated)
+			assert.Equal(t, 2, cidrSet.unavailableCIDRs)
+		})
+	}
+}
+
+func TestSetReservedRangesOverlap(t *testing.T) {
+	cidrSet, err := NewCIDRSet(netip.MustParsePrefix("10.0.0.0/30"), 31)
+	if err != nil {
+		t.Fatalf("NewCIDRSet() returned an unexpected error: %v", err)
+	}
+
+	first, err := cidrSet.AllocateNext()
+	if err != nil {
+		t.Fatalf("AllocateNext() returned an unexpected error: %v", err)
+	}
+	assert.Equal(t, netip.MustParsePrefix("10.0.0.0/31"), first)
+	assert.Equal(t, 1, cidrSet.unavailableCIDRs)
+
+	reserved := netipx.IPRangeFrom(
+		netip.MustParseAddr("10.0.0.0"),
+		netip.MustParseAddr("10.0.0.1"),
+	)
+	if err := cidrSet.SetReservedRanges([]netipx.IPRange{reserved}); err != nil {
+		t.Fatalf("SetReservedRanges() returned an unexpected error: %v", err)
+	}
+	assert.Equal(t, 1, cidrSet.unavailableCIDRs)
+
+	if err := cidrSet.Release(first); err != nil {
+		t.Fatalf("Release() returned an unexpected error: %v", err)
+	}
+	assert.Equal(t, 1, cidrSet.unavailableCIDRs)
+
+	if err := cidrSet.SetReservedRanges(nil); err != nil {
+		t.Fatalf("SetReservedRanges(nil) returned an unexpected error: %v", err)
+	}
+	assert.Equal(t, 0, cidrSet.unavailableCIDRs)
 }

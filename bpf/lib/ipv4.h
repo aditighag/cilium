@@ -35,6 +35,8 @@ struct {
 	__uint(map_flags, LRU_MEM_FLAVOR);
 } cilium_ipv4_frag_datagrams __section_maps_btf;
 
+DECLARE_CONFIG(bool, enable_ipv4_fragments, "Enable IPv4 fragments tracking")
+
 static __always_inline int
 ipv4_csum_update_by_value(struct __ctx_buff *ctx, int l3_off, __u64 old_val,
 			  __u64 new_val, __u32 len)
@@ -50,7 +52,28 @@ ipv4_csum_update_by_diff(struct __ctx_buff *ctx, int l3_off, __u64 diff)
 			       0, (__u32)diff, 0);
 }
 
-static __always_inline int ipv4_load_daddr(struct __ctx_buff *ctx, int off,
+/**
+ * Rewrite the L3 address at addr_off and amend the L3 checksum accordingly.
+ * @arg sum: set to the checksum diff of the change, for the caller to fold
+ *      into any paired L4 pseudo-header checksum update.
+ *
+ * Return 0 on success or a negative DROP_* reason
+ */
+static __always_inline int
+ipv4_l3_rewrite_addr(struct __ctx_buff *ctx, int l3_off, __u16 addr_off,
+		     __be32 old_addr, __be32 new_addr, __wsum *sum)
+{
+	*sum = csum_diff(&old_addr, 4, &new_addr, 4, 0);
+	if (ctx_store_bytes(ctx, l3_off + addr_off, &new_addr, 4, 0) < 0)
+		return DROP_WRITE_ERROR;
+
+	if (ipv4_csum_update_by_diff(ctx, l3_off, *sum) < 0)
+		return DROP_CSUM_L3;
+
+	return 0;
+}
+
+static __always_inline int ipv4_load_daddr(const struct __ctx_buff *ctx, int off,
 					   __u32 *dst)
 {
 	return ctx_load_bytes(ctx, off + offsetof(struct iphdr, daddr), dst, 4);
@@ -85,7 +108,6 @@ static __always_inline bool ipv4_is_in_subnet(__be32 addr,
 	return (addr & bpf_htonl(~((1 << (32 - prefixlen)) - 1))) == subnet;
 }
 
-#ifdef ENABLE_IPV4_FRAGMENTS
 static __always_inline int
 ipv4_frag_get_l4ports(const struct ipv4_frag_id *frag_id,
 		      struct ipv4_frag_l4ports *ports)
@@ -102,7 +124,7 @@ ipv4_frag_get_l4ports(const struct ipv4_frag_id *frag_id,
 }
 
 static __always_inline int
-ipv4_handle_fragmentation(struct __ctx_buff *ctx,
+ipv4_handle_fragmentation(const struct __ctx_buff *ctx,
 			  const struct iphdr *ip4,
 			  fraginfo_t fraginfo,
 			  int l4_off,
@@ -138,22 +160,19 @@ ipv4_handle_fragmentation(struct __ctx_buff *ctx,
 
 	return 0;
 }
-#endif
 
 static __always_inline int
-ipv4_load_l4_ports(struct __ctx_buff *ctx, struct iphdr *ip4 __maybe_unused,
+ipv4_load_l4_ports(const struct __ctx_buff *ctx, const struct iphdr *ip4 __maybe_unused,
 		   fraginfo_t fraginfo, int l4_off, enum ct_dir dir __maybe_unused,
 		   __be16 *ports)
 {
-#ifdef ENABLE_IPV4_FRAGMENTS
-	return ipv4_handle_fragmentation(ctx, ip4, fraginfo, l4_off, dir,
-					 (struct ipv4_frag_l4ports *)ports);
-#else
+	if (CONFIG(enable_ipv4_fragments))
+		return ipv4_handle_fragmentation(ctx, ip4, fraginfo, l4_off, dir,
+						 (struct ipv4_frag_l4ports *)ports);
 	if (unlikely(!ipfrag_has_l4_header(fraginfo)))
 		return DROP_FRAG_NOSUPPORT;
 	if (l4_load_ports(ctx, l4_off, ports) < 0)
 		return DROP_CT_INVALID_HDR;
-#endif
 
 	return 0;
 }

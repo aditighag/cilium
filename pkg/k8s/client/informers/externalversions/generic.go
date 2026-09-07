@@ -75,6 +75,8 @@ func (f *sharedInformerFactory) ForResource(resource schema.GroupVersionResource
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Cilium().V2().CiliumNodes().Informer()}, nil
 	case v2.SchemeGroupVersion.WithResource("ciliumnodeconfigs"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Cilium().V2().CiliumNodeConfigs().Informer()}, nil
+	case v2.SchemeGroupVersion.WithResource("ciliumpodippools"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Cilium().V2().CiliumPodIPPools().Informer()}, nil
 
 		// Group=cilium.io, Version=v2alpha1
 	case v2alpha1.SchemeGroupVersion.WithResource("ciliumbgpadvertisements"):
@@ -89,6 +91,8 @@ func (f *sharedInformerFactory) ForResource(resource schema.GroupVersionResource
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Cilium().V2alpha1().CiliumBGPPeerConfigs().Informer()}, nil
 	case v2alpha1.SchemeGroupVersion.WithResource("ciliumcidrgroups"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Cilium().V2alpha1().CiliumCIDRGroups().Informer()}, nil
+	case v2alpha1.SchemeGroupVersion.WithResource("ciliumdatapathplugins"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Cilium().V2alpha1().CiliumDatapathPlugins().Informer()}, nil
 	case v2alpha1.SchemeGroupVersion.WithResource("ciliumendpointslices"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Cilium().V2alpha1().CiliumEndpointSlices().Informer()}, nil
 	case v2alpha1.SchemeGroupVersion.WithResource("ciliumgatewayclassconfigs"):
@@ -97,10 +101,14 @@ func (f *sharedInformerFactory) ForResource(resource schema.GroupVersionResource
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Cilium().V2alpha1().CiliumL2AnnouncementPolicies().Informer()}, nil
 	case v2alpha1.SchemeGroupVersion.WithResource("ciliumloadbalancerippools"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Cilium().V2alpha1().CiliumLoadBalancerIPPools().Informer()}, nil
-	case v2alpha1.SchemeGroupVersion.WithResource("ciliumnodeconfigs"):
-		return &genericInformer{resource: resource.GroupResource(), informer: f.Cilium().V2alpha1().CiliumNodeConfigs().Informer()}, nil
+	case v2alpha1.SchemeGroupVersion.WithResource("ciliumnetworkdriverclusterconfigs"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Cilium().V2alpha1().CiliumNetworkDriverClusterConfigs().Informer()}, nil
+	case v2alpha1.SchemeGroupVersion.WithResource("ciliumnetworkdrivernodeconfigs"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Cilium().V2alpha1().CiliumNetworkDriverNodeConfigs().Informer()}, nil
 	case v2alpha1.SchemeGroupVersion.WithResource("ciliumpodippools"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Cilium().V2alpha1().CiliumPodIPPools().Informer()}, nil
+	case v2alpha1.SchemeGroupVersion.WithResource("ciliumresourceippools"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Cilium().V2alpha1().CiliumResourceIPPools().Informer()}, nil
 
 	}
 

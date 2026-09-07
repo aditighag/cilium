@@ -10,8 +10,7 @@ import (
 
 	"github.com/cilium/statedb"
 	"github.com/cilium/statedb/index"
-
-	"github.com/cilium/cilium/pkg/k8s/resource"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 type L2AnnounceKey struct {
@@ -30,7 +29,7 @@ type L2AnnounceEntry struct {
 	L2AnnounceKey
 
 	// The key of the services for which this proxy entry was added
-	Origins []resource.Key
+	Origins []types.NamespacedName
 }
 
 func (pne *L2AnnounceEntry) DeepCopy() *L2AnnounceEntry {
@@ -42,7 +41,7 @@ func (pne *L2AnnounceEntry) DeepCopy() *L2AnnounceEntry {
 }
 
 var (
-	L2AnnounceIDIndex = statedb.Index[*L2AnnounceEntry, L2AnnounceKey]{
+	l2AnnounceIDIndex = statedb.Index[*L2AnnounceEntry, L2AnnounceKey]{
 		Name: "id",
 		FromObject: func(b *L2AnnounceEntry) index.KeySet {
 			return index.NewKeySet(b.Key())
@@ -59,22 +58,28 @@ var (
 		Unique: true,
 	}
 
-	L2AnnounceOriginIndex = statedb.Index[*L2AnnounceEntry, resource.Key]{
+	l2AnnounceOriginIndex = statedb.Index[*L2AnnounceEntry, types.NamespacedName]{
 		Name: "origin",
 		FromObject: func(b *L2AnnounceEntry) index.KeySet {
 			return index.StringerSlice(b.Origins)
 		},
-		FromKey:    index.Stringer[resource.Key],
+		FromKey:    index.Stringer[types.NamespacedName],
 		FromString: index.FromString,
 	}
+
+	// L2AnnounceByID queries the L2 announce table by entry key.
+	L2AnnounceByID = l2AnnounceIDIndex.Query
+
+	// L2AnnouncesByOrigin queries the L2 announce table by origin.
+	L2AnnouncesByOrigin = l2AnnounceOriginIndex.Query
 )
 
 func NewL2AnnounceTable(db *statedb.DB) (statedb.RWTable[*L2AnnounceEntry], error) {
 	return statedb.NewTable(
 		db,
 		"l2-announce",
-		L2AnnounceIDIndex,
-		L2AnnounceOriginIndex,
+		l2AnnounceIDIndex,
+		l2AnnounceOriginIndex,
 	)
 }
 

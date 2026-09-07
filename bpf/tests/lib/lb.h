@@ -18,7 +18,7 @@ lb_v4_delete_service(__be32 addr, __be16 port, __u8 proto)
 }
 
 static __always_inline void
-__lb_v4_upsert_service(__be32 addr, __be16 port, __u8 proto, __u8 proto_int,
+__lb_v4_upsert_service(__be32 addr, __be16 port, __u8 proto,
 		       __u16 backend_count, __u16 rev_nat_index, __u8 flags, __u8 flags2,
 		       bool session_affinity, __u32 affinity_timeout)
 {
@@ -44,8 +44,11 @@ __lb_v4_upsert_service(__be32 addr, __be16 port, __u8 proto, __u8 proto_int,
 
 	if (lb4_svc_is_two_scopes(&svc_value)) {
 		/* Register with both scopes: */
-		svc_key.proto = proto_int;
+		svc_key.proto = proto;
 		svc_key.scope = LB_LOOKUP_SCOPE_INT;
+		/* For external IPs, only the EXT-scope entry has backends. */
+		if (lb4_svc_is_external_ip(&svc_value))
+			svc_value.count = 0;
 		map_update_elem(&cilium_lb4_services_v2, &svc_key, &svc_value, BPF_ANY);
 	}
 }
@@ -54,17 +57,17 @@ static __always_inline void
 lb_v4_upsert_service(__be32 addr, __be16 port, __u8 proto, __u16 backend_count,
 		     __u16 rev_nat_index)
 {
-	__lb_v4_upsert_service(addr, port, proto, proto, backend_count, rev_nat_index,
+	__lb_v4_upsert_service(addr, port, proto, backend_count, rev_nat_index,
 			       SVC_FLAG_ROUTABLE, 0, false, 0);
 }
 
 static __always_inline void
-__lb_v4_add_service(__be32 addr, __be16 port, __u8 proto, __u8 proto_int,
+__lb_v4_add_service(__be32 addr, __be16 port, __u8 proto,
 		    __u16 backend_count, __u16 rev_nat_index, __u8 flags,
 		    __u8 flags2, bool session_affinity, __u32 affinity_timeout)
 {
 	/* Register with both scopes: */
-	__lb_v4_upsert_service(addr, port, proto, proto_int, backend_count, rev_nat_index,
+	__lb_v4_upsert_service(addr, port, proto, backend_count, rev_nat_index,
 			       flags, flags2, session_affinity, affinity_timeout);
 
 	/* Insert a reverse NAT entry for the above service */
@@ -79,7 +82,7 @@ static __always_inline void
 lb_v4_add_service(__be32 addr, __be16 port, __u8 proto, __u16 backend_count,
 		  __u16 rev_nat_index)
 {
-	__lb_v4_add_service(addr, port, proto, proto, backend_count, rev_nat_index,
+	__lb_v4_add_service(addr, port, proto, backend_count, rev_nat_index,
 			    SVC_FLAG_ROUTABLE, 0, false, 0);
 }
 
@@ -87,8 +90,54 @@ static __always_inline void
 lb_v4_add_service_with_flags(__be32 addr, __be16 port, __u8 proto, __u16 backend_count,
 			     __u16 rev_nat_index, __u8 flags, __u8 flags2)
 {
-	__lb_v4_add_service(addr, port, proto, proto, backend_count, rev_nat_index,
+	__lb_v4_add_service(addr, port, proto, backend_count, rev_nat_index,
 			    flags, flags2, false, 0);
+}
+
+static __always_inline void
+lb_v4_add_nodeport_service(__be32 addr, __be16 port, __u8 proto,
+			   __u16 backend_count, __u16 rev_nat_index,
+			   __u8 flags2)
+{
+	__lb_v4_add_service(addr, port, proto, backend_count, rev_nat_index,
+			    SVC_FLAG_ROUTABLE | SVC_FLAG_NODEPORT, flags2, false, 0);
+}
+
+static __always_inline void
+lb_v4_add_hostport_service(__be32 addr, __be16 port, __u8 proto,
+			   __u16 backend_count, __u16 rev_nat_index,
+			   __u8 flags2)
+{
+	__lb_v4_add_service(addr, port, proto, backend_count, rev_nat_index,
+			    SVC_FLAG_ROUTABLE | SVC_FLAG_HOSTPORT, flags2, false, 0);
+}
+
+static __always_inline void
+lb_v4_add_l7_service(__be32 addr, __be16 port, __u8 proto,
+		     __u16 rev_nat_index, __u32 proxy_port)
+{
+	struct lb4_key svc_key = {
+		.address = addr,
+		.dport = port,
+		.proto = proto,
+		.scope = LB_LOOKUP_SCOPE_EXT,
+	};
+	struct lb4_service svc_value = {
+		.l7_lb_proxy_port = proxy_port,
+		.count = 0,
+		.rev_nat_index = rev_nat_index,
+		.flags = SVC_FLAG_ROUTABLE,
+		.flags2 = SVC_FLAG_L7_LOADBALANCER,
+	};
+
+	map_update_elem(&cilium_lb4_services_v2, &svc_key, &svc_value, BPF_ANY);
+
+	struct lb4_reverse_nat revnat_value = {
+		.address = addr,
+		.port = port,
+	};
+
+	map_update_elem(&cilium_lb4_reverse_nat, &rev_nat_index, &revnat_value, BPF_ANY);
 }
 
 static __always_inline void
@@ -191,6 +240,24 @@ lb_v6_add_service_with_flags(const union v6addr *addr, __be16 port, __u8 proto,
 }
 
 static __always_inline void
+lb_v6_add_nodeport_service(const union v6addr *addr, __be16 port, __u8 proto,
+			   __u16 backend_count, __u16 rev_nat_index,
+			   __u8 flags2)
+{
+	__lb_v6_add_service(addr, port, proto, backend_count, rev_nat_index,
+			    SVC_FLAG_ROUTABLE | SVC_FLAG_NODEPORT, flags2);
+}
+
+static __always_inline void
+lb_v6_add_hostport_service(const union v6addr *addr, __be16 port, __u8 proto,
+			   __u16 backend_count, __u16 rev_nat_index,
+			   __u8 flags2)
+{
+	__lb_v6_add_service(addr, port, proto, backend_count, rev_nat_index,
+			    SVC_FLAG_ROUTABLE | SVC_FLAG_HOSTPORT, flags2);
+}
+
+static __always_inline void
 lb_v6_add_backend(const union v6addr *svc_addr, __be16 svc_port, __u16 backend_slot,
 		  __u32 backend_id, const union v6addr *backend_addr,
 		  __be16 backend_port, __u8 backend_proto, __u8 cluster_id)
@@ -218,5 +285,33 @@ lb_v6_add_backend(const union v6addr *svc_addr, __be16 svc_port, __u16 backend_s
 
 	memcpy(&backend.address, backend_addr, sizeof(*backend_addr));
 	map_update_elem(&cilium_lb6_backends_v3, &backend_id, &backend, BPF_ANY);
+}
+
+static __always_inline void
+lb_v6_add_l7_service(const union v6addr *addr, __be16 port, __u8 proto,
+		     __u16 rev_nat_index, __u32 proxy_port)
+{
+	struct lb6_key svc_key __align_stack_8 = {
+		.dport = port,
+		.proto = proto,
+		.scope = LB_LOOKUP_SCOPE_EXT,
+	};
+	struct lb6_service svc_value = {
+		.l7_lb_proxy_port = proxy_port,
+		.count = 0,
+		.rev_nat_index = rev_nat_index,
+		.flags = SVC_FLAG_ROUTABLE,
+		.flags2 = SVC_FLAG_L7_LOADBALANCER,
+	};
+
+	memcpy(&svc_key.address, addr, sizeof(*addr));
+	map_update_elem(&cilium_lb6_services_v2, &svc_key, &svc_value, BPF_ANY);
+
+	struct lb6_reverse_nat revnat_value __align_stack_8 = {
+		.port = port,
+	};
+
+	memcpy(&revnat_value.address, addr, sizeof(*addr));
+	map_update_elem(&cilium_lb6_reverse_nat, &rev_nat_index, &revnat_value, BPF_ANY);
 }
 #endif

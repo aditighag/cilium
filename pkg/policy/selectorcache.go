@@ -245,7 +245,7 @@ type SelectorCache struct {
 	// selector (adding/removing selectors/identities) and is always kept open and committed on
 	// request. Updates from all concurrent callers are pooled to the same write transaction
 	// until Commit() is called.
-	// There may be no other write transactions on 'selections'.
+	// There may be no other write transactions on 'readableSelections'.
 	writeableSelections types.SelectorWriteTxn
 
 	// idCache contains all known identities as informed by the
@@ -275,10 +275,13 @@ type SelectorCache struct {
 	userHandlerDone chan struct{}
 }
 
-// GetReadTxn returns a read-only state of the current selectors in the selector cache.
-// The returned SelectorReadTxn should be Close()d as soon as possible to limit memory use.
+// GetSelectorSnapshot returns a read-only state of the current selectors in the selector cache.
+// The returned SelectorSnapshot should be Invalidate()d if stored on the heap and not needed any more.
 func (sc *SelectorCache) GetSelectorSnapshot() SelectorSnapshot {
-	return *sc.readTxn.Load()
+	if sc != nil {
+		return *sc.readTxn.Load()
+	}
+	return SelectorSnapshot{}
 }
 
 // WithRLock calls the given function with the selector cache locked for reading, so that the caller
@@ -317,7 +320,7 @@ func (sc *SelectorCache) GetModel() models.SelectorCache {
 			Selector:   key,
 			Identities: ids,
 			Users:      int64(sel.numUsers()),
-			Labels:     labelArrayToModel(sel.GetMetadataLabels()),
+			Labels:     labelArrayListToModel(sel.GetMetadataLabels()),
 		}
 		selCacheMdl = append(selCacheMdl, selMdl)
 	}
@@ -354,14 +357,18 @@ func (sc *SelectorCache) Stats() selectorStats {
 	return result
 }
 
-func labelArrayToModel(arr labels.LabelArray) models.LabelArray {
-	lbls := make(models.LabelArray, 0, len(arr))
-	for _, l := range arr {
-		lbls = append(lbls, &models.Label{
-			Key:    l.Key,
-			Value:  l.Value,
-			Source: l.Source,
-		})
+func labelArrayListToModel(list labels.LabelArrayList) models.LabelArrayList {
+	lbls := make(models.LabelArrayList, 0, len(list))
+	for _, arr := range list {
+		lblArray := make(models.LabelArray, 0, len(arr))
+		for _, l := range arr {
+			lblArray = append(lblArray, &models.Label{
+				Key:    l.Key,
+				Value:  l.Value,
+				Source: l.Source,
+			})
+		}
+		lbls = append(lbls, lblArray)
 	}
 	return lbls
 }
@@ -531,7 +538,7 @@ func selectsAll(selectors ...Selector) bool {
 // AddSelectorsTxn adds Selectors in to the selector cache, and returns the corresponding
 // slice of cached selectors.
 // Commit() must be called aftewards to make the selections of new selectors observable by readers.
-func (sc *SelectorCache) AddSelectorsTxn(user CachedSelectionUser, lbls stringLabels, selectors ...Selector) (CachedSelectorSlice, bool) {
+func (sc *SelectorCache) AddSelectorsTxn(user CachedSelectionUser, selectors ...Selector) (CachedSelectorSlice, bool) {
 	if selectsAll(selectors...) {
 		selectors = []Selector{types.WildcardSelector}
 	}
@@ -539,13 +546,13 @@ func (sc *SelectorCache) AddSelectorsTxn(user CachedSelectionUser, lbls stringLa
 	sc.mutex.Lock()
 	defer sc.mutex.Unlock()
 
-	return sc.addSelectorsTxn(user, lbls, selectors...)
+	return sc.addSelectorsTxn(user, selectors...)
 }
 
 // AddSelectors adds Selectors in to the selector cache, and returns the corresponding slice of
 // cached selectors.
 // Selections of new selectors are visible to readers right after this call.
-func (sc *SelectorCache) AddSelectors(user CachedSelectionUser, lbls stringLabels, selectors ...Selector) (CachedSelectorSlice, bool) {
+func (sc *SelectorCache) AddSelectors(user CachedSelectionUser, selectors ...Selector) (CachedSelectorSlice, bool) {
 	if selectsAll(selectors...) {
 		selectors = []Selector{types.WildcardSelector}
 	}
@@ -554,10 +561,10 @@ func (sc *SelectorCache) AddSelectors(user CachedSelectionUser, lbls stringLabel
 	defer sc.mutex.Unlock()
 
 	defer sc.commit()
-	return sc.addSelectorsTxn(user, lbls, selectors...)
+	return sc.addSelectorsTxn(user, selectors...)
 }
 
-func (sc *SelectorCache) addSelectorsTxn(user CachedSelectionUser, lbls stringLabels, selectors ...Selector) (CachedSelectorSlice, bool) {
+func (sc *SelectorCache) addSelectorsTxn(user CachedSelectionUser, selectors ...Selector) (CachedSelectorSlice, bool) {
 	css := make(CachedSelectorSlice, len(selectors))
 
 	added := false
@@ -568,7 +575,7 @@ func (sc *SelectorCache) addSelectorsTxn(user CachedSelectionUser, lbls stringLa
 		sel, exists := sc.selectors.Get(key)
 		if !exists {
 			// add the selector to the selector cache
-			sel = sc.addSelectorLocked(lbls, key, selector)
+			sel = sc.addSelectorLocked(key, selector)
 		}
 
 		if sel.addUser(user, sc.localIdentityNotifier) {
@@ -585,8 +592,8 @@ func (sc *SelectorCache) addSelectorsTxn(user CachedSelectionUser, lbls stringLa
 }
 
 // must hold lock for writing
-func (sc *SelectorCache) addSelectorLocked(lbls stringLabels, key string, source Selector) *identitySelector {
-	sel := newIdentitySelector(sc, key, source, lbls)
+func (sc *SelectorCache) addSelectorLocked(key string, source Selector) *identitySelector {
+	sel := newIdentitySelector(sc, key, source)
 
 	sc.selectors.Set(key, sel)
 
@@ -613,7 +620,7 @@ func (sc *SelectorCache) addSelectorLocked(lbls stringLabels, key string, source
 // cached, the corresponding CachedSelector is returned, otherwise one
 // is created and added to the cache.
 // NOTE: Only used for testing, but from multiple packages
-func (sc *SelectorCache) AddIdentitySelectorForTest(user CachedSelectionUser, lbls stringLabels, es api.EndpointSelector) (cachedSelector CachedSelector, added bool) {
+func (sc *SelectorCache) AddIdentitySelectorForTest(user CachedSelectionUser, es api.EndpointSelector) (cachedSelector CachedSelector, added bool) {
 	// The key returned here may be different for equivalent
 	// labelselectors, if the selector's requirements are stored
 	// in different orders. When this happens we'll be tracking
@@ -623,7 +630,7 @@ func (sc *SelectorCache) AddIdentitySelectorForTest(user CachedSelectionUser, lb
 	defer sc.mutex.Unlock()
 	sel, exists := sc.selectors.Get(key)
 	if !exists {
-		sel = sc.addSelectorLocked(lbls, key, types.NewLabelSelector(es))
+		sel = sc.addSelectorLocked(key, types.NewLabelSelector(es))
 		sc.commit()
 	}
 	return sel, sel.addUser(user, sc.localIdentityNotifier)
@@ -866,4 +873,19 @@ func (sc *SelectorCache) UpdateIdentities(added, deleted identity.IdentityMap, w
 		sc.queueNotifiedUsersCommit(readTxn, wg)
 	}
 	return mutated
+}
+
+// getIdentities captures the current set of identities.
+// Used for debugging, staging, and testing.
+func (sc *SelectorCache) getIdentities() identity.IdentityMap {
+	sc.mutex.RLock()
+	defer sc.mutex.RUnlock()
+
+	out := make(identity.IdentityMap, len(sc.idCache.ids))
+
+	for nid, id := range sc.idCache.ids {
+		out[nid] = id.lbls
+	}
+
+	return out
 }

@@ -18,6 +18,21 @@ const (
 	CompletionDelay  = 250 * time.Millisecond
 )
 
+type testOwner struct {
+	id      string
+	cleanup func(*Completion)
+}
+
+func (o *testOwner) ID() string {
+	return o.id
+}
+
+func (o *testOwner) CleanupAfterWait(c *Completion) {
+	if o.cleanup != nil {
+		o.cleanup(c)
+	}
+}
+
 func TestNoCompletion(t *testing.T) {
 	var err error
 
@@ -26,9 +41,15 @@ func TestNoCompletion(t *testing.T) {
 
 	wg := NewWaitGroup(ctx)
 
+	// Ensure context is not cancelled
+	require.NoError(t, wg.Context().Err())
+
 	// Wait should return immediately, since there are no completions.
 	err = wg.Wait()
 	require.NoError(t, err)
+
+	// Ensure context was cancelled by Wait
+	require.ErrorIs(t, wg.Context().Err(), context.Canceled)
 }
 
 func TestCompletionBeforeWait(t *testing.T) {
@@ -39,7 +60,7 @@ func TestCompletionBeforeWait(t *testing.T) {
 
 	wg := NewWaitGroup(ctx)
 
-	comp := wg.AddCompletion()
+	comp := wg.AddCompletionWithCallback(nil, nil)
 
 	comp.Complete(nil)
 
@@ -56,7 +77,7 @@ func TestCompletionAfterWait(t *testing.T) {
 
 	wg := NewWaitGroup(ctx)
 
-	comp := wg.AddCompletion()
+	comp := wg.AddCompletionWithCallback(nil, nil)
 
 	go func() {
 		time.Sleep(CompletionDelay)
@@ -68,6 +89,28 @@ func TestCompletionAfterWait(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestCompletionAfterWaitWithCancelledContext(t *testing.T) {
+	var err error
+
+	ctx, cancel := context.WithTimeout(context.Background(), TestTimeout)
+	defer cancel()
+
+	wg := NewWaitGroup(ctx)
+
+	comp := wg.AddCompletionWithCallback(nil, nil)
+
+	wg.Cancel()
+
+	go func() {
+		time.Sleep(CompletionDelay)
+		comp.Complete(nil)
+	}()
+
+	// Wait should block until comp.Complete is called, an error as the context was cancelled
+	err = wg.Wait()
+	require.ErrorIs(t, err, context.Canceled)
+}
+
 func TestCompletionBeforeAndAfterWait(t *testing.T) {
 	var err error
 
@@ -76,9 +119,9 @@ func TestCompletionBeforeAndAfterWait(t *testing.T) {
 
 	wg := NewWaitGroup(ctx)
 
-	comp1 := wg.AddCompletion()
+	comp1 := wg.AddCompletionWithCallback(nil, nil)
 
-	comp2 := wg.AddCompletion()
+	comp2 := wg.AddCompletionWithCallback(nil, nil)
 
 	comp1.Complete(nil)
 
@@ -103,7 +146,7 @@ func TestCompletionTimeout(t *testing.T) {
 	defer cancel()
 	wg := NewWaitGroup(wgCtx)
 
-	comp := wg.AddCompletionWithCallback(func(err error) {
+	comp := wg.AddCompletionWithCallback(nil, func(err error) {
 		// Callback gets called with context.DeadlineExceeded if the WaitGroup times out
 		require.Equal(t, context.DeadlineExceeded, err)
 	})
@@ -113,11 +156,62 @@ func TestCompletionTimeout(t *testing.T) {
 	// Wait should block until wgCtx expires.
 	err = wg.Wait()
 	require.Error(t, err)
-	require.Equal(t, wgCtx.Err(), err)
+
+	// Errors are now different when the context times out
+	require.NotEqual(t, wgCtx.Err(), err)
+	require.Equal(t, context.DeadlineExceeded, wgCtx.Err())
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 
 	// Complete is idempotent and harmless, and can be called after the
 	// context is canceled.
 	comp.Complete(nil)
+}
+
+func TestCompletionWaitCleanupOnTimeout(t *testing.T) {
+	var cleaned int
+
+	ctx, cancel := context.WithTimeout(context.Background(), TestTimeout)
+	defer cancel()
+
+	wgCtx, cancel := context.WithTimeout(ctx, WaitGroupTimeout)
+	defer cancel()
+	wg := NewWaitGroup(wgCtx)
+
+	var comp *Completion
+	owner := &testOwner{
+		id: "cleanup-owner",
+		cleanup: func(got *Completion) {
+			require.Same(t, comp, got)
+			cleaned++
+		},
+	}
+	comp = wg.AddCompletionWithCallback(owner, nil)
+
+	err := wg.Wait()
+	require.Error(t, err)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Equal(t, 1, cleaned)
+}
+
+func TestCompletionWaitCleanupNotCalledOnNormalCompletion(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), TestTimeout)
+	defer cancel()
+
+	wg := NewWaitGroup(ctx)
+
+	cleaned := false
+	comp := wg.AddCompletionWithCallback(&testOwner{
+		id: "normal-completion-owner",
+		cleanup: func(*Completion) {
+			cleaned = true
+		},
+	}, nil)
+
+	comp.Complete(nil)
+
+	err := wg.Wait()
+	require.NoError(t, err)
+	require.False(t, cleaned)
 }
 
 func TestCompletionMultipleCompleteCalls(t *testing.T) {
@@ -129,7 +223,7 @@ func TestCompletionMultipleCompleteCalls(t *testing.T) {
 	// Set a shorter timeout to shorten the test duration.
 	wg := NewWaitGroup(ctx)
 
-	comp := wg.AddCompletion()
+	comp := wg.AddCompletionWithCallback(nil, nil)
 
 	// Complete is idempotent.
 	comp.Complete(nil)
@@ -151,7 +245,7 @@ func TestCompletionWithCallback(t *testing.T) {
 	// Set a shorter timeout to shorten the test duration.
 	wg := NewWaitGroup(ctx)
 
-	comp := wg.AddCompletionWithCallback(func(err error) {
+	comp := wg.AddCompletionWithCallback(nil, func(err error) {
 		if err == nil {
 			callbackCount++
 		}
@@ -183,13 +277,13 @@ func TestCompletionWithCallbackError(t *testing.T) {
 	// Set a shorter timeout to shorten the test duration.
 	wg := NewWaitGroup(ctx)
 
-	comp := wg.AddCompletionWithCallback(func(err error) {
+	comp := wg.AddCompletionWithCallback(nil, func(err error) {
 		callbackCount++
 		// Completion that completes with a failure gets the reason for the failure
 		require.Equal(t, err1, err)
 	})
 
-	wg.AddCompletionWithCallback(func(err error) {
+	wg.AddCompletionWithCallback(nil, func(err error) {
 		callbackCount2++
 		// When one completions fail the other completion callbacks
 		// are called with context.Canceled
@@ -223,12 +317,12 @@ func TestCompletionWithCallbackOtherError(t *testing.T) {
 	// Set a shorter timeout to shorten the test duration.
 	wg := NewWaitGroup(ctx)
 
-	wg.AddCompletionWithCallback(func(err error) {
+	wg.AddCompletionWithCallback(nil, func(err error) {
 		callbackCount++
 		require.Equal(t, context.Canceled, err)
 	})
 
-	comp2 := wg.AddCompletionWithCallback(func(err error) {
+	comp2 := wg.AddCompletionWithCallback(nil, func(err error) {
 		callbackCount2++
 		require.Equal(t, err2, err)
 	})
@@ -259,7 +353,7 @@ func TestCompletionWithCallbackTimeout(t *testing.T) {
 	defer cancel()
 	wg := NewWaitGroup(wgCtx)
 
-	comp := wg.AddCompletionWithCallback(func(err error) {
+	comp := wg.AddCompletionWithCallback(nil, func(err error) {
 		if err == nil {
 			callbackCount++
 		}
@@ -271,7 +365,10 @@ func TestCompletionWithCallbackTimeout(t *testing.T) {
 	// Wait should block until wgCtx expires.
 	err = wg.Wait()
 	require.Error(t, err)
-	require.Equal(t, wgCtx.Err(), err)
+	// Errors are now different when the context times out
+	require.NotEqual(t, wgCtx.Err(), err)
+	require.Equal(t, context.DeadlineExceeded, wgCtx.Err())
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 
 	// Complete is idempotent and harmless, and can be called after the
 	// context is canceled.
